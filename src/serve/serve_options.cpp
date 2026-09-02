@@ -629,12 +629,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.devices = product::parse_devices(require_value("--devices"));
         } else if (arg == "--rope-yarn-factor") {
             options.rope_yarn_factor = std::stof(require_value("--rope-yarn-factor"));
-            // PORT NOTE (2026-10-24): the upstream patch allowed [1,8]; the second commit caps it at
-            // 4 because the attention visible-keys ceiling cannot serve more. Cap here as well so a
+            // PORT NOTE (2026-10-24): the upstream patch allowed [1,8]; the follow-up commit
+            // caps it at 4 because the attention visible-keys ceiling cannot serve more, so a
             // factor that cannot work is refused at the command line, not at engine start.
             if (!(options.rope_yarn_factor >= 1.0F) || options.rope_yarn_factor > 4.0F) {
                 throw std::invalid_argument(
-                    "--rope-yarn-factor must be in [1,4] (1 disables YaRN)");
+                    "--rope-yarn-factor must be in [1,4] (1 disables YaRN; 4 is the attention "
+                    "visible-keys ceiling)");
             }
         } else if (arg == "--rope-original-max-position") {
             options.rope_original_max_position = static_cast<std::uint32_t>(
