@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <span>
@@ -767,6 +768,48 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(sequence);
+}
+
+std::optional<qwen3_5::ContinuationSummary>
+ProgramImpl::drop_continuation_anchor(const ContinuationHandle& continuation,
+                                      runtime::CheckpointRef anchor) noexcept {
+    if (anchor.kind != runtime::CheckpointKind::LongAnchor || has_context_transaction() ||
+        pending_transaction_ || !valid_continuation(continuation)) {
+        return std::nullopt;
+    }
+    const std::uint32_t index = ContractAccess::index(continuation);
+    if (materialization_pins(index, ContractAccess::epoch(continuation)) ||
+        continuation_slots[index].role != ContinuationSlotRole::Catalogued) {
+        return std::nullopt;
+    }
+    SequenceState& sequence = continuation_states[index];
+    // Every condition publish_checkpoint_drop() rejects is checked here first, so a refused drop
+    // changes nothing and a failure past this point is a broken invariant.
+    try {
+        if (sequence.state.fork_pending || !sequence.kv || !state_store || !text_kv_addresses ||
+            std::none_of(sequence.long_anchors.begin(), sequence.long_anchors.end(),
+                         [&](const LongAnchorCheckpoint& candidate) {
+                             return candidate.frontier == anchor.frontier &&
+                                    candidate.ordinal == anchor.ordinal;
+                         })) {
+            return std::nullopt;
+        }
+        const std::optional<qwen3_5::TargetKVRequirement> retained =
+            retained_requirement_after_drop(continuation_summary(sequence), anchor);
+        if (!retained ||
+            !text_kv_addresses->can_truncate_inactive_prefix(sequence.kv->text,
+                                                             retained->main_frontier) ||
+            (sequence.kv->backend &&
+             (!backend_kv_addresses || !backend_kv_addresses->can_truncate_inactive_prefix(
+                                           *sequence.kv->backend, retained->backend_frontier)))) {
+            return std::nullopt;
+        }
+    } catch (...) { return std::nullopt; }
+    try {
+        publish_checkpoint_drop(sequence, anchor);
+        advance_resource_revision();
+        return continuation_summary(sequence);
+    } catch (...) { std::terminate(); }
 }
 
 std::vector<runtime::CheckpointRecoveryAlternativeWork>

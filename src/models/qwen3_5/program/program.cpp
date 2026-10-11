@@ -462,6 +462,12 @@ ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) n
     return impl_->release_continuation(std::move(continuation));
 }
 
+std::optional<ContinuationSummary>
+Program::drop_continuation_anchor(const ContinuationHandle& continuation,
+                                  runtime::CheckpointRef anchor) noexcept {
+    return impl_->drop_continuation_anchor(continuation, anchor);
+}
+
 ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexcept {
     return impl_->release_shared_prefix(std::move(shared));
 }

@@ -958,6 +958,11 @@ public:
     [[nodiscard]] FinishResult finish_cancelled(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+    // Drops one long anchor of an idle catalogued continuation and keeps the rest of it. Returns
+    // the continuation's new summary, or nothing (and no change) when the drop is not possible now.
+    [[nodiscard]] std::optional<ContinuationSummary>
+    drop_continuation_anchor(const ContinuationHandle& continuation,
+                             runtime::CheckpointRef anchor) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
 

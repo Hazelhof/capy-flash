@@ -995,8 +995,9 @@ public:
         assign_continuation_summary(publication.summary, result.summary);
         publication.handle.emplace(std::move(*result.continuation));
         result.continuation.reset();
-        publication.session   = active.session;
-        publication.retention = active.retention;
+        publication.session       = active.session;
+        publication.retention     = active.retention;
+        publication.reclaim_floor = reclaim_inflation_;
         migrate_observations(publication, result.summary, active.retention);
         advance_revision(publication.revision);
         if (publication.session && active.update_session_index) {
@@ -1178,6 +1179,8 @@ private:
         std::optional<CacheSessionKey> session;
         std::vector<CheckpointObservation> observations;
         RetentionClass retention = RetentionClass::RecentPrivate;
+        // Reclaim inflation when catalogued; see reclaim_private_owners_for_capture().
+        std::uint64_t reclaim_floor = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1577,7 +1580,8 @@ private:
         entry.handle.reset();
         entry.session.reset();
         entry.observations.clear();
-        entry.retention = RetentionClass::RecentPrivate;
+        entry.retention     = RetentionClass::RecentPrivate;
+        entry.reclaim_floor = 0;
         advance_revision(entry.revision);
     }
 
@@ -1597,16 +1601,78 @@ private:
     // finds the Device State pool full cannot fall back to a Host snapshot of its checkpoint, and
     // private captures never plan pressure. Once earlier conversations fill the pool, every new
     // conversation would keep only its endpoint and re-prefill its next turn. With the reclaim
-    // enabled, a Device-infeasible private capture first releases idle private continuations
-    // without a live session, lowest retention weight first and least recently admitted within
-    // it, until the capture fits or none remains. Continuations with an active edge (a retained
-    // source of a running request) and LiveSession continuations are never released here.
+    // enabled, a Device-infeasible private capture first takes Device state from idle private
+    // continuations without a live session, until the capture fits or none remains:
+    //  - it never takes a checkpoint that costs more to rebuild than the capture protects, so a
+    //    short side conversation's capture is skipped instead of paid for with a long session
+    //    (issue #3: a 1.8k side conversation released a 44k agent session and its anchors);
+    //  - it drops long anchors, lowest first, before it releases whole continuations: an anchor
+    //    only serves a rewrite of the history, a lost endpoint re-prefills the next turn;
+    //  - owners go lowest retention weight first, then lowest GreedyDual priority (rebuild tokens
+    //    of the deepest checkpoint plus the reclaim inflation when catalogued; every release
+    //    raises the inflation to the released priority, so an abandoned long continuation still
+    //    ages out), then least recently admitted.
+    // Continuations with an active edge (a retained source of a running request) and LiveSession
+    // continuations are never touched here.
+    [[nodiscard]] static std::uint64_t
+    continuation_rebuild_tokens(const ContinuationSummary& summary) noexcept {
+        std::uint64_t tokens = 0;
+        if (summary.endpoint) { tokens = std::max(tokens, summary.endpoint->rebuild_work.tokens); }
+        if (summary.rewrite) { tokens = std::max(tokens, summary.rewrite->rebuild_work.tokens); }
+        for (const auto& anchor : summary.long_anchors) {
+            tokens = std::max(tokens, anchor.rebuild_work.tokens);
+        }
+        return tokens;
+    }
+
+    [[nodiscard]] static std::uint64_t reclaim_priority(const CatalogEntry& entry) noexcept {
+        const std::uint64_t cost = continuation_rebuild_tokens(entry.summary);
+        return entry.reclaim_floor > std::numeric_limits<std::uint64_t>::max() - cost
+                   ? std::numeric_limits<std::uint64_t>::max()
+                   : entry.reclaim_floor + cost;
+    }
+
+    [[nodiscard]] static auto reclaim_key(const CatalogEntry& entry) noexcept {
+        return std::tuple{private_retention_weight(entry.retention), reclaim_priority(entry),
+                          entry.id};
+    }
+
+    [[nodiscard]] static auto lowest_long_anchor(const ContinuationSummary& summary) noexcept {
+        return std::min_element(summary.long_anchors.begin(), summary.long_anchors.end(),
+                                [](const auto& left, const auto& right) {
+                                    return left.ref.frontier < right.ref.frontier;
+                                });
+    }
+
+    // Drops the lowest long anchor of an idle catalogued continuation, keeping its endpoint.
+    bool drop_reclaim_anchor(Program& program, std::uint32_t slot) {
+        CatalogEntry& entry = catalog_[slot];
+        const auto anchor   = lowest_long_anchor(entry.summary);
+        const std::optional<ContinuationSummary> after =
+            program.drop_continuation_anchor(*entry.handle, anchor->ref);
+        if (!after) { return false; }
+        if (!valid_continuation_summary(*after) ||
+            continuation_checkpoint_count(*after) + 1 != continuation_checkpoint_count(entry.summary)) {
+            throw std::logic_error("Program dropped more than the selected long anchor");
+        }
+        assign_continuation_summary(entry.summary, *after);
+        migrate_observations(entry, *after, entry.retention);
+        advance_revision(entry.revision);
+        refresh_session_owner_revision(entry.id, slot, entry.revision);
+        saturating_increment(context_stats_.pressure_private_owners_degraded);
+        record_checkpoint_drops(context_stats_, 1);
+        rebuild_prefix_index();
+        return true;
+    }
+
     template <class Reassess>
     void reclaim_private_owners_for_capture(Program& program, CaptureAssessment& baseline,
                                             Reassess&& reassess) {
         if (!reclaim_private_for_capture_) { return; }
         while (baseline.publishes_private && !baseline.physically_feasible) {
+            const std::uint64_t protected_tokens = baseline.protected_rebuild_work.tokens;
             std::optional<std::uint32_t> victim;
+            std::optional<std::uint32_t> anchored;
             for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
                 const CatalogEntry& entry = catalog_[slot];
                 if (entry.state != CatalogState::Catalogued || !entry.handle ||
@@ -1614,14 +1680,23 @@ private:
                     private_has_active_edge(slot)) {
                     continue;
                 }
-                if (!victim || std::pair{private_retention_weight(entry.retention), entry.id} <
-                                   std::pair{private_retention_weight(catalog_[*victim].retention),
-                                             catalog_[*victim].id}) {
+                if (continuation_rebuild_tokens(entry.summary) <= protected_tokens &&
+                    (!victim || reclaim_key(entry) < reclaim_key(catalog_[*victim]))) {
                     victim = slot;
                 }
+                if (!entry.summary.long_anchors.empty() &&
+                    lowest_long_anchor(entry.summary)->rebuild_work.tokens <= protected_tokens &&
+                    (!anchored || reclaim_key(entry) < reclaim_key(catalog_[*anchored]))) {
+                    anchored = slot;
+                }
+            }
+            if (anchored && drop_reclaim_anchor(program, *anchored)) {
+                baseline = reassess();
+                continue;
             }
             if (!victim) { return; }
             CatalogEntry& entry = catalog_[*victim];
+            reclaim_inflation_  = std::max(reclaim_inflation_, reclaim_priority(entry));
             const auto released = program.release_continuation(std::move(*entry.handle));
             if (released.status != ConsumeStatus::Consumed) { return; }
             const std::uint32_t dropped = continuation_checkpoint_count(entry.summary);
@@ -3441,6 +3516,7 @@ private:
     CapturePlanner capture_planner_;
     RuntimeStats context_stats_;
     std::uint64_t next_continuation_id_  = 1;
+    std::uint64_t reclaim_inflation_     = 0;
     std::uint64_t next_shared_prefix_id_ = 1;
     std::uint64_t retention_epoch_       = 0;
     std::uint64_t demand_epoch_          = 0;

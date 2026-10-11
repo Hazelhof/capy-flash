@@ -552,6 +552,9 @@ public:
     [[nodiscard]] FinishResult finish_terminal(SequenceHandle sequence, bool cancelled) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
+    [[nodiscard]] std::optional<qwen3_5::ContinuationSummary>
+    drop_continuation_anchor(const ContinuationHandle& continuation,
+                             runtime::CheckpointRef anchor) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
     void fail_all_cleanup() noexcept;
     [[nodiscard]] detail::PhysicalResources admission_capacity() const noexcept;

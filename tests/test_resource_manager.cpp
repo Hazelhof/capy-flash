@@ -1,6 +1,7 @@
 #include "runtime/engine/context_cache/resource_manager.h"
 
 #include <algorithm>
+#include <unordered_map>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -995,7 +996,8 @@ public:
         FakeCaptureAssessment assessment = capture_assessment;
         if (!permit_shared_publication) { assessment.publishes_shared = false; }
         if (capture_feasible_after_releases &&
-            released_continuations.size() >= *capture_feasible_after_releases) {
+            released_continuations.size() + dropped_anchors.size() >=
+                *capture_feasible_after_releases) {
             assessment.physically_feasible = true;
         }
         return assessment;
@@ -1107,6 +1109,8 @@ public:
         if (finish_with_rewrite) {
             result.summary.rewrite = rewrite_checkpoint(key, finish_frontier - 1U);
         }
+        result.summary.long_anchors     = finish_long_anchors;
+        catalogued_summaries_[sequence.id] = result.summary;
         result.continuation.emplace(sequence.id, key);
         return result;
     }
@@ -1124,6 +1128,21 @@ public:
         return FakeAbortResult{.status      = ConsumeStatus::Consumed,
                                .timings     = FakeTimings{.value = 7},
                                .speculative = FakeSpeculativeStats{.value = 9}};
+    }
+
+    [[nodiscard]] std::optional<FakeContinuationSummary>
+    drop_continuation_anchor(const FakeContinuationHandle& continuation,
+                             CheckpointRef anchor) noexcept {
+        const auto found = catalogued_summaries_.find(continuation.id);
+        if (!allow_anchor_drops || found == catalogued_summaries_.end()) { return std::nullopt; }
+        auto& anchors = found->second.long_anchors;
+        const auto it = std::find_if(anchors.begin(), anchors.end(),
+                                     [&](const auto& item) { return item.ref == anchor; });
+        if (it == anchors.end()) { return std::nullopt; }
+        anchors.erase(it);
+        dropped_anchors.push_back(anchor);
+        advance_revision();
+        return found->second;
     }
 
     [[nodiscard]] FakeReleaseResult
@@ -1192,6 +1211,10 @@ public:
     std::vector<std::uint64_t> started_action_ids;
     std::vector<std::uint32_t> selected_shared_capture_frontiers;
     std::vector<std::uint32_t> released_continuations;
+    std::vector<FakeCheckpointSummary> finish_long_anchors;
+    bool allow_anchor_drops = false;
+    std::vector<CheckpointRef> dropped_anchors;
+    std::unordered_map<std::uint32_t, FakeContinuationSummary> catalogued_summaries_;
 
 private:
     void advance_revision() noexcept {
@@ -2940,7 +2963,7 @@ void test_hostless_private_capture_reclaims_oldest_idle_continuation() {
 
         program.capture_assessment = FakeCaptureAssessment{
             .shortlist_key          = FakeShortlistKey{.digest = 53, .frontier = 12},
-            .protected_rebuild_work = PrefillWork{.tokens = 12},
+            .protected_rebuild_work = PrefillWork{.tokens = 64},
             .publishes_private      = true,
             .physically_feasible    = false,
         };
@@ -2972,6 +2995,124 @@ void test_hostless_private_capture_reclaims_oldest_idle_continuation() {
                 "Host-less capture reclaim was not reported as a private eviction");
         (void)finish_active(manager, program, active, 12);
     }
+}
+
+// Issue #3: two short side conversations between two turns of a long agent session evicted the
+// session, the least recently admitted, though it cost hundreds of times more to rebuild. The
+// reclaim prefers the cheapest continuation, and a long one nobody returns to still ages out as
+// the releases raise the inflation (GreedyDual).
+void test_hostless_private_capture_reclaims_cheapest_and_ages_long_continuation() {
+    FakeManager manager(1, 3, 0, true, 2, test_cost_model(), true);
+    FakeProgram program;
+    const ActiveRequest session = start_active(manager, program, 71, make_base(71), 1);
+    (void)finish_active(manager, program, session, 300);
+    const ActiveRequest side = start_active(manager, program, 72, make_base(72), 2);
+    (void)finish_active(manager, program, side, 100);
+
+    // Priorities are the inflation when catalogued plus the rebuild tokens. Round 0: session
+    // 0+300, side 0+100 -> side, inflation 100. Round 1: session 300, A 100+100 -> A, inflation
+    // 200. Round 2: session 300, B 200+100 -> tie, the older session goes, inflation 300.
+    std::vector<std::uint32_t> expected;
+    std::uint32_t previous = side.sequence.id;
+    for (std::uint32_t round = 0; round < 3; ++round) {
+        const std::uint32_t digest = 73 + round;
+        const ActiveRequest active = start_active(manager, program, digest, make_base(digest),
+                                                  3 + round);
+        program.capture_assessment = FakeCaptureAssessment{
+            .shortlist_key          = FakeShortlistKey{.digest = digest, .frontier = 12},
+            .protected_rebuild_work = PrefillWork{.tokens = 1000},
+            .publishes_private      = true,
+            .physically_feasible    = false,
+        };
+        program.capture_summary.endpoint        = endpoint(digest, 12);
+        program.capture_feasible_after_releases = program.released_continuations.size() + 1;
+        const auto reserved = manager.reserve_active_capture(
+            program, active.lane, FakeCaptureOffer{.id = 10 + round}, 0, {});
+        require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+                "Host-less private capture was skipped instead of reclaiming Device state");
+        expected.push_back(round < 2 ? previous : session.sequence.id);
+        require(program.released_continuations == expected,
+                "Host-less capture reclaim did not release the cheapest aged continuation");
+        auto progress      = manager.progress_context_transaction(program, {});
+        const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+        require(outcome.status == ContextTransactionStatus::Published,
+                "Host-less private capture did not publish after reclaiming");
+        (void)finish_active(manager, program, active, 100);
+        previous = active.sequence.id;
+    }
+}
+
+// Issue #3, measured shape: the only idle continuation was a long agent session holding its
+// endpoint and two long anchors. The reclaim drops the anchors, lowest first, before it releases
+// any continuation, and then releases the cheapest one, not the session.
+void test_hostless_private_capture_reclaim_drops_anchors_first() {
+    FakeManager manager(1, 3, 0, true, 2, test_cost_model(), true);
+    FakeProgram program;
+    program.allow_anchor_drops  = true;
+    program.finish_long_anchors = {long_anchor(81, 100, 1), long_anchor(81, 200, 2)};
+    const ActiveRequest session = start_active(manager, program, 81, make_base(81), 1);
+    (void)finish_active(manager, program, session, 300);
+    program.finish_long_anchors.clear();
+    const ActiveRequest side = start_active(manager, program, 82, make_base(82), 2);
+    (void)finish_active(manager, program, side, 50);
+    const ActiveRequest active = start_active(manager, program, 83, make_base(83), 3);
+
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 83, .frontier = 12},
+        .protected_rebuild_work = PrefillWork{.tokens = 1000},
+        .publishes_private      = true,
+        .physically_feasible    = false,
+    };
+    program.capture_summary.endpoint        = endpoint(83, 12);
+    program.capture_feasible_after_releases = 3;
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 20}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
+            "Host-less private capture was skipped instead of reclaiming Device state");
+    require(program.dropped_anchors.size() == 2 && program.dropped_anchors[0].frontier == 100 &&
+                program.dropped_anchors[1].frontier == 200,
+            "Host-less capture reclaim did not drop the long anchors lowest first");
+    require(program.released_continuations == std::vector<std::uint32_t>{side.sequence.id} &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "Host-less capture reclaim released the long session instead of the side conversation");
+    auto progress      = manager.progress_context_transaction(program, {});
+    const auto outcome = std::get<FakeManager::ActiveCaptureOutcome>(std::move(progress));
+    require(outcome.status == ContextTransactionStatus::Published,
+            "Host-less private capture did not publish after reclaiming");
+    RuntimeStats stats;
+    manager.populate_runtime_stats(program, stats);
+    require(stats.pressure_private_owners_degraded == 2 &&
+                stats.pressure_private_owners_evicted == 1,
+            "Host-less capture reclaim did not report two degradations and one eviction");
+    (void)finish_active(manager, program, active, 12);
+}
+
+// A capture never takes a checkpoint that costs more to rebuild than the capture protects: a
+// 64-token side capture is skipped instead of dropping a 100-token anchor or a 300-token session.
+void test_hostless_private_capture_reclaim_never_pays_more_than_it_protects() {
+    FakeManager manager(1, 3, 0, true, 2, test_cost_model(), true);
+    FakeProgram program;
+    program.allow_anchor_drops  = true;
+    program.finish_long_anchors = {long_anchor(91, 100, 1)};
+    const ActiveRequest session = start_active(manager, program, 91, make_base(91), 1);
+    (void)finish_active(manager, program, session, 300);
+    program.finish_long_anchors.clear();
+    const ActiveRequest active = start_active(manager, program, 92, make_base(92), 2);
+    program.capture_assessment = FakeCaptureAssessment{
+        .shortlist_key          = FakeShortlistKey{.digest = 92, .frontier = 12},
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_private      = true,
+        .physically_feasible    = false,
+    };
+    program.capture_summary.endpoint        = endpoint(92, 12);
+    program.capture_feasible_after_releases = 1;
+    const auto reserved =
+        manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 30}, 0, {});
+    require(reserved == FakeManager::ActiveCaptureReserveResult::Skipped &&
+                program.dropped_anchors.empty() && program.released_continuations.empty() &&
+                manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
+            "a small capture took Device state worth more than it protects");
+    (void)finish_active(manager, program, active, 12);
 }
 
 void test_projected_nested_shared_candidates_use_marginal_value() {
@@ -3559,6 +3700,12 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 int main() {
     run_test("Host-less private capture reclaim",
              test_hostless_private_capture_reclaims_oldest_idle_continuation);
+    run_test("Host-less private capture reclaim by rebuild cost",
+             test_hostless_private_capture_reclaims_cheapest_and_ages_long_continuation);
+    run_test("Host-less private capture reclaim drops anchors first",
+             test_hostless_private_capture_reclaim_drops_anchors_first);
+    run_test("Host-less private capture reclaim never pays more than it protects",
+             test_hostless_private_capture_reclaim_never_pays_more_than_it_protects);
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
     run_test("publication-only construction",
