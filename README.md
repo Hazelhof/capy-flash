@@ -3,13 +3,44 @@
   <img alt="capy-flash" src="docs/logo/capy-flash-lockup.svg" width="560">
 </picture></h1>
 
-**Qwen3.8-Flash-Next (MoE 125B-A6B, NVFP4 experts) on two 16 GB consumer GPUs.** The routed experts that do not fit
-in VRAM live in host RAM and are computed on the CPU; everything else runs tensor-parallel on the two GPUs.
-The same engine keeps serving the dense Qwen3.8-27B. capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU
-tensor-parallel fork of [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE)
-lists every piece of prior work it builds on.
+**Qwen3.8-Flash-Next (125B MoE) in NVFP4 on two 16 GB consumer GPUs.**
 
-Status: **v0.5.0** (2026-10-15). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
+Against [Strata](https://github.com/Niko1221/Strata) 0.1.44.1 on the same machine (2x RTX 5070 Ti 16 GB, Ryzen 9 9900X, 96 GB DDR5):
+
+| | **capy-flash**, NVFP4 | Strata, same NVFP4 weights | Strata, 3-bit IQ3_S |
+|---|---:|---:|---:|
+| prefill, 15k-token prompt | **3,435 tok/s** | 2,703 tok/s | 2,906 tok/s |
+| prefill, 55k-token prompt | 2,791 tok/s ¹ | 3,821 tok/s | **4,037 tok/s** |
+| time to first token, agentic replay | **1.82 s** | 2.42 s | 1.86 s |
+| generation, agentic replay | 100.8 tok/s | 78.3 tok/s | **124.1 tok/s** |
+| tokens per agentic task run ² | **42.9k** | — | 52.7k |
+| time for 20 agentic task runs ² | **4.28 h** | — | 4.32 h |
+
+- **NVIDIA's official NVFP4 experts, used as published**: not re-quantized.
+- **Fewer tokens, same finish time**: Strata's 3-bit experts generate faster, but on the same coding tasks they
+  write 23 % more tokens, so the agent finishes in the same time.
+- **Built for agents**: 20/20 multi-step coding tasks, 0 malformed tool calls in 1,124; OpenAI- and
+  Anthropic-compatible API.
+- **One engine, two models**: it also serves the dense Qwen3.8-27B, exactly as ninfer-tp2 v0.4.9 did.
+
+¹ Long prompts of new text wait on reading the model's n-gram (PLE) table from disk between chunks; with the rows
+cached the 55k prompt runs at 3.4-3.9k tok/s. Overlapping that read with the GPU work is the next change.
+² Strata 0.1.43 (0.1.44 did not change its IQ3_S path); 5 multi-step coding tasks x 4 runs, OpenCode. Details below.
+
+**Quick start** (2x RTX 50-series 16 GB, an AVX-512 CPU, ~70 GiB of free RAM):
+```bash
+hf download Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash --local-dir capy-fn
+curl -LO https://github.com/ValerioDolci/capy-flash/releases/download/v0.5.1/capy-flash-v0.5.1-linux-x86_64-sm120a-ubuntu26.04.tar.gz
+tar -xzf capy-flash-v0.5.1-*.tar.gz
+capy-flash-v0.5.1-*/serve-flash-next.sh capy-fn/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer
+```
+
+The routed experts that do not fit in VRAM live in host RAM and are computed on the CPU; everything else runs
+tensor-parallel on the two GPUs. capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork
+of [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every
+piece of prior work it builds on.
+
+Status: **v0.5.1** (2026-10-15). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
 
 ## What it does
 - Tensor parallel over PCIe on two GPUs **without peer-to-peer** (pinned-host mailbox, FP32 partial sums).
@@ -40,7 +71,11 @@ One machine: AMD Ryzen 9 9900X, 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.
 | Strata 0.1.44.1, GSQ-RCO IQ3_S experts (25 % smaller, lower quality) | 1.86 s (4.53) | 124.1 tok/s | 236 s |
 
 **Agent tasks**: 5 multi-step coding tasks of a private task bank, 4 runs each, OpenCode with the model's sampling:
-20/20 solved, 42.9k generated tokens per run (the GB300 reference: 26.5k), no malformed tool call in 1,124.
+20/20 solved, 42.9k generated tokens per run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300
+reference: 26.5k), no malformed tool call in 1,124.
+
+**Prefill** (same prompts on the three engines, server side, no prefix reuse, 2026-10-15): ~3.5k / ~15k / ~55k tokens:
+capy-flash 1,941 / 3,435 / 2,791 tok/s; Strata 0.1.44.1 IQ3_S 1,745 / 2,906 / 4,037; Strata NVFP4 1,347 / 2,703 / 3,821.
 
 **Qwen3.8-27B** (same machine, ninfer-tp2 v0.4.9 serving flags, agentic replay at temperature 0): the ninfer-tp2 gate
 gives the same golden ids, perplexity (4k 4.385905, 64k 4.133481) and greedy texts (60/60) as v0.4.9; replay TTFT 1.42 s,
