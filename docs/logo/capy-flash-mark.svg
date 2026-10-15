@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+<defs><clipPath id="c"><circle cx="256" cy="256" r="244"/></clipPath><clipPath id="h"><path d="M256 160 C318 160 350 172 354 220 C358 268 360 326 348 362 C336 398 302 408 256 408 C210 408 176 398 164 362 C152 326 154 268 158 220 C162 172 194 160 256 160 Z"/></clipPath></defs>
+<circle cx="256" cy="256" r="244" fill="#FFF1D6"/>
+<!-- steam -->
+<path d="M96 300 C80 280 112 266 96 244 M420 300 C404 280 436 266 420 244" fill="none" stroke="#F2D9B0" stroke-width="10" stroke-linecap="round"/>
+<g clip-path="url(#c)">
+<path d="M90 540 C90 430 150 368 256 368 C362 368 422 430 422 540 Z" fill="#8B5A33" stroke="#3A2414" stroke-width="11" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M0 432 C40 416 80 416 120 432 C160 448 200 448 240 432 C280 416 320 416 360 432 C400 448 440 448 480 432 C500 424 512 422 520 424 L520 520 L0 520 Z" fill="#5DB8C9"/>
+<path d="M150 462 C180 454 210 454 240 462 M296 484 C326 476 356 476 386 484" fill="none" stroke="#9AD8E2" stroke-width="9" stroke-linecap="round"/>
+</g>
+<!-- ears -->
+<path d="M176 190 C160 186 156 166 168 160 C180 154 194 164 194 178 Z" fill="#8B5A33" stroke="#3A2414" stroke-width="11" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M336 190 C352 186 356 166 344 160 C332 154 318 164 318 178 Z" fill="#8B5A33" stroke="#3A2414" stroke-width="11" stroke-linejoin="round" stroke-linecap="round"/>
+<!-- head -->
+<path d="M256 160 C318 160 350 172 354 220 C358 268 360 326 348 362 C336 398 302 408 256 408 C210 408 176 398 164 362 C152 326 154 268 158 220 C162 172 194 160 256 160 Z" fill="#A86B3C"/>
+<g clip-path="url(#h)">
+ <path d="M200 262 C200 248 222 242 256 242 C290 242 312 248 312 262 L318 420 L194 420 Z" fill="#8B5A33"/>
+</g>
+<path d="M256 160 C318 160 350 172 354 220 C358 268 360 326 348 362 C336 398 302 408 256 408 C210 408 176 398 164 362 C152 326 154 268 158 220 C162 172 194 160 256 160 Z" fill="none" stroke="#3A2414" stroke-width="11" stroke-linejoin="round"/>
+<!-- eyes -->
+<path d="M180 222 C185 219 199 219 204 222 C204 231 199 236 192 236 C185 236 180 231 180 222 Z" fill="#3A2414"/>
+<path d="M178 221 Q192 215 206 221" fill="none" stroke="#3A2414" stroke-width="7" stroke-linecap="round"/>
+<path d="M308 222 C313 219 327 219 332 222 C332 231 327 236 320 236 C313 236 308 231 308 222 Z" fill="#3A2414"/>
+<path d="M306 221 Q320 215 334 221" fill="none" stroke="#3A2414" stroke-width="7" stroke-linecap="round"/>
+<!-- cheeks -->
+<ellipse cx="184" cy="276" rx="14" ry="9" fill="#E0876A" opacity="0.6"/>
+<ellipse cx="328" cy="276" rx="14" ry="9" fill="#E0876A" opacity="0.6"/>
+<!-- nostrils -->
+<path d="M234 266 Q222 272 220 286" fill="none" stroke="#3A2414" stroke-width="10" stroke-linecap="round"/>
+<path d="M278 266 Q290 272 292 286" fill="none" stroke="#3A2414" stroke-width="10" stroke-linecap="round"/>
+<!-- mouth -->
+<path d="M256 322 L256 346 M234 352 Q246 360 256 346 Q266 360 278 352" fill="none" stroke="#3A2414" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+<!-- glow -->
+<path d="M196 70 L178 62 M188 104 L170 106 M316 70 L334 62 M324 104 L342 106" stroke="#FFC21A" stroke-width="9" stroke-linecap="round"/>
+<!-- yuzu-bolt -->
+<g transform="rotate(-8 256 112)">
+<ellipse cx="256" cy="112" rx="56" ry="52" fill="#FFC21A" stroke="#3A2414" stroke-width="10" stroke-linejoin="round" stroke-linecap="round"/>
+<path d="M226 92 C232 80 244 72 256 70" fill="none" stroke="#FFE58A" stroke-width="9" stroke-linecap="round"/>
+<path d="M266 76 L230 120 L254 120 L244 152 L286 104 L262 104 L274 76 Z" fill="#3A2414" stroke="#3A2414" stroke-width="3" stroke-linejoin="round"/>
+</g>
+</svg>

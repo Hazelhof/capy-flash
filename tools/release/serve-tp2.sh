@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Two-GPU launcher for the release tarball: serve-tp2.sh <artifact.ninfer> [ninfer-serve flags...]
-# The production profile of the README (two 16 GB sm_120 boards, no P2P): INT8 KV, 196,608-token
+# Qwen3.8-27B two-GPU launcher for the release tarball: serve-tp2.sh <artifact.ninfer> [ninfer-serve flags...]
+# (Qwen3.8-Flash-Next: serve-flash-next.sh.) The ninfer-tp2 production profile (two 16 GB sm_120 boards, no P2P): INT8 KV, 196,608-token
 # context, MTP with 3 draft tokens, Vision on device 0. Environment overrides:
 #   NINFER_HOST (127.0.0.1)  NINFER_PORT (8080)  NINFER_DEVICES (0,1)  NINFER_MAX_CONTEXT (196608)
 #   NINFER_VISION=0 drops the Vision flags (artifacts without a vision component).

@@ -144,3 +144,8 @@ Qwen3.8-Flash-Next work onward: the routed-expert offload engine (expert cache
 in VRAM partitioned by id between the two ranks, CPU expert path inside the
 captured round, FP32 partial-sum exchanges, elastic KV / expert slots, MTP draft
 shortlist). Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The capy-flash logo (docs/logo) is part of this tree and under the same license.
+Its wordmark is drawn from glyph outlines of the Outfit typeface, Copyright 2021
+The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts), licensed
+under the SIL Open Font License 1.1; no font software is included.

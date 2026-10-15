@@ -1,4 +1,7 @@
-# capy-flash
+<h1 align="center"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/logo/capy-flash-lockup-dark.svg">
+  <img alt="capy-flash" src="docs/logo/capy-flash-lockup.svg" width="560">
+</picture></h1>
 
 **Qwen3.8-Flash-Next (MoE 125B-A6B, NVFP4 experts) on two 16 GB consumer GPUs.** The routed experts that do not fit
 in VRAM live in host RAM and are computed on the CPU; everything else runs tensor-parallel on the two GPUs.
@@ -58,10 +61,17 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTUR
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.1/bin/nvcc
 ninja -C build apps/ninfer-serve
 ```
+Or take the prebuilt tarball of a [release](https://github.com/ValerioDolci/capy-flash/releases) (Ubuntu, `sm_120a`):
+it has `serve-flash-next.sh` and `serve-tp2.sh` (27B) with the profiles of this README ([tools/release](tools/release/README-release.md)).
 
 ## Model weights
-Not included. Download `nvidia/Qwen3.8-Flash-Next-NVFP4` from Hugging Face and accept its terms (NVIDIA Open Model
-License, together with the Qwen license of Qwen3.8-Flash-Next). Convert it in one command (artifact + MTP draft shortlist):
+Ready to serve: [`Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash)
+(126.6 GB, the artifact measured above, with its draft shortlist and `SHA256SUMS`; NVIDIA Open Model License together with
+the Qwen Community License of Qwen3.8-Flash-Next):
+```
+hf download Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash --local-dir <dir>
+```
+Or convert `nvidia/Qwen3.8-Flash-Next-NVFP4` yourself in one command (artifact + MTP draft shortlist, same result):
 ```
 python tools/capy_flash/convert.py --model <checkpoint dir> --out <dir>
 ```
