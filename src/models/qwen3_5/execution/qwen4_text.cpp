@@ -35,8 +35,71 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 
 namespace ninfer::models::qwen3_5::execution {
+
+namespace {
+
+// The next prefill chunk's PLE rows are read from storage on a helper thread while the GPUs run
+// this chunk (T165, from T164: a gather of rows that are not in the page cache otherwise stalls
+// both GPUs before every chunk). prefetch() only issues MADV_WILLNEED for the rows and touches no
+// shared state, so the next chunk's gather() decodes the same bytes, sooner. Joined on scope exit.
+// Diagnostics (T166): NINFER_QWEN4_PLE_TIMING=1 prints the duration of every prefill PLE gather and
+// prefetch to stderr; NINFER_QWEN4_PLE_NEXT_PREFETCH=0 turns the next-chunk prefetch off (A/B).
+bool ple_timing() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_QWEN4_PLE_TIMING");
+        return v != nullptr && *v != 0 && *v != '0';
+    }();
+    return on;
+}
+bool ple_next_prefetch_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_QWEN4_PLE_NEXT_PREFETCH");
+        return v == nullptr || *v != '0';
+    }();
+    return on;
+}
+double ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+class NextChunkPlePrefetch {
+public:
+    NextChunkPlePrefetch() = default;
+    NextChunkPlePrefetch(const NextChunkPlePrefetch&)            = delete;
+    NextChunkPlePrefetch& operator=(const NextChunkPlePrefetch&) = delete;
+    ~NextChunkPlePrefetch() {
+        if (thread_.joinable()) { thread_.join(); }
+    }
+    void start(PleGather& gather, std::span<const std::int32_t> history,
+               std::size_t first, std::size_t count) {
+        if (!ple_next_prefetch_enabled() || count == 0 || first >= history.size()) { return; }
+        count   = std::min(count, history.size() - first);
+        thread_ = std::thread([&gather, history, first, count] {
+            try {
+                const auto t0 = std::chrono::steady_clock::now();
+                gather.prefetch(history, first, count);
+                if (ple_timing()) {
+                    std::fprintf(stderr, "ple_timing prefetch first=%zu count=%zu ms=%.1f\n", first,
+                                 count, ms_since(t0));
+                }
+            } catch (...) {
+                // A hint: a failed prefetch leaves the next gather to read the rows itself.
+            }
+        });
+    }
+
+private:
+    std::thread thread_;
+};
+
+} // namespace
+
 namespace {
 
 void require_shape(const Tensor& t, DType dtype, std::initializer_list<std::int32_t> shape,
@@ -167,6 +230,7 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
             ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
         }
         Tensor ple_embedding;
+        NextChunkPlePrefetch next_ple;
         if (config_.ple) {
             if (runtime.ple_gather == nullptr || runtime.ple_host == nullptr) {
                 throw std::logic_error("Qwen4Exp prefill has no PLE gather staging");
@@ -176,9 +240,17 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
                                                         text_prefill->token_ids.size());
             // The staging buffer is reused per chunk; the previous chunk ended in a device
             // synchronization, so its upload has completed.
+            const auto gather_t0 = std::chrono::steady_clock::now();
             runtime.ple_gather->gather(
                 history, base, static_cast<std::size_t>(len),
                 std::span<std::uint16_t>(runtime.ple_host, static_cast<std::size_t>(width) * len));
+            if (ple_timing()) {
+                std::fprintf(stderr, "ple_timing gather first=%u count=%d ms=%.1f\n", base, len,
+                             ms_since(gather_t0));
+            }
+            // The prompt continues in `history` beyond this call's `ids` (one chunk per call).
+            next_ple.start(*runtime.ple_gather, history, static_cast<std::size_t>(base) + len,
+                           prefill_chunk_);
             ple_embedding = work_.alloc(DType::BF16, {static_cast<std::int32_t>(width), len});
             CUDA_CHECK(cudaMemcpyAsync(ple_embedding.data, runtime.ple_host, ple_embedding.bytes(),
                                        cudaMemcpyHostToDevice, s));
@@ -805,6 +877,7 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
             loan1.lend(*tp_->work, spans[1]);
         }
         std::uint32_t ple_width = 0;
+        NextChunkPlePrefetch next_ple;
         if (config_.ple) {
             // One host gather of the chunk's n-gram rows, uploaded to both ranks below. The
             // staging is reused per chunk; the previous chunk ended in a synchronization of both
@@ -815,10 +888,18 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
             ple_width = runtime[0]->ple_gather->width();
             const std::span<const std::int32_t> history(text_prefill->token_ids.data(),
                                                         text_prefill->token_ids.size());
+            const auto gather_t0 = std::chrono::steady_clock::now();
             runtime[0]->ple_gather->gather(
                 history, base, static_cast<std::size_t>(len),
                 std::span<std::uint16_t>(runtime[0]->ple_host,
                                          static_cast<std::size_t>(ple_width) * len));
+            if (ple_timing()) {
+                std::fprintf(stderr, "ple_timing gather first=%u count=%d ms=%.1f\n", base, len,
+                             ms_since(gather_t0));
+            }
+            // The prompt continues in `history` beyond this call's `ids` (one chunk per call).
+            next_ple.start(*runtime[0]->ple_gather, history, static_cast<std::size_t>(base) + len,
+                           prefill_chunk_);
         }
         RankTensors ids_device, positions, rope_positions, ple_embedding, xf;
         for (int rank = 0; rank < kTensorParallelWidth; ++rank) {

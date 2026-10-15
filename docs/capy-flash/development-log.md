@@ -354,3 +354,14 @@ failures under parallel GPU load were a test artifact: the test's setup memsets 
 default stream, which the cache's non-blocking streams do not wait for. The test now orders its setup on the reader
 streams and runs serially. Open: long prefills are not bit-reproducible run to run even with
 `NINFER_QWEN4_EXPERT_FREEZE=1`.
+
+**T164-T166**: long prefills of new text slowed down between 16k and 64k tokens (T163: 2,791 tok/s at ~55k vs
+3,435 at ~15k). Cause (nsys and NVMe counters): before every chunk the host gathers the chunk's PLE rows (16 rows of
+160 B per token, scattered in a 47.7 GiB table mapped from the artifact, not resident) with both GPUs idle; rows not
+in the page cache cost 0.4-6 s per 16k-token chunk. Fix: a helper thread issues MADV_WILLNEED for the next chunk's
+rows right after the current chunk's gather, so the reads overlap the GPU work; the gather is unchanged (same bytes,
+same values). Cold random text, same binary, prefetch off/on, 3 arms each: PLE wait per chunk after the first
+0.4-5.9 s -> ~0.11 s; ~80k-token prompts 32 s -> 21.4 s median. Token identity with the expert residency frozen:
+identical (2k and 16k prompts, 1,024-token chunks). The first chunk of a request is not covered; issuing its advice
+from 16 threads instead of one did not help (T168: 1.06-1.28 s vs 1.24-1.28 s at ~15k tokens), so the read latency,
+not the advice, bounds it.

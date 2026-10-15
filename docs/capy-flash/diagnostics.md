@@ -74,6 +74,8 @@ Expert cache and prompt streaming:
 | `NINFER_MOE_GROUPED_PIECES` | `1` / unset (off) | `1` computes the prefill gate/up per piece instead of over the whole call (T56). | performance | same bits | capy |
 | `NINFER_HC_SCALAR` | `1` / unset (off) | `1` keeps the scalar hyper-connection kernels at every width instead of the vectorized ones (T56). | performance | same bits | capy |
 | `NINFER_T53_PLE_PREFETCH` | on (default), `0` | Starts page reads of the next round's PLE rows right after the round's sync (T53). | performance | timing | capy |
+| `NINFER_QWEN4_PLE_NEXT_PREFETCH` | on (default), `0` | Prefill: a helper thread starts the page reads of the next chunk's PLE rows while the GPUs run the current chunk (T165-T166). | performance | timing | capy |
+| `NINFER_QWEN4_PLE_TIMING` | off (default), `1` | Prints the duration of every prefill PLE gather and prefetch to stderr (`ple_timing ...`). | diagnostics | none | capy |
 | `NINFER_QWEN4_DRAFT_SPLIT` | on (default), `0` | At TP2 the shortlist draft head is split across the ranks; `0` keeps it on rank 0 (T43, T55). | performance | timing (drafts only) | capy |
 
 CPU expert executor (all bit-identical by construction, T35):
