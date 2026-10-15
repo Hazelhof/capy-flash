@@ -21,8 +21,9 @@
 #            decode seconds / MTP rounds) is reported against it (PASS within +-1 %, else WARN)
 #   dflash2  a short DFlash2 K=7 --lm-head-draft run on the _df2nv artifact (10 prompts), same checks
 #
-# The gate does not take a GPU lease; wrap it (e.g. gpu-lease run ricerca -- tools/tp2/gate.sh ...).
-# Paths default to the development workstation; override them with the GATE_* variables below.
+# The gate does not reserve the GPUs; run it on idle GPUs or wrap it in your own GPU scheduler.
+# Artifact paths default to $GATE_ARTIFACTS_DIR (default $HOME/ninfer-artifacts); override any of
+# them with the GATE_* variables below.
 # GATE_EXTRA_FLAGS (e.g. --embedding-host) is appended to the runner of golden, ppl, greedy and
 # dflash2, so an option that must not change any result is checked against the same reference.
 set -uo pipefail
@@ -30,12 +31,13 @@ set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 src=${GATE_SRC:-$(cd "$here/../.." && pwd)}   # source tree: golden record.sh, perplexity corpus
 
-ARTIFACT=${GATE_ARTIFACT:-/home/feyd/ninfer-artifacts/qwen3_8_27b_quasar_nvfp4_mtpnv.ninfer}
+ARTIFACTS_DIR=${GATE_ARTIFACTS_DIR:-$HOME/ninfer-artifacts}
+ARTIFACT=${GATE_ARTIFACT:-$ARTIFACTS_DIR/qwen3_8_27b_quasar_nvfp4_mtpnv.ninfer}
 # The production DFlash2 artifact (drafter MLP gate/up NVFP4, v0.4.5); the older _df2 (Q8) stays for comparisons.
-DF2_ARTIFACT=${GATE_DF2_ARTIFACT:-/home/feyd/ninfer-artifacts/qwen3_8_27b_quasar_nvfp4_df2nv.ninfer}
+DF2_ARTIFACT=${GATE_DF2_ARTIFACT:-$ARTIFACTS_DIR/qwen3_8_27b_quasar_nvfp4_df2nv.ninfer}
 TEST_ARTIFACT=${GATE_TEST_ARTIFACT:-$DF2_ARTIFACT}
-TEST_SCRATCH=${GATE_TEST_SCRATCH:-/home/feyd/ninfer-artifacts/tmp}
-GOLDEN_MODEL=${GATE_GOLDEN_MODEL:-/home/feyd/ninfer-artifacts/tmp/golden-sync/synthetic/model.ninfer}
+TEST_SCRATCH=${GATE_TEST_SCRATCH:-$ARTIFACTS_DIR/tmp}
+GOLDEN_MODEL=${GATE_GOLDEN_MODEL:-$ARTIFACTS_DIR/tmp/golden-sync/synthetic/model.ninfer}
 PROMPTS=${GATE_PROMPTS:-}           # --record only: JSONL of {"id","text"}; copied into the reference
 DEVICES=${GATE_DEVICES:-0,1}
 PORT=${GATE_PORT:-8090}

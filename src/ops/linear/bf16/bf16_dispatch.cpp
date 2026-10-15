@@ -24,6 +24,9 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
     for (const auto& entry : kShapes) {
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
+    // T103: any other shape takes the generic route (correct for every N/K/T, untuned), e.g.
+    // Qwen3.8-Flash-Next's indexer, hyper-connection and GDN projections kept in BF16.
+    if (n > 0 && k > 0) return launch_bf16_generic;
     throw std::invalid_argument("bf16 linear: unsupported shape");
 }
 

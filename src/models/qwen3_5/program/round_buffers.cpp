@@ -289,6 +289,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     rope_deltas = ingress_tensor(offsetof(MtpDecodeIngress, rope_deltas), DType::I32, {batch});
     sampling    = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) + offsetof(MtpDecodeIngress, sampling));
+    forced_targets =
+        ingress_tensor(offsetof(MtpDecodeIngress, forced_targets), DType::I32, {width, batch});
 
     licensed_tokens =
         egress_tensor(offsetof(MtpDecodeEgress, licensed_tokens), DType::I32, {width, batch});
@@ -299,6 +301,8 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
     next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    next_draft_logprobs = egress_tensor(offsetof(MtpDecodeEgress, next_draft_logprobs),
+                                        DType::FP32, {batch, drafts});
     verify_ids       = layout.verify_ids.bind(backing);
     target_positions = layout.target_positions.bind(backing);
     target_argmax    = layout.target_argmax.bind(backing);

@@ -85,11 +85,31 @@ enum class SpeculativeBackend : std::uint8_t {
     DFlash2,
 };
 
+// MTP adaptive window (SpeculativeOptions::min_draft_probability): which probability of a
+// proposal is compared with the threshold.
+enum class MtpWindowRule : std::uint8_t {
+    Chain, // the product of the softmax probabilities of proposals 1..k (the chain's)
+    Step,  // proposal k's own softmax probability, every one of 1..k must pass (Strata's rule)
+};
+
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
+    // MTP only: 0 verifies every round's K proposals. In (0,1) a round verifies only its first k
+    // proposals whose probability (window_rule) is >= this; the CUDA Graph keeps width K+1 and
+    // proposes K tokens every round, the columns past k route no experts.
+    float min_draft_probability = 0.0F;
+    MtpWindowRule window_rule   = MtpWindowRule::Chain;
+    // T43, Qwen4Exp MTP only: a draft token shortlist file (whitespace-separated token IDs in
+    // priority order, '#' comment lines). The proposal heads score only these rows of the Text
+    // output head; the verification head stays the full vocabulary, so greedy output does not
+    // depend on it. Empty = the artifact's sidecar `<artifact stem>.draft_shortlist.txt` when it
+    // exists (T55), else full-vocabulary proposals; "none" = full-vocabulary proposals.
+    // draft_shortlist_rows > 0 keeps the first N IDs of the file.
+    std::string draft_shortlist;
+    std::uint32_t draft_shortlist_rows = 0;
 };
 
 enum class StartupPhase : std::uint8_t {
@@ -159,6 +179,147 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+enum class RoutedExpertBackend : std::uint8_t {
+    // Device slot cache of the hot experts per layer + the CPU for the missing ones, both inside
+    // the round, with asynchronous cache fills decided per window on the host.
+    Offload,
+    // Every expert read in place from host memory over PCIe by the GPU (reference route; slow).
+    Mapped,
+};
+
+inline constexpr std::size_t kDefaultExpertSlotHeadroomBytes = 512ULL * 1024ULL * 1024ULL;
+
+// Split of each decode call's missing experts between the CPU and the GPU, which reads its share
+// of the expert weights from host memory over PCIe in parallel with the CPU (T18). Decided on the
+// device per layer call, from the call's routing; prefill chunks keep every miss on the CPU.
+enum class MissSplitMode : std::uint8_t {
+    Off,      // every missing expert on the CPU
+    Auto,     // the GPU share minimizing max(CPU time, GPU time) under `costs` (none at <= min_misses)
+    Fraction, // floor(fraction x misses + 0.5) on the GPU
+    Count,    // the first `count` misses in route order on the GPU (T22's device_reads)
+};
+
+// The Auto rule's cost model, µs. CPU: fixed per call + per expert + per extra column of an
+// expert, x read_slowdown while the GPU reads (host RAM shared with the link); GPU: fixed per
+// share + per expert + per extra column. Defaults: ws (9900X, 6 threads; 5070 Ti PCIe 5.0 x8),
+// T18 probe with the cache fill stream on (docs/capy-flash/development-log.md): CPU 55-61 µs per expert (T33 engine:
+// 59), x1.2 while the GPU share reads; staged GPU share 135-150 µs per expert.
+struct MissSplitCosts {
+    float cpu_fixed_us         = 13.0F;
+    float cpu_expert_us        = 58.0F;
+    float cpu_column_us        = 1.9F;
+    float cpu_read_slowdown    = 1.2F;
+    float gpu_fixed_us         = 10.0F;
+    float gpu_expert_us        = 140.0F;
+    float gpu_column_us        = 0.0F;
+};
+
+struct MissSplitOptions {
+    MissSplitMode mode         = MissSplitMode::Off;
+    float fraction             = 0.0F; // Fraction, in [0,1]
+    std::uint32_t count        = 0;    // Count, <= 16
+    std::uint32_t min_misses   = 2;    // Auto: no GPU share at this many misses or fewer
+    std::uint32_t max_reads    = 16;   // GPU share at most (<= 16)
+    // GPU share path: true = copy the experts into VRAM scratch slots with a streaming kernel,
+    // then compute there; false = compute straight from host memory (zero-copy W4A4).
+    bool staged                = true;
+    MissSplitCosts costs;
+    // tp 2 (T42): the GPU share runs on rank 1, over its own link and SMs (idle while rank 0
+    // waits for the CPU), from its own copy of the residency mirror and the same device rule;
+    // false = on rank 0, as at one device. Staged path only (the zero-copy share stays on rank 0).
+    bool peer_share            = true;
+};
+
+// Routed experts of a MoE model whose expert banks stay in host memory (Qwen3.8-Flash-Next).
+// Ignored for models whose experts live on the device.
+struct RoutedExpertOptions {
+    RoutedExpertBackend backend = RoutedExpertBackend::Offload;
+    // Device slots per layer (1..512); 0 sizes them from the device memory left after the rest of
+    // the Program minus `slot_headroom_bytes`. MemorySummary reports the resolved count.
+    std::uint32_t slots_per_layer    = 0;
+    std::size_t slot_headroom_bytes  = kDefaultExpertSlotHeadroomBytes;
+    // Host threads computing the missing experts (pinned, spread over the L3 domains).
+    std::uint32_t cpu_threads        = 6;
+    // Cache insertions per layer per decode window; 0 = unlimited.
+    std::uint32_t insert_cap         = 2;
+    // > 0: a missing expert enters a full layer only with a decayed routing frequency of at least
+    // this many routes (half-life `half_life_tokens`); 0 admits every insertion (LRU).
+    // Default 2 / 256 (T54, T27 workload n = 5 paired vs LRU: 1 GPU +4.1 % plain / +4.2 % MTP,
+    // TP2 +3.6 % / +4.1 %, every prompt positive; misses per generated token -8 to -11 % at 1 GPU).
+    float admit_threshold            = 2.0F;
+    float half_life_tokens           = 256.0F;
+    // > 0: the victim of a cache insertion is the resident with the lowest decayed frequency x
+    // 2^(-windows since its last use / evict_tau_windows) instead of the least recently used one
+    // (frequency with half-life `half_life_tokens`); 0 = LRU. Default 4 (T61, T27 workload n = 5
+    // paired vs LRU victim: 1 GPU +2.1 % plain / +5.2 % MTP, TP2 +1.5 % / +5.8 %; misses per
+    // generated token -4 to -8 %).
+    float evict_tau_windows          = 4.0F;
+    // Missing experts per layer and call (0..16) the GPU reads from host memory over PCIe itself,
+    // in parallel with the CPU computing the others (shares the link with the cache fills).
+    // Shorthand for miss_split {Count, device_reads, zero-copy} when miss_split is Off.
+    std::uint32_t device_reads       = 0;
+    // Router-ahead prefetch (decode rounds, one device): after each layer's attention the next
+    // layer's router scores its experts from the current residual and up to `prefetch_slots`
+    // non-resident ones are copied into staging slots (2 * prefetch_slots device slots outside the
+    // cache) in time for that layer when the link allows; 0 = off (nothing allocated or run).
+    std::uint32_t prefetch_slots       = 0;
+    float prefetch_min_score           = 0.0F; // window score gate (sum of the tokens' p)
+    std::uint32_t prefetch_first_layer = 2;    // first predicted layer
+    float prefetch_link_gbps           = 24.0F; // copy rate assumed by the per-layer budget
+    // Prompt windows observed layer by layer so the prompt's residency fills during the prefill,
+    // queued hottest first across layers; false = observed after the chunk, layer by layer.
+    // On by default (T25: +4 % decode on the T27 workload); offload backend only, ignored otherwise.
+    bool warm_start                    = true;
+    // Prefill chunks of at least this many tokens stream each layer's non-resident experts to the
+    // device over PCIe (a ring of slots the cache lends during the prompt) and run every routed
+    // expert on the GPU tensor cores; shorter chunks leave the non-resident experts to the CPU.
+    // 0 = never stream.
+    std::uint32_t stream_min_tokens  = 512;
+    // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
+    std::uint32_t stream_ring_slots  = 576;
+    // While streaming, leave the experts the previous prompt chunk routed least to the CPU (in
+    // parallel with the copies of the others) as long as the CPU's estimated time stays within the
+    // copies' (cost model: CPU stream_cpu_expert_us + stream_cpu_token_us per routed token and
+    // expert, PCIe stream_link_us per copied expert), in chunks of at most stream_cpu_max_tokens
+    // (T34, 1 GPU eco: the tail gains 1.7x at chunk 1024 and loses 1.6x at chunk 4096, where
+    // copying the whole layer is cheaper than the CPU work of its least-routed experts).
+    bool stream_cpu_tail                = true;
+    std::uint32_t stream_cpu_max_tokens = 2047;
+    float stream_cpu_expert_us          = 45.0F;
+    float stream_cpu_token_us           = 9.0F;
+    float stream_link_us                = 105.0F;
+    MissSplitOptions miss_split;
+    // Largest prefill chunk of a streamed prompt (T42). Chunks wider than EngineOptions::
+    // prefill_chunk run on workspace lent from the expert slot pool for the prompt's duration
+    // (the slots of the layers below the streaming ring, reclaimed before decode), so the decode
+    // cache keeps its slots. The planner takes the largest of prompt_chunk, prompt_chunk / 2, ...
+    // (> prefill_chunk) whose workspace fits, with the ring, in half the Text layers' slots.
+    // 0 or <= prefill_chunk: off (every chunk is prefill_chunk wide, on the Program's arena).
+    std::uint32_t prompt_chunk          = 16384;
+    // Elastic expert columns per GPU (T64, see ElasticKvOptions): resolved by the Engine when
+    // ElasticKvOptions::enabled and slots_per_layer is 0; set by hand only with both explicit.
+    std::uint32_t elastic_columns       = 0;
+};
+
+// Elastic VRAM between the KV cache and the routed-expert slot cache (T64; Qwen4Exp offload
+// backend). Off: the KV pool is sized and backed for max_context at startup and the expert slots
+// take what is left (a fixed partition). On: the KV pool keeps its addresses for max_context but
+// only the pages in use are backed by device memory; the expert cache gets every other byte. Its
+// slots are base slots, enough for max_context's KV (or for kv_budget_bytes), plus elastic
+// columns: one more slot in every layer per column. When the KV needs more pages, the cache gives
+// up whole columns (each layer drops its coldest experts, ExpertCachePolicy::set_active_columns),
+// their memory backs the KV pages; when a new request starts, KV pages past the live extent are
+// released and the columns come back (refilled by later insertions). Requires the offload backend
+// and slots_per_layer = 0 (resolved).
+struct ElasticKvOptions {
+    bool enabled = false;
+    // KV backing grows (and starts) in steps of this many tokens per pool.
+    std::uint32_t grow_tokens = 8192;
+    // > 0: at most this many bytes of KV per GPU (text + MTP pools); the base slots are sized for
+    // it instead of max_context's KV, and a request needing more KV fails.
+    std::size_t kv_budget_bytes = 0;
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -168,8 +329,10 @@ struct EngineOptions {
     // (one id per rank, rank 0 first; rank 0 must equal `device`) for generation, ordinary, with
     // MTP or with DFlash2 speculative decoding (DFlash2 with the optimized proposal head only; its
     // drafter runs on rank 0), with or without Vision (see `vision_device`), and for
-    // CausalScoring: DFlash, the MoE architecture, KV storage other than BF16/INT8 and the Host
-    // context-cache tiers are rejected. At 1 `devices` is empty or {device}.
+    // CausalScoring: DFlash, the Qwen3.5 MoE architecture, KV storage other than BF16/INT8 and
+    // the Host context-cache tiers are rejected. Qwen4Exp (Qwen3.8-Flash-Next) runs ordinary
+    // generation and CausalScoring at tp 2 (no speculative decoding, no Vision), its routed
+    // experts partitioned by ID parity between the ranks. At 1 `devices` is empty or {device}.
     int tp = 1;
     std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
@@ -206,6 +369,14 @@ struct EngineOptions {
     // device memory: frees the table's bytes (1.18 GiB for Qwen3.8-27B) on every device for the
     // KV pool, costs as much pinned host RAM once. Same bytes, identical results. tp 1 and 2.
     bool embedding_host = false;
+    // Qwen4Exp (Qwen3.8-Flash-Next) at tp 2: split each hyper-connection mixer by residual streams
+    // across the ranks (half the mixer bytes per rank, two all-reduces per mixer) instead of
+    // replicating it (no exchange). Same mathematics; the split sums partials in a different
+    // order. Unused by other architectures and at tp 1. Placement only: the Program refuses it
+    // (the execution runs the replicated mixers).
+    bool tp_hc_split_streams = false;
+    RoutedExpertOptions routed_experts;
+    ElasticKvOptions elastic_kv;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     StartupObserver startup_observer;
@@ -906,6 +1077,12 @@ struct MemorySummary {
     // observation it must cover. Zero without CUDA Graphs; entry 1 is zero at tp 1.
     std::array<std::size_t, 2> cuda_graph_observed_bytes{};
     std::size_t kv_payload_bytes                  = 0;
+    // Offloaded routed experts: device slots per layer and the bytes of the slot pool.
+    std::uint32_t routed_expert_slots             = 0;
+    std::size_t routed_expert_pool_bytes          = 0;
+    // Prefill chunk and the workspace a wider-than-base chunk borrows from the pool (T42; 0 = none).
+    std::uint32_t prefill_chunk                   = 0;
+    std::size_t routed_expert_prompt_workspace_bytes = 0;
     std::uint32_t host_state_capacity_slots       = 0;
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;

@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded, nvfp4_mse
+from .methods import (
+    cast_direct,
+    fp8_row_maxabs,
+    grouped_absmax,
+    import_encoded,
+    nvfp4_mse,
+    nvfp4_mse_stacked,
+)
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -205,10 +212,185 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+# Dense projections the NVFP4-dense Flash-Next recipe stores as NVFP4: the attention and GDN
+# input/output projections, the shared expert and the output head. Their tensor-parallel halves are
+# the per-rank GEMV shapes measured for F0-B ([6656,2560], [8192,2560], [2560,3072], [640,2560],
+# [124160,2560]). Hyper-connection mixers, the QSA indexer, the PLE projections and the MTP stem
+# projections stay Q8: their format is not decided, and the hyper-connection down projection
+# ([320|4, 10240]) cannot be NVFP4 at all (N % 128 != 0).
+_FLASH_NEXT_NVFP4_GROUPS = {
+    "attention": (
+        "/attention/query",
+        "/attention/key",
+        "/attention/gate",
+        "/attention/value",
+        "/attention/output",
+    ),
+    "gdn": ("/gdn/query", "/gdn/key", "/gdn/value", "/gdn/z", "/gdn/output"),
+    "shared": ("/moe/shared/gate", "/moe/shared/up", "/moe/shared/down"),
+}
+_FLASH_NEXT_NVFP4_DENSE = tuple(s for group in _FLASH_NEXT_NVFP4_GROUPS.values() for s in group)
+
+# T103: dense projections a Flash-Next recipe may keep in BF16 (as the checkpoint, GB300 and Strata):
+# the QSA indexer q|k, every hyper-connection mixer (block attn_hc/ffn_hc and the text/MTP hc_head,
+# Down|inject and Up) and the GDN q|k|v|z|out projections. The engine runs them through the generic
+# BF16 linear (ops/linear/bf16/bf16_generic.cu) and the hyper-connection general route.
+_FLASH_NEXT_BF16_GROUPS = {
+    "indexer": ("/attention/indexer_query", "/attention/indexer_key"),
+    "hc": tuple(
+        f"{mixer}/{role}"
+        for mixer in ("attn_hc", "ffn_hc", "hc_head")
+        for role in ("down", "inject", "up")
+    ),
+    "gdn": _FLASH_NEXT_NVFP4_GROUPS["gdn"],
+}
+
+
+def _flash_next(
+    model, recipe, *, nvfp4_dense: bool, nvfp4_groups=None, nvfp4_head=None, bf16_groups=()
+):
+    """Qwen3.8-Flash-Next (Qwen4Exp) from the ModelOpt NVFP4 checkpoint.
+
+    Routed Text experts keep their ModelOpt NVFP4 codes, block scales, weight divisors and
+    activation divisors (``import_encoded``, AllowA4). Each layer's routed gate/up and down
+    projections become one parent each, a stack with one divisor per source matrix, so an expert
+    is a fixed row range of its bank: in the code plane, in the swizzled scale plane (each source
+    covers whole 128-row tiles) and one FP32 divisor word per projection. The MTP layer's block-FP8
+    experts are re-encoded to NVFP4 by nvfp4_mse_stacked, so they have the same per-matrix divisor
+    layout (A16Only: the checkpoint has no activation calibration for them; ninfer-ext instead
+    stores one absmax divisor for the whole MTP bank). The n-gram table keeps its FP8 codes under the shared
+    multiplier. Routers, shared-expert gates, norms and small vectors stay direct; the token
+    embedding is Q8.
+
+    Dense projections are Q8 with a Q6 output head, exactly as ninfer-ext's recipe of the same
+    name, unless ``nvfp4_dense``: then the projections in _FLASH_NEXT_NVFP4_DENSE and the output
+    head are NVFP4 (nvfp4_mse, A16Only) and the GDN a/b projections stay Q8 in their own parent.
+    ``nvfp4_groups`` (names of _FLASH_NEXT_NVFP4_GROUPS) and ``nvfp4_head`` select a subset instead
+    (mixed recipes); the selection applies to the Text and MTP layers alike. ``bf16_groups``
+    (names of _FLASH_NEXT_BF16_GROUPS, T103) keep those projections in BF16 (cast_direct), Text
+    and MTP alike; they take precedence over ``nvfp4_groups``.
+    """
+    if nvfp4_groups is None:
+        nvfp4_groups = tuple(_FLASH_NEXT_NVFP4_GROUPS) if nvfp4_dense else ()
+    if nvfp4_head is None:
+        nvfp4_head = nvfp4_dense
+    nvfp4_suffixes = tuple(s for group in nvfp4_groups for s in _FLASH_NEXT_NVFP4_GROUPS[group])
+    bf16_suffixes = tuple(s for group in bf16_groups for s in _FLASH_NEXT_BF16_GROUPS[group])
+    if model.config.get("model_type") != "qwen4_exp_text":
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    # Vision's mixed groupwise assignment; the loop below restates every Text and MTP choice.
+    _optional(model, recipe)
+    _assign(recipe, "text/token_embedding", Q8)
+    if nvfp4_head:
+        recipe.assign(
+            "text/output_head", format="nvfp4", method=nvfp4_mse, activation_policy="A16Only"
+        )
+    else:
+        _assign(recipe, "text/output_head", Q6)
+    for name, parameter in model.parameters.items():
+        if name.startswith("vision/") or not (parameter.projection or name.endswith("/ple/table")):
+            continue
+        if name.endswith("/ple/table"):
+            recipe.assign(name, format=FP8, method=import_encoded, source=parameter.source)
+            continue
+        if name.endswith(("/moe/router", "/moe/shared_score")) or name in (
+            "text/token_embedding",
+            "text/output_head",
+        ):
+            continue
+        if "/moe/experts/" in name:
+            if name.startswith("text/"):
+                recipe.assign(
+                    name,
+                    format="nvfp4",
+                    method=import_encoded,
+                    source=parameter.source,
+                    activation_policy="AllowA4",
+                )
+            else:
+                recipe.assign(
+                    name, format="nvfp4", method=nvfp4_mse_stacked, activation_policy="A16Only"
+                )
+            continue
+        if bf16_suffixes and name.endswith(bf16_suffixes):
+            _assign(recipe, name, "bf16")
+            continue
+        if nvfp4_suffixes and name.endswith(nvfp4_suffixes):
+            recipe.assign(name, format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
+            continue
+        _assign(recipe, name, Q8)
+    # Each layer's gate/up and down banks become one parent so an expert is a fixed row range of
+    # its bank, addressed by the expert cache as a few contiguous spans.
+    for names in model.packing_groups:
+        if all("/moe/experts/" in name for name in names):
+            recipe.group(names)
+
+
+def qwen3_8_flash_next_nvfp4(model, recipe, sources):
+    """Flash-Next, NVFP4 experts, Q8 dense projections, Q6 head (ninfer-ext's choices)."""
+    _flash_next(model, recipe, nvfp4_dense=False)
+
+
+def qwen3_8_flash_next_nvfp4_dense(model, recipe, sources):
+    """Flash-Next, NVFP4 experts, NVFP4 attention/GDN/shared-expert projections and head."""
+    _flash_next(model, recipe, nvfp4_dense=True)
+
+
+def qwen3_8_flash_next_nvfp4_mix(model, recipe, sources):
+    """Flash-Next, NVFP4 experts, NVFP4 attention/GDN projections and head, Q8 shared expert (T26b)."""
+    _flash_next(model, recipe, nvfp4_dense=False, nvfp4_groups=("attention", "gdn"), nvfp4_head=True)
+
+
+def qwen3_8_flash_next_nvfp4_gdn(model, recipe, sources):
+    """Flash-Next, NVFP4 experts, NVFP4 GDN projections (q/k/v/z/out), everything else as the Q8 recipe (T26c)."""
+    _flash_next(model, recipe, nvfp4_dense=False, nvfp4_groups=("gdn",), nvfp4_head=False)
+
+
+def _flash_next_g_bf16(*groups, gdn_q8=False):
+    """G (NVFP4 GDN, Q8 dense, Q6 head) with the T103 BF16 groups; BF16 GDN replaces NVFP4 GDN,
+    and ``gdn_q8`` keeps the GDN projections Q8 (as the rest of the dense) instead of NVFP4."""
+
+    def recipe_function(model, recipe, sources):
+        _flash_next(
+            model,
+            recipe,
+            nvfp4_dense=False,
+            nvfp4_groups=() if ("gdn" in groups or gdn_q8) else ("gdn",),
+            nvfp4_head=False,
+            bf16_groups=groups,
+        )
+
+    gdn = " and Q8 GDN" if gdn_q8 else ""
+    recipe_function.__doc__ = f"Flash-Next G with {', '.join(groups)} projections in BF16{gdn} (T103)."
+    return recipe_function
+
+
+qwen3_8_flash_next_nvfp4_gdn_idxbf16 = _flash_next_g_bf16("indexer")
+qwen3_8_flash_next_nvfp4_gdn_hcbf16 = _flash_next_g_bf16("hc")
+qwen3_8_flash_next_nvfp4_gdnbf16 = _flash_next_g_bf16("gdn")
+qwen3_8_flash_next_nvfp4_gdn_idxhcbf16 = _flash_next_g_bf16("indexer", "hc")
+qwen3_8_flash_next_nvfp4_allbf16 = _flash_next_g_bf16("indexer", "hc", "gdn")
+# Valerio's T103 candidate: indexer and hyper-connections BF16, GDN Q8, everything else as G.
+qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8 = _flash_next_g_bf16("indexer", "hc", gdn_q8=True)
+# T104 (Valerio): indexer BF16 + GDN Q8, hyper-connections Q8 as G (cheapest candidate).
+qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 = _flash_next_g_bf16("indexer", gdn_q8=True)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
+    "qwen3_8_flash_next_nvfp4": qwen3_8_flash_next_nvfp4,
+    "qwen3_8_flash_next_nvfp4_dense": qwen3_8_flash_next_nvfp4_dense,
+    "qwen3_8_flash_next_nvfp4_mix": qwen3_8_flash_next_nvfp4_mix,
+    "qwen3_8_flash_next_nvfp4_gdn": qwen3_8_flash_next_nvfp4_gdn,
+    "qwen3_8_flash_next_nvfp4_gdn_idxbf16": qwen3_8_flash_next_nvfp4_gdn_idxbf16,
+    "qwen3_8_flash_next_nvfp4_gdn_hcbf16": qwen3_8_flash_next_nvfp4_gdn_hcbf16,
+    "qwen3_8_flash_next_nvfp4_gdnbf16": qwen3_8_flash_next_nvfp4_gdnbf16,
+    "qwen3_8_flash_next_nvfp4_gdn_idxhcbf16": qwen3_8_flash_next_nvfp4_gdn_idxhcbf16,
+    "qwen3_8_flash_next_nvfp4_allbf16": qwen3_8_flash_next_nvfp4_allbf16,
+    "qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8,
+    "qwen3_8_flash_next_nvfp4_idxbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxbf16_gdnq8,
 }

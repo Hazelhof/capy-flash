@@ -323,6 +323,121 @@ bool split_proposal_token_ids(const artifact::Shape& shape, const Config& config
            split_proposal_rows(shape.front(), config, options);
 }
 
+// A routed-expert projection of a Text or MTP block: ".../moe/experts/<e>/{gate,up,down}".
+bool routed_expert(std::string_view name) {
+    return !block_leaf(name).empty() && name.find("/moe/experts/") != std::string_view::npos;
+}
+
+// ---- Qwen4Exp (Qwen3.8-Flash-Next) ---------------------------------------------------------------
+
+// The decoder block index of a Text or MTP block name: Text block i is i, MTP block i follows the
+// Text blocks (num_hidden_layers + i).
+std::uint32_t qwen4_block_index(std::string_view name, const TextConfig& text) {
+    for (const auto& [prefix, base] :
+         {std::pair<std::string_view, std::uint32_t>{"text/layers/", 0U},
+          std::pair<std::string_view, std::uint32_t>{"mtp/layers/", text.num_hidden_layers}}) {
+        if (!name.starts_with(prefix)) { continue; }
+        const auto digits = name.substr(prefix.size(), name.find('/', prefix.size()) - prefix.size());
+        std::uint32_t index = 0;
+        for (const char c : digits) {
+            if (c < '0' || c > '9') { reject(name, "has a malformed block index"); }
+            index = index * 10 + static_cast<std::uint32_t>(c - '0');
+        }
+        if (digits.empty()) { reject(name, "has a malformed block index"); }
+        return base + index;
+    }
+    reject(name, "is not a decoder block parameter");
+}
+
+// One hyper-connection mixer parameter ({norm, down, inject, up}) of a block, of the output mixer
+// (text/hc_head, mtp/hc_head), or a parameter laid out over the wide residual (PLE norms and
+// convolution, MTP hidden norm). Replicated unless options.hc_split_streams; split, rank r keeps
+// the residual streams [r*S/tp, (r+1)*S/tp): rows of the per-stream vectors and of Up, columns of
+// Down|inject and of the depthwise convolution.
+LogicalShard qwen4_stream_shard(std::string_view name, std::string_view leaf,
+                                const artifact::Shape& shape, const TextConfig& text,
+                                const LoadOptions& options) {
+    if (!options.hc_split_streams) { return whole(ShardAxis::Replicated); }
+    const auto streams = text.hyper_connection.value().hc_count;
+    const auto wide    = text.residual_width();
+    if (leaf == "norm" || leaf == "key_norm" || leaf == "query_norm" || leaf == "conv_norm" ||
+        leaf == "hidden_norm" || leaf == "up") {
+        if (leading(name, shape) != wide) { reject(name, "requires a wide-residual row axis"); }
+        return even(name, ShardAxis::Rows, wide, streams, options.tp);
+    }
+    if (leaf == "down" || leaf == "inject" || leaf == "convolution") {
+        if (trailing(name, shape) != wide) { reject(name, "requires a wide-residual column axis"); }
+        return even(name, ShardAxis::Columns, wide, streams, options.tp);
+    }
+    reject(name, "has no hyper-connection stream placement");
+}
+
+// The rank that holds and runs a block's shared expert, whole: SingleDevice(block index % tp).
+// The shared expert's 640-wide intermediate has no tile-aligned half for the stored formats (NVFP4
+// rows split in 128-row tiles: 320 is not one; Q8 row-split columns in 128s: the Down half of 320
+// is not one), so the blocks alternate it between the ranks instead; its output joins the rank's
+// MoE partial before the block's one all-reduce.
+int qwen4_shared_expert_rank(std::string_view name, const TextConfig& text, int tp) {
+    return static_cast<int>(qwen4_block_index(name, text) % static_cast<std::uint32_t>(tp));
+}
+
+LogicalShard qwen4_block_shard(std::string_view name, std::string_view leaf,
+                               const artifact::Shape& shape, const TextConfig& text,
+                               const LoadOptions& options) {
+    for (const std::string_view mixer : {"attn_hc/", "ffn_hc/"}) {
+        if (leaf.starts_with(mixer)) {
+            return qwen4_stream_shard(name, leaf.substr(mixer.size()), shape, text, options);
+        }
+    }
+    // The QSA indexer is replicated: its input is the same on both ranks and its selection is
+    // deterministic, so both ranks select the same blocks without an exchange.
+    if (leaf.starts_with("attention/indexer_")) { return whole(ShardAxis::Replicated); }
+    // Router and shared-expert gate: every rank routes the same tokens to the same experts; the
+    // routed experts themselves stay HostMapped and are partitioned by expert ID at run time.
+    if (leaf == "moe/router" || leaf == "moe/shared_score") { return whole(ShardAxis::Replicated); }
+    if (leaf.starts_with("moe/shared/")) {
+        return whole(ShardAxis::SingleDevice, qwen4_shared_expert_rank(name, text, options.tp));
+    }
+    if (leaf.starts_with("ple/")) {
+        const auto ple_leaf = leaf.substr(4);
+        // key|value share one parent, and every rank needs all value rows: replicated in both
+        // modes. The table is a HostFile object read by host code, never placed on a device.
+        if (ple_leaf == "key" || ple_leaf == "value" || ple_leaf == "table") {
+            return whole(ShardAxis::Replicated);
+        }
+        return qwen4_stream_shard(name, ple_leaf, shape, text, options);
+    }
+    // Gated attention (12 query and 1 KV heads per rank) and GDN (8 key and 24 value heads per
+    // rank): the dense Qwen3.5 head rules.
+    if (leaf.starts_with("attention/") || leaf.starts_with("gdn/")) {
+        return block_shard(name, leaf, shape, text, options.tp);
+    }
+    reject(name, "has no Qwen4Exp placement for this parameter");
+}
+
+LogicalShard qwen4_shard(std::string_view name, const artifact::Shape& shape,
+                         const Config& config, const LoadOptions& options) {
+    const auto& text = config.text;
+    if (name == "text/token_embedding" || name == "mtp/embedding_norm" ||
+        name == "mtp/embedding_projection" || name == "mtp/hidden_projection") {
+        return whole(ShardAxis::Replicated);
+    }
+    if (name == "text/output_head") {
+        const auto rows = leading(name, shape);
+        return even(name, ShardAxis::Rows, rows, rows, options.tp);
+    }
+    if (name == "mtp/hidden_norm") { return qwen4_stream_shard(name, "hidden_norm", shape, text, options); }
+    for (const std::string_view head : {"text/hc_head/", "mtp/hc_head/"}) {
+        if (name.starts_with(head)) {
+            return qwen4_stream_shard(name, name.substr(head.size()), shape, text, options);
+        }
+    }
+    if (const auto leaf = block_leaf(name); !leaf.empty()) {
+        return qwen4_block_shard(name, leaf, shape, text, options);
+    }
+    reject(name, "has no Qwen4Exp placement for this parameter");
+}
+
 // logical_shard() for options that validate_tensor_parallel_ranks() accepted.
 LogicalShard shard_rule(std::string_view name, const artifact::Shape& shape, const Config& config,
                         const LoadOptions& options) {
@@ -330,10 +445,12 @@ LogicalShard shard_rule(std::string_view name, const artifact::Shape& shape, con
     if (options.embedding_host && name == "text/token_embedding") {
         return whole(ShardAxis::HostMapped);
     }
+    if (config.text.qwen4() && routed_expert(name)) { return whole(ShardAxis::HostMapped); }
     if (tp == 1) { return {}; }
     if (in_component(name, "vision")) {
         return whole(ShardAxis::SingleDevice, options.vision_rank);
     }
+    if (config.text.qwen4()) { return qwen4_shard(name, shape, config, options); }
     if ((name == "proposal/head" && split_proposal_head(shape, config, options)) ||
         (name == "proposal/token_ids" && split_proposal_token_ids(shape, config, options))) {
         const auto rows = leading(name, shape);
@@ -467,7 +584,7 @@ parent_placements(std::span<const PendingWeight> weights, std::size_t object_cou
 
 void install_shard_resolver(artifact::Binder& binder, std::span<const PendingWeight> weights,
                             const Config& config, const LoadOptions& options) {
-    if (options.tp == 1 && !options.embedding_host) { return; }
+    if (options.tp == 1 && !options.embedding_host && !config.text.qwen4()) { return; }
     if (binder.device_count() != options.tp) {
         throw std::logic_error("Binder device count differs from tensor parallelism");
     }

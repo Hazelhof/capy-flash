@@ -63,7 +63,17 @@ struct ServeOptions {
     // Private long-anchor opportunities at the message boundaries before the final message: the
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
     // turn branches from the conversation; see to_prompt_input.
-    std::uint32_t turn_anchors = 1;
+    // Unset = the model's default (resolve_turn_anchors): 0 on Qwen4Exp, 1 elsewhere.
+    // capy-flash (T152): on Qwen3.8-Flash-Next every prefill pass reads the non-resident experts from
+    // host RAM (~0.8 s fixed), and the anchor splits one pass more per agentic turn (TTFT 2.67 ->
+    // 1.82 s without it); a cancelled or edited turn then re-prefills the conversation. T161: on
+    // models whose weights are all on the GPU (Qwen3.8-27B) the extra pass costs nothing measurable,
+    // so they keep the anchor.
+    std::optional<std::uint32_t> turn_anchors;
+    // T64/T66c Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
+    // (--elastic, --kv-grow, --kv-budget-gib) and the decode miss split (--miss-split auto|off).
+    ElasticKvOptions elastic_kv;
+    std::optional<MissSplitMode> miss_split;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;
@@ -94,6 +104,11 @@ struct ServeOptions {
 ServeOptions parse_serve_options(int argc, char** argv);
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
+// --turn-anchors when given, otherwise the model's default: 0 for Qwen4ExpForCausalLM (each prefill
+// pass reads the non-resident experts from host RAM), 1 for every other architecture.
+[[nodiscard]] std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,
+                                                 std::string_view architecture);
+
 std::string serve_usage_text(const char* argv0);
 
 } // namespace ninfer::serve

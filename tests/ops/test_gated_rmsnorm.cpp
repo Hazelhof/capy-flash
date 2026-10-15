@@ -21,7 +21,8 @@ constexpr ReductionCriterion gated_rmsnorm_bf16_criterion() {
 
 std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,
                                          const std::vector<float>& weight,
-                                         const std::vector<float>& gate, const Shape& shape) {
+                                         const std::vector<float>& gate, const Shape& shape,
+                                         bool sigmoid_gate) {
     std::vector<double> output(input.size());
     const auto row_count = static_cast<std::int64_t>(shape.rows) * shape.tokens;
     for (std::int64_t row = 0; row < row_count; ++row) {
@@ -34,16 +35,26 @@ std::vector<double> gated_rmsnorm_oracle(const std::vector<float>& input,
         const double inverse = 1.0 / std::sqrt(sum_squares / static_cast<double>(shape.d) + kEps);
         for (std::int32_t column = 0; column < shape.d; ++column) {
             const double gate_value = gate[base + column];
-            const double silu       = gate_value / (1.0 + std::exp(-gate_value));
+            const double sigmoid    = 1.0 / (1.0 + std::exp(-gate_value));
+            const double activation = sigmoid_gate ? sigmoid : gate_value * sigmoid;
             output[base + column]   = static_cast<double>(input[base + column]) * inverse *
-                                    static_cast<double>(weight[column]) * silu;
+                                    static_cast<double>(weight[column]) * activation;
         }
     }
     return output;
 }
 
+void launch(bool sigmoid_gate, const Tensor& x, const Tensor& weight, const Tensor& z, Tensor& out,
+            cudaStream_t stream) {
+    if (sigmoid_gate) {
+        ops::gated_rmsnorm_sigmoid(x, weight, z, kEps, out, stream);
+    } else {
+        ops::gated_rmsnorm(x, weight, z, kEps, out, stream);
+    }
+}
+
 int run_case(const char* label, const Shape& shape, std::uint32_t seed, float input_scale = 4.0F,
-             bool bf16x2_unaligned = false, bool graph = false) {
+             bool bf16x2_unaligned = false, bool graph = false, bool sigmoid_gate = false) {
     const std::size_t count = shape.elements();
     std::vector<float> input(count), weight(shape.d), gate(count);
     fill_uniform(input, seed, -input_scale, input_scale);
@@ -54,7 +65,7 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     round_to_bf16(input);
     round_to_bf16(weight);
     round_to_bf16(gate);
-    std::vector<double> reference = gated_rmsnorm_oracle(input, weight, gate, shape);
+    std::vector<double> reference = gated_rmsnorm_oracle(input, weight, gate, shape, sigmoid_gate);
 
     DeviceInput device_input  = make_input(input, bf16x2_unaligned);
     DeviceInput device_weight = make_input(weight, bf16x2_unaligned);
@@ -68,7 +79,7 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     Tensor weight_tensor(device_weight.data, DType::BF16, {shape.d});
     Tensor gate_tensor   = tensor_for(device_gate.data, shape);
     Tensor output_tensor = tensor_for(output_data, shape);
-    ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, output_tensor, nullptr);
+    launch(sigmoid_gate, input_tensor, weight_tensor, gate_tensor, output_tensor, nullptr);
     cuda_synchronize();
 
     if (graph) {
@@ -77,7 +88,7 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
         cudaGraphExec_t executable;
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
-        ops::gated_rmsnorm(input_tensor, weight_tensor, gate_tensor, kEps, output_tensor, stream);
+        launch(sigmoid_gate, input_tensor, weight_tensor, gate_tensor, output_tensor, stream);
         CUDA_CHECK(cudaStreamEndCapture(stream, &captured));
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
@@ -93,7 +104,7 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
         CUDA_CHECK(cudaGraphExecDestroy(executable));
         CUDA_CHECK(cudaGraphDestroy(captured));
         CUDA_CHECK(cudaStreamDestroy(stream));
-        reference = gated_rmsnorm_oracle(input, weight, gate, shape);
+        reference = gated_rmsnorm_oracle(input, weight, gate, shape, sigmoid_gate);
     }
 
     int failures = verify_reduction(label, from_device_bf16(output_data, count), reference,
@@ -124,6 +135,22 @@ int main() {
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);
     failures += run_case("gated_rmsnorm near-zero [128,32]", {128, 32}, 1404U, 1.0e-5F);
     failures += run_case("gated_rmsnorm unaligned [128,48]", {128, 48}, 1405U, 4.0F, true);
+    // Qwen3.8-Flash-Next GDN output gate (sigmoid): 48 value heads, and 24 per two-device shard.
+    for (int columns : {1, 2, 3, 4, 5, 6, 7, 8, 16, 57, 128, 4096}) {
+        const std::string label = "gated_rmsnorm_sigmoid [128,48," + std::to_string(columns) + "]";
+        failures += run_case(label.c_str(), {128, 48, columns}, 1500U + columns, 4.0F, false,
+                             columns == 4 || columns == 57, true);
+    }
+    for (int columns : {1, 4, 8}) {
+        const std::string label =
+            "gated_rmsnorm_sigmoid shard [128,24," + std::to_string(columns) + "]";
+        failures +=
+            run_case(label.c_str(), {128, 24, columns}, 1530U + columns, 4.0F, false, false, true);
+    }
+    failures += run_case("gated_rmsnorm_sigmoid near-zero [128,48]", {128, 48}, 1541U, 1.0e-5F,
+                         false, false, true);
+    failures += run_case("gated_rmsnorm_sigmoid unaligned [128,48,3]", {128, 48, 3}, 1542U, 4.0F,
+                         true, false, true);
     std::cout << (failures ? "FAIL" : "OK") << " gated_rmsnorm\n";
     return failures ? 1 : 0;
 }

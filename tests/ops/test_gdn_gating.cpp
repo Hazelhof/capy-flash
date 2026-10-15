@@ -15,7 +15,6 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr std::int32_t kHeads = 48;
 
 constexpr PointwiseCriterion kGdnGatingFp32{/*absolute=*/1.0e-7, /*relative=*/2.2e-7};
 
@@ -42,11 +41,11 @@ std::vector<double> read_fp32(const void* device, std::size_t elements) {
 
 void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
                    const std::vector<float>& a_log, const std::vector<float>& dt_bias,
-                   std::vector<double>& g, std::vector<double>& beta) {
+                   std::vector<double>& g, std::vector<double>& beta, std::int32_t heads) {
     g.resize(a.size());
     beta.resize(b.size());
     for (std::size_t i = 0; i < a.size(); ++i) {
-        const std::size_t head = i % kHeads;
+        const std::size_t head = i % heads;
         const double av        = static_cast<double>(a[i]);
         const double bv        = static_cast<double>(b[i]);
         const double bias      = static_cast<double>(dt_bias[head]);
@@ -56,9 +55,10 @@ void gating_oracle(const std::vector<float>& a, const std::vector<float>& b,
     }
 }
 
-int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals) {
-    const std::size_t elements = static_cast<std::size_t>(kHeads) * tokens;
-    std::vector<float> a(elements), b(elements), a_log(kHeads), dt_bias(kHeads);
+int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendentals,
+             std::int32_t heads = 48, bool packed = false) {
+    const std::size_t elements = static_cast<std::size_t>(heads) * tokens;
+    std::vector<float> a(elements), b(elements), a_log(heads), dt_bias(heads);
     fill_uniform(a, seed, -8.0F, 8.0F);
     fill_uniform(b, seed + 1u, -8.0F, 8.0F);
     fill_uniform(a_log, seed + 2u, -2.0F, 1.0F);
@@ -74,10 +74,19 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     round_to_bf16(b);
 
     std::vector<double> reference_g, reference_beta;
-    gating_oracle(a, b, a_log, dt_bias, reference_g, reference_beta);
+    gating_oracle(a, b, a_log, dt_bias, reference_g, reference_beta, heads);
 
     const std::vector<std::uint16_t> a_bits = bf16_bits(a);
     const std::vector<std::uint16_t> b_bits = bf16_bits(b);
+    // Packed: a and b are the two row halves of one [2H, T] matrix (the projection output).
+    std::vector<std::uint16_t> ab_bits(2 * elements);
+    for (std::int32_t t = 0; t < tokens; ++t) {
+        for (std::int32_t h = 0; h < heads; ++h) {
+            ab_bits[static_cast<std::size_t>(t) * 2 * heads + h] = a_bits[static_cast<std::size_t>(t) * heads + h];
+            ab_bits[static_cast<std::size_t>(t) * 2 * heads + heads + h] = b_bits[static_cast<std::size_t>(t) * heads + h];
+        }
+    }
+    DeviceBuffer device_ab                  = to_device(ab_bits);
     DeviceBuffer device_a                   = to_device(a_bits);
     DeviceBuffer device_b                   = to_device(b_bits);
     DeviceBuffer device_a_log               = to_device(a_log);
@@ -87,19 +96,26 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     device_g.fill(0xff);
     device_beta.fill(0xff);
 
-    Tensor tensor_a(device_a.p, DType::BF16, {kHeads, tokens});
-    Tensor tensor_b(device_b.p, DType::BF16, {kHeads, tokens});
-    Tensor tensor_a_log(device_a_log.p, DType::FP32, {kHeads});
-    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {kHeads});
-    Tensor tensor_g(device_g.data(), DType::FP32, {kHeads, tokens});
-    Tensor tensor_beta(device_beta.data(), DType::FP32, {kHeads, tokens});
+    Tensor tensor_a(device_a.p, DType::BF16, {heads, tokens});
+    Tensor tensor_b(device_b.p, DType::BF16, {heads, tokens});
+    if (packed) {
+        const Tensor ab(device_ab.p, DType::BF16, {2 * heads, tokens});
+        tensor_a = ab.slice(0, 0, heads);
+        tensor_b = ab.slice(0, heads, heads);
+    }
+    Tensor tensor_a_log(device_a_log.p, DType::FP32, {heads});
+    Tensor tensor_dt_bias(device_dt_bias.p, DType::FP32, {heads});
+    Tensor tensor_g(device_g.data(), DType::FP32, {heads, tokens});
+    Tensor tensor_beta(device_beta.data(), DType::FP32, {heads, tokens});
 
     ops::gdn_gating(tensor_a, tensor_b, tensor_a_log, tensor_dt_bias, tensor_g, tensor_beta,
                     nullptr);
     cuda_synchronize();
 
-    const std::string label = std::string("gdn_gating T=") + std::to_string(tokens) +
-                              (stress_transcendentals ? " transcendental-range" : "");
+    const std::string label = std::string("gdn_gating H=") + std::to_string(heads) +
+                              " T=" + std::to_string(tokens) +
+                              (stress_transcendentals ? " transcendental-range" : "") +
+                              (packed ? " packed a|b" : "");
     int failures = 0;
     failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
                                  reference_g, kGdnGatingFp32);
@@ -132,6 +148,14 @@ int main() {
     failures += run_case(128, 0x303u, false);
     failures += run_case(4096, 0x404u, false);
     failures += run_case(17, 0x505u, true);
+    // One rank's 24 of 48 value heads (two-device split, Qwen3.8-Flash-Next).
+    failures += run_case(1, 0x606u, false, 24);
+    failures += run_case(8, 0x707u, false, 24);
+    failures += run_case(4096, 0x808u, false, 24);
+    // a|b as row slices of one projection output (T49).
+    failures += run_case(4, 0x909u, false, 48, true);
+    failures += run_case(17, 0xa0au, true, 48, true);
+    failures += run_case(8, 0xb0bu, false, 24, true);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_gating correctness\n";
     return failures == 0 ? 0 : 1;

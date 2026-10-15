@@ -41,6 +41,7 @@ constexpr std::size_t kDefaultFlush    = 256ULL << 20;
 enum class ProfileSelection : std::uint8_t {
     Qwen27B,
     Qwen35B,
+    FlashNext,
     All,
 };
 
@@ -103,8 +104,9 @@ std::int32_t parse_i32(std::string_view text, const char* label, std::int32_t mi
 ProfileSelection parse_profile(std::string_view value) {
     if (value == "27b") return ProfileSelection::Qwen27B;
     if (value == "35b") return ProfileSelection::Qwen35B;
+    if (value == "flash-next") return ProfileSelection::FlashNext;
     if (value == "all") return ProfileSelection::All;
-    throw std::invalid_argument("--profile must be 27b, 35b, or all");
+    throw std::invalid_argument("--profile must be 27b, 35b, flash-next, or all");
 }
 
 CommitSelection parse_commits(std::string_view value) {
@@ -131,7 +133,7 @@ ValidSelection parse_valid(std::string_view value) {
 
 void print_help(const char* program) {
     std::printf("Usage: %s [options]\n\n"
-                "  --profile 27b|35b|all       Registered all-layer geometry (default all).\n"
+                "  --profile 27b|35b|flash-next|all Registered all-layer geometry (default all).\n"
                 "  --component fold|recurrent|all\n"
                 "                              Measured component (default all).\n"
                 "  --width T                   One physical width in [2,16].\n"
@@ -190,6 +192,10 @@ std::vector<Profile> selected_profiles(ProfileSelection selection) {
     }
     if (selection == ProfileSelection::Qwen35B || selection == ProfileSelection::All) {
         profiles.push_back({"35b-a3b", 30, 32, 8192, {2, 6, 16}});
+    }
+    if (selection == ProfileSelection::FlashNext || selection == ProfileSelection::All) {
+        // Qwen3.8-Flash-Next: 36 GDN layers of the 16/48 geometry; MTP verify widths K+1.
+        profiles.push_back({"flash-next", 36, 48, 10240, {2, 4, 5, 8}});
     }
     return profiles;
 }

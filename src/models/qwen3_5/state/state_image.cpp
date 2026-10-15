@@ -56,6 +56,12 @@ bool same_dflash_spec(const std::optional<DFlashLocalStateSpec>& left,
            left->kv_heads == right->kv_heads && left->head_dim == right->head_dim;
 }
 
+bool same_ple_spec(const std::optional<PleStateSpec>& left,
+                   const std::optional<PleStateSpec>& right) noexcept {
+    if (left.has_value() != right.has_value()) { return false; }
+    return !left || (left->layers == right->layers && left->rows == right->rows);
+}
+
 bool same_region(const LayoutRegion& left, const LayoutRegion& right) noexcept {
     return left.offset == right.offset && left.bytes == right.bytes &&
            left.alignment == right.alignment;
@@ -79,6 +85,9 @@ bool same_host_layout(const StateImageHostLayout& left,
            same_optional_region(left.dflash_local_k, right.dflash_local_k) &&
            same_optional_region(left.dflash_local_v, right.dflash_local_v) &&
            left.dflash_local_layer_bytes == right.dflash_local_layer_bytes &&
+           same_ple_spec(left.spec.ple, right.spec.ple) &&
+           same_optional_region(left.ple, right.ple) &&
+           left.ple_layer_bytes == right.ple_layer_bytes &&
            left.image_bytes == right.image_bytes;
 }
 
@@ -93,6 +102,9 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     if (spec.dflash_local && (spec.dflash_local->layers == 0 || spec.dflash_local->kv_heads <= 0 ||
                               spec.dflash_local->head_dim <= 0)) {
         throw std::invalid_argument("StateImage host DFlash geometry is invalid");
+    }
+    if (spec.ple && (spec.ple->layers == 0 || spec.ple->rows <= 0)) {
+        throw std::invalid_argument("StateImage host PLE geometry is invalid");
     }
 
     LayoutBuilder builder;
@@ -130,6 +142,13 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
         host.dflash_local_v =
             builder.add(component_bytes, kStateImageAlignment, "StateImage host DFlash local V");
     }
+    if (spec.ple) {
+        const Tensor ple_slot(nullptr, DType::BF16, {spec.ple->rows});
+        host.ple_layer_bytes = ple_slot.bytes();
+        host.ple = builder.add(checked_mul(host.ple_layer_bytes, spec.ple->layers,
+                                           "StateImage host PLE bytes overflow"),
+                               kStateImageAlignment, "StateImage host PLE convolution");
+    }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
     return host;
 }
@@ -163,6 +182,12 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
             plan_cyclic_kv_cache(builder, dflash.layers, dflash.capacity, dflash.kv_heads,
                                  dflash.head_dim, spec.linear.slot_count);
     }
+    if (spec.ple) {
+        out.ple = builder.add_tensor(DType::BF16,
+                                     {spec.ple->rows, spec.linear.slot_count,
+                                      static_cast<std::int32_t>(spec.ple->layers)},
+                                     kStateImageAlignment, "StateImage PLE convolution");
+    }
 
     out.host = plan_host_state_image(spec);
     return out;
@@ -184,9 +209,13 @@ TransferWork state_image_transfer_work(const StateImageHostLayout& layout) {
             payload, checked_mul(component_bytes, 2U, "StateImage transfer payload overflow"),
             "StateImage transfer payload overflow");
     }
+    if (layout.ple) {
+        payload = checked_add(payload, layout.ple->bytes, "StateImage transfer payload overflow");
+    }
     const std::uint64_t operations =
         2ULL * layout.spec.linear.layers + 1ULL +
-        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL);
+        (layout.spec.dflash_local ? 2ULL * layout.spec.dflash_local->layers : 0ULL) +
+        (layout.spec.ple ? layout.spec.ple->layers : 0ULL);
     if (operations > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("StateImage transfer operation count exceeds uint32");
     }
@@ -278,6 +307,15 @@ StateImageDevicePool::StateImageDevicePool(DeviceSpan backing, const StateImageD
         throw std::invalid_argument("StateImage DFlash layout is inconsistent");
     }
     StateImageSpec device_spec{.linear = layout.linear.spec, .hidden = continuation_hidden_.ne[0]};
+    if (layout.ple) {
+        ple_.emplace(layout.ple->bind(backing));
+        if (ple_->dtype != DType::BF16 || !ple_->is_contiguous() ||
+            ple_->ne[1] != linear_.slot_count()) {
+            throw std::invalid_argument("StateImage PLE layout is inconsistent");
+        }
+        device_spec.ple =
+            PleStateSpec{.layers = static_cast<std::uint32_t>(ple_->ne[2]), .rows = ple_->ne[0]};
+    }
     if (layout.dflash_local) {
         device_spec.dflash_local = DFlashLocalStateSpec{
             .layers   = static_cast<std::uint32_t>(layout.dflash_local->k.size()),
@@ -311,6 +349,13 @@ Tensor StateImageDevicePool::continuation_hidden_slot(std::int32_t slot) const {
     return continuation_hidden_.slice(1, slot, 1).view({host_layout_.spec.hidden});
 }
 
+Tensor StateImageDevicePool::ple_states(std::uint32_t layer) const {
+    if (!ple_ || layer >= static_cast<std::uint32_t>(ple_->ne[2])) {
+        throw std::out_of_range("StateImage PLE layer is out of range");
+    }
+    return ple_->slice(2, static_cast<std::int32_t>(layer), 1).view({ple_->ne[0], ple_->ne[1]});
+}
+
 CyclicKVCache* StateImageDevicePool::dflash_local() noexcept {
     return dflash_local_ ? &*dflash_local_ : nullptr;
 }
@@ -341,6 +386,10 @@ void StateImageDevicePool::zero_slot_local(std::int32_t slot, cudaStream_t strea
     linear_.zero_slot(slot, stream);
     const Tensor hidden = continuation_hidden_slot(slot);
     CUDA_CHECK(cudaMemsetAsync(hidden.data, 0, hidden.bytes(), stream));
+    for (std::uint32_t layer = 0; layer < ple_layers(); ++layer) {
+        const Tensor states = ple_states(layer).slice(1, slot, 1);
+        CUDA_CHECK(cudaMemsetAsync(states.data, 0, states.bytes(), stream));
+    }
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
@@ -356,20 +405,17 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, cudaStream_t stream) {
     validate_slot(slot, slot_count(), "StateImage zero slot is out of range");
     zero_slot_local(slot, stream);
     if (mirror_ != nullptr) {
+        // Every component the mirror holds: GDN state, the hidden column, the PLE convolution
+        // history (Qwen4Exp at tp 2) and the split drafter's DFlash rings.
         const ScopedCurrentDevice scope(mirror_device_);
-        if (mirror_->dflash_local_) {
-            mirror_->zero_slot_local(slot, mirror_stream_);
-        } else {
-            mirror_->linear_.zero_slot(slot, mirror_stream_);
-            const Tensor hidden = mirror_->continuation_hidden_slot(slot);
-            CUDA_CHECK(cudaMemsetAsync(hidden.data, 0, hidden.bytes(), mirror_stream_));
-        }
+        mirror_->zero_slot_local(slot, mirror_stream_);
     }
 }
 
 void StateImageDevicePool::zero_all_local(cudaStream_t stream) {
     linear_.zero_all(stream);
     CUDA_CHECK(cudaMemsetAsync(continuation_hidden_.data, 0, continuation_hidden_.bytes(), stream));
+    if (ple_) { CUDA_CHECK(cudaMemsetAsync(ple_->data, 0, ple_->bytes(), stream)); }
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
@@ -392,8 +438,15 @@ void StateImageDevicePool::copy_slot_local(std::int32_t source, std::int32_t des
     linear_.copy_slot(source, destination, stream);
     const Tensor source_hidden      = continuation_hidden_slot(source);
     const Tensor destination_hidden = continuation_hidden_slot(destination);
-    CUDA_CHECK(cudaMemcpyAsync(destination_hidden.data, source_hidden.data,
-                               destination_hidden.bytes(), cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(::ninfer::memcpy_device_async(destination_hidden.data, source_hidden.data,
+                               destination_hidden.bytes(), stream));
+    for (std::uint32_t layer = 0; layer < ple_layers(); ++layer) {
+        const Tensor states = ple_states(layer);
+        const Tensor from   = states.slice(1, source, 1);
+        const Tensor to     = states.slice(1, destination, 1);
+        CUDA_CHECK(
+            ::ninfer::memcpy_device_async(to.data, from.data, to.bytes(), stream));
+    }
 }
 
 void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destination,
@@ -461,6 +514,13 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
     CUDA_CHECK(
         cudaMemcpyAsync(byte_offset(destination.data, host_layout_.continuation_hidden.offset),
                         hidden.data, hidden.bytes(), cudaMemcpyDeviceToHost, stream));
+    for (std::uint32_t layer = 0; layer < ple_layers(); ++layer) {
+        const Tensor states = ple_states(layer).slice(1, source, 1);
+        CUDA_CHECK(cudaMemcpyAsync(byte_offset(destination.data,
+                                               host_layout_.ple->offset +
+                                                   layer * host_layout_.ple_layer_bytes),
+                                   states.data, states.bytes(), cudaMemcpyDeviceToHost, stream));
+    }
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
@@ -505,6 +565,13 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     CUDA_CHECK(cudaMemcpyAsync(hidden.data,
                                byte_offset(source.data, host_layout_.continuation_hidden.offset),
                                hidden.bytes(), cudaMemcpyHostToDevice, stream));
+    for (std::uint32_t layer = 0; layer < ple_layers(); ++layer) {
+        const Tensor states = ple_states(layer).slice(1, destination, 1);
+        CUDA_CHECK(cudaMemcpyAsync(
+            states.data,
+            byte_offset(source.data, host_layout_.ple->offset + layer * host_layout_.ple_layer_bytes),
+            states.bytes(), cudaMemcpyHostToDevice, stream));
+    }
     if (dflash_local_) {
         for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);

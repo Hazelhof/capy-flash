@@ -12,7 +12,11 @@ add_library(ninfer_core STATIC
   tensor.cpp
   weight_view.cpp
   decode_graph.cpp
+  expert_cache_policy.cpp
+  expert_cache.cu
+  expert_staging.cu
+  elastic_arena.cu
 )
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
-target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads)
+target_link_libraries(ninfer_core PUBLIC CUDA::cudart CUDA::nvtx3 Threads::Threads PRIVATE CUDA::cuda_driver)

@@ -43,6 +43,8 @@ struct ExecutionCore {
     // rank 1's stream in a decode-graph capture.
     const TpExecution* tp                     = nullptr;
     const DecodeGraphPeerBridge* graph_bridge = nullptr;
+    // Qwen4Exp only: the Program's expert backend, PLE states and staging.
+    const Qwen4Runtime* qwen4 = nullptr;
 };
 
 struct PrefillContext {
@@ -88,6 +90,8 @@ struct MtpBatchContext {
     // and rank 1's continuation hidden store.
     qwen3_5::MtpDecodeState* peer_frame    = nullptr;
     Tensor* peer_continuation_hidden_store = nullptr;
+    // T41: also write every proposal's log-probability to the egress (adaptive window).
+    bool draft_logprobs = false;
 };
 
 struct DFlashBatchContext {
@@ -142,6 +146,9 @@ struct TargetVerifyFrameView {
     Tensor licensed_counts;
     Tensor accepted_drafts;
     Tensor selected_hidden;
+    // T59 replay (NINFER_QWEN4_REPLAY): when bound, copied over target_tokens before acceptance,
+    // so the accepted count and the bonus token follow the reference continuation.
+    Tensor forced_targets;
     const GdnReplayRecords* replay_records = nullptr;
     const ops::SamplingConfig* sampling    = nullptr;
     DFlashFeatureSink* feature_sink        = nullptr;
@@ -164,6 +171,14 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                           TargetVerifyFrameView peer, Tensor& peer_continuation_hidden_store,
                           ops::CausalAttentionExecutionEnvelope envelope);
 
+// T123 rank-consistency probe (NINFER_TP_RANK_PROBE=<log path>): after every tp 2 verification both
+// ranks' verification hidden are copied to pinned host memory; tp_rank_probe_check compares them,
+// column by column, after the round's synchronization and logs any divergence. First call (from
+// Program setup, outside any capture) allocates the staging.
+[[nodiscard]] bool tp_rank_probe_enabled() noexcept;
+void tp_rank_probe_check(std::uint32_t frontier, std::int32_t row, std::int32_t count,
+                         const std::int32_t* tokens) noexcept;
+
 [[nodiscard]] PrefillChunkResult prefill_text_chunk(PrefillContext& state,
                                                     std::span<const TokenId> ids,
                                                     std::uint32_t nominal_length,
@@ -183,8 +198,12 @@ struct MtpBridgeInput {
     std::array<std::int32_t, 3> rope_position{};
 };
 
+// Samples the token after `absolute_position` - 1 from its retained hidden (a zero-suffix prefix
+// hit). Qwen4Exp retains the wide residual, which goes through the Text output mixer first; at
+// tensor-parallel width 2 `peer_hidden` is rank 1's retained copy when it keeps one (MTP), else
+// rank 0's is copied to rank 1.
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
-                        std::int32_t purpose);
+                        std::int32_t purpose, const Tensor* peer_hidden = nullptr);
 // Resumes the MTP head at `position` from the retained target hidden of that position. At
 // tensor-parallel width 2 `peer_previous_hidden` is rank 1's retained copy (the same StateImage
 // slot of its mirror pool) and both ranks run the split head; it is null on one device.

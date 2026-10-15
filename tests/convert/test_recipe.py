@@ -9,6 +9,7 @@ import torch
 from tools.artifact.reader import Artifact
 from tools.artifact.codecs.row_split import decode_row_split_codes
 from tools.artifact.codecs.nvfp4 import encode_nvfp4
+from tools.artifact.layouts import block_scale_geometry
 from tools.artifact.schema import binding_parts
 from tools.artifact.writer import ArtifactWriter
 from tools.convert.methods import grouped_absmax, import_encoded
@@ -213,17 +214,50 @@ def test_nvfp4_encoded_only_import_streams_complete_parent_tiles(tmp_path):
         )
 
 
-def test_incompatible_nvfp4_divisors_keep_default_parents_separate():
+def test_incompatible_nvfp4_divisors_keep_default_parents_separate(tmp_path):
     model = Model({"text": {"config": {}}})
-    for name, divisor in (("gate", 2.0), ("up", 4.0)):
-        source, _, _ = _encoded_source(name, divisor)
+    expected = {}
+    for name, divisor, shift in (("gate", 2.0, 0), ("up", 4.0, 17)):
+        source, codes, scales = _encoded_source(name, divisor, shift)
         model.add(Parameter(name, source.shape, source))
+        expected[name] = encode_nvfp4(codes, scales, struct.pack("<f", divisor), (128, 64))
     model.packing_groups = [("gate", "up")]
     recipe = Recipe(model)
     recipe.assign("*", format="nvfp4", method=import_encoded)
     assert len(recipe.prepare(device="cpu").weights) == 2
+    # An explicit group stacks them: one parent, each source keeping its own divisor word.
     recipe.group(("gate", "up"))
-    with pytest.raises(ValueError, match="weight divisors differ"):
+    prepared = recipe.prepare(device="cpu", rows_per_chunk=128)
+    (job,) = prepared.weights
+    assert job.spec.shape == (256, 64) and job.spec.divisors == 2
+    path = tmp_path / "stacked.ninfer"
+    _write(path, model, prepared)
+    single = block_scale_geometry("nvfp4", (128, 64))
+    stacked = block_scale_geometry("nvfp4", (256, 64), 2)
+    with Artifact(path) as artifact:
+        assert artifact.object(job.spec.id).divisors == 2
+        raw = artifact.read_object(job.spec.id)
+    for index, name in enumerate(("gate", "up")):
+        own = expected[name]
+        code_bytes, scale_bytes = single.code_plane_bytes, single.scale_plane_bytes
+        assert raw[index * code_bytes : (index + 1) * code_bytes] == own[:code_bytes]
+        first = stacked.scale_plane_offset + index * scale_bytes
+        assert raw[first : first + scale_bytes] == own[
+            single.scale_plane_offset : single.scale_plane_offset + scale_bytes
+        ]
+        word = stacked.weight_divisor_offset + 4 * index
+        assert raw[word : word + 4] == own[single.weight_divisor_offset :]
+    # A stack needs complete sources of equal rows.
+    model.parameters.clear()
+    for name, rows in (("gate", 128), ("up", 256)):
+        source, _, _ = _encoded_source(name, 2.0 if name == "gate" else 4.0)
+        if rows != 128:
+            source = replace(source, shape=(rows, 64))
+        model.add(Parameter(name, source.shape, source))
+    recipe = Recipe(model)
+    recipe.assign("*", format="nvfp4", method=import_encoded)
+    recipe.group(("gate", "up"))
+    with pytest.raises(ValueError, match="equal row counts"):
         recipe.prepare(device="cpu")
 
 

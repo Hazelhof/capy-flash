@@ -178,6 +178,11 @@ public:
     // Bytes of the curve's per-rank reservation that `rank` does not allocate, whatever the page
     // count: at tp 2 with Vision, the encode workspace of the rank without the tower.
     [[nodiscard]] std::size_t unallocated_reservation_bytes(int rank) const noexcept;
+    // T64: one rank's KV page-pool bytes (Text + MTP pools) at the curve's minimum page count and
+    // its pages, and the number of KV planes (each elastic plane may cost one granule more).
+    [[nodiscard]] std::size_t kv_pool_bytes() const noexcept;
+    [[nodiscard]] std::uint32_t kv_pool_pages() const noexcept;
+    [[nodiscard]] std::size_t kv_plane_count() const noexcept;
     [[nodiscard]] SequencePlan finalize(std::uint32_t main_page_groups) &&;
 
 public:
@@ -1135,6 +1140,17 @@ struct RuntimeContractAccess {
 [[nodiscard]] SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                                     DeviceContext& device,
                                                     const EngineOptions& options);
+
+// Device bytes one more offloaded-expert slot per layer costs (every layer's slot), or 0 when the
+// model's routed experts are not offloaded (EngineOptions::routed_experts does not apply).
+[[nodiscard]] std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
+                                                       const EngineOptions& options);
+// Device bytes of the offload backend's prefetch staging slots (T25; 0 when prefetch is off).
+[[nodiscard]] std::int64_t offloaded_expert_staging_bytes(const execution::Parameters& parameters,
+                                                          const EngineOptions& options);
+// Device bytes of the staged miss split's scratch slots (T18), or 0 when not used.
+[[nodiscard]] std::int64_t offloaded_expert_split_bytes(const execution::Parameters& parameters,
+                                                        const EngineOptions& options);
 
 // Tensor-parallel width 2, with Parameters(model, 0) and Parameters(model, 1) of one two-device
 // Model: rank 1's Parameters supply the Vision tower when rank 1 holds it.

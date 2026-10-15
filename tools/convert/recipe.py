@@ -23,6 +23,7 @@ from .methods import (
     import_encoded,
     nvfp4_absmax,
     nvfp4_mse,
+    nvfp4_mse_stacked,
 )
 from .model import Model
 from .sources.logical import LogicalSource, select_rows
@@ -305,6 +306,45 @@ class Recipe:
                 "grouped inputs need compatible rows or an explicit parent shape"
             )
 
+        def parent_divisors(sources, selection) -> int:
+            """How many NVFP4 divisors this parent stores: one per source, or one for all.
+
+            A parent whose sources were quantised apart keeps each source's divisor, and the
+            stored plane addresses them by an equal share of its rows. That is a partition only
+            if the sources have equal row counts, so a parent that needs several divisors and
+            cannot be divided equally is refused here, where its shape is chosen.
+            """
+            if selection.format != "nvfp4" or len(sources) < 2:
+                return 1
+            if selection.method is nvfp4_mse_stacked:
+                # Quantised apart by request: one divisor per complete, equal source matrix.
+                if any(len(source.shape) != 2 for source in sources) or (
+                    len({source.shape[0] for source in sources}) != 1
+                ):
+                    raise ValueError(
+                        "stacked NVFP4 sources must be complete matrices with equal row counts"
+                    )
+                return len(sources)
+            if selection.method is not import_encoded:
+                # A quantizing method writes the one divisor it chooses for the parent.
+                return 1
+            words = [
+                source.weight_divisor() if source.weight_divisor else None
+                for source in sources
+            ]
+            # A stack is only chosen when the sources are known to disagree. A divisor no source
+            # states at plan time is unknown, not different.
+            if None in words or len(set(words)) == 1:
+                return 1
+            if any(len(source.shape) != 2 for source in sources) or (
+                len({source.shape[0] for source in sources}) != 1
+            ):
+                raise ValueError(
+                    "NVFP4 sources quantised against different divisors must be complete "
+                    "matrices with equal row counts"
+                )
+            return len(sources)
+
         def emit(items, chosen=None):
             if len({self.model.parameters[name].residency for name, _ in items}) > 1:
                 raise ValueError(
@@ -317,9 +357,10 @@ class Recipe:
             dims, sources = parent_shape(items, chosen)
             selection = items[0][1]
             layout = selection.layout or default_layout(selection.format)
-            encoded_size(layout, selection.format, dims)
+            divisors = parent_divisors(sources, selection)
+            encoded_size(layout, selection.format, dims, divisors)
             spec = TensorSpec(
-                f"weight/{len(weights):06d}", dims, selection.format, layout
+                f"weight/{len(weights):06d}", dims, selection.format, layout, divisors
             )
             inputs = tuple(
                 MethodInput(
@@ -454,6 +495,11 @@ class Recipe:
 
         uses = []
         auxiliary_outputs = []
+        # Each Use reads only its own auxiliaries; index them once instead of scanning every
+        # auxiliary for every Use (quadratic across a stacked expert bank).
+        auxiliaries_by_use: dict[tuple[str, str], list[tuple[str, AuxiliaryValue]]] = {}
+        for (parameter, source_input, role), value in auxiliary_values.items():
+            auxiliaries_by_use.setdefault((parameter, source_input), []).append((role, value))
         for (name, input_name), policy in self.policies.items():
             # Explicitly shared weights retain independent Use and calibration records.
             key = (name, input_name, "activation_input_divisor")
@@ -469,9 +515,7 @@ class Recipe:
                 raise ValueError(f"{name}: provide its independent activation divisor")
             use = {"parameter": name, "input": input_name, "activation_policy": policy}
             referenced = {}
-            for (parameter, source_input, role), value in auxiliary_values.items():
-                if (parameter, source_input) != (name, input_name):
-                    continue
+            for role, value in auxiliaries_by_use.get((name, input_name), ()):
                 if role == "activation_input_divisor":
                     if value.format != "fp32" or value.shape != ():
                         raise ValueError(

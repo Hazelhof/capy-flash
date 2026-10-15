@@ -23,6 +23,24 @@ struct InstanceInfo {
 
 class LoadPlan;
 
+// Where one routed expert of a Qwen4Exp block lives in its layer's stacked NVFP4 banks: for the
+// gate|up bank (its gate rows, then its up rows) and for the down bank, the parent and the byte
+// ranges from the parent's first byte that hold the expert's codes, swizzled block scales and its
+// FP32 divisor words. An expert cache slot is these spans copied back to back; every span is a
+// contiguous range of the host-mapped bank (3 per bank for Qwen3.8-Flash-Next).
+struct ExpertBankSpans {
+    const WeightParent* parent = nullptr;
+    std::uint64_t row_begin    = 0;
+    std::uint64_t row_count    = 0;
+    std::vector<ByteSpan> spans;
+};
+
+struct RoutedExpertSpans {
+    ExpertBankSpans gate_up, down;
+
+    [[nodiscard]] std::uint64_t bytes() const noexcept;
+};
+
 class Model {
 public:
     ~Model();
@@ -47,6 +65,10 @@ public:
     // The view on `device`: a complete parent, or that rank's Rows/Columns shard with the split
     // axis of its logical shape narrowed. Throws when the parameter is not resident there.
     [[nodiscard]] const BoundWeight& weight(WeightId id, int device = 0) const;
+
+    // A Residency::HostFile weight (the Qwen4Exp n-gram table): its mapped object segments and
+    // geometry, shared by every device. Throws for any other weight.
+    [[nodiscard]] const BoundWeight& file_weight(WeightId id) const;
 
     [[nodiscard]] ops::WeightInput input(WeightUseId id, int device = 0) const;
     [[nodiscard]] ops::WeightInput input(WeightId id, int device = 0) const;
@@ -88,5 +110,10 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
 };
+
+// Throws unless `expert` of `moe` binds a gate and an up matrix that are adjacent rows of one
+// parent and a down matrix that is a row block of one parent, with NVFP4 rows on 128-row tiles.
+[[nodiscard]] RoutedExpertSpans routed_expert_spans(const Model& model, const MoeWeights& moe,
+                                                    std::uint32_t expert, int device = 0);
 
 } // namespace ninfer::models::qwen3_5

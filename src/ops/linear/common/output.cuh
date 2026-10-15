@@ -26,6 +26,20 @@ struct LinearBf16Output {
     }
 };
 
+// T128c: FP32 output (row-parallel partials that are exchanged before the single BF16 rounding).
+struct LinearF32Output {
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ float* at(int row, int token) const {
+        return data + static_cast<std::int64_t>(token) * rows + row;
+    }
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        *at(row, token) = value;
+    }
+};
+
 struct LinearBf16StridedOutput {
     __nv_bfloat16* data;
     std::int64_t leading_dim;

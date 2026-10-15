@@ -49,6 +49,9 @@ WeightView bind_view(const ParameterReference& reference, const MaterializedArti
     if (reference.residency == Residency::Values) {
         throw ArtifactError(reference.name + ": owning values do not have parent backing");
     }
+    if (reference.residency == Residency::HostFile) {
+        throw ArtifactError(reference.name + ": file-mapped objects are read through segments");
+    }
     WeightView out;
     out.shape             = reference.shape;
     std::uint64_t covered = 0;

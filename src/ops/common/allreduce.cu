@@ -25,11 +25,17 @@
 
 #include "ninfer/ops/peer_mailbox.h"
 
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+
 #include "ops/launcher/residual_add.h" // detail::residual_add_launch
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -105,12 +111,34 @@ private:
 // the current device changed; the caller holds a CurrentDeviceGuard.
 PeerMailbox* captured_mailbox(const std::array<Tensor, 2>& buffer, std::size_t bytes,
                               const ExecutionContext& ec, const PeerEvents& events) {
+    for (int rank = 0; rank < 2; ++rank) {
+        if ((reinterpret_cast<std::uintptr_t>(buffer[rank].data) % 16) != 0) { return nullptr; }
+    }
+    return detail::captured_mailbox_for(bytes, ec, events);
+}
+
+// EAGER HOST EXCHANGE SELECTION (T56). Returns the HostExchange attached to `events` when it serves
+// this pair and neither rank's stream is capturing; otherwise the driver-staged pull stays.
+HostExchange* eager_host_exchange(const ExecutionContext& ec, const PeerEvents& events) {
+    HostExchange* exchange = events.host_exchange();
+    if (exchange == nullptr || !exchange->serves(ec)) { return nullptr; }
+    for (int rank = 0; rank < 2; ++rank) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ec.dev[rank]->stream, &status));
+        if (status != cudaStreamCaptureStatusNone) { return nullptr; }
+    }
+    return exchange;
+}
+
+} // namespace
+
+PeerMailbox* detail::captured_mailbox_for(std::size_t bytes, const ExecutionContext& ec,
+                                          const PeerEvents& events) {
     PeerMailbox* mailbox = events.mailbox();
     if (mailbox == nullptr || events.staged_only() || !mailbox->serves(ec)) { return nullptr; }
     if ((bytes % 16) != 0 || bytes > mailbox->max_bytes()) { return nullptr; }
     unsigned long long capture[2] = {0, 0};
     for (int rank = 0; rank < 2; ++rank) {
-        if ((reinterpret_cast<std::uintptr_t>(buffer[rank].data) % 16) != 0) { return nullptr; }
         const DeviceContext& local = *ec.dev[rank];
         CurrentDeviceGuard::set(local.device);
         cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
@@ -118,6 +146,55 @@ PeerMailbox* captured_mailbox(const std::array<Tensor, 2>& buffer, std::size_t b
         if (status != cudaStreamCaptureStatusActive) { return nullptr; }
     }
     return capture[0] == capture[1] ? mailbox : nullptr;
+}
+
+namespace {
+
+// The staged path's local combine of allreduce_sum_f32: one IEEE FP32 addition per element (the
+// mailbox kernel's arithmetic, so the transports agree bit for bit) and the optional single BF16
+// rounding of the sum.
+__global__ void allreduce_f32_combine_kernel(float* __restrict__ partial,
+                                             const float* __restrict__ peer,
+                                             __nv_bfloat16* __restrict__ bf16_out,
+                                             std::size_t count, unsigned int dither_key,
+                                             unsigned int dither_bit) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += stride) {
+        float sum = __fadd_rn(partial[i], peer[i]);
+        if (dither_key != 0U) {
+            // T128 diagnostic (NINFER_TP_AR_DITHER): flip one low mantissa bit of half the sums.
+            unsigned int h = static_cast<unsigned int>(i) ^ dither_key;
+            h ^= h >> 16; h *= 0x7feb352dU; h ^= h >> 15; h *= 0x846ca68bU; h ^= h >> 16;
+            if ((h & 1U) != 0U) { sum = __uint_as_float(__float_as_uint(sum) ^ (1U << dither_bit)); }
+        }
+        partial[i]      = sum;
+        if (bf16_out != nullptr) { bf16_out[i] = __float2bfloat16_rn(sum); }
+    }
+}
+
+void allreduce_f32_combine(float* partial, const float* peer, __nv_bfloat16* bf16_out,
+                           std::size_t count, cudaStream_t stream) {
+    constexpr int kThreads = 256;
+    const std::size_t want = (count + kThreads - 1) / kThreads;
+    const int blocks       = static_cast<int>(want < 1024 ? (want < 1 ? 1 : want) : 1024);
+    // T128: NINFER_TP_AR_DITHER=<seed> (diagnostic), keyed per call so the layers differ.
+    static const unsigned int seed = [] {
+        const char* v = std::getenv("NINFER_TP_AR_DITHER");
+        return v != nullptr ? static_cast<unsigned int>(std::strtoul(v, nullptr, 10)) : 0U;
+    }();
+    static const unsigned int bit = [] {
+        const char* v = std::getenv("NINFER_TP_AR_DITHER_BIT");
+        return v != nullptr ? static_cast<unsigned int>(std::strtoul(v, nullptr, 10)) & 15U : 0U;
+    }();
+    // The callers combine rank 0 then rank 1 of each exchange: both ranks get the same key (the
+    // ranks must keep identical bits).
+    static unsigned int calls = 0;
+    const unsigned int call = (calls++) >> 1;
+    const unsigned int key  = seed == 0U ? 0U : ((seed * 0x9E3779B9U) ^ (call * 0x85EBCA6BU)) | 1U;
+    allreduce_f32_combine_kernel<<<blocks, kThreads, 0, stream>>>(partial, peer, bf16_out, count,
+                                                                  key, bit);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 #ifndef NDEBUG
@@ -208,10 +285,11 @@ PeerEvents::~PeerEvents() {
 
 PeerEvents::PeerEvents(PeerEvents&& other) noexcept
     : inputs_ready_(other.inputs_ready_), pull_done_(other.pull_done_), mailbox_(other.mailbox_),
-      staged_scopes_(other.staged_scopes_) {
+      host_exchange_(other.host_exchange_), staged_scopes_(other.staged_scopes_) {
     other.inputs_ready_  = {nullptr, nullptr};
     other.pull_done_     = {nullptr, nullptr};
     other.mailbox_       = nullptr;
+    other.host_exchange_ = nullptr;
     other.staged_scopes_ = 0;
 }
 
@@ -221,6 +299,7 @@ PeerEvents& PeerEvents::operator=(PeerEvents&& other) noexcept {
     inputs_ready_.swap(other.inputs_ready_);
     pull_done_.swap(other.pull_done_);
     std::swap(mailbox_, other.mailbox_);
+    std::swap(host_exchange_, other.host_exchange_);
     std::swap(staged_scopes_, other.staged_scopes_);
     return *this;
 }
@@ -257,6 +336,433 @@ void detail::require_allreduce_sum_arguments(const std::array<Tensor, 2>& buffer
 #endif
 }
 
+HostExchange::HostExchange(const ExecutionContext& ec, std::size_t chunk_bytes)
+    : chunk_bytes_(chunk_bytes) {
+    require_two_devices(ec, "HostExchange: requires an ExecutionContext with two distinct devices");
+    require(chunk_bytes_ > 0 && chunk_bytes_ % 256 == 0, "HostExchange: chunk must be a multiple of 256 bytes");
+    const CurrentDeviceGuard guard;
+    for (int rank = 0; rank < 2; ++rank) {
+        devices_[static_cast<std::size_t>(rank)] = ec.dev[rank]->device;
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&side_[static_cast<std::size_t>(rank)], cudaStreamNonBlocking));
+        const auto r = static_cast<std::size_t>(rank);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&receive_[r], cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&begun_[r], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&received_[r], cudaEventDisableTiming));
+    }
+}
+
+HostExchange::~HostExchange() {
+    int previous = 0;
+    if (cudaGetDevice(&previous) != cudaSuccess) { previous = -1; }
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        if (devices_[rank] < 0 || cudaSetDevice(devices_[rank]) != cudaSuccess) { continue; }
+        if (side_[rank] != nullptr) {
+            (void)cudaStreamSynchronize(side_[rank]);
+            (void)cudaStreamDestroy(side_[rank]);
+        }
+        if (receive_[rank] != nullptr) {
+            (void)cudaStreamSynchronize(receive_[rank]);
+            (void)cudaStreamDestroy(receive_[rank]);
+        }
+        for (cudaEvent_t e : chunk_done_[rank]) { (void)cudaEventDestroy(e); }
+        for (cudaEvent_t e : group_ready_[rank]) { (void)cudaEventDestroy(e); }
+        for (cudaEvent_t e : pipe_chunk_[rank]) { (void)cudaEventDestroy(e); }
+        for (cudaEvent_t e : {begun_[rank], received_[rank]}) {
+            if (e != nullptr) { (void)cudaEventDestroy(e); }
+        }
+        if (stats_[rank] != nullptr) { (void)cudaFree(stats_[rank]); }
+    }
+    // The peers' host-to-device reads ran on the ranks' own streams: drain both devices before
+    // the buffers go.
+    for (std::size_t rank = 0; rank < 2; ++rank) {
+        if (devices_[rank] >= 0 && cudaSetDevice(devices_[rank]) == cudaSuccess) {
+            (void)cudaDeviceSynchronize();
+        }
+    }
+    for (std::byte* h : host_) {
+        if (h != nullptr) { (void)cudaFreeHost(h); }
+    }
+    if (previous >= 0) { (void)cudaSetDevice(previous); }
+}
+
+bool HostExchange::serves(const ExecutionContext& ec) const noexcept {
+    return ec.tp == 2 && ec.dev[0].has_value() && ec.dev[1].has_value() &&
+           ec.dev[0]->device == devices_[0] && ec.dev[1]->device == devices_[1];
+}
+
+void HostExchange::reserve(std::size_t bytes, std::size_t chunks, const ExecutionContext& ec) {
+    if (bytes > capacity_) {
+        // Earlier exchanges may still read or write the old buffers: drain both devices.
+        for (int rank = 0; rank < 2; ++rank) {
+            CurrentDeviceGuard::set(ec.dev[rank]->device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
+        for (std::byte*& h : host_) {
+            if (h != nullptr) { CUDA_CHECK(cudaFreeHost(h)); }
+            h = nullptr;
+        }
+        capacity_ = 0;
+        for (std::byte*& h : host_) {
+            void* p = nullptr;
+            CUDA_CHECK(cudaHostAlloc(&p, bytes, cudaHostAllocPortable));
+            h = static_cast<std::byte*>(p);
+        }
+        capacity_ = bytes;
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        auto& events = chunk_done_[static_cast<std::size_t>(rank)];
+        if (events.size() >= chunks) { continue; }
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        while (events.size() < chunks) {
+            cudaEvent_t e = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            events.push_back(e);
+        }
+    }
+}
+
+void HostExchange::pull(const std::array<const void*, 2>& source,
+                        const std::array<void*, 2>& destination, std::size_t bytes,
+                        const ExecutionContext& ec, const PeerEvents& events) {
+    require(serves(ec), "HostExchange: serves another device pair");
+    const std::size_t chunks = (bytes + chunk_bytes_ - 1) / chunk_bytes_;
+    reserve(bytes, chunks, ec);
+    // Leg 1, both ranks: operand -> own host buffer, on the side stream, one event per chunk.
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(side_[r], events.inputs_ready(rank), 0));
+        for (std::size_t c = 0; c < chunks; ++c) {
+            const std::size_t offset = c * chunk_bytes_;
+            const std::size_t n      = std::min(chunk_bytes_, bytes - offset);
+            CUDA_CHECK(cudaMemcpyAsync(host_[r] + offset, static_cast<const std::byte*>(source[r]) + offset,
+                                       n, cudaMemcpyDeviceToHost, side_[r]));
+            CUDA_CHECK(cudaEventRecord(chunk_done_[r][c], side_[r]));
+        }
+    }
+    // Leg 2, both ranks: the peer's host buffer -> own staging, on the rank's stream, chunk by
+    // chunk behind the peer's events (the two legs of a pair overlap on two different links).
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r    = static_cast<std::size_t>(rank);
+        const auto peer = static_cast<std::size_t>(1 - rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        const cudaStream_t stream = ec.dev[rank]->stream;
+        for (std::size_t c = 0; c < chunks; ++c) {
+            const std::size_t offset = c * chunk_bytes_;
+            const std::size_t n      = std::min(chunk_bytes_, bytes - offset);
+            CUDA_CHECK(cudaStreamWaitEvent(stream, chunk_done_[peer][c], 0));
+            CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(destination[r]) + offset,
+                                       host_[peer] + offset, n, cudaMemcpyHostToDevice, stream));
+        }
+    }
+}
+
+HostExchange* eager_exchange(const ExecutionContext& ec, const PeerEvents& events) {
+    return eager_host_exchange(ec, events);
+}
+
+void HostExchange::copy(int from, const void* source, void* destination, std::size_t bytes,
+                        const ExecutionContext& ec, const PeerEvents& events) {
+    require(serves(ec), "HostExchange: serves another device pair");
+    require(from == 0 || from == 1, "HostExchange: copy from rank 0 or 1");
+    if (bytes == 0) { return; }
+    const std::size_t chunks = (bytes + chunk_bytes_ - 1) / chunk_bytes_;
+    reserve(bytes, chunks, ec);
+    const auto f = static_cast<std::size_t>(from);
+    const int to = 1 - from;
+    CurrentDeviceGuard::set(ec.dev[from]->device);
+    CUDA_CHECK(cudaStreamWaitEvent(side_[f], events.inputs_ready(from), 0));
+    for (std::size_t c = 0; c < chunks; ++c) {
+        const std::size_t offset = c * chunk_bytes_;
+        const std::size_t n      = std::min(chunk_bytes_, bytes - offset);
+        CUDA_CHECK(cudaMemcpyAsync(host_[f] + offset, static_cast<const std::byte*>(source) + offset,
+                                   n, cudaMemcpyDeviceToHost, side_[f]));
+        CUDA_CHECK(cudaEventRecord(chunk_done_[f][c], side_[f]));
+    }
+    CurrentDeviceGuard::set(ec.dev[to]->device);
+    const cudaStream_t stream = ec.dev[to]->stream;
+    for (std::size_t c = 0; c < chunks; ++c) {
+        const std::size_t offset = c * chunk_bytes_;
+        const std::size_t n      = std::min(chunk_bytes_, bytes - offset);
+        CUDA_CHECK(cudaStreamWaitEvent(stream, chunk_done_[f][c], 0));
+        CUDA_CHECK(cudaMemcpyAsync(static_cast<std::byte*>(destination) + offset, host_[f] + offset,
+                                   n, cudaMemcpyHostToDevice, stream));
+    }
+}
+
+// ---- T62: the prefill MoE exchange by column groups, optional narrow payload ------------------
+
+namespace {
+
+constexpr int kPayloadF16 = 1; // HostExchange::Payload::FP16; anything else narrows to BF16
+
+// T128b: the FP16 payload carries v * 2^-k (exact), saturated to the FP16 range (NaN stays NaN); the
+// receiver multiplies by 2^k (exact). down = 2^-k, up = 2^k; the BF16 payload ignores them.
+__device__ __forceinline__ std::uint16_t narrow_bits(float v, int payload, float down) {
+    if (payload != kPayloadF16) { return __bfloat16_as_ushort(__float2bfloat16_rn(v)); }
+    float s = v * down;
+    if (fabsf(s) > 65504.0F) { s = copysignf(65504.0F, s); }
+    return __half_as_ushort(__float2half_rn(s));
+}
+
+__device__ __forceinline__ float widen_bits(std::uint16_t b, int payload, float up) {
+    return payload == kPayloadF16 ? __half2float(__ushort_as_half(b)) * up
+                                  : __bfloat162float(__ushort_as_bfloat16(b));
+}
+
+// NINFER_TP_AR_SHIFT = k (0..14, default 2).
+int exchange_shift() {
+    static const int k = [] {
+        const char* v = std::getenv("NINFER_TP_AR_SHIFT");
+        const int s = v != nullptr ? std::atoi(v) : 2;
+        return s < 0 ? 0 : (s > 14 ? 14 : s);
+    }();
+    return k;
+}
+
+// dst[i] = narrow(src[i]), RNE.
+__global__ void exchange_narrow_kernel(const float* __restrict__ src, std::uint16_t* __restrict__ dst,
+                                       std::size_t count, int payload, float down) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += stride) {
+        dst[i] = narrow_bits(src[i], payload, down);
+    }
+}
+
+// S = fl32(widen(narrow(own)) + widen(peer)); own <- S; out <- RNE_bf16(S). The own operand is
+// rounded exactly as the copy the peer received, so both ranks add the same two values.
+__global__ void exchange_narrow_combine_kernel(float* __restrict__ partial,
+                                               const std::uint16_t* __restrict__ peer,
+                                               __nv_bfloat16* __restrict__ bf16_out,
+                                               std::size_t count, int payload, float down,
+                                               float up) {
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += stride) {
+        const float own = widen_bits(narrow_bits(partial[i], payload, down), payload, up);
+        const float sum = __fadd_rn(own, widen_bits(peer[i], payload, up));
+        partial[i]      = sum;
+        if (bf16_out != nullptr) { bf16_out[i] = __float2bfloat16_rn(sum); }
+    }
+}
+
+// stats[0] = max |v| bits (non-negative floats order as unsigned ints), [1] = |v| > 65504,
+// [2] = 0 < |v| < 2^-14 (FP16 subnormal), [3] = non-finite.
+__global__ void exchange_stats_kernel(const float* __restrict__ v, std::size_t count,
+                                      unsigned long long* __restrict__ stats) {
+    unsigned int max_bits = 0;
+    unsigned long long over = 0, sub = 0, bad = 0;
+    const std::size_t stride = static_cast<std::size_t>(gridDim.x) * blockDim.x;
+    for (std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < count; i += stride) {
+        const float a = fabsf(v[i]);
+        if (!isfinite(a)) { ++bad; continue; }
+        max_bits = max(max_bits, __float_as_uint(a));
+        over += a > 65504.0F ? 1ULL : 0ULL;
+        sub += (a > 0.0F && a < 6.103515625e-05F) ? 1ULL : 0ULL;
+    }
+    atomicMax(stats, static_cast<unsigned long long>(max_bits));
+    if (over != 0) { atomicAdd(stats + 1, over); }
+    if (sub != 0) { atomicAdd(stats + 2, sub); }
+    if (bad != 0) { atomicAdd(stats + 3, bad); }
+}
+
+int grid_for(std::size_t count) {
+    const std::size_t want = (count + 255) / 256;
+    return static_cast<int>(want < 1 ? 1 : (want > 1024 ? 1024 : want));
+}
+
+bool exchange_stats_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_TP_AR_MAXABS");
+        return v != nullptr && std::string(v) == "1";
+    }();
+    return on;
+}
+
+} // namespace
+
+void HostExchange::grow(std::vector<cudaEvent_t>& events, std::size_t count, int device) {
+    if (events.size() >= count) { return; }
+    CurrentDeviceGuard::set(device);
+    while (events.size() < count) {
+        cudaEvent_t e = nullptr;
+        CUDA_CHECK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        events.push_back(e);
+    }
+}
+
+bool HostExchange::begin_sum_f32(const std::array<Tensor, 2>& partial,
+                                 const std::array<Tensor, 2>& staging,
+                                 const std::array<Tensor, 2>* bf16_out, Payload payload,
+                                 const ExecutionContext& ec) {
+    require(serves(ec), "HostExchange: serves another device pair");
+    require(!pending_.active, "HostExchange: begin_sum_f32 while a call is open");
+    for (int rank = 0; rank < 2; ++rank) {
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ec.dev[rank]->stream, &status));
+        if (status != cudaStreamCaptureStatusNone) { return false; }
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        require(partial[rank].dtype == DType::FP32 && staging[rank].dtype == DType::FP32,
+                "begin_sum_f32: partial/staging must be FP32");
+        require(partial[rank].data != nullptr && staging[rank].data != nullptr &&
+                    partial[rank].is_contiguous() && staging[rank].is_contiguous(),
+                "begin_sum_f32: partial/staging must be contiguous non-null");
+        require(partial[rank].data != staging[rank].data, "begin_sum_f32: staging aliases partial");
+        for (int d = 0; d < 4; ++d) {
+            require(partial[rank].ne[d] == partial[0].ne[d] &&
+                        staging[rank].ne[d] == partial[0].ne[d],
+                    "begin_sum_f32: partial/staging shapes must match on both devices");
+        }
+        if (bf16_out != nullptr) {
+            const Tensor& out = (*bf16_out)[rank];
+            require(out.dtype == DType::BF16 && out.data != nullptr && out.is_contiguous() &&
+                        out.numel() == partial[0].numel(),
+                    "begin_sum_f32: bf16_out must be contiguous BF16 of the partial's size");
+        }
+    }
+    const CurrentDeviceGuard guard;
+    Pending& p = pending_;
+    p          = Pending{};
+    p.ec       = &ec;
+    p.partial  = partial;
+    p.staging  = staging;
+    p.has_out  = bf16_out != nullptr;
+    if (p.has_out) { p.out = *bf16_out; }
+    p.payload = payload;
+    p.rows    = partial[0].ne[0];
+    p.columns = static_cast<std::int64_t>(partial[0].numel()) / std::max<std::int64_t>(p.rows, 1);
+    const std::size_t esize = payload == Payload::FP32 ? 4 : 2;
+    const std::size_t bytes = static_cast<std::size_t>(partial[0].numel()) * esize;
+    reserve(bytes, 0, ec);
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        // staging[r] (and the narrow copy in it) is free once rank r's stream got here.
+        CUDA_CHECK(cudaEventRecord(begun_[r], ec.dev[rank]->stream));
+        CUDA_CHECK(cudaStreamWaitEvent(receive_[r], begun_[r], 0));
+    }
+    p.active = true;
+    return true;
+}
+
+void HostExchange::columns_ready(int rank, std::int64_t first, std::int64_t count) {
+    Pending& p = pending_;
+    require(p.active, "HostExchange: columns_ready without begin_sum_f32");
+    require(rank == 0 || rank == 1, "HostExchange: rank must be 0 or 1");
+    const auto r    = static_cast<std::size_t>(rank);
+    const auto peer = static_cast<std::size_t>(1 - rank);
+    require(first == p.done[r] && count >= 0 && first + count <= p.columns,
+            "HostExchange: column groups must be consecutive within [0, T)");
+    if (count == 0) { return; }
+    const ExecutionContext& ec = *p.ec;
+    const CurrentDeviceGuard guard;
+    const std::size_t esize  = p.payload == Payload::FP32 ? 4 : 2;
+    const std::size_t total  = static_cast<std::size_t>(p.rows * p.columns);
+    const std::size_t begin  = static_cast<std::size_t>(p.rows * first);
+    const std::size_t n      = static_cast<std::size_t>(p.rows * count);
+    const std::size_t offset = begin * esize, bytes = n * esize;
+    const cudaStream_t stream = ec.dev[rank]->stream;
+    CurrentDeviceGuard::set(ec.dev[rank]->device);
+    const std::byte* source = nullptr;
+    std::byte* destination  = nullptr; // on the peer
+    if (p.payload == Payload::FP32) {
+        source      = static_cast<const std::byte*>(p.partial[r].data) + offset;
+        destination = static_cast<std::byte*>(p.staging[peer].data) + offset;
+    } else {
+        auto* own = static_cast<std::uint16_t*>(p.staging[r].data) + begin;
+        exchange_narrow_kernel<<<grid_for(n), 256, 0, stream>>>(
+            static_cast<const float*>(p.partial[r].data) + begin, own, n,
+            static_cast<int>(p.payload), ldexpf(1.0F, -exchange_shift()));
+        CUDA_CHECK(cudaGetLastError());
+        source      = reinterpret_cast<const std::byte*>(own);
+        destination = reinterpret_cast<std::byte*>(static_cast<std::uint16_t*>(p.staging[peer].data) +
+                                                   total + begin);
+    }
+    const std::size_t chunks = (bytes + chunk_bytes_ - 1) / chunk_bytes_;
+    grow(group_ready_[r], p.groups[r] + 1, ec.dev[rank]->device);
+    grow(pipe_chunk_[r], p.chunks[r] + chunks, ec.dev[rank]->device);
+    CurrentDeviceGuard::set(ec.dev[rank]->device);
+    const cudaEvent_t ready = group_ready_[r][p.groups[r]++];
+    CUDA_CHECK(cudaEventRecord(ready, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(side_[r], ready, 0));
+    for (std::size_t c = 0; c < chunks; ++c) {
+        const std::size_t o = c * chunk_bytes_;
+        const std::size_t m = std::min(chunk_bytes_, bytes - o);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaMemcpyAsync(host_[r] + offset + o, source + o, m, cudaMemcpyDeviceToHost,
+                                   side_[r]));
+        const cudaEvent_t done = pipe_chunk_[r][p.chunks[r]++];
+        CUDA_CHECK(cudaEventRecord(done, side_[r]));
+        CurrentDeviceGuard::set(ec.dev[1 - rank]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(receive_[peer], done, 0));
+        CUDA_CHECK(cudaMemcpyAsync(destination + o, host_[r] + offset + o, m,
+                                   cudaMemcpyHostToDevice, receive_[peer]));
+    }
+    p.done[r] += count;
+}
+
+void HostExchange::finish_sum_f32() {
+    Pending& p = pending_;
+    require(p.active, "HostExchange: finish_sum_f32 without begin_sum_f32");
+    require(p.done[0] == p.columns && p.done[1] == p.columns,
+            "HostExchange: finish_sum_f32 before every column was reported");
+    const ExecutionContext& ec = *p.ec;
+    const CurrentDeviceGuard guard;
+    for (int rank = 0; rank < 2; ++rank) {
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        CUDA_CHECK(cudaEventRecord(received_[static_cast<std::size_t>(rank)],
+                                   receive_[static_cast<std::size_t>(rank)]));
+    }
+    const std::size_t count = static_cast<std::size_t>(p.rows * p.columns);
+    const bool stats        = exchange_stats_enabled();
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto r = static_cast<std::size_t>(rank);
+        CurrentDeviceGuard::set(ec.dev[rank]->device);
+        const cudaStream_t stream = ec.dev[rank]->stream;
+        // Inbound data complete, and the peer has read rank r's host buffer (its receive copies
+        // follow rank r's device-to-host copies): partial[r] and the buffers may be reused.
+        CUDA_CHECK(cudaStreamWaitEvent(stream, received_[r], 0));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, received_[1 - r], 0));
+        if (stats) {
+            if (stats_[r] == nullptr) { CUDA_CHECK(cudaMalloc(&stats_[r], 4 * sizeof(unsigned long long))); }
+            auto* st = static_cast<unsigned long long*>(stats_[r]);
+            CUDA_CHECK(cudaMemsetAsync(st, 0, 4 * sizeof(unsigned long long), stream));
+            exchange_stats_kernel<<<grid_for(count), 256, 0, stream>>>(
+                static_cast<const float*>(p.partial[r].data), count, st);
+            CUDA_CHECK(cudaGetLastError());
+            unsigned long long h[4] = {0, 0, 0, 0};
+            CUDA_CHECK(cudaMemcpyAsync(h, st, sizeof(h), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const auto bits = static_cast<std::uint32_t>(h[0]);
+            float max_abs   = 0.0F;
+            std::memcpy(&max_abs, &bits, sizeof(max_abs));
+            std::fprintf(stderr,
+                         "T62 maxabs call=%lld rank=%d T=%lld max=%.6g over_fp16=%llu "
+                         "sub_fp16=%llu nonfinite=%llu n=%zu\n",
+                         static_cast<long long>(calls_), rank, static_cast<long long>(p.columns),
+                         static_cast<double>(max_abs), h[1], h[2], h[3], count);
+        }
+        auto* out = p.has_out ? static_cast<__nv_bfloat16*>(p.out[r].data) : nullptr;
+        if (p.payload == Payload::FP32) {
+            allreduce_f32_combine(static_cast<float*>(p.partial[r].data),
+                                  static_cast<const float*>(p.staging[r].data), out, count, stream);
+        } else {
+            exchange_narrow_combine_kernel<<<grid_for(count), 256, 0, stream>>>(
+                static_cast<float*>(p.partial[r].data),
+                static_cast<const std::uint16_t*>(p.staging[r].data) + count, out, count,
+                static_cast<int>(p.payload), ldexpf(1.0F, -exchange_shift()),
+                ldexpf(1.0F, exchange_shift()));
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    ++calls_;
+    p.active = false;
+}
+
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                    const ExecutionContext& ec, const PeerEvents& events) {
     detail::require_allreduce_sum_arguments(buffer, staging, ec, events);
@@ -286,13 +792,24 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
     }
 
     // Phase B: each rank pulls the peer's operand into storage only it owns. Both inbound copies
-    // are issued before either rank waits again, so the two directions overlap.
-    for (int rank = 0; rank < 2; ++rank) {
-        const DeviceContext& local = *ec.dev[rank];
-        CurrentDeviceGuard::set(local.device);
-        CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
-        CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
-        CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+    // are issued before either rank waits again, so the two directions overlap. Eagerly with a
+    // HostExchange attached the pull goes through its pinned buffers (T56: no host block).
+    if (HostExchange* exchange = eager_host_exchange(ec, events)) {
+        exchange->pull({buffer[0].data, buffer[1].data}, {staging[0].data, staging[1].data}, bytes,
+                       ec, events);
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+        }
+    } else {
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
+            CUDA_CHECK(pull_peer(staging[rank].data, buffer[1 - rank].data, bytes, local.stream));
+            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+        }
     }
 
     // Phase C: the in-place combine may only overwrite buffer[rank] once the peer has finished
@@ -303,6 +820,93 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
         CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
         Tensor accumulator = buffer[rank];
         detail::residual_add_launch(staging[rank], accumulator, local.stream);
+    }
+}
+
+void allreduce_sum_f32(const std::array<Tensor, 2>& partial, const std::array<Tensor, 2>& staging,
+                       const std::array<Tensor, 2>* bf16_out, const ExecutionContext& ec,
+                       const PeerEvents& events) {
+    require_two_devices(ec,
+                        "allreduce_sum_f32: requires an ExecutionContext with two distinct devices");
+    for (int rank = 0; rank < 2; ++rank) {
+        require(partial[rank].dtype == DType::FP32 && staging[rank].dtype == DType::FP32,
+                "allreduce_sum_f32: partial/staging must be FP32");
+        require(partial[rank].data != nullptr && staging[rank].data != nullptr,
+                "allreduce_sum_f32: partial/staging data must be non-null");
+        require(partial[rank].is_contiguous() && staging[rank].is_contiguous(),
+                "allreduce_sum_f32: partial/staging must be contiguous");
+        require(partial[rank].data != staging[rank].data,
+                "allreduce_sum_f32: staging must not alias the partial");
+        for (int d = 0; d < 4; ++d) {
+            require(partial[rank].ne[d] == partial[0].ne[d] &&
+                        staging[rank].ne[d] == partial[0].ne[d],
+                    "allreduce_sum_f32: partial/staging shapes must match on both devices");
+        }
+        if (bf16_out != nullptr) {
+            const Tensor& out = (*bf16_out)[rank];
+            require(out.dtype == DType::BF16 && out.data != nullptr && out.is_contiguous(),
+                    "allreduce_sum_f32: bf16_out must be contiguous non-null BF16");
+            require((reinterpret_cast<std::uintptr_t>(out.data) % 16) == 0,
+                    "allreduce_sum_f32: bf16_out must be 16-byte aligned");
+            for (int d = 0; d < 4; ++d) {
+                require(out.ne[d] == partial[0].ne[d],
+                        "allreduce_sum_f32: bf16_out must have the partial's shape");
+            }
+            require(out.data != partial[rank].data && out.data != staging[rank].data,
+                    "allreduce_sum_f32: bf16_out must not alias the partial or staging");
+        }
+    }
+    require(events.live(), "allreduce_sum_f32: events must be live");
+    const std::size_t count = partial[0].numel();
+    const std::size_t bytes = count * sizeof(float);
+    if (bytes == 0) { return; }
+
+    const CurrentDeviceGuard guard;
+    const auto out_data = [&](int rank) -> __nv_bfloat16* {
+        return bf16_out != nullptr ? static_cast<__nv_bfloat16*>((*bf16_out)[rank].data) : nullptr;
+    };
+
+    PeerMailbox* mailbox = captured_mailbox(partial, bytes, ec, events);
+    if (mailbox != nullptr && mailbox->kernel() == PeerExchangeKernel::Pipelined) {
+        const int slot = mailbox->take_capture_slot(bytes);
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            mailbox->enqueue_exchange_sum_f32(rank, slot, partial[rank].data, bytes, out_data(rank),
+                                              local.stream);
+        }
+        return;
+    }
+
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaEventRecord(events.inputs_ready(rank), local.stream));
+    }
+    if (HostExchange* exchange = eager_host_exchange(ec, events)) {
+        exchange->pull({partial[0].data, partial[1].data}, {staging[0].data, staging[1].data},
+                       bytes, ec, events);
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+        }
+    } else {
+        for (int rank = 0; rank < 2; ++rank) {
+            const DeviceContext& local = *ec.dev[rank];
+            CurrentDeviceGuard::set(local.device);
+            CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.inputs_ready(1 - rank), 0));
+            CUDA_CHECK(pull_peer(staging[rank].data, partial[1 - rank].data, bytes, local.stream));
+            CUDA_CHECK(cudaEventRecord(events.pull_done(rank), local.stream));
+        }
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        const DeviceContext& local = *ec.dev[rank];
+        CurrentDeviceGuard::set(local.device);
+        CUDA_CHECK(cudaStreamWaitEvent(local.stream, events.pull_done(1 - rank), 0));
+        allreduce_f32_combine(static_cast<float*>(partial[rank].data),
+                              static_cast<const float*>(staging[rank].data), out_data(rank), count,
+                              local.stream);
     }
 }
 

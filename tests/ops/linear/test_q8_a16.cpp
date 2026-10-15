@@ -24,8 +24,17 @@ constexpr std::array kGeometries{
     // Two-device halves of the MTP projections.
     Geometry{5120, 3072, 307U},  Geometry{5120, 5120, 311U},  Geometry{5120, 8704, 313U},
     Geometry{7168, 5120, 317U},  Geometry{17408, 5120, 331U},
-    // Two-device vocabulary-row half of a Q8 output head.
-    Geometry{124160, 5120, 337U}};
+    // Qwen4Exp hyper-connection Down(+inject)/Up and the PLE key/value parent.
+    Geometry{324, 10240, 337U},  Geometry{320, 10240, 347U},  Geometry{10240, 320, 349U},
+    Geometry{12800, 2560, 353U},
+    // Qwen4Exp dense projections of the Q8 recipe.
+    Geometry{13312, 2560, 359U}, Geometry{640, 2560, 367U},   Geometry{2560, 6144, 373U},
+    Geometry{16384, 2560, 379U}, Geometry{96, 2560, 383U},    Geometry{1280, 2560, 389U},
+    Geometry{2560, 640, 397U},   Geometry{2560, 2560, 401U},
+    // Qwen4Exp tp 2 shards of the QSA input and output (T49 decode routes).
+    Geometry{6656, 2560, 409U},  Geometry{2560, 3072, 419U},
+    // Two-device vocabulary-row half of a Q8 output head (ninfer-tp2 v0.4.8, issue #6).
+    Geometry{124160, 5120, 421U}};
 
 int q8_a16_conformance() {
     int failures = 0;

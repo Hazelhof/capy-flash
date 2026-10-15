@@ -237,6 +237,7 @@ Target 引用须能找到对应组件，其数学关联由架构 binder 检查�
 | layout | ID | 第 6 节的布局 |
 | offset | U64 | 对象起点在逻辑 payload 中的字节偏移 |
 | bytes | PositiveU64 | 该对象完整编码的字节数 |
+| divisors | PositiveU64 | 可选，缺省为 1。堆叠进本平面且各自独立量化的源矩阵数量；每个源矩阵各持一个 NVFP4 权重除数，按平面行数均分。仅 `nvfp4` 与 `block_scale_k16_m128x4_v1` 允许大于 1（Qwen4Exp 的 routed expert bank）|
 
 ```json
 {

@@ -47,17 +47,44 @@ struct WeightGeometry {
     std::uint64_t scale_offset        = 0;
     std::uint64_t scale_bytes         = 0;
     std::uint64_t divisor_offset      = 0;
+    // NVFP4 FP32 weight divisors after the scale plane. A stacked plane (separately quantised
+    // source matrices of equal row counts, e.g. a layer's routed experts) keeps one per source:
+    // row r uses word r / (rows / divisor_count). Each source covers whole 128-row scale tiles.
+    std::uint64_t divisor_count = 1;
+
+    [[nodiscard]] std::uint64_t rows_per_divisor() const noexcept {
+        return shape.empty() ? 0 : shape.front() / divisor_count;
+    }
 };
 
 [[nodiscard]] WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                                             std::span<const std::uint64_t> shape);
+                                             std::span<const std::uint64_t> shape,
+                                             std::uint64_t divisors = 1);
 [[nodiscard]] std::uint64_t weight_element_count(std::span<const std::uint64_t> shape);
 
 struct WeightParent {
     WeightGeometry geometry;
-    const std::byte* data      = nullptr;
+    const std::byte* data = nullptr;
+    // The NVFP4 divisor of a single-divisor parent; 0 for other formats and for a stacked plane,
+    // whose per-source words are at geometry.divisor_offset.
     float weight_scale_divisor = 0.0F;
 };
+
+// Byte ranges, from the first encoded byte of a parent, that hold whole logical rows
+// [row_begin, row_begin + row_count): their codes (and RowSplit high bits), their scales and, for a
+// stacked NVFP4 plane, the divisor words of the sources they belong to. Empty ranges are omitted
+// and adjacent ones joined. BlockScaleK16M128x4 needs 128-row aligned rows (its scales are
+// swizzled in 128-row tiles stored tile-row-major) and a stacked plane whole sources; a
+// single-divisor NVFP4 parent's one word is not part of any row block and is not returned.
+struct ByteSpan {
+    std::uint64_t offset = 0;
+    std::uint64_t bytes  = 0;
+
+    friend bool operator==(const ByteSpan&, const ByteSpan&) = default;
+};
+[[nodiscard]] std::vector<ByteSpan> weight_row_block_spans(const WeightGeometry& geometry,
+                                                           std::uint64_t row_begin,
+                                                           std::uint64_t row_count);
 
 struct WeightRegion {
     const WeightParent* parent = nullptr;

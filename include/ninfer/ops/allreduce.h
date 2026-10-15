@@ -87,10 +87,13 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <vector>
 
 namespace ninfer::ops {
 
 class PeerMailbox; // see ops/peer_mailbox.h
+class HostExchange;
 
 // Probes cudaDeviceCanAccessPeer in both directions and enables peer access on both devices only
 // when both directions report support; a device that already had peer access enabled is left
@@ -172,12 +175,145 @@ public:
 
     [[nodiscard]] bool staged_only() const noexcept { return staged_scopes_ != 0; }
 
+    // Selects `exchange` (null: none) as the transport of this pair's EAGER (uncaptured) staged
+    // collectives: allreduce_sum() and allreduce_sum_f32() outside a capture move the peer's
+    // operand through its pinned host buffers instead of the driver-staged cross-device copy.
+    // Captured calls ignore it. It must serve the ExecutionContext these events were created for.
+    void attach_host_exchange(HostExchange* exchange) noexcept { host_exchange_ = exchange; }
+    [[nodiscard]] HostExchange* host_exchange() const noexcept { return host_exchange_; }
+
 private:
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
     PeerMailbox* mailbox_           = nullptr;
+    HostExchange* host_exchange_    = nullptr;
     mutable int staged_scopes_      = 0;
 };
+
+/**
+ * Eager transport of the staged collectives on boards without peer access (T56).
+ *
+ * Without P2P, cudaMemcpyAsync(DeviceToDevice) across the two devices is staged by the driver
+ * through host memory and BLOCKS THE CALLING HOST THREAD until the copy is done (measured on CUDA
+ * 13.1 / driver 580: 34-62 ms per call for a [2560,16384] FP32 partial), the two directions run
+ * one after the other, and the host can enqueue nothing past the exchange. HostExchange moves the
+ * same bytes asynchronously through two pinned host buffers of its own: rank r copies its
+ * operand device-to-host on a side stream of its device in chunks (its own link, D2H direction)
+ * and records one event per chunk; the peer's stream waits for each chunk and copies it
+ * host-to-device into its staging (the peer's link, H2D direction). Both ranks run both legs at
+ * once, the host never blocks, and the bits moved are the same as the driver-staged pull's.
+ *
+ * Ordering (the staged path's three phases, unchanged around it): the side stream starts after
+ * inputs_ready(r); the peer's last host-to-device chunk precedes pull_done(1-r), which rank r's
+ * stream waits for before its combine (so its operand is not overwritten while being read) and
+ * which precedes the next call's inputs_ready(r) (so its host buffer is not overwritten while the
+ * peer still reads it). The buffers grow on demand; growing synchronizes both devices first.
+ */
+class HostExchange {
+public:
+    explicit HostExchange(const ExecutionContext& ec, std::size_t chunk_bytes = 8u << 20);
+    ~HostExchange();
+    HostExchange(const HostExchange&)            = delete;
+    HostExchange& operator=(const HostExchange&) = delete;
+
+    // Phase B of a staged collective, eager: destination[r] (on dev r) receives source[1-r]'s
+    // `bytes`. Enqueued on ec.dev[r]->stream after inputs_ready(r) of both ranks were recorded.
+    void pull(const std::array<const void*, 2>& source, const std::array<void*, 2>& destination,
+              std::size_t bytes, const ExecutionContext& ec, const PeerEvents& events);
+
+    [[nodiscard]] bool serves(const ExecutionContext& ec) const noexcept;
+
+    // T68: one-way eager copy of `bytes` from `source` (on dev `from`) to `destination` (on the
+    // peer, dev 1 - from) through `from`'s pinned host buffer: device-to-host on `from`'s side
+    // stream behind inputs_ready(from), then host-to-device on the peer's stream, chunk by chunk.
+    // For memory the peer cannot address without P2P (the elastic VMM pool). Eager only: take the
+    // exchange from eager_exchange(). Host buffer reuse follows pull(): the next exchange's
+    // inputs_ready(from) must come after the peer's stream has passed this copy.
+    void copy(int from, const void* source, void* destination, std::size_t bytes,
+              const ExecutionContext& ec, const PeerEvents& events);
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+
+    // ---- T62: the TP2 prefill MoE exchange, by column groups, with an optional narrow payload --
+    //
+    // One FP32 summing all-reduce of the per-rank partials P_r (contiguous FP32 [H, T], H = ne[0],
+    // columns contiguous), issued in three steps instead of one call so that the exchange of the
+    // first columns overlaps the computation of the later ones:
+    //
+    //   begin_sum_f32(...)            once, before any column of either rank is ready;
+    //   columns_ready(r, first, n)    per rank, after the work that makes columns [first, first+n)
+    //                                 of P_r final has been enqueued on ec.dev[r]->stream; the
+    //                                 groups of a rank are consecutive and cover [0, T) exactly;
+    //   finish_sum_f32()              once both ranks have reported all T columns.
+    //
+    // Result, both ranks, identical bits (the one FP32 addition is commutative):
+    //
+    //   FP32 payload:  S = fl32(P_0 + P_1)                         (== allreduce_sum_f32)
+    //   FP16 payload:  S = fl32(f16(P_0) + f16(P_1))               f16 = RNE to binary16
+    //   BF16 payload:  S = fl32(bf16(P_0) + bf16(P_1))             bf16 = RNE to bfloat16
+    //   partial[r] = S;  bf16_out[r] = RNE_bf16(S) when bf16_out is given.
+    //
+    // Each rank rounds ITS OWN operand to the payload format too, so both ranks add the same two
+    // values. A narrow payload halves the bytes on the links; f16 overflows to infinity above
+    // 65504 (the caller guards the range; NINFER_TP_AR_MAXABS=1 reports per call the largest
+    // |P_r| and the count of values beyond the FP16 range, synchronously: diagnostic only).
+    //
+    // Transport: rank r's group goes device-to-host on rank r's side stream (narrowed first on
+    // rank r's stream into the first half of staging[r] for FP16/BF16) in chunks, each chunk
+    // host-to-device on a receive stream of the peer into staging[1-r] (FP32) or into the second
+    // half of staging[1-r] (FP16/BF16). finish waits on rank r's stream for both receive streams
+    // (its inbound data, and the peer's reads of rank r's host buffer, which follow rank r's own
+    // device-to-host copies) and combines. The receive stream of rank r starts each call behind
+    // rank r's stream at begin (the previous call's combine has read staging[r]).
+    // Eager only: begin returns false, enqueuing nothing, when either rank's stream is capturing.
+    // `staging[r]`: FP32 of the partial's shape, disjoint from it. Not thread-safe; one call at a
+    // time; the pinned buffers are shared with pull() (calls on the two paths are stream-ordered
+    // through each rank's stream).
+    enum class Payload : int { FP32 = 0, FP16 = 1, BF16 = 2 };
+    [[nodiscard]] bool begin_sum_f32(const std::array<Tensor, 2>& partial,
+                                     const std::array<Tensor, 2>& staging,
+                                     const std::array<Tensor, 2>* bf16_out, Payload payload,
+                                     const ExecutionContext& ec);
+    void columns_ready(int rank, std::int64_t first, std::int64_t count);
+    void finish_sum_f32();
+    // Columns of rank r reported in the open call (0 when none is open).
+    [[nodiscard]] std::int64_t columns_done(int rank) const noexcept {
+        return pending_.active ? pending_.done[static_cast<std::size_t>(rank)] : 0;
+    }
+
+private:
+    void reserve(std::size_t bytes, std::size_t chunks, const ExecutionContext& ec);
+    static void grow(std::vector<cudaEvent_t>& events, std::size_t count, int device);
+
+    std::array<int, 2> devices_{-1, -1};
+    std::size_t chunk_bytes_ = 0;
+    std::size_t capacity_    = 0;
+    std::array<std::byte*, 2> host_{nullptr, nullptr};
+    std::array<cudaStream_t, 2> side_{nullptr, nullptr};
+    std::array<std::vector<cudaEvent_t>, 2> chunk_done_;
+
+    // T62 state.
+    struct Pending {
+        bool active = false;
+        const ExecutionContext* ec = nullptr;
+        std::array<Tensor, 2> partial, staging, out;
+        bool has_out    = false;
+        Payload payload = Payload::FP32;
+        std::int64_t rows = 0, columns = 0;
+        std::array<std::int64_t, 2> done{0, 0};
+        std::array<std::size_t, 2> groups{0, 0}, chunks{0, 0};
+    };
+    Pending pending_;
+    std::int64_t calls_ = 0;
+    std::array<cudaStream_t, 2> receive_{nullptr, nullptr};
+    std::array<cudaEvent_t, 2> begun_{nullptr, nullptr};
+    std::array<cudaEvent_t, 2> received_{nullptr, nullptr};
+    std::array<std::vector<cudaEvent_t>, 2> group_ready_, pipe_chunk_;
+    std::array<void*, 2> stats_{nullptr, nullptr};
+};
+
+// T68: the HostExchange attached to `events` when it serves `ec` and neither rank's stream is
+// capturing (the eager collectives' own selection); null otherwise (callers keep their UVA copy).
+HostExchange* eager_exchange(const ExecutionContext& ec, const PeerEvents& events);
 
 /**
  * Two-device summing all-reduce, in place:
@@ -202,7 +338,43 @@ private:
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                    const ExecutionContext& ec, const PeerEvents& events);
 
+/**
+ * Two-device summing all-reduce of FP32 partials, rounded once:
+ *
+ *   sum[i]       = fl32(partial_rank0[i] + partial_rank1[i])     (one IEEE FP32 addition)
+ *   partial[r]   = sum                                            (in place, FP32, both ranks)
+ *   bf16_out[r]  = RNE_bf16(sum)                                  (when `bf16_out` is non-null)
+ *
+ * The addition is commutative, so both ranks hold the same bits. This is the exchange for
+ * row-parallel partials accumulated in FP32 (the Qwen4Exp MoE: a rank's resident routed experts,
+ * its CPU-path experts and, on its blocks, the shared expert, summed in FP32 on that rank), whose
+ * block output is then rounded to BF16 exactly once, after the cross-rank sum.
+ *
+ * `partial[r]`, `staging[r]` are contiguous FP32 tensors of one shape on `ec.dev[r]`;
+ * `staging[r]` must not overlap `partial[r]` and its contents afterwards are unspecified.
+ * `bf16_out`, when given, holds a contiguous BF16 tensor of the same shape per rank (16-byte
+ * aligned), not overlapping the others. Transports as allreduce_sum(): inside a two-device capture
+ * with a pipelined PeerMailbox attached and the payload (4 bytes per element) whole 16-byte
+ * vectors within one slot, one FP32 exchange kernel per device; otherwise the staged copies and a
+ * local FP32 combine. Both transports give identical bits. A mailbox created with the original
+ * (Legacy) kernel has no FP32 exchange, so such pairs stay staged.
+ *
+ * Requires `ec.tp == 2` and a live `events`. Consecutive calls sharing the same arguments need no
+ * host synchronization between them.
+ */
+void allreduce_sum_f32(const std::array<Tensor, 2>& partial, const std::array<Tensor, 2>& staging,
+                       const std::array<Tensor, 2>* bf16_out, const ExecutionContext& ec,
+                       const PeerEvents& events);
+
 namespace detail {
+// The mailbox attached to `events` when a captured exchange of `bytes` would take it: a mailbox
+// that serves `ec` is attached, no StagedScope is open, `bytes` is whole 16-byte vectors within one
+// slot, and both ranks' streams are capturing into the same capture. Null otherwise. Leaves the
+// current device changed (the caller restores it). For fused Ops that exchange through
+// PeerMailbox::exchange_slot themselves and must pick the same transport an allreduce would.
+[[nodiscard]] PeerMailbox* captured_mailbox_for(std::size_t bytes, const ExecutionContext& ec,
+                                                const PeerEvents& events);
+
 // allreduce_sum()'s argument checks alone; allreduce_sum() runs them itself. A row-parallel form
 // calls this before issuing either rank's partial, so a call rejected for its all-reduce
 // arguments enqueues nothing.

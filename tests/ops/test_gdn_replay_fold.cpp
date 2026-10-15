@@ -776,6 +776,16 @@ int main() {
     // One rank's shard of the 48x48 geometry under two-device tensor parallelism.
     failures += run_case({48, 24, 5120, 8}, 4, 1, {3}, 1871U, true);
     failures += run_case({48, 24, 5120, 8}, 6, 8, {0, 1, 2, 3, 6, 4, 1, 5}, 1881U);
+    // Qwen3.8-Flash-Next: 36 GDN layers, MTP verify widths T<=8, and the two-device shard.
+    failures += run_case({36, 48, 10240}, 2, 1, {2}, 1891U, true);
+    failures += run_case({36, 48, 10240}, 4, 1, {3}, 1893U, true);
+    failures += run_case({36, 48, 10240}, 4, 4, {0, 1, 4, 2}, 1895U);
+    failures += run_case({36, 48, 10240}, 8, 8, {8, 0, 1, 2, 3, 7, 5, 6}, 1897U, true);
+    failures += run_case({36, 24, 5120, 8}, 4, 1, {3}, 1899U, true);
+    failures += run_case({36, 24, 5120, 8}, 8, 2, {5, 8}, 1901U);
+    // The 4-layer synthetic Flash-Next checkpoints (3 GDN layers), MTP verify windows.
+    failures += run_case({3, 48, 10240}, 4, 1, {3}, 1903U, true);
+    failures += run_case({3, 48, 10240}, 4, 2, {0, 4}, 1905U);
     failures += run_record_fold_rounds();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;

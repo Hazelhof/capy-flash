@@ -67,6 +67,12 @@ KvCapacityPolicy parse_kv_capacity(const char* text) {
 
 } // namespace
 
+std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,
+                                   std::string_view architecture) {
+    if (configured) { return *configured; }
+    return architecture == "Qwen4ExpForCausalLM" ? 0U : 1U;
+}
+
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
@@ -80,6 +86,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--turn-anchors N] "
+           "[--elastic] [--kv-grow N] [--kv-budget-gib G] [--miss-split auto|off] "
            "[--request-log-jsonl FILE] [--log-speculation-detail] "
            "[--log-speculation-detail-max-steps N] "
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
@@ -131,6 +138,10 @@ std::string serve_usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom; --vram-headroom-mib N changes that margin (requires auto)\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
+           "       Qwen4Exp: --elastic backs the KV on demand and lends unused KV to the expert "
+           "slot cache (grow step --kv-grow tokens, default 8192; --kv-budget-gib caps one "
+           "request's KV); --miss-split auto lets the GPU read part of each window's missing "
+           "experts (best at one GPU), off keeps them all on the CPU (default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --tp 2 --devices A,B splits the dense model across two GPUs (rank 0 on A) for "
@@ -291,6 +302,33 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
                                       "max-long-anchors-per-continuation"));
             context_capacity_explicit = true;
+        } else if (arg == "--elastic") {
+            options.elastic_kv.enabled = true;
+        } else if (arg == "--kv-grow") {
+            options.elastic_kv.grow_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-grow"), "kv-grow"));
+            if (options.elastic_kv.grow_tokens == 0) {
+                throw std::invalid_argument("--kv-grow must be positive");
+            }
+        } else if (arg == "--kv-budget-gib") {
+            const std::string value = require_value("--kv-budget-gib");
+            double gib = 0.0;
+            try {
+                gib = std::stod(value);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("--kv-budget-gib must be a number");
+            }
+            if (!(gib > 0.0)) { throw std::invalid_argument("--kv-budget-gib must be positive"); }
+            options.elastic_kv.kv_budget_bytes = static_cast<std::size_t>(gib * 1073741824.0);
+        } else if (arg == "--miss-split") {
+            const std::string value = require_value("--miss-split");
+            if (value == "auto") {
+                options.miss_split = MissSplitMode::Auto;
+            } else if (value == "off") {
+                options.miss_split = MissSplitMode::Off;
+            } else {
+                throw std::invalid_argument("--miss-split must be auto or off");
+            }
         } else if (arg == "--turn-anchors") {
             options.turn_anchors = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--turn-anchors"), "turn-anchors"));

@@ -261,12 +261,76 @@ void row_scale() {
 
 } // namespace
 
+// A stacked NVFP4 plane (one divisor per source matrix, e.g. a layer's routed experts) and the
+// byte spans of a row block. Oracle: weight_scale_offset() of every (row, group) of the block, and
+// the plane sizes written out by hand.
+void stacked_row_blocks() {
+    const std::vector<std::uint64_t> shape{1024, 128};
+    const auto g = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape, 8);
+    check(g.divisor_count == 8 && g.rows_per_divisor() == 128, "stacked divisor count");
+    check(g.bytes == g.divisor_offset + 8 * 4 && g.divisor_offset == g.scale_offset + 1024 * 8,
+          "stacked plane size");
+    const auto single = weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape);
+    check(single.bytes + 7 * 4 == g.bytes, "stacked plane adds one word per extra source");
+    bool rejected = false;
+    try {
+        (void)weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4, shape, 16);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "a divisor covering 64 rows (half a scale tile) was accepted");
+    rejected = false;
+    try {
+        (void)weight_geometry(QType::Q8_G32_FP16, QuantLayout::RowSplit, shape, 2);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    check(rejected, "a grouped integer format accepted several divisors");
+    // Rows 256..511: sources 2 and 3 (an expert's gate and up in a gate|up bank).
+    const auto spans = weight_row_block_spans(g, 256, 256);
+    check(spans.size() == 3, "stacked row block is codes, scales and divisors");
+    if (spans.size() == 3) {
+        check(spans[0] == ByteSpan{256 * 64, 256 * 64}, "code span");
+        std::uint64_t low = ~0ULL, high = 0, count = 0;
+        for (std::uint64_t row = 256; row < 512; ++row) {
+            for (std::uint64_t group = 0; group < 8; ++group) {
+                const auto offset = weight_scale_offset(g, row, group);
+                low               = std::min(low, offset);
+                high              = std::max(high, offset);
+                ++count;
+            }
+        }
+        check(spans[1] == ByteSpan{low, high - low + 1} && count == high - low + 1,
+              "scale span is not the contiguous set of the block's swizzled scales");
+        check(spans[2] == ByteSpan{g.divisor_offset + 2 * 4, 2 * 4}, "divisor span");
+    }
+    const auto down = weight_row_block_spans(single, 128, 128);
+    check(down.size() == 2, "a single-divisor plane's word is not part of a row block");
+    for (const auto [begin, count] : {std::pair{64ULL, 128ULL}, std::pair{128ULL, 64ULL}}) {
+        rejected = false;
+        try {
+            (void)weight_row_block_spans(g, begin, count);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        check(rejected, "a row block off the 128-row tiles was accepted");
+    }
+    rejected = false;
+    try {
+        const std::vector<SliceRange> rows{{0, 512}};
+        (void)tensor_slice(g, ShardAxis::Rows, rows);
+    } catch (const ArtifactError&) { rejected = true; }
+    check(rejected, "a stacked plane was sliced");
+    const auto q8 = weight_geometry(QType::Q8_G32_FP16, QuantLayout::RowSplit,
+                                    std::vector<std::uint64_t>{4, 200});
+    const auto rows = weight_row_block_spans(q8, 1, 2);
+    check(rows.size() == 2 && rows[0] == ByteSpan{q8.code_bytes_per_row, 2 * q8.code_bytes_per_row} &&
+              rows[1] == ByteSpan{q8.scale_offset + q8.scale_bytes_per_row,
+                                  2 * q8.scale_bytes_per_row},
+          "RowSplit row block spans");
+}
+
 int main() {
     try {
         contiguous();
         row_split();
         block_scale();
         row_scale();
+        stacked_row_blocks();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

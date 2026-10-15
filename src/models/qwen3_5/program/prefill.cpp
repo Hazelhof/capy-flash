@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -19,6 +20,19 @@
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <cstdlib>
+#include <string_view>
+
+namespace {
+// T66: NINFER_QWEN4_REWRITE_SPLITS=1 keeps the rewrite-frontier prefill splits for Qwen4Exp.
+bool qwen4_rewrite_splits() {
+    static const bool on = [] {
+        const char* v = std::getenv("NINFER_QWEN4_REWRITE_SPLITS");
+        return v != nullptr && std::string_view(v) == "1";
+    }();
+    return on;
+}
+} // namespace
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -57,6 +71,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
                          const ops::SamplingConfig* sampling, std::int32_t state_source_slot,
                          std::int32_t state_destination_slot, std::uint32_t mtp_proposal_extent) {
     card.set_sampling(sampling);
+    card.set_qwen4_runtime(execution.qwen4);
     card.set_linear_state_slots(state_source_slot, state_destination_slot);
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
@@ -169,15 +184,26 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 }
 
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
-                        std::int32_t purpose) {
-    if (hidden.dtype != DType::BF16 ||
-        hidden.ne[0] != dimension(state.execution.parameters.model.config().text.hidden_size) ||
-        hidden.ne[1] != 1 || hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
+                        std::int32_t purpose, const Tensor* peer_hidden) {
+    const TextConfig& config = state.execution.parameters.model.config().text;
+    // Qwen4Exp retains the wide residual (T66b: a zero-suffix hit of this architecture).
+    const std::int32_t rows =
+        config.qwen4() ? dimension(config.residual_width()) : dimension(config.hidden_size);
+    if (hidden.dtype != DType::BF16 || hidden.ne[0] != rows || hidden.ne[1] != 1 ||
+        hidden.ne[2] != 1 || hidden.ne[3] != 1 || hidden.data == nullptr) {
         throw std::invalid_argument("sample_from_hidden requires BF16 [hidden,1]");
     }
     state.execution.work.reset();
     Tensor logits = state.execution.io.logits.slice(1, 0, 1);
-    if (state.execution.tp != nullptr) {
+    if (config.qwen4()) {
+        TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
+                         state.text_kv, state.execution.linear_attention, state.execution.io,
+                         state.execution.prefill_hidden, state.execution.prefill_chunk,
+                         state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
+                         state.execution.tp);
+        card.set_qwen4_runtime(state.execution.qwen4);
+        card.qwen4_logits_from_hidden(hidden, peer_hidden, logits);
+    } else if (state.execution.tp != nullptr) {
         project_split_output_head(state, hidden, logits);
     } else {
         project(hidden, state.execution.parameters.text.output_head, logits, state.execution.work,
@@ -670,6 +696,17 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
+        // T64: before the prompt maps its KV, size the KV backing for the prompt and the first
+        // decode tokens (up to one grow step) and give the rest back to the expert cache.
+        if (qwen4_elastic) {
+            const std::uint32_t ahead = std::min<std::uint32_t>(
+                request_plan.summary.effective_output_tokens + draft_window + 1U,
+                qwen4_elastic->step_tokens());
+            qwen4_elastic->rebalance(std::min(capacity, prompt_tokens + ahead),
+                                     backend_materialized == 0
+                                         ? 0U
+                                         : std::min(capacity, backend_materialized + ahead));
+        }
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling,
                          request_plan.accepted_length_steps,
@@ -832,6 +869,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         timing.resume_submit();
         replay_fold->execute(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()),
                              device.stream);
+        // Qwen4Exp: the PLE convolution history advances by the same committed prefixes.
+        fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow>(fold_rows.data(), lanes.size()));
         if (peer) {
             // Rank 1 folds its own records into its own GDN state with the same rows and commit
             // counts: the accepted prefix belongs to the round, and the two ranks' records differ
@@ -933,9 +972,30 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             }
         }
 
-        timing.begin_wait();
-        synchronize_devices();
-        timing.end_wait();
+        // T49: a Qwen4Exp MTP commit that keeps every lane active does not wait for its fold:
+        // the fold and the PLE advance are stream-ordered before the next round on each rank's
+        // stream, read only kernel arguments and arena memory that later work reaches in stream
+        // order, and the host prepares the next round (PLE rows, expert window) meanwhile. A
+        // device fault in them surfaces at that round's synchronization. Terminal or cancelled
+        // rows release resources below and keep the wait.
+        bool defer_wait = speculative_backend == SpeculativeBackend::Mtp &&
+                          qwen4_runtime_record.has_value() && !needs_hidden_correction;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            defer_wait = defer_wait && terminal[row] == 0 && cancelled[row] == 0;
+        }
+        if (defer_wait && peer) {
+            // The next round is one graph launched on rank 0's stream: it must also follow rank
+            // 1's fold, which ran on rank 1's stream.
+            const ScopedCurrentDevice rank1(peer->device.device);
+            if (!qwen4_peer_commit_event) { qwen4_peer_commit_event.emplace(peer->device); }
+            qwen4_peer_commit_event->record(peer->device.stream);
+            qwen4_peer_commit_event->wait(device.stream);
+        }
+        if (!defer_wait) {
+            timing.begin_wait();
+            synchronize_devices();
+            timing.end_wait();
+        }
         work.reset();
     } catch (...) {
         try {
@@ -982,7 +1042,35 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     sequence.mtp_draft_count = 0;
                 } else {
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
+                    if (qwen4_mtp_calib != nullptr) {
+                        const auto extent = mtp_host_ingress->current_extents[row];
+                        if (extent > 0) {
+                            std::fprintf(qwen4_mtp_calib, "%d %u", extent, committed - 1U);
+                            for (std::uint32_t k = 0; k < draft_window; ++k) {
+                                std::fprintf(qwen4_mtp_calib, " %.5g", sequence.mtp_draft_logprobs[k]);
+                            }
+                            std::fputc('\n', qwen4_mtp_calib);
+                        }
+                        for (std::uint32_t k = 0; k < draft_window; ++k) {
+                            sequence.mtp_draft_logprobs[k] =
+                                mtp_host_egress->next_draft_logprobs[k * max_concurrency + row];
+                        }
+                    }
                     sequence.mtp_draft_count = static_cast<std::uint32_t>(next);
+                    if (mtp_min_p > 0.0F) {
+                        // T41 adaptive window: the next round verifies the proposals up to the
+                        // first whose probability (chain product or its own) is below the floor.
+                        const float floor = std::log(mtp_min_p);
+                        float chain       = 0.0F;
+                        std::uint32_t keep = 0;
+                        for (; keep < sequence.mtp_draft_count; ++keep) {
+                            const float lp =
+                                mtp_host_egress->next_draft_logprobs[keep * max_concurrency + row];
+                            chain = mtp_window_rule == MtpWindowRule::Step ? lp : chain + lp;
+                            if (!(chain >= floor)) { break; }
+                        }
+                        sequence.mtp_draft_count = keep;
+                    }
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
                             mtp_host_egress->next_drafts[step * max_concurrency + row];
@@ -1067,7 +1155,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         execution::PrefillContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, tp ? &*tp : nullptr, graph_peer_bridge()},
+             proposal_head, tp ? &*tp : nullptr, graph_peer_bridge(), qwen4_runtime()},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1110,10 +1198,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 const TokenId token = staged.prompt.token_ids[staged.base];
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                            cudaMemcpyHostToDevice, device.stream));
-                execution::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
-                                                  peer_retains_hidden() ? &peer_previous_hidden
-                                                                        : nullptr,
-                                                  bridge.position, bridge.rope_position, false);
+                in_qwen4_window([&] {
+                    execution::mtp_bridge_and_propose(
+                        schedule_state, bridge_token, previous_hidden,
+                        peer_retains_hidden() ? &peer_previous_hidden : nullptr, bridge.position,
+                        bridge.rope_position, false);
+                });
             }
             sequence.mtp_kv_valid = staged.base;
             commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
@@ -1153,8 +1243,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 const auto rewrite_split                    = std::upper_bound(
                     staged.prompt.identity.rewrite_execution_frontiers.begin(),
                     staged.prompt.identity.rewrite_execution_frontiers.end(), staged.cursor);
+                // T66: Qwen4Exp pays each prefill call's expert pass (streamed over PCIe, or the
+                // CPU path below 2 048 columns): splitting at every rewrite frontier (one per
+                // assistant turn) made a 10-turn 1.2k-token prompt 2.4x slower in ninfer-serve.
+                // Rewrite frontiers only keep resumed and root GDN decompositions bit-identical
+                // (they are not captures), so Qwen4Exp splits at capture frontiers only;
+                // NINFER_QWEN4_REWRITE_SPLITS=1 restores them.
                 if (rewrite_split != staged.prompt.identity.rewrite_execution_frontiers.end() &&
-                    (!split_frontier || *rewrite_split < *split_frontier)) {
+                    (!split_frontier || *rewrite_split < *split_frontier) &&
+                    (qwen4_runtime() == nullptr || qwen4_rewrite_splits())) {
                     split_frontier = *rewrite_split;
                 }
                 execution::PrefillChunkResult result;
@@ -1238,9 +1335,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if (!sequence.tail_hidden_valid) {
                 throw std::logic_error("zero-suffix reuse has no target tail hidden");
             }
+            const Tensor peer_sample_hidden =
+                peer_retains_hidden() ? peer_tail_hidden(sequence) : Tensor{};
             execution::sample_from_hidden(schedule_state, sequence.tail_hidden,
                                           checked_i32(staged.prompt_tokens, "sample position"),
-                                          ops::kSamplePurposePrefill);
+                                          ops::kSamplePurposePrefill,
+                                          peer_retains_hidden() ? &peer_sample_hidden : nullptr);
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
             if (staged.prepare_mtp) {
@@ -1252,11 +1352,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
                 const Tensor peer_previous_hidden =
                     peer_retains_hidden() ? peer_tail_hidden(sequence) : Tensor{};
-                execution::mtp_bridge_and_propose(
-                    schedule_state, io.token, sequence.tail_hidden,
-                    peer_retains_hidden() ? &peer_previous_hidden : nullptr,
-                    checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
-                    bridge_rope, staged.initial_mtp_extent != 0);
+                in_qwen4_window([&] {
+                    execution::mtp_bridge_and_propose(
+                        schedule_state, io.token, sequence.tail_hidden,
+                        peer_retains_hidden() ? &peer_previous_hidden : nullptr,
+                        checked_i32(staged.prompt_tokens - 1, "MTP full-prefix bridge position"),
+                        bridge_rope, staged.initial_mtp_extent != 0);
+                });
                 sequence.mtp_kv_valid = staged.prompt_tokens;
                 commit_sequence_kv(sequence, sequence.text_kv_valid, sequence.mtp_kv_valid);
                 staged.mtp_bridge = MtpBridgeMode::None;
@@ -1277,6 +1379,24 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         const double vision_seconds       = staged.vision ? staged.vision->elapsed_seconds() : 0.0;
         const std::uint32_t prompt_tokens = staged.prompt_tokens;
 
+        if (qwen4_tfdump) {
+            // Validation: teacher-forced first token (NINFER_QWEN4_TFDUMP_FORCE).
+            if (const std::int32_t forced = qwen4_tfdump->forced_token(prompt_tokens); forced >= 0) {
+                host_tokens[0] = forced;
+            }
+        }
+        if (qwen4_replay) {
+            // T59 replay: the reference's first token after the prompt.
+            if (const execution::Qwen4ReplaySequence* ref = qwen4_replay->match(sequence.ledger);
+                ref != nullptr && sequence.ledger.size() == prompt_tokens) {
+                host_tokens[0] = ref->ids[prompt_tokens];
+                ++qwen4_replay->forced_tokens;
+            }
+        }
+        if (qwen4_replay_record != nullptr) {
+            std::fprintf(qwen4_replay_record, "req %u\n", static_cast<unsigned>(prompt_tokens));
+        }
+        qwen4_round_follows = false; // T59 round log: the next round starts a request
         validate_licensed_tokens(std::span<const TokenId>(host_tokens, 1));
         if (sequence.ledger.size() != prompt_tokens) {
             throw std::logic_error("candidate token ledger does not match prompt length");
@@ -1291,6 +1411,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 throw std::logic_error("staged MTP prefill did not reach the prompt frontier");
             }
             sequence.mtp_draft_count = staged.initial_mtp_extent;
+            // The prompt's proposals carry no recorded probability (T41 calibration skips NaN).
+            sequence.mtp_draft_logprobs.fill(std::numeric_limits<float>::quiet_NaN());
             std::copy_n(initial_drafts.begin(), staged.initial_mtp_extent,
                         sequence.mtp_drafts.begin());
         } else if (is_masked_draft_backend(speculative_backend) &&

@@ -346,10 +346,21 @@ int verify_registry() {
             }
         }
     }
+    // BF16 has no rejected shape since T103 (f425e087): every shape the registry does not name
+    // takes the generic BF16 route (bf16_generic.cu, checked against FP64 by t103_bf16_generic).
+    for (const Entry& entry : {Entry{QType::BF16, 8192, 5120}, Entry{QType::BF16, 1000, 777}}) {
+        try {
+            (void)ops::linear_workspace_capacity_bytes(entry.qtype, entry.n, entry.k,
+                                                       ops::LinearPolicy::A16Only, 1, 1);
+        } catch (const std::exception& error) {
+            std::cerr << "registry: BF16 [" << entry.n << ',' << entry.k
+                      << "] not taken by the generic route: " << error.what() << '\n';
+            ++failures;
+        }
+    }
     const std::vector<Entry> rejected{
         {QType::FP8_E4M3FN_ROW_BF16, 5120, 5120},
         {QType::NVFP4, 5120, 5120},
-        {QType::BF16, 8192, 5120},
     };
     for (const Entry& entry : rejected) {
         try {

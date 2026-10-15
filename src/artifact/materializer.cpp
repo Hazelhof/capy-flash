@@ -6,17 +6,70 @@
 
 #include <cuda_runtime.h>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
 #include <cmath>
+#include <exception>
+#include <future>
 #include <limits>
 #include <string>
+#include <thread>
 #include <tuple>
+#include <vector>
 
 namespace ninfer::artifact {
 namespace {
+
+// T156: the host-mapped weights are one page-locked allocation (64.6 GiB for Qwen3.8-Flash-Next).
+// Without enough free RAM the populate + registration stalls in reclaim and systemd-oomd kills the
+// server or a neighbour (measured: 35 GiB held by another process -> memory pressure 36 % while
+// loading). Refuse up front, with the numbers, unless NINFER_RAM_GUARD=0.
+void require_host_memory(std::uint64_t bytes) {
+#if defined(__linux__)
+    if (const char* guard = std::getenv("NINFER_RAM_GUARD"); guard != nullptr && guard[0] == '0') {
+        return;
+    }
+    std::ifstream meminfo("/proc/meminfo");
+    std::uint64_t total_kib = 0, available_kib = 0;
+    for (std::string line; std::getline(meminfo, line);) {
+        std::istringstream fields(line);
+        std::string key;
+        std::uint64_t value = 0;
+        fields >> key >> value;
+        if (key == "MemTotal:") { total_kib = value; }
+        if (key == "MemAvailable:") { available_kib = value; }
+    }
+    if (total_kib == 0 || available_kib == 0) { return; } // unreadable: no guard rather than a false refusal
+    constexpr std::uint64_t kGiB = 1ULL << 30;
+    const std::uint64_t total     = total_kib * 1024;
+    const std::uint64_t available = available_kib * 1024;
+    const std::uint64_t reserve   = std::max<std::uint64_t>(2 * kGiB, total / 20);
+    if (available >= bytes + reserve) { return; }
+    const auto gib = [](std::uint64_t value) {
+        std::ostringstream text;
+        text.setf(std::ios::fixed);
+        text.precision(1);
+        text << static_cast<double>(value) / static_cast<double>(1ULL << 30) << " GiB";
+        return text.str();
+    };
+    throw ArtifactError("not enough free RAM for the host-mapped weights: they need " + gib(bytes) +
+                        " of page-locked memory plus a " + gib(reserve) + " reserve, and " +
+                        gib(available) + " is available (MemAvailable). Free memory (another model "
+                        "still loaded?) or set NINFER_RAM_GUARD=0 to start anyway");
+#else
+    (void)bytes;
+#endif
+}
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;
 constexpr std::size_t kMaximumSlotCount = 4;
@@ -150,24 +203,122 @@ struct ReadSpan {
 float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeometry& geometry,
                    std::span<const std::byte> host, MaterializationStats& stats) {
     if (geometry.format != QType::NVFP4) { return 0.0F; }
-    std::array<std::byte, 4> word{};
+    // A stacked plane keeps one word per source; every one is checked, none is the parent's.
+    const auto count = static_cast<std::size_t>(geometry.divisor_count);
+    std::vector<std::byte> words(4 * count);
     if (!host.empty()) {
-        std::copy_n(host.data() + geometry.divisor_offset, word.size(), word.data());
+        std::copy_n(host.data() + geometry.divisor_offset, words.size(), words.data());
     } else {
         const auto& object = reader.directory().tensor(handle);
         reader.read_into(checked_add(object.offset, geometry.divisor_offset, "weight divisor"),
-                         word);
-        stats.read_bytes = checked_add(stats.read_bytes, word.size(), "read bytes");
+                         words);
+        stats.read_bytes = checked_add(stats.read_bytes, words.size(), "read bytes");
     }
-    const auto value = std::bit_cast<float>(read_u32_le(word.data()));
-    if (!std::isfinite(value) || value <= 0) {
-        throw ArtifactError(reader.directory().tensor(handle).id +
-                            ": invalid NVFP4 weight divisor");
+    float first = 0.0F;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto value = std::bit_cast<float>(read_u32_le(words.data() + 4 * i));
+        if (!std::isfinite(value) || value <= 0) {
+            throw ArtifactError(reader.directory().tensor(handle).id +
+                                ": invalid NVFP4 weight divisor");
+        }
+        if (i == 0) { first = value; }
     }
-    return value;
+    return count == 1 ? first : 0.0F;
+}
+
+// Reads one large object straight into host memory with a few concurrent preads: one buffered
+// stream does not keep an NVMe busy, and the host-mapped Flash-Next expert banks are 65 GiB.
+void parallel_read(const Reader& reader, std::uint64_t offset, std::span<std::byte> destination) {
+    constexpr std::uint64_t kChunk = 64ULL << 20;
+    const std::uint64_t bytes      = destination.size();
+    const std::uint64_t chunks     = (bytes + kChunk - 1) / kChunk;
+    if (chunks <= 1) {
+        reader.read_into(offset, destination);
+        return;
+    }
+    const auto workers = static_cast<unsigned>(std::min<std::uint64_t>(
+        chunks, std::max(1U, std::min(8U, std::thread::hardware_concurrency()))));
+    std::vector<std::future<void>> tasks;
+    tasks.reserve(workers);
+    for (unsigned worker = 0; worker < workers; ++worker) {
+        tasks.push_back(std::async(std::launch::async, [&, worker] {
+            for (std::uint64_t chunk = worker; chunk < chunks; chunk += workers) {
+                const std::uint64_t begin = chunk * kChunk;
+                const std::uint64_t count = std::min(kChunk, bytes - begin);
+                reader.read_into(offset + begin,
+                                 destination.subspan(static_cast<std::size_t>(begin),
+                                                     static_cast<std::size_t>(count)));
+            }
+        }));
+    }
+    // Every task finishes before an error leaves this frame: they write into `destination`.
+    std::exception_ptr failure;
+    for (auto& task : tasks) {
+        try {
+            task.get();
+        } catch (...) {
+            if (!failure) { failure = std::current_exception(); }
+        }
+    }
+    if (failure) { std::rethrow_exception(failure); }
 }
 
 } // namespace
+
+// Read-only shared mapping of one file range; the page cache owns residency.
+class FileMapping {
+public:
+    FileMapping(const std::filesystem::path& path, std::uint64_t offset, std::uint64_t bytes) {
+        const auto page    = static_cast<std::uint64_t>(::sysconf(_SC_PAGESIZE));
+        const auto aligned = offset / page * page;
+        length_            = static_cast<std::size_t>(offset - aligned + bytes);
+        const int fd       = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) { throw ArtifactError(path.string() + ": cannot open for mapping"); }
+        base_ = ::mmap(nullptr, length_, PROT_READ, MAP_SHARED, fd, static_cast<off_t>(aligned));
+        ::close(fd);
+        if (base_ == MAP_FAILED) {
+            base_ = nullptr;
+            throw ArtifactError(path.string() + ": mmap failed");
+        }
+        // Lookups touch scattered rows; read-ahead would only evict other pages.
+        (void)::madvise(base_, length_, MADV_RANDOM);
+        data_ = static_cast<const std::byte*>(base_) + (offset - aligned);
+    }
+
+    ~FileMapping() {
+        if (base_ != nullptr) { ::munmap(base_, length_); }
+    }
+
+    FileMapping(const FileMapping&)            = delete;
+    FileMapping& operator=(const FileMapping&) = delete;
+
+    [[nodiscard]] const std::byte* data() const noexcept { return data_; }
+
+private:
+    void* base_            = nullptr;
+    std::size_t length_    = 0;
+    const std::byte* data_ = nullptr;
+};
+
+MaterializedArtifact::MaterializedArtifact()                                           = default;
+MaterializedArtifact::~MaterializedArtifact()                                          = default;
+MaterializedArtifact::MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
+MaterializedArtifact& MaterializedArtifact::operator=(MaterializedArtifact&&) noexcept = default;
+
+std::span<const MappedObjectSegment>
+MaterializedArtifact::file_segments(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || objects_[handle.index].file.empty()) {
+        throw ArtifactError("object has no file mapping");
+    }
+    return objects_[handle.index].file;
+}
+
+const WeightGeometry& MaterializedArtifact::file_geometry(ObjectHandle handle) const {
+    if (handle.index >= objects_.size() || !objects_[handle.index].file_geometry) {
+        throw ArtifactError("object has no mapped tensor geometry");
+    }
+    return *objects_[handle.index].file_geometry;
+}
 
 const WeightParent& MaterializedArtifact::device_parent(ObjectHandle handle, int device) const {
     if (!has_device(handle, device)) { throw ArtifactError("object has no device weight backing"); }
@@ -294,14 +445,17 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         if (plan.host_mapped_bytes > std::numeric_limits<std::size_t>::max()) {
             throw ArtifactError("host-mapped backing exceeds size_t");
         }
+        require_host_memory(plan.host_mapped_bytes);
         try {
             out.host_mapped_ = std::make_unique<PinnedHostBuffer>(
-                static_cast<std::size_t>(plan.host_mapped_bytes), HostMapping::Yes);
+                static_cast<std::size_t>(plan.host_mapped_bytes), HostMapping::Yes,
+                PinnedHostPages::Huge);
         } catch (const std::exception& error) {
             throw ArtifactError("host-mapped weight buffer of " +
                                 std::to_string(plan.host_mapped_bytes) + " bytes: " + error.what());
         }
         auto* host = static_cast<std::byte*>(out.host_mapped_->data());
+        reader.open_all(); // parallel_read below must not race a lazy continuation open
         std::array<const std::byte*, kMaximumDevices> mapped{};
         for (std::size_t device = 0; device < devices.size(); ++device) {
             selection.select(device);
@@ -326,7 +480,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             const auto bytes   = std::span(host + placement.offset,
                                            static_cast<std::size_t>(placement.bytes));
             const auto payload = static_cast<std::size_t>(descriptor.bytes);
-            reader.read_into(descriptor.offset, bytes.first(payload));
+            parallel_read(reader, descriptor.offset, bytes.first(payload));
             // Padding after the stored payload reads as zero, as in a device arena.
             std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(payload), bytes.end(),
                       std::byte{0});
@@ -342,6 +496,24 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             }
         }
         out.stats_.host_mapped_bytes = plan.host_mapped_bytes;
+    }
+    for (const auto handle : plan.file_objects) {
+        reader.validate_object(handle);
+        auto& storage      = out.objects_.at(handle.index);
+        const auto& object = reader.directory().object(handle);
+        if (!storage.file.empty()) { throw ArtifactError("duplicate file-mapped placement"); }
+        for (const auto& segment : reader.segments(object_offset(object), object_bytes(object))) {
+            auto mapping = std::make_unique<FileMapping>(reader.file_path(segment.file_index),
+                                                         segment.file_offset, segment.bytes);
+            storage.file.push_back({segment.destination_offset, segment.bytes, mapping->data(),
+                                    reader.file_path(segment.file_index), segment.file_offset});
+            out.mappings_.push_back(std::move(mapping));
+        }
+        if (std::holds_alternative<TensorObject>(object)) {
+            storage.file_geometry = reader.geometry(handle);
+        }
+        out.stats_.mapped_file_bytes =
+            checked_add(out.stats_.mapped_file_bytes, object_bytes(object), "mapped bytes");
     }
     std::vector<CopyRange> ranges;
     const auto add_ranges = [&](const TensorObject& descriptor, std::uint64_t source,

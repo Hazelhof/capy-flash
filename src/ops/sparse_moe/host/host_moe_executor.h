@@ -1,0 +1,241 @@
+#pragma once
+
+// Weight-major host executor for the routed experts a layer could not find on the GPU.
+//
+// One call computes, for T <= max_tokens token positions (decode windows T <= 8, prefill chunks
+// up to the chunk length),
+//   out[t] = sum over host experts e routed by t of alpha[t,e] * W_down[e] (SiLU(W_gate[e] x_t) * (W_up[e] x_t))
+// with NVFP4 weights read in place from the pinned host banks (block_scale_k16_m128x4_v1, the
+// Qwen4Exp bank layout of models::qwen3_5::routed_expert_spans) and W4A8 activations: x_t and the
+// SwiGLU output are quantized to int8 per 16 elements (host_nvfp4.h). Each expert is read once
+// per call whatever its number of tokens (weight-major):
+//   phase 1  items = (expert, S x 16 intermediate rows): gate and up rows of all the expert's
+//            tokens, SwiGLU in FP32, int8 quantization of the item's 16-blocks
+//   phase 2  items = S x 16 output rows: down rows of every host expert, weighted sum over experts
+//            in first-routed order, written for all T tokens (zeros where no host expert)
+// An item's slices are 16-row blocks 32 rows apart in one 128-row scale tile, ordered so that
+// consecutive items read the same swizzled scale cache lines. An expert's tokens are taken in
+// groups of up to kHostMaxTokens per dot call (one group in decode windows).
+// Decode-size calls (T <= kHostMaxTokens) use the Static schedule by default (Options::schedule):
+// the same two phases over 16-row slices owned per member, stealing at the end, the input
+// quantized by each member for itself (one barrier per call).
+// The output is deterministic and independent of the thread count, item size and schedule. The dot kernel
+// of a group depends on its number of tokens m: m >= min_multi_token uses the multi-token dot,
+// otherwise the per-token (FreeToken) dot; the two differ in FP32 accumulation order only.
+//
+// Port of ninfer-offload's HostMoeExecutor (src/ops/sparse_moe/host/host_moe.{h,cpp} @1fd5c39,
+// Apache-2.0, 1872183316/ninfer-offload) to NVFP4 W4A8 with a pinned spin pool.
+
+#include "ops/sparse_moe/host/host_nvfp4.h"
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <thread>
+#include <vector>
+
+namespace ninfer::ops::host {
+
+// Routed experts of one MoE layer in host memory. Expert e owns gate rows [e*2I, e*2I+I), up rows
+// [e*2I+I, (e+1)*2I) of gate_up [E*2I, H] and rows [e*H, (e+1)*H) of down [E*H, I].
+struct HostExpertLayer {
+    Nvfp4Plane gate_up;
+    Nvfp4Plane down;
+    std::int32_t experts      = 0;
+    std::int32_t hidden       = 0;
+    std::int32_t intermediate = 0;
+    // T98 validation (Options::emulate_w4a4): the layer's NVFP4 activation divisors of x and h.
+    float gate_up_input_divisor = 0.0F;
+    float down_input_divisor    = 0.0F;
+};
+
+struct HostMoeJob {
+    std::int32_t tokens = 0;
+    std::int32_t top_k  = 0;
+    const std::uint16_t* x  = nullptr; // [T][H] BF16 bits
+    const std::int32_t* ids = nullptr; // [T][top_k] expert id, or negative = computed elsewhere
+    const float* alpha      = nullptr; // [T][top_k] routing weight
+    float* out              = nullptr; // [T][H] overwritten
+};
+
+// One (expert, token) intermediate of the last call: the int8 SwiGLU output (stored order, see
+// W4A8Activation) and its block scales, the semantic quantization boundary between the two phases.
+struct HostMoeIntermediate {
+    std::int32_t expert = 0;
+    std::int32_t token  = 0;
+    W4A8Activation act;
+};
+
+// Steady-clock ns of one pool member during a call, from the start of run(): body entered (woken),
+// token phase done, first barrier passed, gate/up done, second barrier passed, down done. With
+// member_quantize the token phase is part of gate/up (stamps 1 and 2 equal stamp 0).
+struct alignas(64) HostMoeMemberTimes {
+    std::int64_t ns[6] = {0, 0, 0, 0, 0, 0};
+};
+
+struct HostMoeCallStats {
+    std::int32_t experts = 0; // distinct host experts
+    std::int32_t pairs   = 0; // (token, host expert) pairs
+    // Steady-clock ns seen by member 0: end of the token phase, of gate/up, of down (from the
+    // start of run()).
+    std::int64_t phase_ns[3] = {0, 0, 0};
+    // From the start of run(): the pool dispatched (routing parsed), the last member finished.
+    std::int64_t dispatch_ns = 0;
+    std::int64_t end_ns      = 0;
+    // record_members: [members] per-member stamps, owned by the executor until the next run().
+    const HostMoeMemberTimes* members = nullptr;
+    std::int32_t member_count         = 0;
+};
+
+enum class Schedule { Dynamic, Static };
+
+// Physical cores spread over the L3 domains (CCDs) in round-robin order, lowest SMT sibling of
+// each core, from Linux sysfs. On the 9900X: 0, 6, 1, 7, 2, 8, ...
+[[nodiscard]] std::vector<int> spread_cpus(std::int32_t count);
+// Physical cores filling one L3 domain (CCD) before the next, starting with domain `first`
+// (index in ascending L3 id order): 0, 1, 2, 3, 4, 5, 6, ... on the 9900X with first = 0.
+[[nodiscard]] std::vector<int> packed_cpus(std::int32_t count, std::int32_t first = 0);
+
+// Persistent pinned pool. The thread that constructs the pool is member 0 (pinned to cpus[0]) and
+// must be the only caller of run(). Idle members spin with pause for `spin_ms`, then sleep on a
+// futex until the next run().
+class HostCpuPool {
+public:
+    explicit HostCpuPool(std::span<const int> cpus, double spin_ms = 20.0);
+    ~HostCpuPool();
+    HostCpuPool(const HostCpuPool&)            = delete;
+    HostCpuPool& operator=(const HostCpuPool&) = delete;
+
+    [[nodiscard]] std::int32_t size() const noexcept { return size_; }
+
+    // Runs body(member, pool) on every member including the caller; returns when all finished.
+    using Body = void (*)(void* context, std::int32_t member);
+    void run(Body body, void* context);
+
+    // Barrier among the members of the current run(); `index` counts the barriers already passed
+    // by the calling member in this run, starting at 1.
+    void barrier(std::int32_t index) noexcept;
+
+private:
+    void worker(std::int32_t member, int cpu);
+
+    std::int32_t size_ = 1;
+    double spin_ms_    = 20.0;
+    std::vector<std::thread> threads_;
+    Body body_      = nullptr;
+    void* context_  = nullptr;
+    alignas(64) std::atomic<std::uint32_t> generation_{0};
+    alignas(64) std::atomic<std::int32_t> finished_{0};
+    alignas(64) std::atomic<std::int32_t> arrived_{0};
+    std::atomic<bool> stop_{false};
+};
+
+class HostMoeExecutor {
+public:
+    struct Options {
+        // Experts with at least this many tokens use the multi-token dot, the others the
+        // per-token (FreeToken) dot. 1 = multi-token everywhere: measured 12 % faster per call on
+        // the decode pattern at 6 threads (T03 kernel: one decode per group, one accumulator),
+        // and a token's dot result then never depends on the other tokens of the window.
+        std::int32_t min_multi_token = 1;
+        // 16-row slices per work item (1, 2 or 4): granularity of both phases (Dynamic schedule).
+        std::int32_t slices_per_item = 4;
+        // Work distribution of a call with T <= kHostMaxTokens (wider calls are always Dynamic):
+        //   Dynamic  items claimed from a shared counter (one atomic per item)
+        //   Static   member m owns the contiguous 16-row slices [N m / n, N (m+1) / n) of each
+        //            phase (gate/up: N = U * I/16 in expert order; down: N = H/16 output slices,
+        //            every host expert summed in the same order) and claims them in runs of 4
+        //            from a counter on its own cache line; at most one slice of imbalance (the
+        //            Dynamic items are 4 slices: 20 % at U = 1-2 on 6 threads), long sequential
+        //            row streams per member.
+        // Both give bit-identical outputs (T35: per-call cost at 1-3 experts; docs/capy-flash/development-log.md).
+        Schedule schedule = Schedule::Static;
+        // Static only: a member that has finished its own range takes single slices from the
+        // others' remaining ranges (bit-identical; absorbs per-core bandwidth differences).
+        bool steal = true;
+        // Static only: every member quantizes the activations of the tokens its own gate/up
+        // slices need (same codec, private buffer) instead of a shared token phase + barrier.
+        bool member_quantize = true;
+        // Software prefetch of the codes `prefetch_rows` rows ahead in the dots (0 = off).
+        std::int32_t prefetch_rows = 0;
+        // Per-member timestamps of every call (HostMoeCallStats::members); ~20 ns per stamp.
+        bool record_members = false;
+        // T98 validation only (NINFER_HOST_MOE_W4A4=1): compute with the GPU's W4A4 recipe
+        // (moe_slots_nvfp4: x and h to E2M1 with E4M3 scales per 16 against the layer's input
+        // divisors, gate/up and h rounded to BF16) in FP64 sums instead of W4A8. Slow.
+        bool emulate_w4a4 = false;
+        // T98 (on by default since capy-flash v0.2.1; NINFER_HOST_MOE_A4=0 restores W4A8): the same
+        // fast dots with the GPU's W4A4 activation codec (quantize_*_a4) and its BF16 roundings of
+        // gate/up and h, so an expert quantizes its activations the same way whether it runs on the
+        // CPU or on the GPU (the sums still run in a different order). Without it, which experts run
+        // where (a matter of timing) changed the activation precision, and the output with it (T98).
+        bool a4 = true;
+    };
+
+    // `max_tokens` >= 1 bounds the tokens of one call (any value; buffers scale with it).
+    HostMoeExecutor(HostCpuPool& pool, std::int32_t hidden, std::int32_t intermediate,
+                    std::int32_t max_tokens, std::int32_t max_top_k, Options options);
+
+    // Called by pool member 0 only.
+    HostMoeCallStats run(const HostExpertLayer& layer, const HostMoeJob& job);
+
+    // Intermediates of the last run() (qualification of the two phases separately).
+    [[nodiscard]] std::int32_t intermediate_count() const noexcept;
+    [[nodiscard]] HostMoeIntermediate intermediate(std::int32_t i) const;
+
+private:
+    static void body(void* self, std::int32_t member);
+    void phase_tokens(std::int32_t member);
+    void phase_gate_up();
+    void phase_down(std::int32_t member);
+    void static_gate_up(std::int32_t member);
+    void static_down(std::int32_t member);
+    static void emu_body(void* self, std::int32_t member);
+    void emu_call();
+    std::int32_t emu_phase_ = 0;
+    std::vector<float> emu_xc_, emu_xsf_, emu_h_, emu_hc_, emu_hsf_;
+    void stamp(std::int32_t member, int index) noexcept {
+        if (options_.record_members) members_[static_cast<std::size_t>(member)].ns[index] = now_rel();
+    }
+    [[nodiscard]] std::int64_t now_rel() const noexcept;
+    [[nodiscard]] DotKernel kernel_for(std::int32_t tokens) const noexcept {
+        return tokens >= options_.min_multi_token ? DotKernel::MultiToken : DotKernel::PerToken;
+    }
+
+    HostCpuPool& pool_;
+    std::int32_t hidden_, intermediate_, max_tokens_, max_top_k_;
+    Options options_;
+
+    // Current call. Pairs (token, host expert) are grouped by expert (CSR): expert u owns pairs
+    // [pair_begin_[u], pair_begin_[u+1]), tokens ascending; experts in first-routed order.
+    const HostExpertLayer* layer_ = nullptr;
+    const HostMoeJob* job_        = nullptr;
+    std::int32_t unique_count_    = 0;
+    std::int32_t slices_          = 4;      // slices per work item of this call
+    std::vector<std::int32_t> unique_;      // [U] expert id
+    std::vector<std::int32_t> pair_begin_;  // [U+1]
+    std::vector<std::int32_t> pair_token_;  // [P]
+    std::vector<float> pair_alpha_;         // [P]
+    std::vector<std::int32_t> expert_slot_; // [experts] u of an expert in this call, or -1
+    std::vector<std::int32_t> used_tokens_; // tokens with at least one host expert
+    W4A8ActivationBuffer x_act_;            // [max_tokens] by token
+    W4A8ActivationBuffer h_act_;            // [max_tokens * max_top_k] by pair
+    std::vector<std::vector<float>> acc_;   // per pool member: [max_tokens][64] down sums
+    struct alignas(64) Cursor {             // Static: a member's remaining slice range
+        std::atomic<std::int32_t> next{0};
+        std::int32_t end = 0;
+    };
+    std::unique_ptr<Cursor[]> gate_cursor_, down_cursor_;
+    std::vector<W4A8ActivationBuffer> member_x_; // member_quantize: per member [kHostMaxTokens]
+    std::vector<HostMoeMemberTimes> members_;    // record_members
+    bool static_ = false;                        // schedule of the current call
+
+    std::int64_t start_ns_ = 0;
+    std::int64_t phase_ns_[3] = {0, 0, 0};
+    alignas(64) std::atomic<std::int32_t> next_token_{0};
+    alignas(64) std::atomic<std::int32_t> next_gate_{0};
+    alignas(64) std::atomic<std::int32_t> next_down_{0};
+};
+
+} // namespace ninfer::ops::host

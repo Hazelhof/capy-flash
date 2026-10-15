@@ -23,4 +23,15 @@ namespace ninfer::ops {
 void gated_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor& z, float eps, Tensor& out,
                    cudaStream_t stream);
 
+/**
+ * The same contract with a sigmoid gate:
+ *
+ *   ideal[d,r] = x[d,r] * inv_r * weight[d] * sigmoid(z[d,r]).
+ *
+ * Qwen3.8-Flash-Next (`qwen4_exp`, output_gate_type "sigmoid") applies its GDN output gate this
+ * way. Shapes, oracle, criterion and effects are those of gated_rmsnorm.
+ */
+void gated_rmsnorm_sigmoid(const Tensor& x, const Tensor& weight, const Tensor& z, float eps,
+                           Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops

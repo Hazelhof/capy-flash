@@ -27,18 +27,28 @@ std::uint32_t divide(std::uint32_t extent, int width, const char* label) {
 
 } // namespace
 
-TextConfig shard_text_config(const TextConfig& config, int width) {
+TextConfig shard_text_config(const TextConfig& config, int width, bool hc_split_streams) {
     if (width != 1 && width != kTensorParallelWidth) {
         throw std::invalid_argument("tensor-parallel Text config: width must be 1 or 2");
     }
     TextConfig out = config;
     if (width == 1) { return out; }
-    const auto* dense = std::get_if<DenseConfig>(&out.ffn);
-    if (dense == nullptr) {
-        throw std::invalid_argument("tensor-parallel Text config: the MoE FFN has no two-device "
-                                    "placement");
+    if (config.qwen4()) {
+        // Routed experts are partitioned by expert ID and the shared expert is held whole by one
+        // rank per block (load/sharding.h), so the MoE geometry is unchanged on each rank; the
+        // QSA indexer and the PLE are replicated.
+        if (hc_split_streams) {
+            auto& hc    = out.hyper_connection.value();
+            hc.hc_count = divide(hc.hc_count, width, "hc_count");
+        }
+    } else {
+        const auto* dense = std::get_if<DenseConfig>(&out.ffn);
+        if (dense == nullptr) {
+            throw std::invalid_argument(
+                "tensor-parallel Text config: the MoE FFN has no two-device placement");
+        }
+        out.ffn = DenseConfig{divide(dense->intermediate_size, width, "intermediate_size")};
     }
-    out.ffn        = DenseConfig{divide(dense->intermediate_size, width, "intermediate_size")};
     out.vocab_size = divide(out.vocab_size, width, "vocab_size");
     if (out.attention) {
         out.attention->num_attention_heads =
@@ -97,9 +107,15 @@ void output_logits_split_rank0(const std::array<Tensor, 2>& hidden,
     CUDA_CHECK(cudaSetDevice(rank0.device));
     CUDA_CHECK(cudaStreamWaitEvent(rank0.stream, events.inputs_ready(1), 0));
     // The one cross-device transfer: a plain D2D cudaMemcpyAsync over UVA, the form the
-    // collectives use because it is capturable with and without peer access.
-    CUDA_CHECK(cudaMemcpyAsync(staging.data, partial[1].data, bytes1 * height,
-                               cudaMemcpyDeviceToDevice, rank0.stream));
+    // collectives use because it is capturable with and without peer access. Eagerly with a
+    // HostExchange attached it goes through pinned host memory instead (T68: rank 1's half may
+    // sit in the elastic VMM pool lent to a prompt chunk, which rank 0 cannot address without P2P).
+    if (ops::HostExchange* exchange = ops::eager_exchange(execution, events)) {
+        exchange->copy(1, partial[1].data, staging.data, bytes1 * height, execution, events);
+        CUDA_CHECK(cudaSetDevice(rank0.device));
+    } else {
+        CUDA_CHECK(::ninfer::memcpy_device_async(staging.data, partial[1].data, bytes1 * height, rank0.stream));
+    }
     CUDA_CHECK(cudaEventRecord(events.pull_done(0), rank0.stream));
     // A kernel, not two pitched copies: the column count and the buffers differ between the CUDA
     // Graph profiles of one class, and a captured 2D memcpy node cannot take such a change in place.

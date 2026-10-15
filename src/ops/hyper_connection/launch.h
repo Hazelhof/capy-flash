@@ -1,0 +1,77 @@
+#pragma once
+
+// ninfer::ops::detail - private launch prototypes of the hyper-connection family.
+
+#include "core/tensor.h"
+
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace ninfer::ops::detail {
+
+// Qwen4Exp mixer geometry compiled into the fused route.
+inline constexpr std::int32_t kHcStreams   = 4;
+inline constexpr std::int32_t kHcHidden    = 2560;
+inline constexpr std::int32_t kHcWide      = kHcStreams * kHcHidden;
+inline constexpr std::int32_t kHcRank      = 320;
+inline constexpr std::int32_t kHcRowsCap   = kHcRank + kHcStreams;
+inline constexpr std::int32_t kHcFusedMaxT = 8;
+
+void grouped_offset_rmsnorm_launch(const Tensor& x, const Tensor& weight, std::int32_t groups,
+                                   float eps, Tensor& out, cudaStream_t stream);
+// projection [rows,T] -> lowrank [lowrank_rows,T] BF16 = silu(p/S); inject [S,T] FP32 = 2 sigmoid(p/S)
+void hyper_connection_gates_launch(const Tensor& projection, std::int32_t streams, Tensor& lowrank,
+                                   Tensor* inject, cudaStream_t stream);
+void hyper_connection_collapse_launch(const Tensor& up, const Tensor& normalized,
+                                      std::int32_t streams, Tensor& mixed, cudaStream_t stream);
+void hyper_connection_combine_launch(const Tensor& y, const Tensor& inject, Tensor& residual,
+                                     cudaStream_t stream);
+void hyper_connection_expand_launch(const Tensor& x, std::int32_t streams, Tensor& residual,
+                                    cudaStream_t stream);
+
+// Small-T mix (T <= 8) over Q8 row-split or NVFP4 Down/Up: two launches (mix_small_t.cu). The
+// residual is written only with a pending combine (previous_y non-null).
+struct HcFusedMix {
+    __nv_bfloat16* residual         = nullptr; // [S*H,T]
+    const __nv_bfloat16* previous_y = nullptr; // [H,T] or nullptr (no pending combine)
+    const float* previous_inject    = nullptr; // [S,T]
+    const __nv_bfloat16* norm       = nullptr; // [S*H]
+    const std::int8_t* down_codes   = nullptr; // Q8 [rows, S*H] / NVFP4 E2M1 [padded rows, S*H/2]
+    const __half* down_scales       = nullptr; // Q8 [rows, S*H/32]
+    const std::int8_t* up_codes     = nullptr; // Q8 [S*H, 384] / NVFP4 E2M1 [S*H, R/2]
+    const __half* up_scales         = nullptr; // Q8 [S*H, 12]
+    __nv_bfloat16* mixed            = nullptr; // [H,T]
+    float* inject                   = nullptr; // [S,T] or nullptr
+    float* square_sums              = nullptr; // workspace [T, S]
+    __half* low                     = nullptr; // workspace [T, R] FP16 low-rank activation
+    std::int32_t rows               = 0;       // kHcRank or kHcRowsCap
+    std::int32_t tokens             = 0;
+    float eps                       = 0.0F;
+    // NVFP4 weights (option): E4M3 scale planes (BlockScaleK16M128x4) and matrix divisors; Down is
+    // stored with `down_padded_rows` (a multiple of 128) rows.
+    bool fp4                            = false;
+    const std::uint8_t* down_fp4_scales = nullptr;
+    const std::uint8_t* up_fp4_scales   = nullptr;
+    float down_divisor                  = 1.0F;
+    float up_divisor                    = 1.0F;
+    std::int32_t down_padded_rows       = 0;
+};
+
+// TMA descriptors of the small-T route (encoded per launch from HcFusedMix's weight pointers).
+struct HcFusedMaps {
+    CUtensorMap down_codes;
+    CUtensorMap down_scales;
+    CUtensorMap up_codes;
+};
+
+// Whether the current device runs the small-T route (thread block clusters, sm_90+).
+[[nodiscard]] bool hyper_connection_fused_supported();
+[[nodiscard]] std::size_t hyper_connection_fused_workspace_bytes(std::int32_t tokens);
+void hyper_connection_fused_mix_launch(const HcFusedMix& params, cudaStream_t stream);
+
+} // namespace ninfer::ops::detail

@@ -36,6 +36,58 @@ const BoundWeight& Model::weight(WeightId id, int device) const {
     return bound;
 }
 
+const BoundWeight& Model::file_weight(WeightId id) const {
+    const auto& bound = bound_[0].at(id.index);
+    if (bound.mapped.empty()) {
+        throw std::invalid_argument(bound.name + " is not a file-mapped weight");
+    }
+    return bound;
+}
+
+std::uint64_t RoutedExpertSpans::bytes() const noexcept {
+    std::uint64_t total = 0;
+    for (const auto* bank : {&gate_up, &down}) {
+        for (const auto& span : bank->spans) { total += span.bytes; }
+    }
+    return total;
+}
+
+namespace {
+
+// The parent rows [begin, begin + count) one bound matrix covers, given it is a single region of
+// whole parent rows.
+ExpertBankSpans bank_rows(const BoundWeight& weight) {
+    if (weight.view.parts.size() != 1 || weight.view.shape.size() != 2) {
+        throw std::invalid_argument(weight.name + ": a routed expert binds one region of a bank");
+    }
+    const auto& region = weight.view.parts.front();
+    const auto& g      = region.parent->geometry;
+    if (g.shape.size() != 2 || g.shape[1] != weight.view.shape[1] || region.begin % g.shape[1] ||
+        region.end % g.shape[1]) {
+        throw std::invalid_argument(weight.name + ": a routed expert is not whole bank rows");
+    }
+    return {region.parent, region.begin / g.shape[1], (region.end - region.begin) / g.shape[1],
+            {}};
+}
+
+} // namespace
+
+RoutedExpertSpans routed_expert_spans(const Model& model, const MoeWeights& moe,
+                                      std::uint32_t expert, int device) {
+    const auto& weights = moe.experts.at(expert);
+    auto gate           = bank_rows(model.weight(weights.gate, device));
+    const auto up       = bank_rows(model.weight(weights.up, device));
+    auto down           = bank_rows(model.weight(weights.down, device));
+    if (up.parent != gate.parent || up.row_begin != gate.row_begin + gate.row_count) {
+        throw std::invalid_argument("routed expert " + std::to_string(expert) +
+                                    ": gate and up are not adjacent rows of one bank");
+    }
+    gate.row_count += up.row_count;
+    gate.spans = weight_row_block_spans(gate.parent->geometry, gate.row_begin, gate.row_count);
+    down.spans = weight_row_block_spans(down.parent->geometry, down.row_begin, down.row_count);
+    return {std::move(gate), std::move(down)};
+}
+
 ops::WeightInput Model::input(WeightUseId id, int device) const {
     const auto& parameter = weight(id.parameter, device);
     const auto& use       = parameter.uses.at(id.use_index);

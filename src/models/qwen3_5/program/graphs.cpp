@@ -348,7 +348,8 @@ void ProgramImpl::prepare_graphs() {
                                         prefill_chunk,
                                         proposal_head,
                                         tp_binding(),
-                                        graph_peer_bridge()};
+                                        graph_peer_bridge(),
+                                        qwen4_runtime()};
     };
 
     // Under WSL2 a captured exchange can hang in a graph's first launch although the startup
@@ -422,7 +423,8 @@ void ProgramImpl::prepare_graphs() {
                                                  state_images->continuation_hidden_store(),
                                                  peer ? &*peer->io.mtp_decode : nullptr,
                                                  peer ? &peer->state_images->continuation_hidden_store()
-                                                      : nullptr};
+                                                      : nullptr,
+                                                 mtp_min_p > 0.0F || qwen4_mtp_calib != nullptr};
             const GraphExecutionProfile code_warm = planned_profiles.front();
             // As for ordinary rounds: every batch size is warmed eagerly on both devices at tp 2
             // before any capture, since batch shape selects kernels.

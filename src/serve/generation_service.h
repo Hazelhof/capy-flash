@@ -109,6 +109,7 @@ public:
     explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+    [[nodiscard]] std::uint32_t turn_anchors() const noexcept { return turn_anchors_; }
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this
     // value instead of reinterpreting optional defaults from ServeOptions.
@@ -166,6 +167,7 @@ private:
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;
+    std::uint32_t turn_anchors_ = 0; // --turn-anchors or the model's default (resolve_turn_anchors)
     std::shared_ptr<RequestCapacity> request_capacity_;
     std::shared_ptr<PrefillMissDump> prefill_miss_dump_; // null unless --prefill-miss-dump
 };

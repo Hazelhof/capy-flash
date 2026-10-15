@@ -32,7 +32,8 @@ struct PlannedPool {
     std::size_t bytes = 0;
 };
 
-PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false) {
+PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
+                      bool ple = false) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -56,6 +57,8 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false)
                                 : q36::DFlashLocalStateSpec{
                                       .layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
     }
+    // Qwen4Exp PLE convolution history: (kernel-1)*dilation = 9 columns of 5 channels.
+    if (ple) { spec.ple = q36::PleStateSpec{.layers = 1, .rows = 45}; }
     ninfer::LayoutBuilder builder;
     q36::StateImageDeviceLayout layout = q36::plan_state_image_device_pool(builder, spec);
     return {.layout = std::move(layout), .bytes = builder.finish(256)};
@@ -84,6 +87,10 @@ void fill_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char
                   static_cast<unsigned char>(base + 0x10 + layer));
     }
     set_bytes(pool.continuation_hidden_slot(slot), static_cast<unsigned char>(base + 0x20));
+    for (std::uint32_t layer = 0; layer < pool.ple_layers(); ++layer) {
+        set_bytes(pool.ple_states(layer).slice(1, slot, 1),
+                  static_cast<unsigned char>(base + 0x50 + layer));
+    }
     if (ninfer::CyclicKVCache* local = pool.dflash_local(); local != nullptr) {
         for (std::uint32_t layer = 0; layer < local->layer_count(); ++layer) {
             const auto view = local->layer_view(layer);
@@ -103,6 +110,10 @@ void expect_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned ch
     }
     expect_bytes(pool.continuation_hidden_slot(slot), static_cast<unsigned char>(base + 0x20),
                  label);
+    for (std::uint32_t layer = 0; layer < pool.ple_layers(); ++layer) {
+        expect_bytes(pool.ple_states(layer).slice(1, slot, 1),
+                     static_cast<unsigned char>(base + 0x50 + layer), label);
+    }
     if (ninfer::CyclicKVCache* local = pool.dflash_local(); local != nullptr) {
         for (std::uint32_t layer = 0; layer < local->layer_count(); ++layer) {
             const auto view = local->layer_view(layer);
@@ -120,6 +131,9 @@ void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::s
         expect_bytes(pool.linear().recurrent_slot(layer, slot), 0, label);
     }
     expect_bytes(pool.continuation_hidden_slot(slot), 0, label);
+    for (std::uint32_t layer = 0; layer < pool.ple_layers(); ++layer) {
+        expect_bytes(pool.ple_states(layer).slice(1, slot, 1), 0, label);
+    }
     if (ninfer::CyclicKVCache* local = pool.dflash_local(); local != nullptr) {
         for (std::uint32_t layer = 0; layer < local->layer_count(); ++layer) {
             const auto view = local->layer_view(layer);
@@ -129,8 +143,9 @@ void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::s
     }
 }
 
-void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false) {
-    PlannedPool planned = plan_pool(dflash, 2, dflash2);
+void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false,
+                         bool ple = false) {
+    PlannedPool planned = plan_pool(dflash, 2, dflash2, ple);
     if (dflash2) {
         expect(q36::dflash_local_transfer_work(planned.layout.host).payload_bytes ==
                    40ULL * 1024 * 1024,
@@ -213,6 +228,30 @@ int main() {
     test_host_roundtrip(false, device);
     test_host_roundtrip(true, device);
     test_host_roundtrip(true, device, true);
+
+    // Qwen4Exp: the PLE convolution history is StateImage state (copy, zero, Host round trip).
+    {
+        PlannedPool ple_planned = plan_pool(false, 4, false, true);
+        ninfer::DeviceArena ple_arena(ple_planned.bytes);
+        q36::StateImageDevicePool ple_pool({ple_arena.base(), ple_arena.capacity()},
+                                           ple_planned.layout);
+        expect(ple_pool.ple_layers() == 1 && ple_pool.ple_states(0).ne[0] == 45 &&
+                   ple_pool.ple_states(0).ne[1] == 4 && ple_pool.ple_states(0).is_contiguous(),
+               "StateImage PLE geometry");
+        const auto common = plan_pool(false, 4);
+        expect(q36::state_image_transfer_work(ple_planned.layout.host).payload_bytes ==
+                   q36::state_image_transfer_work(common.layout.host).payload_bytes + 45U * 2U,
+               "StateImage transfer work counts the PLE history of one image");
+        fill_slot(ple_pool, 0, 0x13);
+        fill_slot(ple_pool, 1, 0x61);
+        ple_pool.copy_slot(0, 3, device.stream);
+        ple_pool.zero_slot(1, device.stream);
+        device.synchronize();
+        expect_slot(ple_pool, 3, 0x13, "StateImage PLE D2D destination");
+        expect_zero_slot(ple_pool, 1, "StateImage PLE zero");
+        expect_slot(ple_pool, 0, 0x13, "StateImage PLE source isolation");
+        test_host_roundtrip(false, device, false, true);
+    }
 
     return failures == 0 ? 0 : 1;
 }

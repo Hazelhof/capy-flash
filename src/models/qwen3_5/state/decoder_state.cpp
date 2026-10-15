@@ -14,7 +14,8 @@ std::uint32_t page_count(std::uint32_t capacity) {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
-                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
+                              std::int32_t table_rows, std::uint32_t physical_page_groups,
+                              bool qsa_index, LayoutBuilder* pages_builder) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -43,9 +44,15 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                                        layer_storage.value.scale_leading_extent, kv_heads, 256});
         }
     }
+    // QSA index planes follow every layer's K/V planes, so K/V plane ordinals are unchanged.
+    for (std::uint32_t layer = 0; qsa_index && layer < layers; ++layer) {
+        geometry.planes.push_back({DType::BF16, ops::kQsaIndexRecordWords, 1, 256});
+        geometry.planes.push_back({DType::BF16, ops::kQsaBlockKeyWords, 1, 256});
+    }
     return PagedKVCacheLayout{
         .pages = plan_device_kv_page_pool(
-            builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
+            pages_builder != nullptr ? *pages_builder : builder,
+            DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
                                           .geometry         = std::move(geometry)}),
         .execution_tables = plan_kv_execution_tables(
             builder,
@@ -54,30 +61,35 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         .max_context   = capacity,
         .kv_heads      = kv_heads,
         .layer_storage = layer_storage,
+        .qsa_index     = qsa_index,
+        .elastic_pages = pages_builder != nullptr,
     };
 }
 
 } // namespace
 
-DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
+DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec,
+                                      LayoutBuilder* pages_builder) {
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                spec.text_physical_page_groups);
+                                spec.text_physical_page_groups, spec.qsa_index, pages_builder);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                   spec.mtp_physical_page_groups);
+                                   spec.mtp_physical_page_groups, spec.qsa_index, pages_builder);
     }
     return layout;
 }
 
-PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
-    : pages_(backing, layout.pages), execution_tables_(backing, layout.execution_tables, pages_),
+PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
+                           DeviceSpan elastic)
+    : pages_(layout.elastic_pages ? elastic : backing, layout.pages),
+      execution_tables_(backing, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
-      layer_storage_(layout.layer_storage) {
-    if (pages_.plane_count() !=
-        static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer()) {
+      layer_storage_(layout.layer_storage), qsa_index_(layout.qsa_index) {
+    if (pages_.plane_count() != static_cast<std::size_t>(layers_) *
+                                    (layer_storage_.planes_per_layer() + (qsa_index_ ? 2U : 0U))) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
 }
@@ -134,13 +146,28 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
     };
 }
 
+ops::QsaIndexPlanes PagedKVCache::qsa_index_planes(std::uint32_t layer) const {
+    if (!qsa_index_ || layer >= layers_) {
+        throw std::out_of_range("Paged KV has no QSA index planes for this layer");
+    }
+    const std::size_t base = static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer() +
+                             2U * static_cast<std::size_t>(layer);
+    return ops::QsaIndexPlanes{.records      = pages_.plane(base),
+                               .block_keys   = pages_.plane(base + 1),
+                               .block_tables = execution_tables_.matrix()};
+}
+
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }
 
-DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
-    : text_kv(backing, layout.text_kv) {
-    if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv); }
+DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
+                           DeviceSpan elastic)
+    : text_kv(backing, layout.text_kv, elastic) {
+    if (layout.text_kv.elastic_pages && elastic.data == nullptr) {
+        throw std::invalid_argument("elastic KV pages need their backing");
+    }
+    if (layout.mtp_kv) { mtp_kv.emplace(backing, *layout.mtp_kv, elastic); }
 }
 
 PagedKVCache* DecoderState::mtp_cache() noexcept { return mtp_kv ? &*mtp_kv : nullptr; }

@@ -11,10 +11,12 @@
 #include "models/qwen3_5/state/state_image.h"
 #include "models/load_options.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -32,6 +34,66 @@ struct DFlashPersistentLayout {
     }
 };
 
+// Qwen4Exp Program-owned device inputs of the routed-expert backend and the decode PLE rows.
+struct Qwen4PersistentLayout {
+    // I32 [512]: expert e -> e for the experts this rank reads in place from the bank (all at
+    // tp 1; at tp 2 rank r's ID parity, e % 2 == r), -1 for the others.
+    TensorLayout expert_table;
+    // BF16 [embed_dim, columns]: one column per lane (ordinary) or K+1 per lane (MTP rounds).
+    std::optional<TensorLayout> decode_ple_rows;
+    // Speculative rounds: PLE convolution inputs of the verified window, BF16 [S*H, K+1, C].
+    std::optional<TensorLayout> ple_record;
+    // MTP banks with one weight divisor per bank: the expanded per-expert planes, FP32 [2E], [E].
+    std::optional<TensorLayout> mtp_gate_up_divisors;
+    std::optional<TensorLayout> mtp_down_divisors;
+    // Offloaded experts (Qwen4OffloadExperts), when expert_slots > 0: the I32 slot table
+    // [cache_layers * 512], the FP32 divisors [cache_layers * 1536] and the four planar slot
+    // arrays of cache_layers * expert_slots slots. cache_layers = the Text layers, + 1 for the
+    // MTP layer under MTP.
+    std::int32_t cache_layers = 0;
+    std::int32_t expert_slots = 0;
+    // T64 elastic columns: the pool arrays hold cache_layers * elastic_columns more slots after
+    // the base slots and the prefetch staging slots (Qwen4OffloadOptions::elastic_columns).
+    std::int32_t elastic_columns = 0;
+    std::optional<TensorLayout> cache_table;
+    std::optional<TensorLayout> cache_divisors;
+    std::optional<TensorLayout> cache_reads; // I32 [10 * 8]
+    // tp 2, rank 0: I32 [cache_layers * 512] residency of both GPUs (ExpertCache mirror) for the
+    // CPU path's publish.
+    std::optional<TensorLayout> cache_mirror;
+    // Prefill expert streaming: per Text layer the I32 [512] expert -> slot table of a streamed
+    // chunk (resident slot, ring slot or -1), I32 [text_layers * 512].
+    std::optional<TensorLayout> cache_stream_tables;
+    // Staged miss split (execution::staged_miss_split): four planar arrays of kMissSplitSlots
+    // scratch slots, the I32 [512] scratch table and the I32 [kMissSplitSlots + 1] pick list.
+    std::optional<TensorLayout> stage_table;
+    std::optional<TensorLayout> stage_picks;
+    std::array<LayoutRegion, 4> stage_pool{};
+    // The planar slot pool (one array per plane); bind_pool() gives the plane bases.
+    std::array<LayoutRegion, 4> cache_pool{};
+    std::size_t cache_pool_bytes    = 0;
+
+    // `backing`: the persistent arena, or the elastic arena when PersistentLayout::elastic_bytes.
+    [[nodiscard]] std::array<std::byte*, 4> bind_pool(DeviceSpan backing) const;
+    // T25 prefetch (prefetch_slots > 0): staging_slots more pool slots after the cache's
+    // (cache_layers * expert_slots), their tags, the epoch word, the effective slot rows of the
+    // Text layers and the predictor workspace.
+    std::int32_t staging_slots = 0;
+    std::optional<TensorLayout> prefetch_tags;
+    std::optional<TensorLayout> prefetch_epoch;
+    std::optional<TensorLayout> prefetch_rows;
+    LayoutRegion prefetch_workspace{};
+    // T43 draft shortlist head (rank 0, Qwen4Exp MTP): I32 [draft_prefix + draft_extra] shortlist
+    // row -> token ID, and the three Q6 RowSplit planes (code, high, scale) of the draft_extra
+    // output-head rows outside the prefix view [0, draft_prefix).
+    // Split shortlist at tp 2 (draft_split): rank 0 holds only draft_ids (its block is a view),
+    // rank 1 holds the planes of its draft_extra = half the shortlist rows.
+    std::int32_t draft_prefix = 0;
+    std::int32_t draft_extra  = 0;
+    std::optional<TensorLayout> draft_ids;
+    std::array<LayoutRegion, 3> draft_planes{};
+};
+
 struct PersistentLayout {
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
@@ -42,8 +104,11 @@ struct PersistentLayout {
     std::optional<TensorLayout> score_hidden;
     std::optional<TensorLayout> token_counts;
     std::optional<TensorLayout> sampling_config;
+    std::optional<Qwen4PersistentLayout> qwen4;
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
+    // T64 elastic KV: bytes of the elastic layout (KV page planes, expert slot pools), 0 = none.
+    std::size_t elastic_bytes    = 0;
 };
 
 struct VisionWorkspacePlan {
@@ -65,6 +130,12 @@ struct WorkspacePlan {
     std::size_t dflash_round     = 0;
     std::size_t causal_score     = 0;
     std::size_t general_capacity = 0;
+    // T42: one GPU's workspace for a Qwen4Exp prompt chunk of more than the base chunk (lent by
+    // the offload backend from the slot pool, not part of `capacity`); 0 = off.
+    std::size_t qwen4_prompt     = 0;
+    // T69: the same for every narrower planned chunk width (width, bytes), ascending, ending with
+    // the chosen width: a narrower chunk borrows only what its width needs.
+    std::vector<std::pair<std::uint32_t, std::size_t>> qwen4_prompt_steps;
     // The encoding rank's Vision plan: every tp 1 Program's, and at tp 2 the plan of the rank that
     // holds the tower.
     std::optional<VisionWorkspacePlan> vision;
@@ -100,6 +171,8 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     std::uint32_t draft_window              = 0;
+    float mtp_min_p                         = 0.0F;
+    MtpWindowRule mtp_window_rule           = MtpWindowRule::Chain;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
@@ -114,6 +187,19 @@ struct SequencePlanningInputs {
     // At tp 2 with CUDA Graphs: captured all-reduces use the PeerMailbox transport.
     bool tp_mailbox = true;
     ContextCacheOptions context_cache;
+    // Qwen4Exp routed experts (EngineOptions::routed_experts). Offload with slots_per_layer 0
+    // plans no slot pool: a sizing probe only (the Engine resolves the count first).
+    RoutedExpertOptions qwen4_experts;
+    // T64 elastic KV <-> expert slots (EngineOptions::elastic_kv).
+    ElasticKvOptions elastic_kv;
+    // T43 (Qwen4Exp MTP): the draft shortlist split (execution::split_draft_shortlist): the
+    // output-head prefix [0, draft_prefix) and the other shortlist IDs ascending. Both empty =
+    // full-vocabulary proposals.
+    std::int32_t draft_prefix = 0;
+    std::vector<std::int32_t> draft_extras;
+    // tp 2: the shortlist split in two equal row blocks over the ranks (rank 0: rows [0, R) of the
+    // prefix view, rank 1: rows [R, 2R) gathered), else scored on rank 0 alone.
+    bool draft_split = false;
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -130,7 +216,12 @@ struct SequencePlanImpl {
     std::uint32_t main_page_groups          = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    // T42: > 0 when Qwen4Exp prompt chunks wider than this run on lent workspace: the general
+    // arena and prefill_hidden are planned for this width, prefill_chunk is the prompt chunk.
+    std::uint32_t qwen4_base_chunk          = 0;
     std::uint32_t draft_window              = 0;
+    float mtp_min_p                         = 0.0F;
+    MtpWindowRule mtp_window_rule           = MtpWindowRule::Chain;
     SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
     ProposalHead proposal_head              = ProposalHead::Full;
@@ -141,6 +232,11 @@ struct SequencePlanImpl {
     int tp              = 1;
     bool tp_mailbox     = true;
     ContextCacheOptions context_cache;
+    RoutedExpertOptions qwen4_experts;
+    ElasticKvOptions elastic_kv;              // T64
+    std::int32_t draft_prefix = 0;            // T43, see SequencePlanningInputs
+    std::vector<std::int32_t> draft_extras;
+    bool draft_split = false;
     // Rank 0's persistent layout, and at tp 2 rank 1's: the same layout without the masked
     // drafter's state (DFlashPersistentLayout and the StateImage DFlash local slots).
     PersistentLayout persistent;

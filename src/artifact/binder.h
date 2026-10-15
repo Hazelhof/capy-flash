@@ -11,7 +11,11 @@
 
 namespace ninfer::artifact {
 
-enum class Residency { Device, Host, Values };
+// Device: a device parent, or the one mapped page-locked host copy a HostMapped placement gives
+// every device. Host: owning pageable bytes (resources, small values). Values: owning numeric
+// copies. HostFile: a read-only mapping of the object's file ranges, paged in on access by host
+// code (never device-addressable, never copied at load): the Qwen4Exp n-gram table.
+enum class Residency { Device, Host, Values, HostFile };
 
 struct ParameterReference {
     std::string name;
@@ -68,6 +72,7 @@ private:
     struct Demand {
         bool device             = false;
         bool host               = false;
+        bool file               = false;
         std::uint64_t alignment = 256;
         std::vector<std::byte> host_data;
     };

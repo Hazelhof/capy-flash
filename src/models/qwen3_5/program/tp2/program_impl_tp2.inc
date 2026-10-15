@@ -43,12 +43,14 @@ const PersistentLayout& ProgramImpl::PeerRuntime::layout(const SequencePlanImpl&
 }
 
 ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const SequencePlanImpl& plan)
-    : device(peer_device), persistent(layout(plan).bytes, ZeroFill::Yes),
+    : device(peer_device), elastic_arena(make_elastic_arena(plan, layout(plan), peer_device.device)),
+      persistent(layout(plan).bytes, ZeroFill::Yes),
       workspace_storage(plan.workspace.rank_capacity(1, plan.features.vision_rank), ZeroFill::Yes),
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}) {
     const PersistentLayout& own = layout(plan);
     const DeviceSpan backing    = persistent.alloc_bytes(own.bytes, 256);
-    decoder                     = std::make_unique<qwen3_5::DecoderState>(backing, own.decoder);
+    decoder                     = std::make_unique<qwen3_5::DecoderState>(
+        backing, own.decoder, elastic_arena ? elastic_arena->span() : DeviceSpan{});
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backing, own.state_images);
     if (own.replay_records) {
         replay_records.emplace(backing, *own.replay_records);
@@ -62,6 +64,40 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
         dflash.emplace(backing, *own.dflash, *local);
     }
     if (own.score_hidden) { score_hidden = own.score_hidden->bind(backing); }
+    if (own.qwen4) {
+        qwen4_expert_table = own.qwen4->expert_table.bind(backing);
+        if (own.qwen4->expert_slots > 0) {
+            qwen4_cache_pool = own.qwen4->bind_pool(elastic_arena ? elastic_arena->span() : backing);
+            const auto& q1 = *own.qwen4;
+            if (q1.cache_mirror) {
+                qwen4_cache_mirror = static_cast<std::int32_t*>(q1.cache_mirror->bind(backing).data);
+            }
+            qwen4_cache_reads = static_cast<std::int32_t*>(q1.cache_reads->bind(backing).data);
+            if (q1.stage_table) {
+                qwen4_stage_table = static_cast<std::int32_t*>(q1.stage_table->bind(backing).data);
+                qwen4_stage_picks = static_cast<std::int32_t*>(q1.stage_picks->bind(backing).data);
+                for (std::size_t plane = 0; plane < qwen4_staging.size(); ++plane) {
+                    qwen4_staging[plane] = static_cast<std::byte*>(q1.stage_pool[plane].bind(backing).data);
+                }
+            }
+            if (own.qwen4->cache_stream_tables) {
+                qwen4_stream_tables =
+                    static_cast<std::int32_t*>(own.qwen4->cache_stream_tables->bind(backing).data);
+            }
+            qwen4_cache_table = static_cast<std::int32_t*>(own.qwen4->cache_table->bind(backing).data);
+            qwen4_cache_divisors = static_cast<float*>(own.qwen4->cache_divisors->bind(backing).data);
+        }
+        if (own.qwen4->decode_ple_rows) {
+            qwen4_decode_ple_rows = own.qwen4->decode_ple_rows->bind(backing);
+        }
+        if (own.qwen4->ple_record) { qwen4_ple_record = own.qwen4->ple_record->bind(backing); }
+        if (own.qwen4->draft_extra > 0) {
+            for (std::size_t p = 0; p < qwen4_draft_planes.size(); ++p) {
+                qwen4_draft_planes[p] =
+                    static_cast<std::byte*>(own.qwen4->draft_planes[p].bind(backing).data);
+            }
+        }
+    }
     // A scoring Program decodes nothing: its round state has no decode frame.
     if (static_cast<int>(io.ordinary.has_value()) + static_cast<int>(io.mtp_decode.has_value()) +
             static_cast<int>(io.dflash_decode.has_value()) !=
@@ -130,6 +166,13 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             const ScopedCurrentDevice rank1(execution_context->dev[1]->device);
             peer = std::make_unique<PeerRuntime>(*execution_context->dev[1], plan);
             peer_events.emplace(*execution_context);
+            // T56: eager exchanges (prefill chunks) through pinned host buffers, asynchronously,
+            // instead of the driver-staged peer copy that blocks the host per call.
+            if (const char* v = std::getenv("NINFER_TP_HOST_EXCHANGE");
+                v == nullptr || std::string_view(v) != "0") {
+                host_exchange.emplace(*execution_context);
+                peer_events->attach_host_exchange(&*host_exchange);
+            }
             if (use_cuda_graph) {
                 graph_bridge.emplace(execution_context->dev[0]->device,
                                      execution_context->dev[1]->device);
@@ -145,9 +188,14 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                     // verification activation; the wide slots a full batch's.
                     // NINFER_TP_MAILBOX_SLOT=request leaves the wide slots out (the batched
                     // exchanges then take the staged copies), for A/B runs on one binary.
+                    // Qwen4Exp exchanges its MoE partials in FP32 (allreduce_sum_f32, one
+                    // rounding after the sum): its slot carries [hidden, K+1] FP32.
+                    const std::size_t element =
+                        parameters.model.config().text.qwen4() ? sizeof(float)
+                                                               : sizeof(std::uint16_t);
                     const std::size_t slot_bytes =
                         static_cast<std::size_t>(parameters.model.config().text.hidden_size) *
-                        (static_cast<std::size_t>(draft_window) + 1U) * sizeof(std::uint16_t);
+                        (static_cast<std::size_t>(draft_window) + 1U) * element;
                     const char* slot_env = std::getenv("NINFER_TP_MAILBOX_SLOT");
                     const std::size_t wide_slot_bytes = tp2_mailbox_wide_slot_bytes(
                         slot_bytes, max_concurrency,
@@ -155,6 +203,9 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                             (slot_env == nullptr || std::string_view(slot_env) != "request"));
                     peer_mailbox.emplace(*execution_context, slot_bytes, 2, kernel,
                                          wide_slot_bytes);
+                    // Qwen4Exp: the exchanges release the next hyper-connection mixer early
+                    // (its Down launch streams its weights under the exchange, T45).
+                    peer_mailbox->set_release_dependents(parameters.model.config().text.qwen4());
                     peer_events->attach_mailbox(&*peer_mailbox);
                     tp_transport_status.exchange_kernel = ops::peer_exchange_kernel_name(kernel);
                     tp_transport_status.slot_bytes      = peer_mailbox->max_bytes();
@@ -392,6 +443,7 @@ bool ProgramImpl::degrade_peer_mailbox() {
     const std::size_t slot_bytes          = peer_mailbox->slot_bytes();
     const std::size_t wide_slot_bytes     = peer_mailbox->wide_slot_bytes();
     const ops::PeerExchangeKernel kernel = peer_mailbox->kernel();
+    const bool release_dependents        = peer_mailbox->release_dependents();
     peer_events->attach_mailbox(nullptr);
     peer_mailbox.reset();
     const std::string previous = tp_transport_status.transport;
@@ -403,6 +455,7 @@ bool ProgramImpl::degrade_peer_mailbox() {
         !tp_execution->staged_draft_collectives) {
         tp_execution->staged_draft_collectives = true;
         peer_mailbox.emplace(*execution_context, slot_bytes, 2, kernel, wide_slot_bytes);
+        peer_mailbox->set_release_dependents(release_dependents);
         peer_events->attach_mailbox(&*peer_mailbox);
         tp_transport_status.transport = "mailbox, MTP draft on copies";
         return true;
@@ -426,13 +479,18 @@ void ProgramImpl::project_score_tile_split(const Tensor& hidden, const Tensor& l
     // for one column: rank 1 copies rank 0's hidden once rank 0's stream has staged it, each rank
     // projects its half, and rank 0 gathers both halves into `logits`.
     const DeviceContext& rank1 = peer->device;
-    Tensor peer_hidden         = peer->score_hidden.slice(1, 0, hidden.ne[1]);
+    // The staged columns are contiguous [rows, columns]; rank 1's persistent staging may have
+    // more rows per column (Qwen4Exp stages the wide residual, then projects its mixed hidden).
+    if (static_cast<std::int64_t>(peer->score_hidden.bytes()) < static_cast<std::int64_t>(hidden.bytes()) ||
+        !hidden.is_contiguous()) {
+        throw std::logic_error("tensor-parallel score staging is smaller than the tile");
+    }
+    Tensor peer_hidden(peer->score_hidden.data, hidden.dtype, {hidden.ne[0], hidden.ne[1]});
     CUDA_CHECK(cudaEventRecord(peer_events->inputs_ready(0), device.stream));
     {
         const ScopedCurrentDevice scope(rank1.device);
         CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, peer_events->inputs_ready(0), 0));
-        CUDA_CHECK(cudaMemcpyAsync(peer_hidden.data, hidden.data, hidden.bytes(),
-                                   cudaMemcpyDeviceToDevice, rank1.stream));
+        CUDA_CHECK(::ninfer::memcpy_device_async(peer_hidden.data, hidden.data, hidden.bytes(), rank1.stream));
     }
     const execution::LinearParameters& head0 = parameters.text.output_head;
     const execution::LinearParameters& head1 = peer_parameters->text.output_head;

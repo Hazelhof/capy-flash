@@ -1,0 +1,207 @@
+#include "core/elastic_arena.h"
+
+#include "core/device.h"       // CUDA_CHECK
+#include "core/device_scope.h" // ScopedCurrentDevice
+
+#include <cuda.h>
+
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+
+namespace ninfer {
+namespace {
+
+void cu_check(CUresult r, const char* what) {
+    if (r == CUDA_SUCCESS) { return; }
+    const char* name = nullptr;
+    (void)cuGetErrorName(r, &name);
+    throw std::runtime_error(std::string("ElasticArena: ") + what + " failed (" +
+                             (name != nullptr ? name : "?") + ")");
+}
+
+CUmemAllocationProp device_prop(int device) {
+    CUmemAllocationProp prop{};
+    prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id   = device;
+    return prop;
+}
+
+CUdeviceptr ptr_of(std::byte* p) { return reinterpret_cast<CUdeviceptr>(p); }
+
+} // namespace
+
+ElasticArena::ElasticArena(int device, std::size_t bytes, std::span<const ElasticRangeSpec> ranges)
+    : device_(device), bytes_(bytes), ranges_(ranges.begin(), ranges.end()) {
+    if (bytes == 0) { throw std::invalid_argument("ElasticArena: empty arena"); }
+    ScopedCurrentDevice scope(device_);
+    CUDA_CHECK(cudaFree(nullptr)); // the primary context is current for the driver calls below
+    const CUmemAllocationProp prop = device_prop(device_);
+    std::size_t g                  = 0;
+    cu_check(cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
+             "cuMemGetAllocationGranularity");
+    granule_  = g;
+    reserved_ = (bytes_ + granule_ - 1) / granule_ * granule_;
+    CUdeviceptr va = 0;
+    cu_check(cuMemAddressReserve(&va, reserved_, granule_, 0, 0), "cuMemAddressReserve");
+    base_ = reinterpret_cast<std::byte*>(va);
+    const std::size_t granules = reserved_ / granule_;
+    fixed_.assign(granules, 1);
+    handle_.assign(granules, 0);
+    // A granule is fixed unless an elastic range covers it whole.
+    auto sorted = ranges_;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const ElasticRangeSpec& a, const ElasticRangeSpec& b) { return a.offset < b.offset; });
+    for (std::size_t i = 0; i < sorted.size(); ++i) {
+        const ElasticRangeSpec& r = sorted[i];
+        if (r.mapped > r.bytes || r.offset + r.bytes > bytes_ ||
+            (i > 0 && sorted[i - 1].offset + sorted[i - 1].bytes > r.offset)) {
+            (void)cuMemAddressFree(va, reserved_);
+            throw std::invalid_argument("ElasticArena: elastic ranges overlap or exceed the arena");
+        }
+    }
+    // Bytes covered by ranges, merged; a granule wholly inside the union is not fixed.
+    std::vector<std::uint8_t> covered(granules, 0);
+    {
+        std::size_t i = 0;
+        while (i < sorted.size()) {
+            std::size_t begin = sorted[i].offset;
+            std::size_t end   = begin + sorted[i].bytes;
+            while (i + 1 < sorted.size() && sorted[i + 1].offset == end) {
+                end += sorted[i + 1].bytes;
+                ++i;
+            }
+            ++i;
+            const std::size_t first = (begin + granule_ - 1) / granule_;
+            const std::size_t last  = end / granule_; // exclusive
+            for (std::size_t k = first; k < last; ++k) { fixed_[k] = 0; }
+        }
+    }
+    try {
+        std::vector<std::size_t> initial(ranges_.size());
+        for (std::size_t r = 0; r < ranges_.size(); ++r) { initial[r] = ranges_[r].mapped; }
+        needed(initial, scratch_);
+        for (std::size_t k = 0; k < granules; ++k) {
+            if (scratch_[k] != 0) { back(k); }
+        }
+        // Everything backed reads zero, as a ZeroFill::Yes DeviceArena.
+        for (std::size_t k = 0; k < granules;) {
+            if (handle_[k] == 0) {
+                ++k;
+                continue;
+            }
+            std::size_t e = k;
+            while (e < granules && handle_[e] != 0) { ++e; }
+            CUDA_CHECK(cudaMemset(base_ + k * granule_, 0, (e - k) * granule_));
+            k = e;
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+    } catch (...) {
+        for (std::size_t k = 0; k < handle_.size(); ++k) { release(k); }
+        (void)cuMemAddressFree(va, reserved_);
+        throw;
+    }
+}
+
+ElasticArena::~ElasticArena() {
+    if (base_ == nullptr) { return; }
+    if (cudaSetDevice(device_) != cudaSuccess) { return; }
+    (void)cudaDeviceSynchronize();
+    for (std::size_t k = 0; k < handle_.size(); ++k) { release(k); }
+    (void)cuMemAddressFree(ptr_of(base_), reserved_);
+}
+
+void ElasticArena::needed(std::span<const std::size_t> mapped, std::vector<std::uint8_t>& out) const {
+    if (mapped.size() != ranges_.size()) {
+        throw std::invalid_argument("ElasticArena: one prefix per elastic range");
+    }
+    out.assign(fixed_.begin(), fixed_.end());
+    for (std::size_t r = 0; r < ranges_.size(); ++r) {
+        if (mapped[r] > ranges_[r].bytes) {
+            throw std::invalid_argument("ElasticArena: prefix beyond its range");
+        }
+        if (mapped[r] == 0) { continue; }
+        const std::size_t first = ranges_[r].offset / granule_;
+        const std::size_t last  = (ranges_[r].offset + mapped[r] + granule_ - 1) / granule_;
+        for (std::size_t k = first; k < last; ++k) { out[k] = 1; }
+    }
+}
+
+std::int64_t ElasticArena::physical_delta(std::span<const std::size_t> mapped) const {
+    std::vector<std::uint8_t> want;
+    needed(mapped, want);
+    std::int64_t delta = 0;
+    for (std::size_t k = 0; k < want.size(); ++k) {
+        delta += static_cast<std::int64_t>(want[k] != 0) - static_cast<std::int64_t>(handle_[k] != 0);
+    }
+    return delta * static_cast<std::int64_t>(granule_);
+}
+
+void ElasticArena::back(std::size_t k) {
+    if (handle_[k] != 0) { return; }
+    const CUmemAllocationProp prop = device_prop(device_);
+    CUmemGenericAllocationHandle h = 0;
+    cu_check(cuMemCreate(&h, granule_, &prop, 0), "cuMemCreate");
+    const CUdeviceptr p = ptr_of(base_ + k * granule_);
+    if (const CUresult r = cuMemMap(p, granule_, 0, h, 0); r != CUDA_SUCCESS) {
+        (void)cuMemRelease(h);
+        cu_check(r, "cuMemMap");
+    }
+    CUmemAccessDesc access{};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id   = device_;
+    access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    if (const CUresult r = cuMemSetAccess(p, granule_, &access, 1); r != CUDA_SUCCESS) {
+        (void)cuMemUnmap(p, granule_);
+        (void)cuMemRelease(h);
+        cu_check(r, "cuMemSetAccess");
+    }
+    handle_[k] = h;
+    ++backed_;
+}
+
+void ElasticArena::release(std::size_t k) noexcept {
+    if (handle_[k] == 0) { return; }
+    (void)cuMemUnmap(ptr_of(base_ + k * granule_), granule_);
+    (void)cuMemRelease(static_cast<CUmemGenericAllocationHandle>(handle_[k]));
+    handle_[k] = 0;
+    --backed_;
+}
+
+void ElasticArena::set_mapped(std::span<const std::size_t> mapped, cudaStream_t stream) {
+    needed(mapped, scratch_);
+    ScopedCurrentDevice scope(device_);
+    bool releasing = false;
+    for (std::size_t k = 0; k < scratch_.size() && !releasing; ++k) {
+        releasing = scratch_[k] == 0 && handle_[k] != 0;
+    }
+    // cuMemUnmap requires that no device work still touches the range: every stream of the
+    // device is drained first (the caller resizes between windows, so this costs no overlap).
+    if (releasing) { CUDA_CHECK(cudaDeviceSynchronize()); }
+    for (std::size_t k = 0; k < scratch_.size(); ++k) {
+        if (scratch_[k] == 0 && handle_[k] != 0) { release(k); }
+    }
+    for (std::size_t r = 0; r < ranges_.size(); ++r) {
+        ranges_[r].mapped = std::min(ranges_[r].mapped, mapped[r]);
+    }
+    bool zeroed = false;
+    for (std::size_t k = 0; k < scratch_.size();) {
+        if (scratch_[k] == 0 || handle_[k] != 0) {
+            ++k;
+            continue;
+        }
+        std::size_t e = k;
+        while (e < scratch_.size() && scratch_[e] != 0 && handle_[e] == 0) {
+            back(e);
+            ++e;
+        }
+        CUDA_CHECK(cudaMemsetAsync(base_ + k * granule_, 0, (e - k) * granule_, stream));
+        zeroed = true;
+        k      = e;
+    }
+    if (zeroed) { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+    for (std::size_t r = 0; r < ranges_.size(); ++r) { ranges_[r].mapped = mapped[r]; }
+}
+
+} // namespace ninfer

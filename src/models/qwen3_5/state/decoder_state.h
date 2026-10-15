@@ -2,6 +2,7 @@
 
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
+#include "ninfer/ops/sparse_attention.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,6 +24,10 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+    // Qwen4Exp: every attention layer also keeps the QSA index planes (ops::QsaIndexPlanes:
+    // records BF16 [136,64,1,pages] and pooled block keys BF16 [32,64,1,pages]) in the same page
+    // pool, so they share the K/V frontier, paging, prefix reuse and page copies.
+    bool qsa_index = false;
 };
 
 struct PagedKVCacheLayout {
@@ -32,6 +37,10 @@ struct PagedKVCacheLayout {
     std::uint32_t max_context = 0;
     std::int32_t kv_heads     = 0;
     PagedKVStorageLayout layer_storage;
+    bool qsa_index = false;
+    // T64 elastic KV: the page planes are offsets into a second backing (the elastic arena), the
+    // execution tables into the main one.
+    bool elastic_pages = false;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -57,7 +66,8 @@ private:
 
 class PagedKVCache {
 public:
-    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    // `elastic` backs the page planes of a layout planned with elastic_pages (else unused).
+    PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout, DeviceSpan elastic = {});
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -82,6 +92,11 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    [[nodiscard]] bool has_qsa_index() const noexcept { return qsa_index_; }
+    // The QSA index planes of attention layer `layer`, with the batched execution tables (the K/V
+    // tables: every row addresses the same pages in every plane). Requires has_qsa_index().
+    [[nodiscard]] ops::QsaIndexPlanes qsa_index_planes(std::uint32_t layer) const;
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
@@ -92,6 +107,7 @@ private:
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
+    bool qsa_index_ = false;
 };
 
 struct DecoderStateLayout {
@@ -101,14 +117,17 @@ struct DecoderStateLayout {
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
 };
 
+// `pages_builder` (T64 elastic KV, may be null): plans the page planes of both pools in a second
+// layout, bound to DecoderState's `elastic` backing.
 [[nodiscard]] DecoderStateLayout plan_decoder_state(LayoutBuilder& builder,
-                                                    const DecoderStateSpec& spec);
+                                                    const DecoderStateSpec& spec,
+                                                    LayoutBuilder* pages_builder = nullptr);
 
 struct DecoderState {
     PagedKVCache text_kv;
     std::optional<PagedKVCache> mtp_kv;
 
-    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout);
+    DecoderState(DeviceSpan backing, const DecoderStateLayout& layout, DeviceSpan elastic = {});
 
     [[nodiscard]] PagedKVCache* mtp_cache() noexcept;
     [[nodiscard]] const PagedKVCache* mtp_cache() const noexcept;

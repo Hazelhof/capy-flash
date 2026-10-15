@@ -64,6 +64,7 @@ class BlockScaleGeometry:
     scale_plane_offset: int
     scale_plane_bytes: int
     weight_divisor_offset: int
+    weight_divisor_count: int
     payload_bytes: int
 
 
@@ -198,8 +199,15 @@ def row_split_geometry(
 
 
 def block_scale_geometry(
-    format: str | Nvfp4Format, shape: Sequence[int]
+    format: str | Nvfp4Format, shape: Sequence[int], divisors: int = 1
 ) -> BlockScaleGeometry:
+    """Planes of one NVFP4 parent; ``divisors`` FP32 words close it, one per equal row block.
+
+    A stacked parent (a layer's routed experts, each quantised against its own divisor) keeps one
+    divisor per source matrix; row ``r`` uses word ``r // (N / divisors)``. A 128-row scale tile
+    may not span two of them, so every source is a whole number of tiles and therefore a
+    contiguous range of both the code plane and the swizzled scale plane.
+    """
     spec = _format(format)
     if not isinstance(spec, Nvfp4Format):
         raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
@@ -208,6 +216,12 @@ def block_scale_geometry(
         raise ValueError(
             "block_scale_k16_m128x4_v1 requires N divisible by 128 "
             "and K divisible by 64"
+        )
+    if isinstance(divisors, bool) or not isinstance(divisors, int) or divisors < 1 or n % divisors:
+        raise ValueError("NVFP4 divisor count must divide the plane's rows")
+    if divisors > 1 and (n // divisors) % 128:
+        raise ValueError(
+            "each NVFP4 divisor must cover a whole number of 128-row scale tiles"
         )
     code_plane_bytes = n * k // 2
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
@@ -222,7 +236,8 @@ def block_scale_geometry(
         scale_plane_offset=scale_plane_offset,
         scale_plane_bytes=scale_plane_bytes,
         weight_divisor_offset=weight_divisor_offset,
-        payload_bytes=weight_divisor_offset + 4,
+        weight_divisor_count=divisors,
+        payload_bytes=weight_divisor_offset + 4 * divisors,
     )
 
 
@@ -250,9 +265,12 @@ def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
     shape: Sequence[int],
+    divisors: int = 1,
 ) -> int:
     layout_spec = _layout(layout)
     numeric_spec = _format(format)
+    if divisors != 1 and layout_spec is not BLOCK_SCALE_K16_M128X4_V1:
+        raise ValueError(f"layout {layout_spec.name!r} stores one divisor, not {divisors}")
     if numeric_spec.name not in layout_spec.formats:
         raise ValueError(
             f"layout {layout_spec.name!r} does not accept format {numeric_spec.name!r}"
@@ -271,7 +289,7 @@ def encoded_size(
     if layout_spec is BLOCK_SCALE_K16_M128X4_V1:
         if not isinstance(numeric_spec, Nvfp4Format):
             raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
-        return block_scale_geometry(numeric_spec, shape).payload_bytes
+        return block_scale_geometry(numeric_spec, shape, divisors).payload_bytes
     if layout_spec is ROW_SCALE_V1:
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")

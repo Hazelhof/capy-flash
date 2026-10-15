@@ -266,11 +266,15 @@ code_plane_bytes      = N * K / 2
 scale_plane_offset    = align_up(code_plane_bytes, 256)
 scale_plane_bytes     = N * K / 16
 weight_divisor_offset = scale_plane_offset + scale_plane_bytes
-payload_bytes         = weight_divisor_offset + 4
+payload_bytes         = weight_divisor_offset + 4 * divisors
 ```
 
 The payload is a row-major E2M1 packed-code plane, zero padding to `scale_plane_offset`, a
-swizzled E4M3FN scale plane, and the little-endian FP32 weight-divisor word. Within each packed code
+swizzled E4M3FN scale plane, and `divisors` little-endian FP32 weight-divisor words (the tensor
+object's `divisors`, default 1; word `i` serves rows `[i*N/divisors, (i+1)*N/divisors)`, and with
+more than one word `N/divisors` must be a multiple of 128). Because 128-row tiles are stored in row
+order, the rows of one tile-aligned row block (one source of a stacked plane, one routed expert of
+a bank) are one contiguous range of each plane. Within each packed code
 byte, the low nibble is the smaller K coordinate and the high nibble is the next coordinate.
 
 For logical row `n`, scale-group coordinate `g=floor(k/16)`, and `K_tiles=K/64`, define:
@@ -344,7 +348,7 @@ Layout decoding yields only persistent logical words:
 - `row_split_k128_v1` yields the grouped signed codes and binary16 scales for logical columns
   `0..K-1`, discarding physical columns `K..K_pad-1`;
 - `block_scale_k16_m128x4_v1` yields the packed E2M1 words, natural E4M3FN group-scale words, and
-  matrix-level FP32 weight divisor;
+  the FP32 weight divisor of every stacked source matrix;
 - `row_scale_v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
 - `raw_bytes_v1` yields the enclosing resource bytes.

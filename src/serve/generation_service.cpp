@@ -267,6 +267,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
     engine_options.kv_cache                 = options_.kv_cache;
+    engine_options.elastic_kv               = options_.elastic_kv;
+    if (options_.miss_split) { engine_options.routed_experts.miss_split.mode = *options_.miss_split; }
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_device            = options_.vision_device;
     engine_options.max_vision_tokens        = options_.max_vision_tokens;
@@ -281,6 +283,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    turn_anchors_ = resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     if (!options_.prefill_miss_dump_dir.empty()) {
@@ -372,7 +375,7 @@ PreparedRequest GenerationService::prepare_impl(
         input.context_cache.allow_engine_automatic_shared_prefixes =
             input.context_cache.allow_engine_automatic_shared_prefixes &&
             protocol_allows_engine_automatic;
-        add_turn_anchor_markers(input, options_.turn_anchors);
+        add_turn_anchor_markers(input, turn_anchors_);
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);

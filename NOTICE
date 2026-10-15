@@ -33,6 +33,34 @@ Neroued/ninfer, each licensed under the Apache License, Version 2.0:
     attributes, mirrored rank-1 KV tables and state slots, and the per-rank
     startup memory report.
 
+Slot-pool NVFP4 MoE kernel: prior work
+--------------------------------------
+src/ops/moe_slots/kernels.cu derives from qf_moe.cu of the following project,
+licensed under the Apache License, Version 2.0:
+
+  * SSHdotCodes contributors -- https://github.com/SSHdotCodes/qwen-3.8-flash-next-pro6000
+    Copyright 2026 SSHdotCodes contributors. The decode-size NVFP4 (W4A4)
+    mixture-of-experts kernels for Qwen3.8-Flash-Next (serve/qwenfast/qf_moe.cu,
+    commit 8e5be44). This tree reads the experts from expert-cache slots
+    through a slot table and changes the scalar, output and workspace handling
+    (listed in the file header).
+
+Host expert path: prior work
+----------------------------
+src/ops/sparse_moe/host/ (host_nvfp4, host_moe_executor, host_moe_mailbox) derives
+from the following works, each licensed under the Apache License, Version 2.0:
+
+  * FreeToken authors (FlashML-org) -- https://github.com/FlashML-org/FreeToken
+    (commit 555efd8) The NVFP4 W4A8 AVX-512 VNNI dot (dot_nvfp4_i8_avx512vnni,
+    nvfp4_i8_grp4) and its int8 activation layout, adapted to the swizzled
+    block-scale plane; the binary ready/done flag protocol of the GPU stream
+    memory operations (done reset before each doorbell).
+
+  * 1872183316 -- https://github.com/1872183316/ninfer-offload (commit 1fd5c39)
+    The two-phase weight-major host MoE executor (HostMoeExecutor) and the
+    mapped mailbox with cuStreamWriteValue32/cuStreamWaitValue32 inside the
+    captured graph, here ported to NVFP4 W4A8 with a pinned pool.
+
 Agentic A/B benchmark: prior work
 ---------------------------------
 bench/agentic_ab/ (workload.py, runner.py, analyze.py, build_control.bat and the
@@ -45,6 +73,49 @@ under the Apache License, Version 2.0:
     analysis of the serve's request log. This tree adds the Linux launcher
     (linux.py, run_linux.sh) and, in analyze.py, named arms, the serve-log
     cross-check and the phase table; runner.py records phase events.
+
+Qwen3.8-Flash-Next (Qwen4Exp): prior work
+-----------------------------------------
+The Qwen4Exp configuration, converter adapter, ModelOpt source readers, stacked
+NVFP4 divisor planes, file-mapped objects and huge-page pinned buffers in this
+tree come from the following fork of Neroued/ninfer, licensed under the Apache
+License, Version 2.0:
+
+  * giveen -- https://github.com/giveen/ninfer-ext (commit 9c933f01)
+    tools/convert/qwen4_exp.py, tools/convert/sources/modelopt.py,
+    docs/maintainer/qwen4-exp-model.md, the Qwen4Exp parts of
+    models/qwen3_5/{config,weights,load/text}, and the tests in
+    tests/convert/test_qwen4_exp.py they are adapted from; the router and
+    top-k kernels of src/ops/moe_route (from src/ops/offload_moe), the Text
+    execution order and native parameters of models/qwen3_5/execution/qwen4_*
+    and parameters (from execution/qwen4_text.cpp), and the Q8/Q6 shape
+    selectors of the hidden-2560 projections.
+    The grouped NVFP4 W4A4 expert pipeline of src/ops/moe_grouped (from
+    src/ops/offload_moe/a4_kernels.cu and the routed MMA kernel of
+    src/ops/linear/nvfp4/nvfp4_w4a4_mma.cuh) and the double-buffered layer
+    staging idea of the prefill expert stream (execution/qwen4_expert_pager).
+  * sybrix -- https://github.com/sybrix/qwen3.8-flash-next-ninfer
+    flash-next-reference/gen_synthetic.py, the source of the synthetic
+    checkpoint fixture tests/convert/qwen4_exp_fixture.py; the Program wiring
+    of the Qwen4Exp state (index planes beside the Main KV planes, the PLE
+    convolution state in the StateImage, decode n-gram rows per round).
+
+Qwen3.8-Flash-Next Ops: prior work
+----------------------------------
+The hyper-connection and PLE Ops and the n-gram host gather descend from the
+following forks of Neroued/ninfer, each licensed under the Apache License,
+Version 2.0:
+
+  * giveen -- https://github.com/giveen/ninfer-ext (commit 9c933f01)
+    Grouped offset RMSNorm, the hyper-connection gates, collapse, combine and
+    expand kernels, the PLE dilated convolution and history advance, the
+    n-gram host gather with its direct-I/O row reader, and their FP64 tests.
+
+  * Lars Karlslund -- https://github.com/lkarlslund/ninfer6000 (commit 0c2781d6)
+    The fused small-T hyper-connection mix (per-stream inverse RMS factored out
+    of the Down contraction, BF16 MMA with the tokens as N), the fused-norm PLE
+    gate, MADV_WILLNEED row prefetch for the mapped n-gram table, and the
+    complete FP64 mix and PLE oracles.
 
 Modifications
 -------------
@@ -64,3 +135,12 @@ artifacts, and the tests that qualify them. Single-GPU (--tp 1) behaviour is int
 The full list of changes is the git history on top of the upstream commit.
 
 Vendored dependencies retain their own license files under third_party/.
+
+capy-flash
+----------
+Copyright 2026 Valerio Dolci.
+capy-flash (https://github.com/ValerioDolci/capy-flash) is this tree from the
+Qwen3.8-Flash-Next work onward: the routed-expert offload engine (expert cache
+in VRAM partitioned by id between the two ranks, CPU expert path inside the
+captured round, FP32 partial-sum exchanges, elastic KV / expert slots, MTP draft
+shortlist). Licensed under the Apache License, Version 2.0 (see LICENSE).

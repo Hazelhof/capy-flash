@@ -59,8 +59,11 @@ void validate_tensor_parallel(const LoadOptions& options) {
     }
 }
 
+// Dense Qwen3.5 and Qwen4Exp have tensor-parallel placements (load/sharding.h); a Qwen4Exp plan
+// at tp 2 binds and materializes its per-rank shards, and its execution is the Program's.
 void validate_tensor_parallel(const Config& config, const LoadOptions& options) {
-    if (options.tp > 1 && config.text.architecture != Architecture::Qwen3_5) {
+    if (options.tp > 1 && config.text.architecture != Architecture::Qwen3_5 &&
+        config.text.architecture != Architecture::Qwen4Exp) {
         throw std::invalid_argument(std::string(architecture_name(config.text.architecture)) +
                                     " does not support tensor parallelism");
     }
@@ -82,7 +85,13 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     if (out->config.vision) {
         out->weights.vision = loading::bind_vision(bindings, *out->config.vision, text);
     }
-    if (out->config.mtp) {
+    if (text.qwen4()) {
+        if (out->config.draft || options.proposal_enabled()) {
+            throw artifact::ArtifactError("Qwen4Exp supports MTP speculation only");
+        }
+        out->weights.qwen4 = loading::bind_qwen4_text(bindings, text);
+        if (out->config.mtp) { out->weights.qwen4_mtp = loading::bind_qwen4_mtp(bindings, text); }
+    } else if (out->config.mtp) {
         out->weights.mtp = loading::bind_mtp(bindings, text, out->weights.text);
     }
     if (out->config.draft) {

@@ -95,6 +95,11 @@ void gated_delta_net_batch_update(const Tensor& q, const Tensor& k, const Tensor
  * pairwise non-overlapping. Valid outputs must be bit-identical to the normalized recurrent
  * execution from the same FP32 initial state and represented inputs; no independent FP64
  * comparison is needed to establish this record/snapshot equivalence.
+ *
+ * Launch contract: the kernel is a programmatic dependent of the kernel enqueued just before it
+ * and loads its state tiles (ssm_states at initial_state_slots, valid_columns) while that kernel
+ * still runs; those three must therefore be complete before the preceding kernel starts (not
+ * written by it). q/k/v/g/beta are read after the dependency wait.
  */
 void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tensor& v,
                                    const Tensor& g, const Tensor& beta, float scale,

@@ -17,13 +17,13 @@ WeightUseId Bindings::use(WeightId id, std::string_view input) const {
 }
 
 WeightId Bindings::parameter(std::string name, artifact::Shape shape,
-                             std::vector<std::string> inputs, std::optional<QType> exact_format) {
+                             std::vector<std::string> inputs, std::optional<QType> exact_format,
+                             artifact::Residency residency) {
     if (parameters_.contains(name)) {
         throw artifact::ArtifactError(name + ": duplicate model parameter declaration");
     }
     PendingWeight pending;
-    pending.reference =
-        binder.parameter(name, std::move(shape), artifact::Residency::Device, exact_format);
+    pending.reference = binder.parameter(name, std::move(shape), residency, exact_format);
     for (const auto& input : inputs) {
         const auto& use = binder.use(name, input);
         if (!use.activation_policy) {
@@ -69,11 +69,36 @@ WeightId Bindings::direct(std::string name, artifact::Shape shape, QType format)
     return parameter(std::move(name), std::move(shape), {}, format);
 }
 
+namespace {
+
+// A HostFile weight has no parent view: host code reads the mapped segments of its one object.
+BoundWeight bind_file(const PendingWeight& item,
+                      const artifact::MaterializedArtifact& materialized) {
+    const auto& parts = item.reference.binding.parts;
+    if (parts.size() != 1 || parts[0].begin != 0 ||
+        parts[0].end != weight_element_count(item.reference.shape)) {
+        throw artifact::ArtifactError(item.reference.name +
+                                      ": a file-mapped weight must bind a whole object");
+    }
+    BoundWeight bound{item.reference.name, item.source_objects,
+                      WeightView{item.reference.shape, {}}, item.uses};
+    const auto segments = materialized.file_segments(parts[0].object);
+    bound.mapped.assign(segments.begin(), segments.end());
+    bound.mapped_geometry = materialized.file_geometry(parts[0].object);
+    return bound;
+}
+
+} // namespace
+
 std::vector<BoundWeight> resolve_weights(std::vector<PendingWeight>&& pending,
                                          const artifact::MaterializedArtifact& materialized) {
     std::vector<BoundWeight> out;
     out.reserve(pending.size());
     for (auto& item : pending) {
+        if (item.reference.residency == artifact::Residency::HostFile) {
+            out.push_back(bind_file(item, materialized));
+            continue;
+        }
         auto view = artifact::bind_view(item.reference, materialized);
         out.push_back({std::move(item.reference.name), std::move(item.source_objects),
                        std::move(view), std::move(item.uses)});
@@ -88,6 +113,11 @@ std::vector<BoundWeight> resolve_weights(std::span<const PendingWeight> pending,
     out.reserve(pending.size());
     for (const auto& item : pending) {
         const auto& reference = item.reference;
+        if (reference.residency == artifact::Residency::HostFile) {
+            // One host mapping serves every rank.
+            out.push_back(bind_file(item, materialized));
+            continue;
+        }
         std::size_t held      = 0;
         for (const auto& part : reference.binding.parts) {
             held += materialized.has_device(part.object, device) ? 1 : 0;

@@ -289,7 +289,7 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
     const cudaStream_t stream = ec.dev[target]->stream;
     CUDA_CHECK(cudaStreamWaitEvent(stream, events.inputs_ready(static_cast<int>(source)), 0));
     const auto pull = [&](const Tensor& to, const Tensor& from) {
-        CUDA_CHECK(cudaMemcpyAsync(to.data, from.data, from.bytes(), cudaMemcpyDeviceToDevice,
+        CUDA_CHECK(::ninfer::memcpy_device_async(to.data, from.data, from.bytes(),
                                    stream));
     };
     pull(frames[target]->draft_tokens.slice(1, 0, batch_size),

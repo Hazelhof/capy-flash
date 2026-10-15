@@ -88,6 +88,10 @@ enum class Name : std::size_t {
     DFlashAttention,
     DFlashMlp,
     DecodeDFlashTarget,
+    Qwen4PleGather,
+    Qwen4BeginWindow,
+    Qwen4EndWindow,
+    DecodeMtpPrepare,
     Count,
 };
 
@@ -209,6 +213,10 @@ enum class Name : std::size_t {
         "dflash.attention",
         "dflash.mlp",
         "decode.dflash.target",
+        "qwen4.ple_gather",
+        "qwen4.begin_window",
+        "qwen4.end_window",
+        "decode.mtp.prepare",
     });
     static_assert(names.size() == static_cast<std::size_t>(Name::Count));
     static const auto handles = [] {

@@ -29,6 +29,9 @@ namespace ninfer::models::qwen3_5::loading {
 //   Replicated  norms, text/token_embedding.
 //   HostMapped  text/token_embedding with options.embedding_host, at tp 1 too: one copy in mapped
 //            page-locked host memory that every rank's gather reads in place over PCIe.
+//            Qwen4Exp routed experts ({text,mtp}/layers/<i>/moe/experts/*) always, at tp 1 too:
+//            each layer's stacked gate/up and down banks (65 GiB for Qwen3.8-Flash-Next with MTP)
+//            stay in host memory, where the expert cache copies them from and the CPU reads them.
 //   SingleDevice(vision_rank)  vision/*.
 //   PrimaryOnly  dflash/*, dflash2/* and proposal/*: the drafter and the optimized proposal head
 //            run on rank 0 only, so rank 1 holds none of them. Under MTP, proposal/head instead
@@ -40,6 +43,30 @@ namespace ninfer::models::qwen3_5::loading {
 //            PrimaryOnly. At tp 2 the DFlash2 drafter itself splits (split_dflash2_drafter in
 //            sharding.cpp), with its candidate selector SingleDevice(1) (PrimaryOnly with Vision on
 //            rank 1, NINFER_TP_DRAFT_HEAD=primary or NINFER_TP_SELECTOR=primary).
+//
+// Qwen4Exp (Qwen3.8-Flash-Next) at tp 2, same contiguous head blocks:
+//
+//   Rows     attention/{query,gate} by query heads (12 of 24 per rank), attention/{key,value} by
+//            KV heads (1 of 2), gdn/* as above (8 of 16 key, 24 of 48 value heads),
+//            text/output_head by vocabulary.
+//   Columns  attention/output, gdn/output, gdn/convolution as above.
+//   Replicated  the QSA indexer (attention/indexer_*: same input, deterministic selection, no
+//            exchange), moe/{router,shared_score}, the PLE key|value projection, norms and
+//            convolution, text/token_embedding, mtp/{embedding_norm,embedding_projection,
+//            hidden_projection}, and every hyper-connection mixer ({attn_hc,ffn_hc}/*,
+//            {text,mtp}/hc_head/*, with mtp/hidden_norm): each rank keeps the whole wide
+//            residual and mixes it locally.
+//   Rows/Columns by residual streams, with options.hc_split_streams instead: rank r keeps streams
+//            [r*hc/2, (r+1)*hc/2) — rows of the mixers' norm and Up, of the PLE key/query/conv
+//            norms and of mtp/hidden_norm; columns of Down|inject and of the PLE convolution
+//            (two all-reduces per mixer, see execution).
+//   SingleDevice(block % 2)  moe/shared/{gate,up,down}: the shared expert of Text block i is
+//            whole on rank i % 2 (the MTP block follows the Text blocks), since its 640-wide
+//            intermediate has no tile-aligned half in the stored formats.
+//   HostMapped  routed experts, at every tp (above); rank r computes the experts with ID % 2 == r
+//            from its own cache and CPU path, and the rank partials meet in the block's MoE
+//            all-reduce.
+//   (HostFile)  ple/table: host code reads the mapped table for both ranks.
 //
 // MTP and a masked draft share text/token_embedding and the selected output head by WeightId,
 // so they see that parameter's per-rank view: MTP runs on both ranks and gathers the
@@ -74,7 +101,8 @@ parent_placements(std::span<const PendingWeight> weights, std::size_t object_cou
                   const GeometryLookup& geometry, const Config& config, const LoadOptions& options);
 
 // Installs the combined placements on a Binder planned for options.tp devices. No-op at tp 1
-// unless options.embedding_host, whose one HostMapped parent needs the resolver there too.
+// unless options.embedding_host or a Qwen4Exp model, whose HostMapped parents need the resolver
+// there too.
 void install_shard_resolver(artifact::Binder& binder, std::span<const PendingWeight> weights,
                             const Config& config, const LoadOptions& options);
 

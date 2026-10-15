@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <set>
@@ -279,19 +280,113 @@ ConstructedModel construct_model_on(const EngineOptions& options, DeviceContext&
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner =
-        execution != nullptr
-            ? models::qwen3_5::make_sequence_planner(instance->parameters,
-                                                     *instance->peer_parameters, device, options)
-            : models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
+    const auto make_planner = [&](const EngineOptions& planned) {
+        return execution != nullptr
+                   ? models::qwen3_5::make_sequence_planner(
+                         instance->parameters, *instance->peer_parameters, device, planned)
+                   : models::qwen3_5::make_sequence_planner(instance->parameters, device, planned);
+    };
     // Every rank reserves the same per-rank layout and addresses the same KV pages, so one page
     // count is resolved against the tightest rank's own free memory. A rank that allocates less
     // than that layout (the rank without the Vision tower skips its encode workspace) is credited
     // with the difference, so only the tower's rank pays for it.
-    auto rank_budgets = rank_free_bytes(device, execution);
-    for (std::size_t rank = 0; rank < rank_budgets.size(); ++rank) {
-        rank_budgets[rank] += planner.unallocated_reservation_bytes(static_cast<int>(rank));
+    const auto budgets_of = [&](const auto& planner) {
+        auto budgets = rank_free_bytes(device, execution);
+        for (std::size_t rank = 0; rank < budgets.size(); ++rank) {
+            budgets[rank] += planner.unallocated_reservation_bytes(static_cast<int>(rank));
+        }
+        return budgets;
+    };
+    EngineOptions planned_options = options;
+    // T64 elastic KV: the reservation's KV pool keeps max_context's addresses, but only its first
+    // grow step is backed at startup; the rest of its bytes are address space only.
+    std::size_t elastic_unbacked = 0;
+    // Each elastic KV plane and expert plane may cost one 2 MiB granule more than its bytes.
+    constexpr std::size_t kElasticGranule = std::size_t(2) << 20;
+    if (options.elastic_kv.enabled &&
+        (options.routed_experts.slots_per_layer == 0) != (options.routed_experts.elastic_columns == 0)) {
+        throw std::invalid_argument("elastic_kv: give both slots_per_layer and elastic_columns, or "
+                                    "neither (resolved from the device memory)");
     }
+    if (const std::int64_t slot_bytes =
+            models::qwen3_5::offloaded_expert_slot_bytes(instance->parameters, options);
+        slot_bytes > 0 && options.elastic_kv.enabled) {
+        auto probe = make_planner(planned_options);
+        const std::size_t kv_full = probe.kv_pool_bytes();
+        const std::uint32_t pages = probe.kv_pool_pages();
+        const std::uint32_t step  = (options.elastic_kv.grow_tokens + 63U) / 64U;
+        const std::size_t kv_init =
+            pages == 0 ? kv_full : kv_full / pages * std::min(step, pages);
+        elastic_unbacked = kv_full - kv_init;
+        if (options.routed_experts.slots_per_layer == 0) {
+            const auto budgets    = budgets_of(probe);
+            const auto sizing     = resolve_kv_capacity_symmetric(options.kv_capacity,
+                                                                  probe.capacity_curve(), budgets);
+            const std::size_t budget = *std::min_element(budgets.begin(), budgets.end());
+            const std::size_t slack  = (probe.kv_plane_count() + 16) * kElasticGranule;
+            // The Program without KV and without slots, plus the headroom and the extra slots.
+            const std::size_t fixed =
+                sizing.runtime_reservation_bytes - kv_full + options.routed_experts.slot_headroom_bytes +
+                slack +
+                static_cast<std::size_t>(
+                    models::qwen3_5::offloaded_expert_staging_bytes(instance->parameters, options)) +
+                static_cast<std::size_t>(
+                    models::qwen3_5::offloaded_expert_split_bytes(instance->parameters, options));
+            const std::size_t kv_max = options.elastic_kv.kv_budget_bytes > 0
+                                           ? std::min(kv_full, options.elastic_kv.kv_budget_bytes)
+                                           : kv_full;
+            const auto slots_with = [&](std::size_t kv) -> std::size_t {
+                return budget > fixed + kv ? (budget - fixed - kv) / static_cast<std::size_t>(slot_bytes)
+                                           : 0;
+            };
+            const std::size_t base  = std::min<std::size_t>(slots_with(kv_max), 512);
+            const std::size_t total = std::min<std::size_t>(slots_with(kv_init), 512);
+            if (base == 0) {
+                throw std::invalid_argument(
+                    "elastic_kv: the KV of max_context (" + std::to_string(kv_max) +
+                    " bytes) leaves no expert slot per layer (" + std::to_string(budget) +
+                    " bytes free after weights); lower max_context or set kv_budget_bytes");
+            }
+            planned_options.routed_experts.slots_per_layer = static_cast<std::uint32_t>(base);
+            planned_options.routed_experts.elastic_columns = static_cast<std::uint32_t>(total - base);
+            std::fprintf(stderr,
+                         "elastic KV: %zu base + %zu elastic expert slots per layer, KV %zu bytes at "
+                         "max context (%zu backed at start, budget %zu)\n",
+                         base, total - base, kv_full, kv_init, kv_max);
+        }
+    } else if (slot_bytes > 0 && options.routed_experts.slots_per_layer == 0) {
+        // Offloaded experts: the device memory the rest of the Program leaves, minus the
+        // headroom, becomes expert slots (one slot per layer at a time).
+        auto probe            = make_planner(planned_options);
+        const auto budgets    = budgets_of(probe);
+        const auto sizing     = resolve_kv_capacity_symmetric(options.kv_capacity,
+                                                              probe.capacity_curve(), budgets);
+        const std::size_t budget = *std::min_element(budgets.begin(), budgets.end());
+        // Each of the pool's four planes may cost one arena alignment more.
+        constexpr std::size_t kPoolSlack = std::size_t(1) << 20;
+        // The prefetch staging slots (T25) and the staged miss split's scratch slots (T18) come
+        // out of the same budget.
+        const std::size_t used =
+            sizing.runtime_reservation_bytes + options.routed_experts.slot_headroom_bytes + kPoolSlack +
+            static_cast<std::size_t>(
+                models::qwen3_5::offloaded_expert_staging_bytes(instance->parameters, options)) +
+            static_cast<std::size_t>(
+                models::qwen3_5::offloaded_expert_split_bytes(instance->parameters, options));
+        const std::size_t slots =
+            budget > used ? (budget - used) / static_cast<std::size_t>(slot_bytes) : 0;
+        if (slots == 0) {
+            throw std::invalid_argument(
+                "offloaded experts: no device memory left for one expert slot per layer (" +
+                std::to_string(budget) + " bytes free after weights, " +
+                std::to_string(sizing.runtime_reservation_bytes) + " bytes of Program, " +
+                std::to_string(options.routed_experts.slot_headroom_bytes) + " bytes headroom)");
+        }
+        planned_options.routed_experts.slots_per_layer =
+            static_cast<std::uint32_t>(std::min<std::size_t>(slots, 512));
+    }
+    auto planner      = make_planner(planned_options);
+    auto rank_budgets = budgets_of(planner);
+    for (auto& b : rank_budgets) { b += elastic_unbacked; }
     auto resolution =
         resolve_kv_capacity_symmetric(options.kv_capacity, planner.capacity_curve(), rank_budgets);
     auto sequence = std::move(planner).finalize(resolution.main_page_groups);

@@ -237,4 +237,38 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
                                 Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                                 Tensor& z, WorkspaceArena& workspace, cudaStream_t stream);
 
+/**
+ * Op: gdn_projected_conv_snapshot
+ *
+ * Convolution half of gdn_input_proj_conv_snapshot for an already projected input, for
+ * architectures whose input width has no fused projection route (Qwen3.8-Flash-Next, hidden
+ * 2560): the Linear Op projects, this Op convolves. `projected` is contiguous BF16 [C,W,B] holding
+ * the query, key and value projection rows in that order. Registered profiles are C=10240 with
+ * query/key/value rows 2048/2048/6144 and its two-device half C=5120 with 1024/1024/3072. Every
+ * other operand, the B/W domain, the slot/snapshot contract, the FP64 oracle and the criterion are
+ * those of gdn_input_proj_conv_snapshot with the projection removed: ideal outputs are
+ * SiLU(conv4(history || projected)) evaluated in FP64 from the represented BF16 inputs. Every
+ * tensor operand is mutually non-overlapping except the two read-only slot selectors.
+ */
+void gdn_projected_conv_snapshot(const Tensor& projected, const Tensor& conv_weight,
+                                 Tensor& conv_states, const Tensor& valid_columns,
+                                 const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                 Tensor& value, cudaStream_t stream);
+
+/**
+ * Op: gdn_projected_conv_record
+ *
+ * Convolution half of gdn_input_proj_conv_record: `conv_record` is the caller-projected BF16
+ * [C,T,B] record (the projection writes it directly) that gdn_replay_fold commits later. It is
+ * read-only here; conv_states is not modified. Registered profiles, the ReplaySSM B=1..8,
+ * T=2..16 domain and the outputs are those of gdn_input_proj_conv_record; valid outputs are
+ * bit-identical to gdn_projected_conv_snapshot from the same history and record. Every tensor
+ * operand is mutually non-overlapping.
+ */
+void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_weight,
+                               const Tensor& conv_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots, Tensor& query, Tensor& key,
+                               Tensor& value, cudaStream_t stream);
+
 } // namespace ninfer::ops

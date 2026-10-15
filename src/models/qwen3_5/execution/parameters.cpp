@@ -2,7 +2,9 @@
 
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/moe_route.h"
 
+#include <algorithm>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -303,6 +305,270 @@ public:
         return out;
     }
 
+    // ---- Qwen4Exp ---------------------------------------------------------------------------
+
+    // Rows of several direct BF16 parameters that sit consecutively in one parent.
+    Tensor joined_matrix(std::initializer_list<WeightId> ids) const {
+        WeightView view;
+        std::uint64_t rows = 0, columns = 0;
+        for (const auto id : ids) {
+            const auto& input = weight(id).view;
+            if (input.shape.size() != 2 || (columns != 0 && input.shape[1] != columns)) {
+                throw std::invalid_argument("joined matrix rows must share one width");
+            }
+            columns = input.shape[1];
+            rows += input.shape[0];
+            for (const auto& part : input.parts) {
+                if (part.parent->geometry.format != QType::BF16 ||
+                    (!view.parts.empty() && (view.parts.back().parent != part.parent ||
+                                             view.parts.back().end != part.begin))) {
+                    throw std::invalid_argument("joined matrix is not one contiguous BF16 region");
+                }
+                view.parts.push_back(part);
+            }
+        }
+        view.shape = {rows, columns};
+        return weight_tensor(view, {dimension(columns), dimension(rows)});
+    }
+
+    HyperConnectionParameters hyper_connection(const HyperConnectionWeights& w) const {
+        HyperConnectionParameters out;
+        out.weights.norm = tensor(w.norm);
+        if (w.inject) {
+            out.weights.down =
+                ops::prepare_linear_weight(std::array{input(w.down), input(*w.inject)}).weight;
+            out.inject = true;
+        } else {
+            out.weights.down = linear(w.down).weight;
+        }
+        out.weights.up = linear(w.up).weight;
+        return out;
+    }
+
+    // `mtp`: the MTP layer's bank, which may keep one weight divisor per bank (ninfer-ext's
+    // artifact; reported through `uniform`) and may have no calibrated activation divisors (left
+    // 0 here; Parameters derives them from the Text layers).
+    struct UniformDivisors {
+        float gate_up = 0.0F;
+        float down    = 0.0F;
+    };
+
+    Qwen4ExpertBank expert_bank(const MoeWeights& moe, bool mtp = false,
+                                UniformDivisors* uniform = nullptr) const {
+        const auto& config = model_.config().text;
+        const auto& geo    = std::get<MoeConfig>(config.ffn);
+        if (geo.num_experts != 512 || geo.num_experts_per_tok != ops::kMoeSlotsTopK ||
+            geo.moe_intermediate_size != ops::kMoeSlotsIntermediate ||
+            config.hidden_size != ops::kMoeSlotsHidden) {
+            throw std::invalid_argument("routed experts implement the 2560/512/top-10/640 geometry");
+        }
+        const auto single = [&](WeightId id) -> const WeightRegion& {
+            const auto& parts = weight(id).view.parts;
+            if (parts.size() != 1) {
+                throw std::invalid_argument("a routed expert matrix must be one bank region");
+            }
+            return parts.front();
+        };
+        const WeightParent* gate_up = single(moe.experts.front().gate).parent;
+        const WeightParent* down    = single(moe.experts.front().down).parent;
+        const std::uint64_t h = config.hidden_size, ir = geo.moe_intermediate_size;
+        for (std::uint32_t e = 0; e < geo.num_experts; ++e) {
+            const auto& expert = moe.experts[e];
+            const auto& g      = single(expert.gate);
+            const auto& u      = single(expert.up);
+            const auto& d      = single(expert.down);
+            if (g.parent != gate_up || u.parent != gate_up || d.parent != down ||
+                g.begin != (2 * e) * ir * h || u.begin != (2 * e + 1) * ir * h ||
+                d.begin != e * h * ir) {
+                throw std::invalid_argument("routed experts are not stored expert-major");
+            }
+        }
+        for (const auto* parent : {gate_up, down}) {
+            if (parent->geometry.format != QType::NVFP4 ||
+                parent->geometry.layout != QuantLayout::BlockScaleK16M128x4) {
+                throw std::invalid_argument("routed experts must be block-scaled NVFP4 banks");
+            }
+        }
+        const bool stacked = gate_up->geometry.divisor_count == 2ULL * geo.num_experts &&
+                             down->geometry.divisor_count == geo.num_experts;
+        const bool bank_wide =
+            mtp && gate_up->geometry.divisor_count == 1 && down->geometry.divisor_count == 1;
+        if (!stacked && !bank_wide) {
+            throw std::invalid_argument(
+                "routed expert banks must keep one weight divisor per matrix (stacked planes)");
+        }
+        Qwen4ExpertBank out;
+        out.bank.gate_up_codes  = {gate_up->data, ops::kMoeSlotsGateUpCodeBytes};
+        out.bank.gate_up_scales = {gate_up->data + gate_up->geometry.scale_offset,
+                                   ops::kMoeSlotsGateUpScaleBytes};
+        out.bank.down_codes     = {down->data, ops::kMoeSlotsDownCodeBytes};
+        out.bank.down_scales    = {down->data + down->geometry.scale_offset,
+                                   ops::kMoeSlotsDownScaleBytes};
+        out.bank.slots          = static_cast<std::int32_t>(geo.num_experts);
+        out.gate_up_divisors =
+            reinterpret_cast<const float*>(gate_up->data + gate_up->geometry.divisor_offset);
+        out.down_divisors =
+            reinterpret_cast<const float*>(down->data + down->geometry.divisor_offset);
+        if (bank_wide) {
+            // Host-mapped words, readable here; the Program expands them into per-expert planes.
+            if (uniform == nullptr || !(*out.gate_up_divisors > 0.0F) ||
+                !(*out.down_divisors > 0.0F)) {
+                throw std::invalid_argument("MTP expert bank divisors are invalid");
+            }
+            uniform->gate_up      = *out.gate_up_divisors;
+            uniform->down         = *out.down_divisors;
+            out.gate_up_divisors  = nullptr;
+            out.down_divisors     = nullptr;
+        }
+        if (mtp) {
+            // Calibrated activation divisors stored with the bank (AllowA4 uses) are used like the
+            // Text layers'; the checkpoint has none for MTP, so its banks are A16Only and the
+            // divisors are derived later (Qwen4MtpParameters).
+            bool calibrated = true;
+            for (const auto& expert : moe.experts) {
+                for (const WeightId id : {expert.gate, expert.up, expert.down}) {
+                    const ops::WeightInput use = input(id);
+                    calibrated = calibrated && use.policy == ops::LinearPolicy::AllowA4 &&
+                                 use.activation_input_divisor &&
+                                 *use.activation_input_divisor > 0.0F;
+                }
+            }
+            if (!calibrated) { return out; }
+        }
+        // moe_slots_nvfp4 quantizes each input once per call with one activation divisor per
+        // layer and projection input. ModelOpt calibrates the same input_scale for every expert of
+        // a layer in the real checkpoint (T15), so this is exact there; where experts differ (the
+        // synthetic checkpoints) the smallest divisor, i.e. the largest calibrated range, is used
+        // so no activation saturates its E4M3 block scale.
+        const auto smallest = [&](auto projections, const char* label) {
+            float smallest_divisor = std::numeric_limits<float>::infinity();
+            for (const auto& expert : moe.experts) {
+                for (const WeightId id : projections(expert)) {
+                    const ops::WeightInput use = input(id);
+                    if (use.policy != ops::LinearPolicy::AllowA4 || !use.activation_input_divisor ||
+                        !(*use.activation_input_divisor > 0.0F)) {
+                        throw std::invalid_argument(
+                            std::string("routed expert ") + label +
+                            " inputs must permit NVFP4 activations with a calibrated divisor");
+                    }
+                    smallest_divisor = std::min(smallest_divisor, *use.activation_input_divisor);
+                }
+            }
+            return smallest_divisor;
+        };
+        out.gate_up_input_divisor = smallest(
+            [](const DenseWeights& expert) { return std::array{expert.gate, expert.up}; },
+            "gate/up");
+        out.down_input_divisor =
+            smallest([](const DenseWeights& expert) { return std::array{expert.down}; }, "down");
+        return out;
+    }
+
+    Qwen4MoeParameters qwen4_moe(const MoeWeights& w, bool mtp = false,
+                                 UniformDivisors* uniform = nullptr) const {
+        Qwen4MoeParameters out;
+        out.router = joined_matrix({w.router, w.shared_score});
+        if (out.router.ne[0] != ops::kMoeRouteHidden ||
+            out.router.ne[1] != ops::kMoeRouteExperts + 1) {
+            throw std::invalid_argument("router must be BF16 [513, 2560]");
+        }
+        if (resident(w.shared.gate)) {
+            out.shared = Qwen4SharedExpertParameters{
+                ops::prepare_linear_weight(std::array{input(w.shared.gate), input(w.shared.up)}),
+                linear(w.shared.down)};
+        }
+        out.experts     = expert_bank(w, mtp, uniform);
+        return out;
+    }
+
+    PleParameters ple(const PleWeights& w) const {
+        const auto& config = *model_.config().text.ple;
+        const auto& table  = model_.file_weight(w.table);
+        const auto& geo    = table.mapped_geometry;
+        if (geo.format != QType::FP8_E4M3FN_ROW_BF16 || geo.shape.size() != 2) {
+            throw std::invalid_argument("PLE table must be a file-mapped row-scaled FP8 matrix");
+        }
+        PleParameters out;
+        for (const auto& segment : table.mapped) {
+            out.table.segments.push_back({.object_offset = segment.object_offset,
+                                          .bytes         = segment.bytes,
+                                          .data          = segment.data,
+                                          .file          = segment.file,
+                                          .file_offset   = segment.file_offset});
+        }
+        out.table.rows        = geo.shape[0];
+        out.table.row_width   = static_cast<std::uint32_t>(geo.shape[1]);
+        out.table.row_bytes   = geo.code_bytes_per_row;
+        out.table.scale_plane = geo.scale_offset;
+        out.hash.ngram_size      = config.ngram_size;
+        out.hash.heads_per_ngram = config.heads_per_ngram;
+        out.hash.eos_token_id    = config.eos_token_id;
+        out.hash.multipliers     = config.multipliers;
+        out.hash.head_moduli     = config.head_moduli;
+        out.hash.head_offsets    = config.head_offsets;
+        if (out.hash.heads() * out.table.row_width != config.embed_dim ||
+            out.table.rows != config.table_rows) {
+            throw std::invalid_argument("PLE table geometry does not match the configuration");
+        }
+        out.key_value   = ops::prepare_linear_weight(std::array{input(w.key), input(w.value)});
+        out.key_norm    = tensor(w.key_norm);
+        out.query_norm  = tensor(w.query_norm);
+        out.conv_norm   = tensor(w.conv_norm);
+        out.convolution = tensor(w.convolution);
+        return out;
+    }
+
+    Qwen4BlockParameters qwen4_block(const Qwen4BlockWeights& w, bool mtp = false,
+                                     UniformDivisors* uniform = nullptr) const {
+        Qwen4BlockParameters out;
+        out.attention_hc = hyper_connection(w.attention_hc);
+        out.ffn_hc       = hyper_connection(w.ffn_hc);
+        if (const auto* q = std::get_if<QsaWeights>(&w.mixer)) {
+            const auto& a = q->attention;
+            out.mixer     = QsaParameters{
+                ops::prepare_linear_weight(
+                    std::array{input(a.query), input(a.key), input(a.gate), input(a.value)}),
+                tensor(a.query_norm),
+                tensor(a.key_norm),
+                linear(a.output),
+                ops::prepare_linear_weight(
+                    std::array{input(q->indexer_query), input(q->indexer_key)}),
+                tensor(q->indexer_query_norm),
+                tensor(q->indexer_key_norm)};
+        } else {
+            const auto& g = std::get<GdnWeights>(w.mixer);
+            out.mixer     = Qwen4GdnParameters{
+                ops::prepare_linear_weight(
+                    std::array{input(g.query), input(g.key), input(g.value), input(g.z)}),
+                ops::prepare_linear_weight(std::array{input(g.a_projection), input(g.b_projection)}),
+                tensor(g.a_log),
+                tensor(g.dt_bias),
+                tensor(g.convolution),
+                tensor(g.norm),
+                linear(g.output)};
+        }
+        out.moe = qwen4_moe(w.moe, mtp, uniform);
+        if (w.ple) { out.ple = ple(*w.ple); }
+        return out;
+    }
+
+    Qwen4MtpParameters qwen4_mtp(const Qwen4MtpWeights& w) const {
+        Qwen4MtpParameters out;
+        out.embedding_norm       = tensor(w.embedding_norm);
+        out.hidden_norm          = tensor(w.hidden_norm);
+        out.embedding_projection = linear(w.embedding_projection);
+        out.hidden_projection    = linear(w.hidden_projection);
+        out.head                 = hyper_connection(w.head);
+        if (out.head.inject || w.layer.ple || !std::holds_alternative<QsaWeights>(w.layer.mixer)) {
+            throw std::invalid_argument("MTP layer must be one QSA block without PLE");
+        }
+        UniformDivisors uniform;
+        out.layer                   = qwen4_block(w.layer, true, &uniform);
+        out.uniform_gate_up_divisor = uniform.gate_up;
+        out.uniform_down_divisor    = uniform.down;
+        return out;
+    }
+
 private:
     const Model& model_;
     int device_   = 0;
@@ -314,6 +580,44 @@ private:
 Parameters::Parameters(const Model& source, int rank) : model(source), device(rank) {
     const Prepare prepare(model, device);
     const auto& w        = model.weights();
+    if (model.config().text.qwen4()) {
+        // Qwen4Exp Text at one device or at tp 2 (this rank's shards), and its MTP layer (T24).
+        // Vision, draft and proposal heads have no Qwen4Exp execution yet; loading and the
+        // Program refuse them.
+        if (model.device_count() > 2 || !w.qwen4) {
+            throw std::invalid_argument(
+                "Qwen4ExpForCausalLM executes on one or two devices with its Text weights bound");
+        }
+        text.token_embedding = native_weight(prepare.weight(w.text.token_embedding).view);
+        text.output_head     = prepare.linear(w.text.output_head_use);
+        Qwen4Parameters q;
+        q.head = with_context("text/hc_head", [&] { return prepare.hyper_connection(w.qwen4->head); });
+        q.layers.reserve(w.qwen4->layers.size());
+        for (std::size_t i = 0; i < w.qwen4->layers.size(); ++i) {
+            q.layers.push_back(with_context("text/layers/" + std::to_string(i), [&] {
+                return prepare.qwen4_block(w.qwen4->layers[i]);
+            }));
+        }
+        qwen4 = std::move(q);
+        if (w.qwen4_mtp) {
+            qwen4_mtp = with_context("mtp", [&] { return prepare.qwen4_mtp(*w.qwen4_mtp); });
+            auto& bank = qwen4_mtp->layer.moe.experts;
+            if (!(bank.gate_up_input_divisor > 0.0F) || !(bank.down_input_divisor > 0.0F)) {
+                // No calibrated activation divisors for the MTP experts: the widest calibrated
+                // range of the Text layers (smallest divisor), widened by the margin.
+                float gate_up = std::numeric_limits<float>::infinity();
+                float down    = std::numeric_limits<float>::infinity();
+                for (const auto& layer : qwen4->layers) {
+                    gate_up = std::min(gate_up, layer.moe.experts.gate_up_input_divisor);
+                    down    = std::min(down, layer.moe.experts.down_input_divisor);
+                }
+                bank.gate_up_input_divisor             = gate_up / kQwen4MtpActivationRangeMargin;
+                bank.down_input_divisor                = down / kQwen4MtpActivationRangeMargin;
+                qwen4_mtp->derived_activation_divisors = true;
+            }
+        }
+        return;
+    }
     text.token_embedding = native_weight(prepare.weight(w.text.token_embedding).view);
     text.output_head     = prepare.linear(w.text.output_head_use);
     text.final_norm      = prepare.tensor(w.text.final_norm);

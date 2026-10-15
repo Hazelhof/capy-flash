@@ -48,7 +48,9 @@ void validate_linear_policy(LinearPolicy policy) {
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
+    // T128c: Q8 weights may also write FP32 out (TP2 partials exchanged before the BF16 rounding).
+    const bool fp32_out = out.dtype == DType::FP32 && w.qtype == QType::Q8_G32_FP16;
+    if (x.dtype != DType::BF16 || (out.dtype != DType::BF16 && !fp32_out)) {
         throw std::invalid_argument("linear: x/out must be BF16");
     }
     (void)checked_numel(x, "x");

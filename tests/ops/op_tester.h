@@ -251,6 +251,10 @@ public:
         : storage_(allocation_bytes(payload_bytes, guard_bytes)), payload_bytes_(payload_bytes),
           guard_bytes_(guard_bytes), guard_byte_(guard_byte) {
         storage_.fill(guard_byte_);
+        // cudaMemset runs on the legacy stream, which does not order the non-blocking streams
+        // the Ops run on: wait for it, or under load the guard fill can land after a kernel
+        // wrote the payload (T162: hyper_connection read 0xa5a5a5a5 as its output).
+        cuda_check(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize guarded fill");
     }
 
     void* data() noexcept { return static_cast<std::uint8_t*>(storage_.p) + guard_bytes_; }
@@ -265,6 +269,7 @@ public:
         if (payload_bytes_ != 0) {
             cuda_check(cudaMemset(data(), byte_value, payload_bytes_),
                        "cudaMemset guarded payload");
+            cuda_check(cudaStreamSynchronize(nullptr), "cudaStreamSynchronize guarded payload");
         }
     }
 

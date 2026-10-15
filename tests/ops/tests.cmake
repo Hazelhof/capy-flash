@@ -27,6 +27,7 @@ set(ninfer_op_tests
   target_logprobs
   position
   allreduce
+  allreduce_f32
   linear_split
   output_head_split
   proposal_head_split
@@ -37,7 +38,14 @@ set(ninfer_op_tests
   gdn_projections_split
   gdn_headsplit
   linear_swiglu_split
-  linear_add_split)
+  linear_add_split
+  hyper_connection
+  hyper_connection_split
+  ple
+  moe_slots
+  moe_grouped
+  moe_route
+  moe_predict)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test
     SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_${op}.cpp"
@@ -48,8 +56,32 @@ ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_host_moe_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_moe.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_host_moe_mailbox_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_moe_mailbox.cu"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_flash_next_tp2_mixers_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_flash_next_tp2_mixers.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_flash_next_tp2_moe_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_flash_next_tp2_moe.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_flash_next_gdn_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_flash_next_gdn.cpp"
+  LIBRARIES ninfer_ops)
+
+ninfer_add_op_test(ninfer_sparse_attention_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_attention.cpp"
   LIBRARIES ninfer_ops)
 
 ninfer_add_op_test(ninfer_softmax_attention_test
@@ -142,3 +174,13 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_pair/tests.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_swiglu/tests.cmake")
+
+# T98 validation probe (docs/capy-flash/development-log.md): engine CPU W4A8 vs GPU W4A4 on real experts
+add_executable(t98_expert_probe "${CMAKE_CURRENT_LIST_DIR}/t98_expert_probe.cu")
+ninfer_test_includes(t98_expert_probe)
+target_link_libraries(t98_expert_probe PRIVATE ninfer_ops)
+
+# T103 check (docs/capy-flash/development-log.md): generic BF16 linear on Flash-Next shapes
+add_executable(t103_bf16_generic "${CMAKE_CURRENT_LIST_DIR}/t103_bf16_generic.cu")
+ninfer_test_includes(t103_bf16_generic)
+target_link_libraries(t103_bf16_generic PRIVATE ninfer_ops)

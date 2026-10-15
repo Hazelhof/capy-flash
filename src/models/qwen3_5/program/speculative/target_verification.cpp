@@ -1,7 +1,10 @@
+#include "core/device.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+
+#include <cuda_runtime.h>
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -22,6 +25,12 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
                                  frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
                                  envelope, frame.target_hidden, frame.target_logits,
                                  frame.target_tokens);
+    }
+    if (frame.forced_targets.data != nullptr) {
+        // T59 replay: the reference continuation stands in for the computed argmax.
+        CUDA_CHECK(::ninfer::memcpy_device_async(frame.target_tokens.data, frame.forced_targets.data,
+                                   frame.target_tokens.bytes(),
+                                   execution.device.stream));
     }
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(

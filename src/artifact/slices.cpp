@@ -224,6 +224,9 @@ TensorSlice tensor_column_slice(const WeightGeometry& parent, std::span<const Sl
 
 TensorSlice tensor_slice(const WeightGeometry& parent, ShardAxis axis,
                          std::span<const SliceRange> ranges) {
+    // A stacked NVFP4 plane (routed experts) is held whole, in host memory; no shard rule splits
+    // it, and its per-source divisor words would need their own copy rule.
+    require_slice(parent.divisor_count == 1, "a stacked NVFP4 plane is not sliced");
     if (axis == ShardAxis::Rows) { return tensor_row_slice(parent, ranges); }
     if (axis == ShardAxis::Columns) { return tensor_column_slice(parent, ranges); }
     throw ArtifactError("tensor slice: placement does not narrow an axis");

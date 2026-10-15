@@ -71,6 +71,41 @@ void materialization(DeviceContext& device) {
     require(code[0] == std::byte{0x52}, "native row pointer addressed a different row");
 }
 
+// A HostFile object is mapped, not read: one read-only segment per file it crosses, addressed by
+// object offset, holding exactly the stored bytes; no device or host copy is made.
+void file_mapping(DeviceContext& device) {
+    Fixture fixture;
+    fixture.write(true);
+    std::optional<MaterializedArtifact> backing;
+    ObjectHandle quantized;
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const auto matrix = binder.parameter("matrix", {2, 130}, Residency::HostFile);
+        quantized         = matrix.binding.parts.at(0).object;
+        rejects([&] { (void)bind_view(matrix, MaterializedArtifact{}); },
+                "a file-mapped parameter produced a parent view");
+        backing.emplace(materialize(reader, std::move(binder).finish(), device));
+    }
+    const auto& stats = backing->stats();
+    require(stats.mapped_file_bytes == 528 && stats.h2d_bytes == 0 && stats.read_bytes == 0 &&
+                stats.device_object_count == 0,
+            "a file-mapped object was read, uploaded or given device backing");
+    const auto segments = backing->file_segments(quantized);
+    // q5 spans payload [256, 784); the entry file holds payload [0, 500).
+    require(segments.size() == 2 && segments[0].object_offset == 0 && segments[0].bytes == 244 &&
+                segments[1].object_offset == 244 && segments[1].bytes == 284,
+            "file mapping did not split at the continuation boundary");
+    for (const auto& segment : segments) {
+        require(std::equal(segment.data, segment.data + segment.bytes,
+                           fixture.payload.begin() + 256 +
+                               static_cast<std::ptrdiff_t>(segment.object_offset)),
+                "mapped bytes differ from the stored object");
+    }
+    require(backing->file_geometry(quantized).format == QType::Q5_G64_FP16,
+            "file-mapped tensor geometry lost");
+}
+
 void failure_and_host_only(DeviceContext& device) {
     Fixture fixture;
     fixture.write();
@@ -228,6 +263,7 @@ int main(int argc, char** argv) {
             throw std::invalid_argument("expected [--artifact|--writer-fixture PATH]");
         }
         materialization(device);
+        file_mapping(device);
         failure_and_host_only(device);
         ninfer::test::materialization_cuda_errors(device);
         staging_reuse(device);

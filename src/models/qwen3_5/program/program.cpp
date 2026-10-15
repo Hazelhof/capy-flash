@@ -52,6 +52,24 @@ std::size_t SequencePlanner::unallocated_reservation_bytes(int rank) const noexc
                : 0;
 }
 
+std::size_t SequencePlanner::kv_pool_bytes() const noexcept {
+    if (impl_ == nullptr || impl_->minimum == nullptr) { return 0; }
+    const auto& d = impl_->minimum->persistent.decoder;
+    return d.text_kv.pages.payload_bytes() + (d.mtp_kv ? d.mtp_kv->pages.payload_bytes() : 0);
+}
+
+std::uint32_t SequencePlanner::kv_pool_pages() const noexcept {
+    return impl_ != nullptr && impl_->minimum != nullptr
+               ? impl_->minimum->persistent.decoder.text_kv.pages.spec.page_group_count
+               : 0;
+}
+
+std::size_t SequencePlanner::kv_plane_count() const noexcept {
+    if (impl_ == nullptr || impl_->minimum == nullptr) { return 0; }
+    const auto& d = impl_->minimum->persistent.decoder;
+    return d.text_kv.pages.planes.size() + (d.mtp_kv ? d.mtp_kv->pages.planes.size() : 0);
+}
+
 const runtime::SequenceCapacityCurve& SequencePlanner::capacity_curve() const noexcept {
     static const runtime::SequenceCapacityCurve empty;
     return impl_ != nullptr ? impl_->curve : empty;
@@ -489,6 +507,36 @@ MemorySummary Program::memory_summary() const noexcept { return impl_->memory_su
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
 const TpTransportStatus& Program::tp_transport() const noexcept { return impl_->tp_transport_status; }
+
+std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
+                                         const EngineOptions& options) {
+    if (!parameters.qwen4 || options.routed_experts.backend != RoutedExpertBackend::Offload) {
+        return 0;
+    }
+    // Under MTP the MTP layer is one more cache layer (planning: Qwen4PersistentLayout).
+    const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp && parameters.qwen4_mtp;
+    return execution::Qwen4OffloadExperts::slot_bytes(
+        static_cast<std::int32_t>(parameters.qwen4->layers.size()) + (mtp ? 1 : 0));
+}
+
+std::int64_t offloaded_expert_staging_bytes(const execution::Parameters& parameters,
+                                            const EngineOptions& options) {
+    if (!parameters.qwen4 || options.routed_experts.backend != RoutedExpertBackend::Offload) {
+        return 0;
+    }
+    return static_cast<std::int64_t>(2U * options.routed_experts.prefetch_slots) *
+           execution::Qwen4OffloadExperts::slot_bytes(1);
+}
+
+std::int64_t offloaded_expert_split_bytes(const execution::Parameters& parameters,
+                                          const EngineOptions& options) {
+    if (offloaded_expert_slot_bytes(parameters, options) == 0 ||
+        !execution::staged_miss_split(options.routed_experts)) {
+        return 0;
+    }
+    // Planning: four scratch planes, the I32 [512] table and the pick list, each arena-aligned.
+    return execution::Qwen4OffloadExperts::slot_bytes(1) * execution::kMissSplitSlots + 6 * 4096;
+}
 
 SequencePlanner make_sequence_planner(const execution::Parameters& parameters,
                                       DeviceContext& device, const EngineOptions& options) {

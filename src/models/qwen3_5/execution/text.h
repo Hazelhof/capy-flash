@@ -65,6 +65,7 @@ struct DFlashFeatureSink {
 };
 
 class VisionPrefillSession;
+struct Qwen4Runtime;
 
 class TextContext {
 public:
@@ -106,6 +107,10 @@ public:
 
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+
+    // Qwen4Exp: the Program's runtime inputs (expert backend, PLE states and staging). Required
+    // before any Qwen4Exp call; ignored by the Qwen3.5 architectures.
+    void set_qwen4_runtime(const Qwen4Runtime* runtime) noexcept { qwen4_runtime_ = runtime; }
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
 
@@ -152,7 +157,10 @@ public:
                                   const Tensor& valid_columns, const Tensor& kv_table_rows,
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   Tensor& mtp_hidden);
-    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    // `draft_logprobs` (FP32 [B], optional): each proposal's softmax log-probability over the
+    // proposal vocabulary (T41's adaptive window; the draft shortlist's rows under T43).
+    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                           Tensor* draft_logprobs = nullptr);
     void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
                            ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
                            int logits_column, Tensor* logits, Tensor* draft_token,
@@ -161,6 +169,10 @@ public:
     void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
+    // Qwen4Exp: the complete logits [V,1] (on rank 0) of one retained wide residual [S*H,1]
+    // through the Text output mixer and head. At tp 2 `peer_hidden` is rank 1's copy, or null to
+    // copy rank 0's (the residual is replicated across the ranks).
+    void qwen4_logits_from_hidden(const Tensor& hidden, const Tensor* peer_hidden, Tensor& logits);
 
 #include "models/qwen3_5/execution/tp2/text_context_public.inc"
 private:
@@ -216,6 +228,87 @@ private:
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+
+    // Qwen4Exp (execution/qwen4_text.cpp).
+    [[nodiscard]] bool qwen4() const noexcept { return parameters_.qwen4.has_value(); }
+    // Rows of the hidden a round carries: Qwen4Exp carries the wide residual (S*H), the other
+    // architectures the final-normed hidden (H).
+    [[nodiscard]] std::int32_t carried_hidden_rows() const noexcept {
+        return qwen4() ? dimension(config_.residual_width()) : dimension(config_.hidden_size);
+    }
+    [[nodiscard]] const Qwen4Runtime& qwen4_runtime() const;
+    [[nodiscard]] PrefillChunkResult qwen4_prefill(std::span<const int> ids,
+                                                   const TextPrefill* text_prefill,
+                                                   bool finalize_at_end);
+    void qwen4_ordinary_decode(const Tensor& ids, const Tensor& cache_positions,
+                               const Tensor& rope_positions, const Tensor& kv_table_rows,
+                               const Tensor& source_slots, const Tensor& destination_slots,
+                               ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                               Tensor& logits);
+    // tp 2 (both ranks in lockstep, rank 1's operands from TpExecution; qwen4_text.cpp).
+    void validate_tensor_parallel_qwen4();
+    [[nodiscard]] const Qwen4Runtime& qwen4_peer_runtime() const;
+    [[nodiscard]] PrefillChunkResult qwen4_prefill_tp2(std::span<const int> ids,
+                                                       const TextPrefill* text_prefill,
+                                                       bool finalize_at_end);
+    void qwen4_ordinary_decode_tp2(const Tensor& ids, const Tensor& cache_positions,
+                                   const Tensor& rope_positions, const Tensor& kv_table_rows,
+                                   const Tensor& source_slots, const Tensor& destination_slots,
+                                   ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                                   Tensor& logits);
+    // MTP at tp 2 (T33): the verification over both ranks, the MTP layer per rank (each rank
+    // embeds its own copy of the ids), the proposal through the replicated MTP output mixer and
+    // the vocabulary-split head, and the prompt's MTP KV and drafts.
+    void qwen4_target_verify_tp2(const RankTensors& ids, const RankTensors& cache_positions,
+                                 const RankTensors& rope_positions,
+                                 const RankTensors& valid_columns,
+                                 const RankTensors& kv_table_rows,
+                                 const RankTensors& source_slots,
+                                 ops::CausalAttentionExecutionEnvelope envelope,
+                                 const RankTensors& hidden, Tensor& logits,
+                                 Tensor& target_tokens);
+    void qwen4_mtp_forward_decode_tp2(const Tensor& ids, const RankTensors& hidden,
+                                      const RankTensors& cache_positions,
+                                      const RankTensors& rope_positions,
+                                      const RankTensors& valid_columns,
+                                      const RankTensors& kv_table_rows,
+                                      ops::CausalAttentionExecutionEnvelope envelope,
+                                      const RankTensors& mtp_hidden);
+    void qwen4_mtp_propose_tp2(const RankTensors& hidden, Tensor& logits, Tensor& draft_tokens,
+                               Tensor* draft_logprobs = nullptr);
+    void qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hidden,
+                               const RankTensors& positions, const RankTensors& rope_positions,
+                               std::uint32_t max_visible, bool propose);
+    // T66b: the prefix-reuse bridge column and its proposal steps over both ranks.
+    void qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTensors& hidden,
+                                     const RankTensors& positions,
+                                     const RankTensors& rope_positions,
+                                     ops::CausalAttentionExecutionEnvelope envelope,
+                                     const RankTensors& mtp_hidden, int logits_column,
+                                     Tensor* logits, Tensor* draft_token,
+                                     const Tensor* input_embeddings);
+    // Rank 1's copy (its transient arena) of rank 0's device ids, ordered after rank 0's stream.
+    [[nodiscard]] Tensor qwen4_ids_on_rank1(const Tensor& ids);
+    void qwen4_target_verify(const Tensor& ids, const Tensor& cache_positions,
+                             const Tensor& rope_positions, const Tensor& valid_columns,
+                             const Tensor& kv_table_rows, const Tensor& source_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                             Tensor& logits, Tensor& target_tokens);
+    void qwen4_mtp_forward_decode(const Tensor& ids, const Tensor& hidden,
+                                  const Tensor& cache_positions, const Tensor& rope_positions,
+                                  const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                  ops::CausalAttentionExecutionEnvelope envelope,
+                                  Tensor& mtp_hidden);
+    void qwen4_mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                                 ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
+                                 int logits_column, Tensor* logits, Tensor* draft_token,
+                                 const Tensor* explicit_rope_positions,
+                                 const Tensor* input_embeddings);
+    void qwen4_mtp_propose(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                           Tensor* draft_logprobs = nullptr);
+    void qwen4_mtp_prefill(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                           const Tensor& rope_positions, std::uint32_t max_visible,
+                           bool propose);
     DeviceContext& ctx_;
     const Parameters& parameters_;
     const TextConfig& config_;
@@ -256,6 +349,8 @@ private:
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
     const MtpParameters* mtp_                   = nullptr;
+    const Qwen4Runtime* qwen4_runtime_          = nullptr;
+    const Qwen4MtpParameters* qwen4_mtp_        = nullptr;
 
 #include "models/qwen3_5/execution/tp2/text_context_private.inc"
 };

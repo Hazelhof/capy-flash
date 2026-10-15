@@ -1,4 +1,4 @@
-[2026-10-05 18:54:09] gate RECORD | build /home/feyd/ninfer-v046/build | ref /home/feyd/ninfer-runs/2026-10-05/v047/ref-mtpnv | out /home/feyd/ninfer-runs/2026-10-05/v047/ref-mtpnv | src 47d47864 dirty=1 | stages golden,ppl,greedy,dflash2
+[2026-10-05 18:54:09] gate RECORD | build $BUILD | ref $RUNS/2026-10-05/v047/ref-mtpnv | out $RUNS/2026-10-05/v047/ref-mtpnv | src 47d47864 dirty=1 | stages golden,ppl,greedy,dflash2
 [2026-10-05 18:54:09] clocks 2085 MHz 2092 MHz 
 [2026-10-05 18:54:21] golden   REC   case-1-short: generated_tokens 128 case-2-medium: generated_tokens 128 case-3-long: generated_tokens 124 
 [2026-10-05 18:55:49] ppl-64k  REC   4.133481 (88 s)

@@ -8,6 +8,7 @@
 #include "ninfer/types.h"
 
 #include <array>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <span>
@@ -60,6 +61,8 @@ struct MaterializationPlan {
     // Object order. Not part of any device capacity: one allocation of host_mapped_bytes.
     std::vector<HostMappedPlacement> host_mapped_objects;
     std::uint64_t host_mapped_bytes = 0;
+    // Residency::HostFile objects, mapped read-only from their files (object order).
+    std::vector<ObjectHandle> file_objects;
 };
 
 struct MaterializationStats {
@@ -85,7 +88,21 @@ struct MaterializationStats {
     // the bytes of those parents each device reads in place from it.
     std::uint64_t host_mapped_bytes = 0;
     std::array<std::uint64_t, kMaximumDevices> per_device_host_mapped_bytes{};
+    // Bytes of the Residency::HostFile objects, mapped and never read at load.
+    std::uint64_t mapped_file_bytes = 0;
 };
+
+// One read-only mapped piece of a HostFile object, addressed by its object-relative offset. The
+// page cache owns residency; `file`/`file_offset` locate the same bytes for direct reads.
+struct MappedObjectSegment {
+    std::uint64_t object_offset = 0;
+    std::uint64_t bytes         = 0;
+    const std::byte* data       = nullptr;
+    std::filesystem::path file;
+    std::uint64_t file_offset = 0;
+};
+
+class FileMapping;
 
 // How a device parent relates to its artifact parent. `ranges` is empty for a complete parent;
 // otherwise the device parent concatenates those `axis` ranges of a parent of `source_shape`.
@@ -99,18 +116,21 @@ struct DeviceShard {
 
 class MaterializedArtifact {
 public:
-    MaterializedArtifact()                                           = default;
-    ~MaterializedArtifact()                                          = default;
-    MaterializedArtifact(MaterializedArtifact&&) noexcept            = default;
-    MaterializedArtifact& operator=(MaterializedArtifact&&) noexcept = default;
-    MaterializedArtifact(const MaterializedArtifact&)                = delete;
-    MaterializedArtifact& operator=(const MaterializedArtifact&)     = delete;
+    MaterializedArtifact();
+    ~MaterializedArtifact();
+    MaterializedArtifact(MaterializedArtifact&&) noexcept;
+    MaterializedArtifact& operator=(MaterializedArtifact&&) noexcept;
+    MaterializedArtifact(const MaterializedArtifact&)            = delete;
+    MaterializedArtifact& operator=(const MaterializedArtifact&) = delete;
 
     [[nodiscard]] const WeightParent& device_parent(ObjectHandle handle, int device = 0) const;
     [[nodiscard]] const DeviceShard& device_shard(ObjectHandle handle, int device = 0) const;
     [[nodiscard]] const WeightParent& host_parent(ObjectHandle handle) const;
     [[nodiscard]] std::span<const std::byte> host_bytes(ObjectHandle handle) const;
     [[nodiscard]] bool has_device(ObjectHandle handle, int device = 0) const noexcept;
+    // Segments of a HostFile object in object-offset order; host access only.
+    [[nodiscard]] std::span<const MappedObjectSegment> file_segments(ObjectHandle handle) const;
+    [[nodiscard]] const WeightGeometry& file_geometry(ObjectHandle handle) const;
 
     [[nodiscard]] int device_count() const noexcept { return stats_.device_count; }
 
@@ -130,11 +150,14 @@ private:
         std::array<DeviceStorage, kMaximumDevices> device;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
+        std::vector<MappedObjectSegment> file;
+        std::optional<WeightGeometry> file_geometry;
     };
 
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> arenas_;
     // The HostMapped parents' bytes; every device's parent of such an object points into it.
     std::unique_ptr<PinnedHostBuffer> host_mapped_;
+    std::vector<std::unique_ptr<FileMapping>> mappings_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;
 };

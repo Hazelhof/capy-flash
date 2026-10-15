@@ -325,12 +325,47 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
-    failures += check(defaults.turn_anchors == 1, "turn anchors are not one by default");
+    failures += check(!defaults.turn_anchors.has_value(), "turn anchors are not left to the model by default");
+    failures += check(resolve_turn_anchors(std::nullopt, "Qwen4ExpForCausalLM") == 0 &&
+                          resolve_turn_anchors(std::nullopt, "Qwen3_5ForCausalLM") == 1 &&
+                          resolve_turn_anchors(std::nullopt, "Qwen3_5MoeForCausalLM") == 1 &&
+                          resolve_turn_anchors(2U, "Qwen4ExpForCausalLM") == 2 &&
+                          resolve_turn_anchors(0U, "Qwen3_5ForCausalLM") == 0,
+                      "turn anchors model default (Qwen4Exp 0 T152, others 1 T161) not resolved");
     failures += check(parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "0"}).turn_anchors == 0 &&
                           parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "3"}).turn_anchors == 3,
                       "--turn-anchors did not reach serving options");
     failures += check(serve_usage_text("ninfer-serve").find("--turn-anchors") != std::string::npos,
                       "serve help omits --turn-anchors");
+    // T66c: Qwen4Exp product options.
+    failures += check(!defaults.elastic_kv.enabled && !defaults.miss_split.has_value(),
+                      "elastic KV or miss split on by default");
+    {
+        const auto e = parse({"ninfer-serve", "model.ninfer", "--elastic", "--kv-grow", "4096",
+                              "--kv-budget-gib", "2.5", "--miss-split", "auto"});
+        failures += check(e.elastic_kv.enabled && e.elastic_kv.grow_tokens == 4096 &&
+                              e.elastic_kv.kv_budget_bytes == static_cast<std::size_t>(2.5 * 1073741824.0) &&
+                              e.miss_split == ninfer::MissSplitMode::Auto,
+                          "--elastic/--kv-grow/--kv-budget-gib/--miss-split did not reach serving options");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--miss-split", "off"}).miss_split ==
+                              ninfer::MissSplitMode::Off,
+                          "--miss-split off did not reach serving options");
+        int rejected = 0;
+        for (const auto& bad : {std::vector<std::string>{"--miss-split", "0.3"},
+                                std::vector<std::string>{"--kv-grow", "0"},
+                                std::vector<std::string>{"--kv-budget-gib", "0"},
+                                std::vector<std::string>{"--kv-budget-gib", "x"}}) {
+            std::vector<std::string> args{"ninfer-serve", "model.ninfer"};
+            args.insert(args.end(), bad.begin(), bad.end());
+            try {
+                (void)parse(args);
+            } catch (const std::invalid_argument&) { ++rejected; }
+        }
+        failures += check(rejected == 4, "invalid Qwen4Exp product options were accepted");
+        failures += check(serve_usage_text("ninfer-serve").find("--elastic") != std::string::npos &&
+                              serve_usage_text("ninfer-serve").find("--miss-split") != std::string::npos,
+                          "serve help omits the Qwen4Exp product options");
+    }
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
     failures += check(serve_usage_text("ninfer-serve").find("device-state=max-concurrency") !=

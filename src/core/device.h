@@ -14,6 +14,13 @@ void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 
+// cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream), except that an EAGER copy
+// between two devices goes through cudaMemcpyPeerAsync (T68): without P2P a UVA copy cannot read a
+// VMM allocation (cuMemCreate: the elastic KV / expert pool and the prompt workspace lent from it)
+// of a device other than the stream's (cudaErrorInvalidValue); the peer copy can, staged by the
+// driver. Inside a stream capture the plain UVA copy stays (capture rejects cudaMemcpyPeerAsync).
+cudaError_t memcpy_device_async(void* dst, const void* src, std::size_t bytes, cudaStream_t stream);
+
 // Non-owning execution facts passed to Ops whose launch policy depends on physical device
 // capacity. DeviceContext remains the owner and authoritative source of both values.
 struct DeviceExecutionView {

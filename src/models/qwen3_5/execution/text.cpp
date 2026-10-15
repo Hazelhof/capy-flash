@@ -36,6 +36,7 @@
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/target_logprobs.h"
 
 #include <cuda_runtime.h>
 
@@ -216,9 +217,8 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
         positions == nullptr || active_tokens > positions->ne[0]) {
         throw std::logic_error("DFlash feature positions are invalid");
     }
-    CUDA_CHECK(cudaMemcpyAsync(positions->data, source.data,
-                               static_cast<std::size_t>(active_tokens) * sizeof(std::int32_t),
-                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(::ninfer::memcpy_device_async(positions->data, source.data,
+                               static_cast<std::size_t>(active_tokens) * sizeof(std::int32_t), stream));
 }
 
 void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
@@ -253,7 +253,8 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
     final_norm_ = &parameters_.text.final_norm;
     lm_head_    = &parameters_.text.output_head;
     mtp_        = parameters_.mtp ? &*parameters_.mtp : nullptr;
-    if (mtp_enabled() && mtp_ == nullptr) {
+    qwen4_mtp_  = parameters_.qwen4_mtp ? &*parameters_.qwen4_mtp : nullptr;
+    if (mtp_enabled() && mtp_ == nullptr && qwen4_mtp_ == nullptr) {
         throw std::invalid_argument("MTP state requires selected MTP parameters");
     }
     if (parameters_.proposal) {
@@ -499,9 +500,9 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
                                  static_cast<std::size_t>(T - 1) * column_bytes;
             CUDA_CHECK(
-                cudaMemcpyAsync(x_last.data, x_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+                ::ninfer::memcpy_device_async(x_last.data, x_src, column_bytes, s));
             CUDA_CHECK(
-                cudaMemcpyAsync(ah_last.data, ah_src, column_bytes, cudaMemcpyDeviceToDevice, s));
+                ::ninfer::memcpy_device_async(ah_last.data, ah_src, column_bytes, s));
         }
     }
 
@@ -530,7 +531,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                   static_cast<std::size_t>(axis) * T + (T - 1);
                 auto* dst = static_cast<std::int32_t*>(last_rope_position.data) + axis;
                 CUDA_CHECK(
-                    cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
+                    ::ninfer::memcpy_device_async(dst, src, sizeof(std::int32_t), s));
             }
         }
         text_rope(last_rope_position, *config_.rope_parameters, qn, s);
@@ -599,6 +600,11 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
                                     const Tensor* input_embeddings) {
     require_single_device("MTP forward");
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (qwen4()) {
+        qwen4_mtp_forward_batch(ids, hidden, positions, envelope, mtp_hidden, logits_column,
+                                logits, draft_token, explicit_rope_positions, input_embeddings);
+        return;
+    }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
         throw std::invalid_argument("MTP batch T must be in [1,prefill_chunk]");
@@ -647,6 +653,11 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const Tensor& previou
                                       Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token) {
     require_single_device("MTP proposal");
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (qwen4()) {
+        qwen4_mtp_forward_batch(token, previous_hidden, position, envelope, mtp_hidden, 0, &logits,
+                                &draft_token, nullptr, nullptr);
+        return;
+    }
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(position, DType::I32, {1}, "MTP AR position");
     require_tensor_shape(previous_hidden, DType::BF16, {dimension(config_.hidden_size), 1},
@@ -683,10 +694,16 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                          "ordinary decode Linear Attention source slots");
     require_tensor_shape(linear_state_destination_slots, DType::I32, {batch},
                          "ordinary decode Linear Attention destination slots");
-    require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
+    require_tensor_shape(hidden, DType::BF16, {carried_hidden_rows(), batch},
                          "ordinary decode hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "ordinary decode logits");
+    if (qwen4()) {
+        qwen4_ordinary_decode(ids, cache_positions, rope_positions, kv_table_rows,
+                              linear_state_source_slots, linear_state_destination_slots, envelope,
+                              hidden, logits);
+        return;
+    }
     if (tp2()) {
         ordinary_decode_batch_tp2(ids, cache_positions, rope_positions, kv_table_rows,
                                   linear_state_source_slots, linear_state_destination_slots,
@@ -729,6 +746,18 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     require_single_device("target verification");
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
+    if constexpr (!Tap::enabled) {
+        if (qwen4()) {
+            qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                                linear_state_source_slots, envelope, hidden, logits,
+                                target_tokens);
+            return;
+        }
+    } else {
+        if (qwen4()) {
+            throw std::logic_error("Qwen4Exp verification publishes no speculative feature taps");
+        }
+    }
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashDecodeMaximumWidth) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("target verify batch shape is outside the supported domain");
@@ -815,6 +844,11 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
+    if (qwen4()) {
+        qwen4_mtp_forward_decode(ids, hidden, cache_positions, rope_positions, valid_columns,
+                                 kv_table_rows, envelope, mtp_hidden);
+        return;
+    }
     if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
         batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
@@ -838,15 +872,28 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     mtp_forward_core(ids, hidden, cache_positions, rope_positions, envelope, mtp_hidden, nullptr);
 }
 
-void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens) {
+void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
+                                    Tensor* draft_logprobs) {
     require_single_device("MTP proposal");
     const std::int32_t batch = hidden.ne[1];
+    if (qwen4()) {
+        qwen4_mtp_propose(hidden, logits, draft_tokens, draft_logprobs);
+        return;
+    }
+    if (draft_logprobs != nullptr && proposal_head_ != nullptr) {
+        throw std::invalid_argument("MTP draft log-probabilities need the full proposal head");
+    }
     require_tensor_shape(hidden, DType::BF16, {dimension(config_.hidden_size), batch},
                          "MTP proposal batch hidden");
     require_tensor_shape(logits, DType::BF16, {dimension(config_.vocab_size), batch},
                          "MTP proposal batch logits");
     require_tensor_shape(draft_tokens, DType::I32, {batch}, "MTP proposal batch tokens");
     proposal_argmax(hidden, logits, draft_tokens);
+    if (draft_logprobs != nullptr) {
+        ops::target_logprobs(logits, draft_tokens,
+                             dimension(parameters_.model.resources().public_token_count),
+                             *draft_logprobs, ctx_.stream);
+    }
 }
 
 void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
@@ -1137,6 +1184,16 @@ template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                           const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
+    if (qwen4()) {
+        if constexpr (Tap::enabled) {
+            throw std::logic_error("Qwen4Exp prefill publishes no speculative feature taps");
+        } else {
+            if (multimodal != nullptr) {
+                throw std::invalid_argument("Qwen4Exp image input is not implemented");
+            }
+            return qwen4_prefill(ids, text_prefill, finalize_at_end);
+        }
+    }
     runtime::ExecutionTimingRecorder timing;
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -1322,8 +1379,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 }
                 if (mtp_window.final_column_uses_generated_token) {
                     Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
-                    CUDA_CHECK(cudaMemcpyAsync(generated_mtp_id.data, io_.token.data,
-                                               sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
+                    CUDA_CHECK(::ninfer::memcpy_device_async(generated_mtp_id.data, io_.token.data,
+                                               sizeof(std::int32_t), s));
                 }
 
                 Tensor mtp_input_embeddings;
@@ -1364,9 +1421,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                                                                 ar_visible};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
                                             ar_envelope, next_hidden, logits, next_token);
-                        CUDA_CHECK(cudaMemcpyAsync(io_.mtp->ar_hidden.data, next_hidden.data,
-                                                   io_.mtp->ar_hidden.bytes(),
-                                                   cudaMemcpyDeviceToDevice, s));
+                        CUDA_CHECK(::ninfer::memcpy_device_async(io_.mtp->ar_hidden.data, next_hidden.data,
+                                                   io_.mtp->ar_hidden.bytes(), s));
                         ops::increment_i32_scalar(ar_position, s);
                     }
                 } else {
@@ -1382,9 +1438,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                      {dimension(config_.hidden_size), 1},
                                      "rewrite checkpoint hidden output");
                 const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
-                CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
-                                           checkpoint_hidden.data, checkpoint_hidden.bytes(),
-                                           cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data,
+                                           checkpoint_hidden.data, checkpoint_hidden.bytes(), s));
             }
         }
 

@@ -77,9 +77,13 @@ std::uint64_t weight_element_count(std::span<const std::uint64_t> shape) {
 }
 
 WeightGeometry weight_geometry(QType format, QuantLayout layout,
-                               std::span<const std::uint64_t> shape) {
+                               std::span<const std::uint64_t> shape, std::uint64_t divisors) {
+    if (divisors == 0 || (divisors != 1 && format != QType::NVFP4)) {
+        throw std::invalid_argument("only an NVFP4 plane carries more than one divisor");
+    }
     WeightGeometry out;
-    out.format = format;
+    out.format        = format;
+    out.divisor_count = divisors;
     out.layout = layout;
     out.shape.assign(shape.begin(), shape.end());
     out.elements = weight_element_count(shape);
@@ -148,8 +152,69 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     out.scale_bytes = mul(n, out.scale_bytes_per_row);
     out.bytes       = add(out.scale_offset, out.scale_bytes);
     if (format == QType::NVFP4) {
+        if (n % divisors) {
+            throw std::invalid_argument("NVFP4 divisor count must divide the plane's rows");
+        }
+        // A divisor that covered part of a 128-row scale tile would make two rows of one tile
+        // disagree about the word they were quantised against.
+        if (divisors > 1 && (n / divisors) % 128) {
+            throw std::invalid_argument("each NVFP4 divisor must cover whole 128-row scale tiles");
+        }
         out.divisor_offset = out.bytes;
-        out.bytes          = add(out.bytes, 4);
+        out.bytes          = add(out.bytes, mul(divisors, 4));
+    }
+    return out;
+}
+
+std::vector<ByteSpan> weight_row_block_spans(const WeightGeometry& g, std::uint64_t row_begin,
+                                             std::uint64_t row_count) {
+    if (g.shape.size() != 2 || g.layout == QuantLayout::Contiguous) {
+        if (g.layout != QuantLayout::Contiguous || g.shape.empty()) {
+            throw std::invalid_argument("row block spans require a matrix or a direct tensor");
+        }
+    }
+    const auto rows = g.shape.front();
+    if (!row_count || row_begin >= rows || row_count > rows - row_begin) {
+        throw std::invalid_argument("row block exceeds its parent");
+    }
+    std::vector<ByteSpan> out;
+    const auto push = [&out](std::uint64_t offset, std::uint64_t bytes) {
+        if (!bytes) { return; }
+        if (!out.empty() && out.back().offset + out.back().bytes == offset) {
+            out.back().bytes += bytes;
+        } else {
+            out.push_back({offset, bytes});
+        }
+    };
+    if (g.layout == QuantLayout::Contiguous) {
+        const auto row_bytes = g.code_bytes / rows;
+        push(mul(row_begin, row_bytes), mul(row_count, row_bytes));
+        return out;
+    }
+    push(mul(row_begin, g.code_bytes_per_row), mul(row_count, g.code_bytes_per_row));
+    if (g.high_bytes) {
+        push(add(g.high_offset, mul(row_begin, g.high_bytes_per_row)),
+             mul(row_count, g.high_bytes_per_row));
+    }
+    if (g.layout == QuantLayout::BlockScaleK16M128x4) {
+        if (row_begin % 128 || row_count % 128) {
+            throw std::invalid_argument("NVFP4 row blocks must be whole 128-row scale tiles");
+        }
+        // A 128-row tile row holds K/64 tiles of 512 bytes = 128 * K/16 bytes, stored in row
+        // order, so whole tile rows are one contiguous range of the swizzled plane.
+        push(add(g.scale_offset, mul(row_begin, g.scale_bytes_per_row)),
+             mul(row_count, g.scale_bytes_per_row));
+        if (g.divisor_count > 1) {
+            const auto per = g.rows_per_divisor();
+            if (row_begin % per || row_count % per) {
+                throw std::invalid_argument(
+                    "a stacked NVFP4 row block must cover whole source matrices");
+            }
+            push(add(g.divisor_offset, mul(row_begin / per, 4)), mul(row_count / per, 4));
+        }
+    } else {
+        push(add(g.scale_offset, mul(row_begin, g.scale_bytes_per_row)),
+             mul(row_count, g.scale_bytes_per_row));
     }
     return out;
 }
@@ -260,6 +325,10 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     }
     if (g.shape.size() != 2 || view.shape[1] != g.shape[1]) {
         throw std::invalid_argument("quantized native Weight requires unchanged parent K");
+    }
+    if (g.divisor_count > 1) {
+        throw std::invalid_argument(
+            "a stacked NVFP4 plane has one divisor per source matrix; no native linear reads it");
     }
     const auto planes = weight_row_planes(region);
     if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&

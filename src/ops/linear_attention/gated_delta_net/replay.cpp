@@ -161,7 +161,18 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
     // One rank's shard of geometry_48 under two-device tensor parallelism (FoldGeometry48x24).
     const bool geometry_48_shard = spec.layers == 48 && spec.qk_heads == 8 &&
                                    spec.value_heads == 24 && spec.conv_channels == 5120;
-    return geometry_48 || geometry_30 || geometry_48_shard;
+    // Qwen3.8-Flash-Next: 36 GDN layers of the 16/48 head geometry, and one rank's shard.
+    const bool geometry_36 = spec.layers == 36 && spec.qk_heads == 16 && spec.value_heads == 48 &&
+                             spec.conv_channels == 10240;
+    const bool geometry_36_shard = spec.layers == 36 && spec.qk_heads == 8 &&
+                                   spec.value_heads == 24 && spec.conv_channels == 5120;
+    // The 4-layer synthetic Qwen3.8-Flash-Next checkpoints: 3 GDN layers of 16/48 heads.
+    const bool geometry_3 = spec.layers == 3 && spec.qk_heads == 16 && spec.value_heads == 48 &&
+                            spec.conv_channels == 10240;
+    const bool geometry_3_shard = spec.layers == 3 && spec.qk_heads == 8 &&
+                                  spec.value_heads == 24 && spec.conv_channels == 5120;
+    return geometry_48 || geometry_30 || geometry_48_shard || geometry_36 || geometry_36_shard ||
+           geometry_3 || geometry_3_shard;
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

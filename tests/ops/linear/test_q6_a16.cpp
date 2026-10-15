@@ -39,6 +39,23 @@ int q6_a16_conformance() {
     failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
                           {248320, 2048, 193U, Comparison::Sampled, false, kN248320K2048});
 
+    // Qwen4Exp output head (ninfer-ext's selector boundaries).
+    constexpr std::array kN248320K2560{
+        a16(1),  a16(2),  a16(3),  a16(8),   a16(9),   a16(16),  a16(17),  a16(32),
+        a16(33), a16(64), a16(65), a16(96),  a16(97),  a16(128), a16(512), graph(1),
+        graph(8), graph(64),
+    };
+    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                          {248320, 2560, 199U, Comparison::Sampled, false, kN248320K2560});
+
+    // T43: draft proposal head row blocks of the K = 2560 head (prefix views and gathered
+    // shortlist rows: any row count, T = 1; NINFER_Q6_DRAFT_ROUTE picks the candidate route).
+    constexpr std::array kDraftRows{a16(1), graph(1)};
+    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                          {98304, 2560, 211U, Comparison::Sampled, false, kDraftRows});
+    failures += run_shape("Q6_A16", ActivationCompute::A16, make_q6_g64_fp16_weight,
+                          {10536, 2560, 223U, Comparison::Full, false, kDraftRows});
+
     constexpr std::array kVisionFull{
         convenience(4), a16(8),  a16(16),  a16(20),   a16(24),   a16(28),
         a16(80),        a16(84), graph(8), graph(24), graph(28), graph(84),

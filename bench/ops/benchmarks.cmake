@@ -13,6 +13,7 @@ ninfer_add_op_bench(ninfer_linear_dynamic_grouped_conv_add_bench
 ninfer_add_op_bench(ninfer_gated_delta_net_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gated_delta_net_bench.cu")
 ninfer_add_op_bench(ninfer_kimi_delta_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/kimi_delta_attention_bench.cu")
+ninfer_add_op_bench(ninfer_qsa_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/qsa_bench.cu")
 ninfer_add_op_bench(ninfer_gdn_replay_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/gdn_replay_bench.cu")
 ninfer_add_op_bench(ninfer_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rope_bench.cu")
 ninfer_add_op_bench(ninfer_rmsnorm_rope_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope_bench.cu")
@@ -57,9 +58,14 @@ ninfer_add_op_bench(ninfer_kv_cache_append_bench SOURCES "${CMAKE_CURRENT_LIST_D
 ninfer_add_op_bench(ninfer_prepare_masked_block_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/prepare_masked_block_bench.cu")
 ninfer_add_op_bench(ninfer_sampling_select_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sampling_select_bench.cu")
+ninfer_add_op_bench(ninfer_moe_slots_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/moe_slots_bench.cu")
+ninfer_add_op_bench(ninfer_host_moe_layer_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/host_moe_layer_bench.cu")
 ninfer_add_op_bench(ninfer_sparse_moe_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/sparse_moe_bench.cu")
 ninfer_add_op_bench(ninfer_linear_pair_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/linear_pair_bench.cu")
 ninfer_add_op_bench(ninfer_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")
 ninfer_add_op_bench(ninfer_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
 ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
+ninfer_add_op_bench(ninfer_hyper_connection_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hyper_connection_bench.cu")
+ninfer_add_op_bench(ninfer_ple_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/ple_bench.cu")
+ninfer_add_op_bench(ninfer_miss_split_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/miss_split_bench.cu")

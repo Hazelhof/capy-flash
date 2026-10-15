@@ -70,19 +70,10 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/pdl.cuh"
+#include "peer_exchange_lane.cuh" // protocol constants and the per-warp lane exchange
+
 namespace ninfer::ops::detail {
-
-// Probes of __nanosleep(100) polling before the poller gives up and reports. One probe costs about
-// 0.8 us (4M probes measured 3.25 s on two RTX 5070 Ti), so the limit is ~0.8 s: long enough for
-// any legitimate skew between the two ranks' schedules, short enough to surface a missing peer
-// before a 2 s display watchdog would reset the device (test_allreduce checks the bound).
-inline constexpr std::uint32_t kPeerSpinLimit = 1000000u;
-
-// A poller re-reads the pinned hang word once every this many probes, so a round that already
-// reported a hang does not spin the full limit again at every later exchange.
-inline constexpr std::uint32_t kPeerHangProbe = 1024u;
-
-using PeerVec = uint4; // 16 bytes = 8 BF16 elements, one PCIe transaction per access
 
 // 16-byte chunks per thread per pass. A warp then touches 4 consecutive 512 B lines of the
 // payload: 64 B per thread across a 2 KB span, so both the host write burst and the read phase
@@ -235,19 +226,16 @@ inline int peer_exchange_blocks(std::size_t bytes) {
 // ARITHMETIC. Identical to the original kernel: for every element float(mine) + float(peer) in
 // FP32 and one __floats2bfloat162_rn, `mine` being exactly the value this rank published. The
 // bits of the result do not depend on which kernel moved the operands.
+//
+// The protocol constants (kPeerFlagStride, kPeerPollSleepNs, kPeerPipelinedVecsPerLane) and the
+// per-warp lane exchange live in peer_exchange_lane.cuh, shared with fused Ops.
 
-// Words between two warps' release flags: a 64-byte host line each.
-inline constexpr int kPeerFlagStride = 16;
-
-// Sleep between two polls of the peer's flag; kPeerSpinLimit is calibrated with it.
-inline constexpr std::uint32_t kPeerPollSleepNs = 100u;
-
-// The production geometry: 16-byte vectors per lane and threads per block. Two warps per block
+// The production geometry: 16-byte vectors per lane (kPeerPipelinedVecsPerLane) and threads per
+// block. Two warps per block
 // spread the 40 KiB MTP-3 verify payload over 20 SMs, which keeps more PCIe reads in flight than
 // 5 blocks of 256: 6.2 against 6.8 us per 40 KiB exchange, 3.8 against 4.4 at 10 KiB, on two
 // RTX 5070 Ti over PCIe 5.0 x8 (tools/tp2/mailbox_probe.cu --sweep; 1, 4 or 8 vectors per lane
 // are within 0.4 us, the early relaxed probe plus fence 0.6-1 us slower, the poll sleep neutral).
-inline constexpr int kPeerPipelinedVecsPerLane = 2;
 inline constexpr int kPeerPipelinedThreads     = 64;
 
 // Launch knobs of one pipelined exchange. Production passes the defaults; the standalone probe
@@ -256,6 +244,8 @@ struct PeerPipelinedTuning {
     std::uint32_t spin_limit   = kPeerSpinLimit;
     std::uint32_t sleep_ns     = kPeerPollSleepNs;
     unsigned long long* stamps = nullptr; // kTimed only: kPeerStampCount words per warp
+    // Release the next kernel in the stream at entry (PeerMailbox::set_release_dependents, T45).
+    bool release_dependents = false;
 };
 
 // kTimed stamps, per warp (lane 0): globaltimer at entry, clock64 at entry, after the publish
@@ -288,6 +278,10 @@ __global__ __launch_bounds__(256) void peer_exchange_pipelined_kernel(
     const PeerVecBf16* peer_payload, std::uint32_t* peer_flags, std::uint32_t* epochs,
     std::uint32_t* hang, int vecs, PeerPipelinedTuning tuning) {
     using SystemWord = cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system>;
+    // With tuning.release_dependents a programmatic dependent may start while the exchange waits
+    // on the peer (T45: the next hyper-connection mixer requests its weights then); it must not
+    // read the exchanged data before its dependency wait.
+    if (tuning.release_dependents && threadIdx.x == 0) { pdl::trigger_dependents(); }
 
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
@@ -394,6 +388,53 @@ __global__ __launch_bounds__(256) void peer_exchange_pipelined_kernel(
         out[5]                  = end;
         out[6]                  = peer_globaltimer();
         out[7]                  = spins;
+    }
+}
+
+// ---- pipelined FP32 partial-sum kernel ------------------------------------------------------------
+//
+// The same pipelined protocol (per slot, per warp lane epochs and 64-byte release lines, all loads in
+// flight, the HANG GUARD per warp) over FP32 partials: a 16-byte vector is four floats. The combine
+// is one IEEE FP32 add per element, fl(mine + peer), which is commutative, so both ranks compute the
+// same bits from the same two partials; the sum replaces the partial in place, and when `bf16_out`
+// is non-null it is also stored there rounded once to BF16 (round to nearest even). This is the
+// exchange of row-parallel partials that are themselves FP32 (the Qwen4Exp MoE: resident-expert,
+// CPU-path and shared-expert contributions accumulated in FP32 per rank), so the block output is
+// rounded once, after the cross-rank sum. A slot set mixes BF16 and FP32 exchanges freely: both
+// kernels move 16-byte vectors with the same lane geometry and advance the same per-lane epochs.
+
+template <int G>
+__global__ __launch_bounds__(256) void peer_exchange_pipelined_f32_kernel(
+    PeerVec* partial, PeerVec* mine_payload, std::uint32_t* mine_flags, const PeerVec* peer_payload,
+    std::uint32_t* peer_flags, std::uint32_t* epochs, std::uint32_t* hang, int vecs,
+    __nv_bfloat16* bf16_out, PeerPipelinedTuning tuning) {
+    if (tuning.release_dependents && threadIdx.x == 0) { pdl::trigger_dependents(); } // as above
+    const int lane = static_cast<int>(threadIdx.x & 31u);
+    const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const int base = warp * (32 * G) + lane;
+    if (warp * (32 * G) >= vecs) { return; } // warp-uniform: the grid's last warps may be idle
+
+    PeerVec mine[G] = {};
+#pragma unroll
+    for (int j = 0; j < G; ++j) {
+        const int v = base + j * 32;
+        if (v < vecs) { mine[j] = partial[v]; }
+    }
+    PeerVec peer[G] = {};
+    if (!peer_exchange_lane<G>(warp, lane, mine, peer, mine_payload, mine_flags, peer_payload,
+                               peer_flags, epochs, hang, vecs, tuning.spin_limit,
+                               tuning.sleep_ns)) {
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < G; ++j) {
+        const int v = base + j * 32;
+        if (v >= vecs) { continue; }
+        const PeerVecF32 sum = peer_sum_f32(mine[j], peer[j]);
+        partial[v]           = sum.raw;
+        if (bf16_out != nullptr) {
+            reinterpret_cast<uint2*>(bf16_out)[v] = peer_pack_bf16x4(sum.value);
+        }
     }
 }
 

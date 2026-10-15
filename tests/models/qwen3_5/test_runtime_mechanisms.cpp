@@ -131,6 +131,32 @@ void test_decoder_layout() {
                k8v4.mtp_kv &&
                k8v4.mtp_kv->payload_bytes() == (k8_vector_bytes + v4_vector_bytes) * mtp_vectors,
            "K8V4 Text/MTP asymmetric physical payload bytes");
+
+    // Qwen4Exp: two QSA index planes per attention layer follow all K/V planes, so the K/V plane
+    // ordinals of the layers are unchanged.
+    q36::DecoderStateSpec qsa_spec = decoder_spec(ninfer::KvCacheStorage::Fp8E4M3Row256, true);
+    qsa_spec.qsa_index             = true;
+    ninfer::LayoutBuilder qsa_builder;
+    const q36::DecoderStateLayout qsa = q36::plan_decoder_state(qsa_builder, qsa_spec);
+    (void)qsa_builder.finish(256);
+    const auto& qp = qsa.text_kv.pages.planes;
+    expect(qsa.text_kv.qsa_index && qp.size() == 12 && qsa.mtp_kv && qsa.mtp_kv->qsa_index &&
+               qsa.mtp_kv->pages.planes.size() == 6,
+           "QSA index planes: two per attention layer, Text and MTP");
+    for (std::size_t plane = 0; plane < 8; ++plane) {
+        expect(qp[plane].geometry == fp8.text_kv.pages.planes[plane].geometry,
+               "QSA index planes keep the K/V plane ordinals");
+    }
+    expect(qp[8].geometry.dtype == ninfer::DType::BF16 &&
+               qp[8].geometry.leading_extent == ninfer::ops::kQsaIndexRecordWords &&
+               qp[8].geometry.head_extent == 1 && qp[9].geometry.dtype == ninfer::DType::BF16 &&
+               qp[9].geometry.leading_extent == ninfer::ops::kQsaBlockKeyWords &&
+               qp[9].geometry.head_extent == 1,
+           "QSA index records [136,64,1,pages] and block keys [32,64,1,pages]");
+    expect(qsa.text_kv.payload_bytes() ==
+               fp8.text_kv.payload_bytes() +
+                   2ULL * 5ULL * 64ULL * (ninfer::ops::kQsaIndexRecordWords + ninfer::ops::kQsaBlockKeyWords) * 2ULL,
+           "QSA index planes add 336 B per token per attention layer");
 }
 
 void test_round_layout() {

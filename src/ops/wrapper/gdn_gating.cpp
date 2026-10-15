@@ -32,16 +32,20 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     return total;
 }
 
+// Registered value-head counts: 48, and 24 for one rank of a two-device split.
+bool registered_heads(std::int32_t heads) { return heads == 48 || heads == 24; }
+
 void require_gate_shape(const Tensor& t, const char* label) {
-    if (t.ne[0] != 48 || t.ne[2] != 1 || t.ne[3] != 1) {
+    if (!registered_heads(t.ne[0]) || t.ne[2] != 1 || t.ne[3] != 1) {
         throw std::invalid_argument(std::string("gdn_gating: ") + label +
-                                    " must have shape [48,T]");
+                                    " must have shape [48|24,T]");
     }
 }
 
-void require_vector48_shape(const Tensor& t, const char* label) {
-    if (t.ne[0] != 48 || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
-        throw std::invalid_argument(std::string("gdn_gating: ") + label + " must have shape [48]");
+void require_head_vector_shape(const Tensor& t, std::int32_t heads, const char* label) {
+    if (t.ne[0] != heads || t.ne[1] != 1 || t.ne[2] != 1 || t.ne[3] != 1) {
+        throw std::invalid_argument(std::string("gdn_gating: ") + label +
+                                    " must have shape [H] with the gate head count");
     }
 }
 
@@ -79,16 +83,22 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     require_gate_shape(b, "b");
     require_gate_shape(g, "g");
     require_gate_shape(beta, "beta");
-    require_vector48_shape(A_log, "A_log");
-    require_vector48_shape(dt_bias, "dt_bias");
+    require_head_vector_shape(A_log, a.ne[0], "A_log");
+    require_head_vector_shape(dt_bias, a.ne[0], "dt_bias");
     require_same_gate_shape(a, b, "b");
     require_same_gate_shape(a, g, "g");
     require_same_gate_shape(a, beta, "beta");
     if (n == 0) { return; }
 
-    if (!a.is_contiguous() || !b.is_contiguous() || !A_log.is_contiguous() ||
+    // a and b may be row slices of one [rows >= H, T] matrix (T49: the GDN a|b projection read in
+    // place): contiguous heads, any column stride of at least H elements.
+    const auto columns_strided = [](const Tensor& t) {
+        return t.nb[0] == 2 && t.nb[1] >= 2 * static_cast<std::int64_t>(t.ne[0]) && t.nb[1] % 2 == 0;
+    };
+    if (!columns_strided(a) || !columns_strided(b) || !A_log.is_contiguous() ||
         !dt_bias.is_contiguous() || !g.is_contiguous() || !beta.is_contiguous()) {
-        throw std::invalid_argument("gdn_gating: all tensors must be contiguous");
+        throw std::invalid_argument(
+            "gdn_gating: a/b need contiguous heads (any column stride), the rest contiguous");
     }
     if (a.data == nullptr || b.data == nullptr || A_log.data == nullptr ||
         dt_bias.data == nullptr || g.data == nullptr || beta.data == nullptr) {

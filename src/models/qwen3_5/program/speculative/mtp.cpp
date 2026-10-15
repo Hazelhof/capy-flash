@@ -3,11 +3,14 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/execution/qwen4_tfdump.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/target_logprobs.h"
 #include <cuda_runtime.h>
+#include <array>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -48,7 +51,9 @@ struct MtpRoundView {
     Tensor ar_rope_positions;
     Tensor ar_valid_columns;
     Tensor next_drafts;
+    Tensor next_draft_logprobs;
     Tensor proposal_logits;
+    Tensor forced_targets;
     const ops::SamplingConfig* sampling = nullptr;
 };
 
@@ -84,7 +89,9 @@ MtpRoundView slice_mtp_frame(qwen3_5::MtpDecodeState& frame, std::int32_t batch_
     out.ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
     out.ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
     out.next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
+    out.next_draft_logprobs = frame.next_draft_logprobs.slice(0, 0, batch_size);
     out.proposal_logits    = frame.proposal_logits.slice(1, 0, batch_size);
+    if (qwen4_replay_enabled()) { out.forced_targets = frame.forced_targets.slice(1, 0, batch_size); }
     out.sampling           = frame.sampling;
     return out;
 }
@@ -109,6 +116,7 @@ TargetVerifyFrameView verify_view(const MtpRoundView& view, const GdnReplayRecor
         .licensed_counts         = view.licensed_counts,
         .accepted_drafts         = view.accepted,
         .selected_hidden         = view.selected_hidden,
+        .forced_targets          = view.forced_targets,
         .replay_records          = records,
         .sampling                = view.sampling,
     };
@@ -192,9 +200,8 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
                                  envelope, next_hidden, logits, next_draft);
-        CUDA_CHECK(cudaMemcpyAsync(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
-                                   state.execution.io.mtp->ar_hidden.bytes(),
-                                   cudaMemcpyDeviceToDevice, state.execution.device.stream));
+        CUDA_CHECK(::ninfer::memcpy_device_async(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
+                                   state.execution.io.mtp->ar_hidden.bytes(), state.execution.device.stream));
         ops::increment_i32_scalar(ar_position, state.execution.device.stream);
     }
 }
@@ -209,13 +216,33 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
 
         qwen3_5::MtpDecodeState& frame = state.frame;
         const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
-        const std::int32_t hidden_size =
-            dimension(state.execution.parameters.model.config().text.hidden_size);
+        // Rows of the carried hidden (Qwen4Exp: the wide residual).
+        const std::int32_t hidden_size = frame.ar_hidden.ne[0];
         const auto max_context = static_cast<std::int32_t>(state.text_cache.max_context());
         cudaStream_t stream    = state.execution.device.stream;
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    stream));
+        if (const Qwen4Runtime* qwen4 = state.execution.qwen4;
+            qwen4 != nullptr && qwen4->decode_ple_rows.data != nullptr) {
+            // Qwen4Exp: the n-gram rows of the verified window, gathered on the host before the
+            // launch (one upload node).
+            const Tensor rows = qwen4->decode_ple_rows.slice(1, 0, width * batch_size);
+            CUDA_CHECK(cudaMemcpyAsync(rows.data, qwen4->decode_ple_host, rows.bytes(),
+                                       cudaMemcpyHostToDevice, stream));
+            if (const TpExecution* tp_rows = state.execution.tp;
+                tp_rows != nullptr && tp_rows->qwen4 != nullptr &&
+                tp_rows->qwen4->decode_ple_rows.data != nullptr) {
+                // tp 2: rank 1 uploads the same staging (replicated PLE).
+                const Tensor peer_rows =
+                    tp_rows->qwen4->decode_ple_rows.slice(1, 0, width * batch_size);
+                const DeviceContext& rank1_ple = *tp_rows->execution->dev[1];
+                const ScopedCurrentDevice scope(rank1_ple.device);
+                CUDA_CHECK(cudaMemcpyAsync(peer_rows.data, qwen4->decode_ple_host,
+                                           peer_rows.bytes(), cudaMemcpyHostToDevice,
+                                           rank1_ple.stream));
+            }
+        }
 
         // Tensor-parallel width 2: rank 1 runs the round from its own upload of the same ingress
         // record. Everything else it needs is derived from that record by the same Ops on rank 1,
@@ -241,6 +268,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, &state.mtp_cache, tp);
+        card.set_qwen4_runtime(state.execution.qwen4);
         const MtpRoundView round = slice_mtp_frame(frame, batch_size);
         {
             Tensor verify_ids       = round.verify_ids;
@@ -292,13 +320,22 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                      {std::pair{peer->anchors, round.anchors},
                       std::pair{peer->frontiers, round.frontiers},
                       std::pair{peer->licensed_counts, round.licensed_counts}}) {
-                    CUDA_CHECK(cudaMemcpyAsync(destination.data, source.data, source.bytes(),
-                                               cudaMemcpyDeviceToDevice, rank1->stream));
+                    CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data, source.bytes(), rank1->stream));
                 }
                 prepare_next_round(*peer, max_context, rank1->stream);
             }
 
             Tensor draft0 = round.next_drafts.slice(1, 0, 1).view({batch_size});
+            // T41: each proposal step's softmax log-probability of its argmax over the proposal
+            // vocabulary (the full head, rank 0 holding the gathered logits at tp 2, or T43's
+            // draft shortlist), written by the proposal itself.
+            std::array<Tensor, kMtpDecodeMaximumDrafts> logprob_views;
+            const auto draft_logprob = [&](std::int32_t step) -> Tensor* {
+                if (!state.draft_logprobs) { return nullptr; }
+                logprob_views[static_cast<std::size_t>(step)] =
+                    round.next_draft_logprobs.slice(1, step, 1).view({batch_size});
+                return &logprob_views[static_cast<std::size_t>(step)];
+            };
             if (peer) {
                 // The MTP head is split at tp 2: rank 0 contracts the embedding of the alignment
                 // ids and rank 1 its copy of the target hidden.
@@ -337,10 +374,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
             if (peer) {
                 const TextContext::RankTensors ar_hidden{round.ar_hidden, peer->ar_hidden};
                 Tensor proposal_logits = round.proposal_logits;
-                card.mtp_propose_batch(ar_hidden, proposal_logits, draft0);
+                card.mtp_propose_batch(ar_hidden, proposal_logits, draft0, draft_logprob(0));
             } else {
                 Tensor proposal_logits = round.proposal_logits;
-                card.mtp_propose_batch(round.ar_hidden, proposal_logits, draft0);
+                card.mtp_propose_batch(round.ar_hidden, proposal_logits, draft0, draft_logprob(0));
             }
             for (std::uint32_t step = 0; step + 1 < k; ++step) {
                 const auto s        = static_cast<std::int32_t>(step);
@@ -368,20 +405,22 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                     const TextContext::RankTensors proposal_hidden{round.next_hidden,
                                                                    peer->next_hidden};
                     Tensor proposal_logits = round.proposal_logits;
-                    card.mtp_propose_batch(proposal_hidden, proposal_logits, next);
+                    card.mtp_propose_batch(proposal_hidden, proposal_logits, next,
+                                           draft_logprob(s + 1));
                     const ScopedCurrentDevice scope(rank1->device);
-                    CUDA_CHECK(cudaMemcpyAsync(peer->ar_hidden.data, peer->next_hidden.data,
-                                               peer->ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                    CUDA_CHECK(::ninfer::memcpy_device_async(peer->ar_hidden.data, peer->next_hidden.data,
+                                               peer->ar_hidden.bytes(),
                                                rank1->stream));
                 } else {
                     card.mtp_forward_decode_batch(previous, hidden_batch, position, rope, valid,
                                                   round.mtp_rows, envelopes.ar[step],
                                                   next_hidden_batch);
                     Tensor proposal_logits = round.proposal_logits;
-                    card.mtp_propose_batch(round.next_hidden, proposal_logits, next);
+                    card.mtp_propose_batch(round.next_hidden, proposal_logits, next,
+                                           draft_logprob(s + 1));
                 }
-                CUDA_CHECK(cudaMemcpyAsync(round.ar_hidden.data, round.next_hidden.data,
-                                           round.ar_hidden.bytes(), cudaMemcpyDeviceToDevice,
+                CUDA_CHECK(::ninfer::memcpy_device_async(round.ar_hidden.data, round.next_hidden.data,
+                                           round.ar_hidden.bytes(),
                                            stream));
             }
         }

@@ -1,7 +1,10 @@
+#include <string_view>
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
+#include "models/qwen3_5/execution/qwen4_forward.h"
+#include "models/qwen3_5/execution/qwen4_tfdump.h"
 #include "core/nvtx.h"
 #include "core/device.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
@@ -9,6 +12,7 @@
 #include "ninfer/ops/scatter.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +54,27 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache, nullptr, state.execution.tp);
+        card.set_qwen4_runtime(state.execution.qwen4);
+        if (const Qwen4Runtime* qwen4 = state.execution.qwen4;
+            qwen4 != nullptr && qwen4->decode_ple_rows.data != nullptr) {
+            // The round's n-gram rows, gathered on the host before the launch (one upload node).
+            const Tensor rows = qwen4->decode_ple_rows.slice(1, 0, batch_size);
+            CUDA_CHECK(cudaMemcpyAsync(rows.data, qwen4->decode_ple_host, rows.bytes(),
+                                       cudaMemcpyHostToDevice, state.execution.device.stream));
+            if (state.execution.tp != nullptr) {
+                // tp 2: rank 1 uploads the same host rows into its own copy (replicated PLE).
+                const Qwen4Runtime* peer = state.execution.tp->qwen4;
+                if (peer == nullptr || peer->decode_ple_rows.data == nullptr) {
+                    throw std::logic_error("Qwen4Exp tp 2 decode has no rank 1 PLE rows");
+                }
+                const DeviceContext& rank1 = *state.execution.tp->execution->dev[1];
+                const ScopedCurrentDevice scope(rank1.device);
+                const Tensor peer_rows = peer->decode_ple_rows.slice(1, 0, batch_size);
+                CUDA_CHECK(cudaMemcpyAsync(peer_rows.data, peer->decode_ple_host,
+                                           peer_rows.bytes(), cudaMemcpyHostToDevice,
+                                           rank1.stream));
+            }
+        }
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -183,20 +208,25 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
 }
 
 void ProgramImpl::copy_tail(SequenceState& sequence, std::int32_t column) {
+    // T42: a Qwen4Exp chunk wider than prefill_hidden ran on lent workspace and left its last
+    // column in prefill_hidden's last column (qwen4_text.cpp keep_last_column).
+    if (qwen4_prompt_base_chunk > 0 && column >= prefill_hidden.ne[1] &&
+        column < static_cast<std::int32_t>(prefill_chunk)) {
+        column = prefill_hidden.ne[1] - 1;
+    }
     if (column < 0 || column >= prefill_hidden.ne[1] || sequence.tail_hidden.data == nullptr) {
         throw std::logic_error("target tail hidden column is invalid");
     }
     const Tensor source = prefill_hidden.slice(1, column, 1);
-    CUDA_CHECK(cudaMemcpyAsync(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(),
-                               cudaMemcpyDeviceToDevice, device.stream));
+    CUDA_CHECK(::ninfer::memcpy_device_async(sequence.tail_hidden.data, source.data, sequence.tail_hidden.bytes(), device.stream));
     if (peer_retains_hidden()) {
         // The hidden axis is replicated, so rank 1's final-normed chunk holds the same column:
         // a local copy on rank 1's stream, after the chunk that wrote it.
         const Tensor peer_source      = peer->prefill_hidden.slice(1, column, 1);
         const Tensor peer_destination = peer_tail_hidden(sequence);
         const ScopedCurrentDevice rank1(peer->device.device);
-        CUDA_CHECK(cudaMemcpyAsync(peer_destination.data, peer_source.data,
-                                   peer_destination.bytes(), cudaMemcpyDeviceToDevice,
+        CUDA_CHECK(::ninfer::memcpy_device_async(peer_destination.data, peer_source.data,
+                                   peer_destination.bytes(),
                                    peer->device.stream));
     }
     sequence.tail_hidden_valid = true;
@@ -372,12 +402,18 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
+            if (qwen4_ple_gather) {
+                // Qwen4Exp n-gram embedding of the row's token at `frontier` (its context is the
+                // ledger before it).
+                stage_qwen4_ple_rows(sequence.ledger, frontier,
+                                     std::span<const TokenId>(&sequence.ledger[frontier], 1), row);
+            }
         }
 
         execution::OrdinaryBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, tp_binding(), graph_peer_bridge()},
+             proposal_head, tp_binding(), graph_peer_bridge(), qwen4_runtime()},
             decoder->text_kv,
             *io.ordinary,
             *ordinary_host_ingress,
@@ -386,6 +422,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             peer ? &*peer->io.ordinary : nullptr};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
+        qwen4_begin_window(execution::Qwen4Window::Decode);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
         submit_range.reset();
@@ -393,9 +430,52 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeOrdinaryWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
+            // The expert cache policy reads the round's routing while the device runs it.
+            qwen4_observe_window();
             synchronize_devices();
         }
         timing.end_wait();
+        // T53: the next round's n-gram rows (the sampled token's) start their page reads now.
+        prefetch_qwen4_ple_next_round(lanes, false);
+        qwen4_end_window();
+        if (!qwen4_forced_tokens.empty()) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                force_qwen4_tokens(active_sequence(lanes[row]),
+                                   &ordinary_host_egress->sampled_tokens[row], 1);
+            }
+        }
+        if (qwen4_replay) {
+            // T59 replay: the reference token (teacher forcing through the ordinary route).
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const SequenceState& sequence = active_sequence(lanes[row]);
+                if (const execution::Qwen4ReplaySequence* ref = qwen4_replay->match(sequence.ledger)) {
+                    if (ordinary_host_egress->sampled_tokens[row] != ref->ids[sequence.ledger.size()]) {
+                        ++qwen4_replay->argmax_disagreements;
+                    }
+                    ordinary_host_egress->sampled_tokens[row] = ref->ids[sequence.ledger.size()];
+                    ++qwen4_replay->forced_tokens;
+                } else {
+                    ++qwen4_replay->rounds_unmatched;
+                }
+            }
+        }
+        if (qwen4_top2_file) {
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                write_qwen4_top2(io.ordinary->logits.slice(1, static_cast<std::int32_t>(row), 1),
+                                 lanes[row], active_sequence(lanes[row]).execution_frontier, 0);
+            }
+        }
+        if (qwen4_tfdump && qwen4_tfdump->logits_enabled()) {
+            // Validation dump of the round's logits (position = the consumed token's position).
+            const Tensor logits = io.ordinary->logits.slice(1, 0, static_cast<std::int32_t>(lanes.size()));
+            std::vector<std::uint16_t> host(static_cast<std::size_t>(logits.numel()));
+            CUDA_CHECK(cudaMemcpy(host.data(), logits.data, logits.bytes(), cudaMemcpyDeviceToHost));
+            std::vector<std::int32_t> positions;
+            for (const std::uint32_t lane : lanes) {
+                positions.push_back(static_cast<std::int32_t>(active_sequence(lane).execution_frontier));
+            }
+            qwen4_tfdump->write_logits(host, logits.ne[0], positions);
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -403,7 +483,16 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             RequestControl& request    = requests[lanes[row]];
             const std::uint32_t base_E = sequence.execution_frontier;
             const std::uint32_t base_S = sequence.ledger_frontier;
-            const TokenId token        = ordinary_host_egress->sampled_tokens[row];
+            log_qwen4_round('o', base_E, 0, 0, seconds);
+            TokenId token = ordinary_host_egress->sampled_tokens[row];
+            if (qwen4_tfdump) {
+                // Validation: teacher-forced decode (NINFER_QWEN4_TFDUMP_FORCE).
+                if (const std::int32_t forced = qwen4_tfdump->forced_token(sequence.ledger.size());
+                    forced >= 0) {
+                    token = forced;
+                    ordinary_host_egress->sampled_tokens[row] = token;
+                }
+            }
             validate_licensed_tokens(std::span<const TokenId>(&token, 1));
             sequence.text_kv_valid = base_E + 1;
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
@@ -433,6 +522,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             synchronize_devices();
         } catch (...) {}
         timing.end_wait();
+        qwen4_abandon_window();
         clear_execution_failure_lanes(lanes);
         throw;
     }
@@ -485,6 +575,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
                              static_cast<std::uint64_t>(lanes.size()));
+        std::optional<nvtx::ScopedRange> prepare_range;
+        prepare_range.emplace(nvtx::Name::DecodeMtpPrepare, nvtx::Category::Mtp,
+                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, draft_window, capacity);
@@ -504,9 +597,34 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                     ? budgets[row].generated_tokens_remaining - 1
                                                     : 0;
+            // T59 replay: the recorded window of this frontier (extent, drafts) and the reference.
+            const execution::Qwen4ReplaySequence* replay_ref =
+                qwen4_replay ? qwen4_replay->match(sequence.ledger) : nullptr;
+            const execution::Qwen4ReplayWindow* replay_window = nullptr;
+            if (replay_ref != nullptr) {
+                const auto it = replay_ref->windows.find(frontier);
+                if (it != replay_ref->windows.end()) { replay_window = &it->second; }
+                ++(replay_window != nullptr ? qwen4_replay->windows_replayed
+                                            : qwen4_replay->windows_unlisted);
+            } else if (qwen4_replay) {
+                ++qwen4_replay->rounds_unmatched;
+            }
+            // T121c: NINFER_QWEN4_REPLAY_MODEL_DRAFTS=1 keeps the model's own drafts (and extent) where the
+            // replay has no recorded window: forced targets with realistic rejections.
+            static const bool replay_model_drafts = [] {
+                const char* v = std::getenv("NINFER_QWEN4_REPLAY_MODEL_DRAFTS");
+                return v != nullptr && std::string_view(v) == "1";
+            }();
+            const std::uint32_t proposed_extent =
+                replay_window != nullptr                         ? replay_window->extent
+                : replay_ref != nullptr && !replay_model_drafts ? draft_window
+                                                                 : sequence.mtp_draft_count;
             const std::uint32_t extent =
-                std::min({sequence.mtp_draft_count, draft_window, max_by_budget,
-                          capacity - sequence.execution_frontier - 1});
+                qwen4_mtp_no_drafts
+                    ? 0U
+                    : std::min({proposed_extent, draft_window, max_by_budget,
+                                qwen4_mtp_extent_cap,
+                                capacity - sequence.execution_frontier - 1});
             mtp_host_ingress->anchors[row]        = sequence.ledger.back();
             mtp_host_ingress->base_frontiers[row] = checked_i32(frontier, "MTP batch frontier");
             mtp_host_ingress->remaining_budgets[row] =
@@ -533,12 +651,55 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             mtp_host_ingress->sampling[row]                = request.sampling_host;
             ensure_sequence_kv_mapped(sequence, frontier + extent + 1,
                                       std::min(capacity, frontier + extent + draft_window));
+            if (!qwen4_mtp_oracle.empty()) {
+                // Validation oracle drafts: the reference continuation of the matching sequence.
+                for (const std::vector<TokenId>& line : qwen4_mtp_oracle) {
+                    if (line.size() <= sequence.ledger.size() ||
+                        !std::equal(sequence.ledger.begin(), sequence.ledger.end(), line.begin())) {
+                        continue;
+                    }
+                    for (std::uint32_t j = 0; j < extent && frontier + 1U + j < line.size(); ++j) {
+                        mtp_host_ingress->current_drafts[row * draft_window + j] =
+                            line[frontier + 1U + j];
+                    }
+                    break;
+                }
+            }
+            if (replay_ref != nullptr) {
+                // T59 replay: recorded drafts (or the reference itself where no window was
+                // recorded), and the reference continuation as every column's target, so the
+                // device accepts the recorded count and commits the reference tokens.
+                const auto& ids = replay_ref->ids;
+                for (std::uint32_t j = 0; j < extent; ++j) {
+                    const std::size_t at = frontier + 1U + j;
+                    if (replay_window == nullptr && replay_model_drafts) { continue; } // T121c
+                    mtp_host_ingress->current_drafts[row * draft_window + j] =
+                        replay_window != nullptr && j < replay_window->drafts.size()
+                            ? replay_window->drafts[j]
+                            : ids[std::min(at, ids.size() - 1)];
+                }
+                for (std::uint32_t j = 0; j < width; ++j) {
+                    const std::size_t at = frontier + 1U + j;
+                    mtp_host_ingress->forced_targets[row * width + j] = ids[std::min(at, ids.size() - 1)];
+                }
+            }
+            if (qwen4_ple_gather) {
+                // Qwen4Exp n-gram rows of the verified window: the anchor, then the drafts (the
+                // padding columns past the extent repeat the anchor and are never committed).
+                std::array<TokenId, kMtpDecodeMaximumWidth> window{};
+                window[0] = sequence.ledger.back();
+                for (std::uint32_t j = 0; j < draft_window; ++j) {
+                    window[j + 1] = mtp_host_ingress->current_drafts[row * draft_window + j];
+                }
+                stage_qwen4_ple_rows(sequence.ledger, frontier,
+                                     std::span<const TokenId>(window.data(), width), row * width);
+            }
         }
 
         execution::MtpBatchContext schedule_state{
             {device, parameters, work, state_images->linear(),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
-             proposal_head, tp_binding(), graph_peer_bridge()},
+             proposal_head, tp_binding(), graph_peer_bridge(), qwen4_runtime()},
             decoder->text_kv,
             *decoder->mtp_cache(),
             *io.mtp_decode,
@@ -546,9 +707,14 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             *mtp_host_egress,
             state_images->continuation_hidden_store(),
             peer ? &*peer->io.mtp_decode : nullptr,
-            peer ? &peer->state_images->continuation_hidden_store() : nullptr};
+            peer ? &peer->state_images->continuation_hidden_store() : nullptr,
+            mtp_min_p > 0.0F || qwen4_mtp_calib != nullptr};
 
+        prepare_range.reset();
         mark_workspace_usage(workspace_plan.mtp_round);
+        // One expert window per MTP round: the verification over the Text layers, then the MTP
+        // layer's alignment and draft calls (the offload backend's layer num_hidden_layers).
+        qwen4_begin_window(execution::Qwen4Window::Decode);
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                     draft_window, envelopes, executable);
         submit_range.reset();
@@ -556,9 +722,62 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         {
             nvtx::ScopedRange wait_range(nvtx::Name::DecodeMtpWait, nvtx::Category::Control,
                                          static_cast<std::uint64_t>(lanes.size()));
+            // The expert cache policy reads the round's routing while the device runs it.
+            qwen4_observe_window();
             synchronize_devices();
         }
         timing.end_wait();
+        // T53: the next round's n-gram rows are known now; their page reads overlap the window
+        // end, the commit and the next round's preparation instead of opening its submit.
+        prefetch_qwen4_ple_next_round(lanes, true);
+        qwen4_end_window();
+        if (!qwen4_forced_tokens.empty()) {
+            // Only the round's last committed token is not consumed by the round itself, so only
+            // single-token commits (NINFER_QWEN4_MTP_NO_DRAFTS) can be forced.
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (mtp_host_egress->licensed_counts[row] != 1) {
+                    throw std::logic_error("NINFER_QWEN4_FORCE_TOKENS requires one token per round");
+                }
+                force_qwen4_tokens(active_sequence(lanes[row]),
+                                   mtp_host_egress->licensed_tokens.data() + row * width, 1);
+            }
+        }
+        if (qwen4_tfdump && qwen4_tfdump->logits_enabled()) {
+            // Validation dump of the target logits of every committed verification column
+            // (position = the consumed token's position, as for ordinary rounds).
+            const Tensor logits = io.mtp_decode->target_logits;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::int32_t count = mtp_host_egress->licensed_counts[row];
+                const Tensor columns =
+                    logits.slice(2, static_cast<std::int32_t>(row), 1).slice(1, 0, count);
+                std::vector<std::uint16_t> host(static_cast<std::size_t>(columns.numel()));
+                CUDA_CHECK(cudaMemcpy(host.data(), columns.data, columns.bytes(),
+                                      cudaMemcpyDeviceToHost));
+                std::vector<std::int32_t> positions;
+                for (std::int32_t j = 0; j < count; ++j) {
+                    positions.push_back(
+                        static_cast<std::int32_t>(active_sequence(lanes[row]).execution_frontier +
+                                                  static_cast<std::uint32_t>(j)));
+                }
+                qwen4_tfdump->write_logits(host, logits.ne[0], positions);
+            }
+        }
+        if (qwen4_top2_file) {
+            // Validation: the target's top-2 of every committed verification column.
+            const Tensor logits = io.mtp_decode->target_logits;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const std::int32_t count = mtp_host_egress->licensed_counts[row];
+                for (std::int32_t j = 0; j < count; ++j) {
+                    write_qwen4_top2(logits.slice(2, static_cast<std::int32_t>(row), 1)
+                                         .slice(1, j, 1)
+                                         .view({logits.ne[0], 1}),
+                                     lanes[row],
+                                     active_sequence(lanes[row]).execution_frontier +
+                                         static_cast<std::uint32_t>(j),
+                                     1);
+                }
+            }
+        }
 
         const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
         for (std::size_t row = 0; row < lanes.size(); ++row) {
@@ -581,8 +800,32 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                                           row * width,
                                                       static_cast<std::size_t>(count_i));
             validate_licensed_tokens(row_tokens);
+            if (peer && execution::tp_rank_probe_enabled()) {   // T123 rank-consistency probe
+                execution::tp_rank_probe_check(base_E, static_cast<std::int32_t>(row), count_i,
+                                               row_tokens.data());
+            }
             const std::uint32_t pcur =
                 static_cast<std::uint32_t>(mtp_host_ingress->current_extents[row]);
+            log_qwen4_round('m', base_E, pcur, accepted_i, seconds);
+            if (qwen4_replay_record != nullptr) {
+                std::fprintf(qwen4_replay_record, "win %u %u %d", base_E, pcur, accepted_i);
+                for (std::uint32_t j = 0; j < draft_window; ++j) {
+                    std::fprintf(qwen4_replay_record, " %d",
+                                 mtp_host_ingress->current_drafts[row * draft_window + j]);
+                }
+                std::fputc('\n', qwen4_replay_record);
+            }
+            if (qwen4_replay) {
+                if (const execution::Qwen4ReplaySequence* ref = qwen4_replay->match(sequence.ledger)) {
+                    for (std::int32_t j = 0; j < count_i; ++j) {
+                        const std::size_t at = sequence.ledger.size() + static_cast<std::size_t>(j);
+                        if (at >= ref->ids.size() || ref->ids[at] != row_tokens[static_cast<std::size_t>(j)]) {
+                            ++qwen4_replay->commit_mismatches;
+                            break;
+                        }
+                    }
+                }
+            }
             if (pcur == 0) {
                 request.speculative_stats.fallback_steps += 1;
             } else {
@@ -624,6 +867,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
             synchronize_devices();
         } catch (...) {}
         timing.end_wait();
+        qwen4_abandon_window();
         clear_execution_failure_lanes(lanes);
         throw;
     }

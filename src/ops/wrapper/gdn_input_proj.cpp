@@ -20,7 +20,9 @@
 #include <array>
 #include <cstdint>
 #include <stdexcept>
+#include <initializer_list>
 #include <string>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -1021,6 +1023,75 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
     dispatch_single_parent_record(x, query_key_value_z_weight, conv_weight, conv_states,
                                   valid_columns, initial_state_slots, conv_record, query, key,
                                   value, z, LinearPolicy::A16Only, workspace, stream);
+}
+
+namespace {
+
+// Registered projected-convolution row profiles: the 16/48-head parent (Qwen3.5 27B and
+// Qwen3.8-Flash-Next) and one rank's 8/24-head half under two-device tensor parallelism.
+std::int32_t projected_conv_channels(const Tensor& query, const Tensor& key, const Tensor& value,
+                                     const char* op) {
+    if (query.ne[0] == 2048 && key.ne[0] == 2048 && value.ne[0] == 6144) { return 10240; }
+    if (query.ne[0] == 1024 && key.ne[0] == 1024 && value.ne[0] == 3072) { return 5120; }
+    throw std::invalid_argument(std::string(op) + ": unregistered query/key/value row profile");
+}
+
+void require_projected_conv_nonoverlap(std::initializer_list<const Tensor*> tensors,
+                                       const char* op) {
+    const std::vector<const Tensor*> list(tensors);
+    for (std::size_t lhs = 0; lhs < list.size(); ++lhs) {
+        if (list[lhs]->data == nullptr) { continue; }
+        for (std::size_t rhs = lhs + 1; rhs < list.size(); ++rhs) {
+            if (list[rhs]->data != nullptr && overlaps(*list[lhs], *list[rhs])) {
+                throw std::invalid_argument(std::string(op) + ": operands must not overlap");
+            }
+        }
+    }
+}
+
+} // namespace
+
+void gdn_projected_conv_snapshot(const Tensor& projected, const Tensor& conv_weight,
+                                 Tensor& conv_states, const Tensor& valid_columns,
+                                 const Tensor& initial_state_slots,
+                                 const Tensor& snapshot_base_slots, Tensor& query, Tensor& key,
+                                 Tensor& value, cudaStream_t stream) {
+    constexpr const char* kOp   = "gdn_projected_conv_snapshot";
+    const std::int32_t channels = projected_conv_channels(query, key, value, kOp);
+    const ConvGeometry geometry = require_snapshot_input(projected, channels);
+    require_snapshot_operands(conv_weight, conv_states, valid_columns, initial_state_slots,
+                              snapshot_base_slots, channels, geometry);
+    require_conv_tensor(query, query.ne[0], geometry.width, geometry.batch, kOp, "query");
+    require_conv_tensor(key, key.ne[0], geometry.width, geometry.batch, kOp, "key");
+    require_conv_tensor(value, value.ne[0], geometry.width, geometry.batch, kOp, "value");
+    require_projected_conv_nonoverlap({&projected, &conv_weight, &conv_states, &valid_columns,
+                                       &initial_state_slots, &query, &key, &value},
+                                      kOp);
+    require_projected_conv_nonoverlap({&snapshot_base_slots, &projected, &conv_weight, &conv_states,
+                                       &valid_columns, &query, &key, &value},
+                                      kOp);
+    detail::gdn_projected_conv_snapshot_launch(projected, conv_weight, conv_states, valid_columns,
+                                               initial_state_slots, snapshot_base_slots, query, key,
+                                               value, stream);
+}
+
+void gdn_projected_conv_record(const Tensor& conv_record, const Tensor& conv_weight,
+                               const Tensor& conv_states, const Tensor& valid_columns,
+                               const Tensor& initial_state_slots, Tensor& query, Tensor& key,
+                               Tensor& value, cudaStream_t stream) {
+    constexpr const char* kOp   = "gdn_projected_conv_record";
+    const std::int32_t channels = projected_conv_channels(query, key, value, kOp);
+    const ConvGeometry geometry = require_record_input(conv_record, channels);
+    require_record_operands(conv_weight, conv_states, valid_columns, initial_state_slots, channels,
+                            geometry);
+    require_conv_tensor(query, query.ne[0], geometry.width, geometry.batch, kOp, "query");
+    require_conv_tensor(key, key.ne[0], geometry.width, geometry.batch, kOp, "key");
+    require_conv_tensor(value, value.ne[0], geometry.width, geometry.batch, kOp, "value");
+    require_projected_conv_nonoverlap({&conv_record, &conv_weight, &conv_states, &valid_columns,
+                                       &initial_state_slots, &query, &key, &value},
+                                      kOp);
+    detail::gdn_projected_conv_record_launch(conv_record, conv_weight, conv_states, valid_columns,
+                                             initial_state_slots, query, key, value, stream);
 }
 
 } // namespace ninfer::ops

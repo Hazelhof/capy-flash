@@ -56,6 +56,33 @@ set_tests_properties(
   ninfer_state_store_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+ninfer_add_test(ninfer_expert_cache_policy_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache_policy.cpp"
+  LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_expert_cache_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_cache.cu"
+  LIBRARIES ninfer_core)
+# T158: the fence and mid-window-fill scenarios need a 20 ms reader kernel to overlap a copy; another
+# process on the same GPU time-slices them apart (the controls then fail, no slot is ever misread).
+set_tests_properties(ninfer_expert_cache_test PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+
+ninfer_add_test(ninfer_elastic_arena_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_elastic_arena.cu"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_elastic_arena_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_expert_staging_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_staging.cu"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_expert_staging_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Replays routing.bin through the policy; it was checked against the offline cache simulators
+# window by window (T14; needs a routing trace, so not a CTest).
+add_executable(ninfer_expert_cache_replay "${CMAKE_CURRENT_LIST_DIR}/../expert_cache_replay.cpp")
+ninfer_test_includes(ninfer_expert_cache_replay)
+target_link_libraries(ninfer_expert_cache_replay PRIVATE ninfer_core)
+
 ninfer_add_test(ninfer_host_timing_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_host_timing.cpp"
   LIBRARIES ninfer_core)

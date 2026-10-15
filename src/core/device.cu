@@ -58,6 +58,23 @@ void destroy_event(cudaEvent_t& event) noexcept {
 
 } // namespace
 
+cudaError_t memcpy_device_async(void* dst, const void* src, std::size_t bytes, cudaStream_t stream) {
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    if (const cudaError_t e = cudaStreamIsCapturing(stream, &status); e != cudaSuccess) { return e; }
+    if (bytes > 0 && status == cudaStreamCaptureStatusNone) {
+        cudaPointerAttributes d{};
+        cudaPointerAttributes s{};
+        if (cudaPointerGetAttributes(&d, dst) != cudaSuccess ||
+            cudaPointerGetAttributes(&s, src) != cudaSuccess) {
+            (void)cudaGetLastError(); // not a device pointer CUDA knows: the plain copy reports it
+        } else if (d.type == cudaMemoryTypeDevice && s.type == cudaMemoryTypeDevice &&
+                   d.device != s.device) {
+            return cudaMemcpyPeerAsync(dst, d.device, src, s.device, bytes, stream);
+        }
+    }
+    return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream);
+}
+
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,

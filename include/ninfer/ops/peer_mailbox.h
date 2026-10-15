@@ -50,6 +50,22 @@
 
 namespace ninfer::ops {
 
+// One rank's raw view of one mailbox slot, for a kernel that runs the pipelined exchange protocol
+// itself (a fused Op exchanging partials mid-kernel; peer_exchange_lane in peer_exchange.cuh): the
+// rank's and the peer's payload slots (pinned, UVA), the first release line of each (warp lane w at
+// w * kPeerFlagStride words), this rank's per-lane epochs (its device memory, lane w at w) and the
+// hang word. A kernel using it must keep the pipelined geometry (lane w = 32 lanes x 2 vectors of
+// 16 bytes = bytes [w KiB, (w+1) KiB) of the payload) so its exchanges and the mailbox's own
+// interleave on the same slots.
+struct PeerExchangeSlot {
+    void* mine_payload          = nullptr;
+    const void* peer_payload    = nullptr;
+    std::uint32_t* mine_flags   = nullptr;
+    std::uint32_t* peer_flags   = nullptr;
+    std::uint32_t* epochs       = nullptr;
+    std::uint32_t* hang         = nullptr;
+};
+
 // The exchange kernel a PeerMailbox launches (src/ops/kernel/peer_exchange.cuh).
 enum class PeerExchangeKernel {
     Pipelined, // per-warp flags and epochs, all loads in flight (the default)
@@ -110,9 +126,33 @@ public:
     void enqueue_exchange_sum(int rank, int slot, void* data, std::size_t bytes,
                               cudaStream_t stream) const;
 
+    // The FP32 form of enqueue_exchange_sum(): `data` holds FP32 partials (`bytes` / 4 of them),
+    // replaced in place by fl32(partial_0 + partial_1), and, when `bf16_out` is non-null (16-byte
+    // aligned, `bytes` / 4 BF16 elements on the same device), that sum rounded once to BF16 is
+    // stored there too. Same slots, sets and protocol as the BF16 exchange, so the two interleave
+    // on one mailbox. Only the pipelined kernel has this form: throws std::logic_error on a
+    // mailbox created with PeerExchangeKernel::Legacy (allreduce_sum_f32 keeps such pairs staged).
+    void enqueue_exchange_sum_f32(int rank, int slot, void* data, std::size_t bytes,
+                                  void* bf16_out, cudaStream_t stream) const;
+
+    // Rank `rank`'s view of slot `slot` (taken by take_capture_slot(bytes) for both ranks) of the
+    // set that carries `bytes`, for a fused kernel that exchanges itself. Pipelined mailboxes only:
+    // throws std::logic_error for a Legacy mailbox, std::invalid_argument for a payload that is not
+    // whole 16-byte vectors within one slot.
+    [[nodiscard]] PeerExchangeSlot exchange_slot(int rank, int slot, std::size_t bytes) const;
+
     // True once an exchange's poller gave up waiting for its peer. Sticky: the two ranks' results
     // diverged, so the owner must not trust any later round.
     [[nodiscard]] bool hang_reported() const noexcept;
+
+    // When true, the pipelined exchange kernels (BF16 and FP32) release the next kernel of their
+    // stream at entry (griddepcontrol.launch_dependents): a programmatic dependent may then start
+    // while the exchange waits on the peer, so it must not read the exchanged data before its
+    // dependency wait. Off by default (kernels such as the Q4/Q5 GEMVs launched as dependents read
+    // their input before waiting); Qwen4Exp turns it on (its dependents are the hyper-connection
+    // mixers, T45). Applies to exchanges enqueued afterwards.
+    void set_release_dependents(bool release) noexcept { release_dependents_ = release; }
+    [[nodiscard]] bool release_dependents() const noexcept { return release_dependents_; }
 
     // Test aid: sets the sticky hang word from the host, as a poller that gave up would, so the
     // owner's recovery can be exercised on hardware where no exchange ever hangs.
@@ -143,6 +183,7 @@ private:
     int slots_                      = 0;
     PeerExchangeKernel kernel_      = PeerExchangeKernel::Pipelined;
     int devices_[2]                 = {0, 0};
+    bool release_dependents_        = false;
 };
 
 } // namespace ninfer::ops

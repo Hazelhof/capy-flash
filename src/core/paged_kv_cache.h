@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <span>
 #include <vector>
@@ -238,6 +239,19 @@ public:
                        std::vector<DeviceKVPageLease>& source);
     void dematerialize_one(DeviceKVPageReservation& reservation, DeviceKVPageLease&& page);
 
+    /**
+     * Elastic backing (T64): only pages [0, backed_pages()) have physical memory. Before a page
+     * at or beyond it is handed out (materialize, materialize_one), `grow(pages)` is called with
+     * the number of leading pages that must then be backed; it backs them and records it with
+     * set_backed_pages(), or throws, leaving the pool unchanged. Without a backing every page is
+     * backed. allocated_extent() is one past the highest allocated page, so a caller may release
+     * the backing of the pages after it.
+     */
+    void set_backing(std::uint32_t backed_pages, std::function<void(std::uint32_t)> grow);
+    void set_backed_pages(std::uint32_t pages);
+    [[nodiscard]] std::uint32_t backed_pages() const noexcept { return backed_pages_; }
+    [[nodiscard]] std::uint32_t allocated_extent() const noexcept;
+
     // Every zero_pages/copy_page issued here is repeated at the same physical indices on `mirror`
     // (another device's pool of identical page capacity) on `where.stream`. Host transfers are
     // rejected while a mirror is attached: the Host tiers are not tensor-parallel aware.
@@ -270,6 +284,7 @@ private:
     void release_free_page(std::int32_t index) noexcept;
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;
     void release_reservation(std::uint32_t pages) noexcept;
+    void require_backed(std::uint32_t pages);
 
     struct FreePageRun {
         std::int32_t begin  = 0;
@@ -287,6 +302,8 @@ private:
     std::uint32_t reserved_pages_           = 0;
     const DeviceKVPagePool* mirror_         = nullptr;
     DeviceKVMirror mirror_where_;
+    std::uint32_t backed_pages_             = 0;
+    std::function<void(std::uint32_t)> grow_backing_;
 };
 
 struct DeviceKVPageReservationRequest {

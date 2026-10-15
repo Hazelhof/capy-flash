@@ -46,7 +46,7 @@ import analyze
 import runner
 import workload
 
-# The production launch line (llama-swap `qwen27b`) plus --lm-head-draft, as the benchmarks run it.
+# A production launch line of the 27B (as served behind llama-swap) plus --lm-head-draft, as the benchmarks run it.
 PROD = ("--tp 2 --devices 0,1 --kv-dtype int8 --max-context 196608 --kv-capacity 196608 "
         "--device-state-slots 4 --max-concurrency 1 --spec mtp --draft-tokens 3 --vision "
         "--vision-device 0 --max-vision-tokens 4096 --lm-head-draft")

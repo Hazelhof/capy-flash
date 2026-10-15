@@ -102,9 +102,17 @@ private:
 // capture and keep it alive as long as the graph executables.
 enum class HostMapping : std::uint8_t { No, Yes };
 
+// Host page size behind a PinnedHostBuffer. Huge asks for 2 MiB pages (transparent huge pages,
+// prefaulted, then registered with cudaHostRegister): a GPU translates host addresses through its
+// own TLB, and scattered SM reads over 4 KiB pages lose much of the link to translation misses.
+// Advisory: without THP, or when the device cannot use registered host pointers, the buffer is
+// the Default allocation and only slower to read.
+enum class PinnedHostPages : std::uint8_t { Default, Huge };
+
 class PinnedHostBuffer {
 public:
-    explicit PinnedHostBuffer(std::size_t size_bytes, HostMapping mapping = HostMapping::No);
+    explicit PinnedHostBuffer(std::size_t size_bytes, HostMapping mapping = HostMapping::No,
+                              PinnedHostPages pages = PinnedHostPages::Default);
     ~PinnedHostBuffer();
 
     PinnedHostBuffer(const PinnedHostBuffer&)            = delete;
@@ -122,6 +130,7 @@ private:
     void* data_       = nullptr;
     std::size_t size_ = 0;
     bool mapped_      = false;
+    bool registered_  = false; // std::aligned_alloc + cudaHostRegister instead of cudaHostAlloc
 };
 
 using WorkspaceArena = DeviceArena;

@@ -71,6 +71,10 @@ void TextContext::validate_tensor_parallel() {
         throw std::invalid_argument(
             "tensor-parallel Linear Attention state pools disagree on their slots");
     }
+    if (qwen4()) {
+        validate_tensor_parallel_qwen4();
+        return;
+    }
     shard_config_       = shard_text_config(config_, kTensorParallelWidth);
     const auto& layers0 = parameters_.text.layers;
     const auto& layers1 = tp.parameters->text.layers;
@@ -642,6 +646,16 @@ template <class Tap>
 PrefillChunkResult
 TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_prefill,
                               const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end) {
+    if (qwen4()) {
+        if constexpr (Tap::enabled) {
+            throw std::logic_error("Qwen4Exp prefill publishes no speculative feature taps");
+        } else {
+            if (multimodal != nullptr) {
+                throw std::invalid_argument("Qwen4Exp image input is not implemented");
+            }
+            return qwen4_prefill(ids, text_prefill, finalize_at_end);
+        }
+    }
     runtime::ExecutionTimingRecorder timing;
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
     if (ids.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -875,8 +889,8 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
             }
             if (mtp_window.final_column_uses_generated_token) {
                 Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
-                CUDA_CHECK(cudaMemcpyAsync(generated_mtp_id.data, io_.token.data,
-                                           sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
+                CUDA_CHECK(::ninfer::memcpy_device_async(generated_mtp_id.data, io_.token.data,
+                                           sizeof(std::int32_t), s));
             }
             // A multimodal prompt's shifted stream carries visual columns: rank 0 embeds the
             // shifted ids and scatters the item's merged embeddings over the shifted visual
@@ -932,8 +946,8 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
                     for_each_rank(execution, [&](int rank) {
                         const auto r        = static_cast<std::size_t>(rank);
                         cudaStream_t stream = rank_stream(rank);
-                        CUDA_CHECK(cudaMemcpyAsync(ar_hidden[r].data, next_hidden[r].data,
-                                                   ar_hidden[r].bytes(), cudaMemcpyDeviceToDevice,
+                        CUDA_CHECK(::ninfer::memcpy_device_async(ar_hidden[r].data, next_hidden[r].data,
+                                                   ar_hidden[r].bytes(),
                                                    stream));
                         Tensor position = ar_position[r];
                         ops::increment_i32_scalar(position, stream);
@@ -951,9 +965,8 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
                                  {dimension(config_.hidden_size), 1},
                                  "rewrite checkpoint hidden output");
             const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
-            CUDA_CHECK(cudaMemcpyAsync(rewrite_checkpoint_hidden_output_->data,
-                                       checkpoint_hidden.data, checkpoint_hidden.bytes(),
-                                       cudaMemcpyDeviceToDevice, s));
+            CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data,
+                                       checkpoint_hidden.data, checkpoint_hidden.bytes(), s));
             if (peer_rewrite_checkpoint_hidden_output_ != nullptr) {
                 // Rank 1 retains the same column of its own final-normed chunk: the hidden axis is
                 // replicated, so this is a local copy on rank 1, not a transfer.
@@ -966,9 +979,9 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
                                      "rank 1 rewrite checkpoint hidden output");
                 const Tensor peer_checkpoint_hidden = peer_xf.slice(1, len - 1, 1);
                 const ScopedCurrentDevice peer(execution.dev[1]->device);
-                CUDA_CHECK(cudaMemcpyAsync(
+                CUDA_CHECK(::ninfer::memcpy_device_async(
                     peer_rewrite_checkpoint_hidden_output_->data, peer_checkpoint_hidden.data,
-                    peer_checkpoint_hidden.bytes(), cudaMemcpyDeviceToDevice, rank_stream(1)));
+                    peer_checkpoint_hidden.bytes(), rank_stream(1)));
             }
         }
     }
@@ -1121,6 +1134,12 @@ void TextContext::target_verify_batch(
     const RankTensors& valid_columns, const RankTensors& kv_table_rows,
     const RankTensors& linear_state_source_slots, ops::CausalAttentionExecutionEnvelope envelope,
     const RankTensors& hidden, Tensor& logits, Tensor& target_tokens) {
+    if (qwen4()) {
+        qwen4_target_verify_tp2(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
+                                linear_state_source_slots, envelope, hidden, logits,
+                                target_tokens);
+        return;
+    }
     NullTap tap;
     target_verify_batch_tp2_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                                  linear_state_source_slots, envelope, hidden, logits, target_tokens,
@@ -1132,6 +1151,9 @@ void TextContext::target_verify_batch(
     const RankTensors& valid_columns, const RankTensors& kv_table_rows,
     const RankTensors& linear_state_source_slots, ops::CausalAttentionExecutionEnvelope envelope,
     const RankTensors& hidden, Tensor& logits, Tensor& target_tokens, DFlashFeatureSink& sink) {
+    if (qwen4()) {
+        throw std::logic_error("Qwen4Exp verification publishes no speculative feature taps");
+    }
     target_verify_batch_tp2_impl(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
                                  linear_state_source_slots, envelope, hidden, logits, target_tokens,
                                  sink);
@@ -1431,10 +1453,8 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const RankTensors& hi
                                      static_cast<std::size_t>(T - 1) * column_bytes;
                 const auto* ah_src = static_cast<const unsigned char*>(ah[r].data) +
                                      static_cast<std::size_t>(T - 1) * column_bytes;
-                CUDA_CHECK(cudaMemcpyAsync(x_last[r].data, x_src, column_bytes,
-                                           cudaMemcpyDeviceToDevice, stream));
-                CUDA_CHECK(cudaMemcpyAsync(ah_last[r].data, ah_src, column_bytes,
-                                           cudaMemcpyDeviceToDevice, stream));
+                CUDA_CHECK(::ninfer::memcpy_device_async(x_last[r].data, x_src, column_bytes, stream));
+                CUDA_CHECK(::ninfer::memcpy_device_async(ah_last[r].data, ah_src, column_bytes, stream));
             }
         });
     }
@@ -1477,7 +1497,7 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const RankTensors& hi
                 const auto* src = static_cast<const std::int32_t*>(rope_positions[r].data) +
                                   static_cast<std::size_t>(axis) * T + (T - 1);
                 auto* dst       = static_cast<std::int32_t*>(last_rope[r].data) + axis;
-                CUDA_CHECK(cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice,
+                CUDA_CHECK(::ninfer::memcpy_device_async(dst, src, sizeof(std::int32_t),
                                            stream));
             }
         }
@@ -1573,6 +1593,11 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const RankTensors&
                                            const RankTensors& mtp_hidden) {
     if (!tp2()) { throw std::invalid_argument("rank-pair MTP decode requires tensor parallelism"); }
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (qwen4()) {
+        qwen4_mtp_forward_decode_tp2(ids, hidden, cache_positions, rope_positions, valid_columns,
+                                     kv_table_rows, envelope, mtp_hidden);
+        return;
+    }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kMaximumMtpDraftTokens + 1) || batch <= 0 ||
@@ -1606,9 +1631,16 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const RankTensors&
 }
 
 void TextContext::mtp_propose_batch(const RankTensors& hidden, Tensor& logits,
-                                    Tensor& draft_tokens) {
+                                    Tensor& draft_tokens, Tensor* draft_logprobs) {
     if (!tp2()) {
         throw std::invalid_argument("rank-pair MTP proposal requires tensor parallelism");
+    }
+    if (qwen4()) {
+        qwen4_mtp_propose_tp2(hidden, logits, draft_tokens, draft_logprobs);
+        return;
+    }
+    if (draft_logprobs != nullptr && proposal_head_ != nullptr) {
+        throw std::invalid_argument("MTP draft log-probabilities need the full proposal head");
     }
     const std::int32_t batch = hidden[0].ne[1];
     for (std::size_t r = 0; r < 2; ++r) {
@@ -1622,6 +1654,11 @@ void TextContext::mtp_propose_batch(const RankTensors& hidden, Tensor& logits,
     auto proposal_scope0 = work_.scope();
     auto proposal_scope1 = tp_->work->scope();
     proposal_argmax_tp2(hidden, logits, draft_tokens);
+    if (draft_logprobs != nullptr) {
+        ops::target_logprobs(logits, draft_tokens,
+                             dimension(parameters_.model.resources().public_token_count),
+                             *draft_logprobs, ctx_.stream);
+    }
 }
 
 void TextContext::mtp_forward_batch(const Tensor& ids, const RankTensors& hidden,
@@ -1632,6 +1669,12 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const RankTensors& hidden
                                     const Tensor* input_embeddings) {
     if (!tp2()) { throw std::invalid_argument("rank-pair MTP bridge requires tensor parallelism"); }
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (qwen4()) {
+        const ScopedCurrentDevice device(ctx_.device);
+        qwen4_mtp_forward_batch_tp2(ids, hidden, positions, rope_positions, envelope, mtp_hidden,
+                                    logits_column, logits, draft_token, input_embeddings);
+        return;
+    }
     const int T = ids.ne[0];
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_) {
         throw std::invalid_argument("MTP batch T must be in [1,prefill_chunk]");
@@ -1680,6 +1723,26 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const RankTensors& pr
         throw std::invalid_argument("rank-pair MTP proposal step requires tensor parallelism");
     }
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
+    if (qwen4()) {
+        // The step's carried hidden is the wide residual; each rank offsets its own position copy
+        // by its own copy of the sequence's RoPE delta (as qwen4_mtp_prefill_tp2's drafts).
+        const ExecutionContext& execution = *tp_->execution;
+        const ScopedCurrentDevice device(ctx_.device);
+        auto rope_scope0 = work_.scope();
+        auto rope_scope1 = tp_->work->scope();
+        RankTensors rope;
+        for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            require_tensor_shape(position[r], DType::I32, {1}, "MTP AR position");
+            const ScopedCurrentDevice current(rank == 0 ? ctx_.device : execution.dev[1]->device);
+            rope[r] = (rank == 0 ? work_ : *tp_->work).alloc(DType::I32, {1});
+            ops::offset_i32_positions(position[r], rank == 0 ? io_.rope_delta : tp_->rope_delta,
+                                      rope[r], rank_stream(rank));
+        }
+        qwen4_mtp_forward_batch_tp2(token, previous_hidden, position, rope, envelope, mtp_hidden,
+                                    0, &logits, &draft_token, nullptr);
+        return;
+    }
     const std::int32_t H = dimension(config_.hidden_size);
     require_tensor_shape(token, DType::I32, {1}, "MTP AR token");
     require_tensor_shape(draft_token, DType::I32, {1}, "MTP AR draft token");

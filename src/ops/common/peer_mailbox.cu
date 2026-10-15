@@ -149,6 +149,12 @@ PeerMailbox::PeerMailbox(const ExecutionContext& ec, std::size_t slot_bytes, int
                     : cudaFuncGetAttributes(&attributes,
                                             detail::peer_exchange_pipelined_kernel<kVecsPerLane>),
                 "cudaFuncGetAttributes");
+            if (kernel_ == PeerExchangeKernel::Pipelined) {
+                throw_on_error(
+                    cudaFuncGetAttributes(&attributes,
+                                          detail::peer_exchange_pipelined_f32_kernel<kVecsPerLane>),
+                    "cudaFuncGetAttributes");
+            }
         }
     } catch (...) {
         release();
@@ -196,6 +202,14 @@ int PeerMailbox::take_capture_slot(std::size_t bytes) noexcept {
     return slot;
 }
 
+namespace {
+detail::PeerPipelinedTuning pipelined_tuning(bool release_dependents) {
+    detail::PeerPipelinedTuning tuning{};
+    tuning.release_dependents = release_dependents;
+    return tuning;
+}
+} // namespace
+
 void PeerMailbox::enqueue_exchange_sum(int rank, int slot, void* data, std::size_t bytes,
                                        cudaStream_t stream) const {
     if (rank < 0 || rank > 1 || slot < 0 || slot >= slots_) {
@@ -228,9 +242,67 @@ void PeerMailbox::enqueue_exchange_sum(int rank, int slot, void* data, std::size
             <<<detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads), kThreads, 0, stream>>>(
                 partial, mine_payload, set.flags[rank] + flag_slot, peer_payload,
                 set.flags[1 - rank] + flag_slot, words + lane_base, hang_, static_cast<int>(vecs),
-                detail::PeerPipelinedTuning{});
+                pipelined_tuning(release_dependents_));
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void PeerMailbox::enqueue_exchange_sum_f32(int rank, int slot, void* data, std::size_t bytes,
+                                           void* bf16_out, cudaStream_t stream) const {
+    if (kernel_ != PeerExchangeKernel::Pipelined) {
+        throw std::logic_error("PeerMailbox: the FP32 exchange needs the pipelined kernel");
+    }
+    if (rank < 0 || rank > 1 || slot < 0 || slot >= slots_) {
+        throw std::invalid_argument("PeerMailbox: rank or slot out of range");
+    }
+    const SlotSet& set = sets_[set_for(bytes)];
+    if (bytes == 0 || bytes > set.slot_bytes || (bytes % sizeof(detail::PeerVec)) != 0 ||
+        (reinterpret_cast<std::uintptr_t>(data) % sizeof(detail::PeerVec)) != 0 ||
+        (reinterpret_cast<std::uintptr_t>(bf16_out) % sizeof(detail::PeerVec)) != 0) {
+        throw std::invalid_argument(
+            "PeerMailbox: an exchange carries whole, aligned 16-byte vectors within one slot");
+    }
+    const std::size_t offset    = static_cast<std::size_t>(slot) * set.slot_bytes;
+    const std::size_t lane_base = static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
+    const std::size_t flag_slot = lane_base * detail::kPeerFlagStride;
+    const std::size_t vecs      = bytes / sizeof(detail::PeerVec);
+    constexpr int kVecsPerLane  = detail::kPeerPipelinedVecsPerLane;
+    constexpr int kThreads      = detail::kPeerPipelinedThreads;
+    detail::peer_exchange_pipelined_f32_kernel<kVecsPerLane>
+        <<<detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads), kThreads, 0, stream>>>(
+            static_cast<detail::PeerVec*>(data),
+            reinterpret_cast<detail::PeerVec*>(set.payload[rank] + offset),
+            set.flags[rank] + flag_slot,
+            reinterpret_cast<const detail::PeerVec*>(set.payload[1 - rank] + offset),
+            set.flags[1 - rank] + flag_slot, set.device_words[rank] + lane_base, hang_,
+            static_cast<int>(vecs), static_cast<__nv_bfloat16*>(bf16_out),
+            pipelined_tuning(release_dependents_));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+PeerExchangeSlot PeerMailbox::exchange_slot(int rank, int slot, std::size_t bytes) const {
+    if (kernel_ != PeerExchangeKernel::Pipelined) {
+        throw std::logic_error("PeerMailbox: a fused exchange needs the pipelined protocol");
+    }
+    if (rank < 0 || rank > 1 || slot < 0 || slot >= slots_) {
+        throw std::invalid_argument("PeerMailbox: rank or slot out of range");
+    }
+    const SlotSet& set = sets_[set_for(bytes)];
+    if (bytes == 0 || bytes > set.slot_bytes || (bytes % sizeof(detail::PeerVec)) != 0) {
+        throw std::invalid_argument(
+            "PeerMailbox: an exchange carries whole 16-byte vectors within one slot");
+    }
+    const std::size_t offset    = static_cast<std::size_t>(slot) * set.slot_bytes;
+    const std::size_t lane_base = static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
+    const std::size_t flag_slot = lane_base * detail::kPeerFlagStride;
+    PeerExchangeSlot view;
+    view.mine_payload = set.payload[rank] + offset;
+    view.peer_payload = set.payload[1 - rank] + offset;
+    view.mine_flags   = set.flags[rank] + flag_slot;
+    view.peer_flags   = set.flags[1 - rank] + flag_slot;
+    view.epochs       = set.device_words[rank] + lane_base;
+    view.hang         = hang_;
+    return view;
 }
 
 bool PeerMailbox::hang_reported() const noexcept {

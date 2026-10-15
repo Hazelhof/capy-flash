@@ -593,8 +593,7 @@ void VisionPrefillSession::encode_on_ranks(const VisionItemView& item, Tensor& r
 
     ScopedCurrentDevice::select(receiver.device->device);
     encoded_->wait(receiver.device->stream);
-    CUDA_CHECK(cudaMemcpyAsync(received.data, encoded.data, encoded.bytes(),
-                               cudaMemcpyDeviceToDevice, receiver.device->stream));
+    CUDA_CHECK(::ninfer::memcpy_device_async(received.data, encoded.data, encoded.bytes(), receiver.device->stream));
     copied_->record(receiver.device->stream);
 
     // The next item's encode overwrites the encoding rank's handoff only after the copy read it.

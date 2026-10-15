@@ -41,7 +41,10 @@ struct GdnReplayFoldRow {
  * copies row descriptors by value; replay consumes record/state contents at the bound addresses,
  * while changing host row descriptors requires a new capture.
  *
- * The Op admits the two registered all-layer geometries only, owns no workspace or device
+ * The Op admits the registered all-layer geometries only: 48 layers of 16/48 heads (10240 conv
+ * channels), 30 layers of 16/32 heads (8192), 36 layers of 16/48 heads (10240; Qwen3.8-Flash-Next),
+ * 3 layers of 16/48 heads (its 4-layer synthetic checkpoints),
+ * and the two-device shards 48 and 36 layers of 8/24 heads (5120). It owns no workspace or device
  * allocation, and does not read query or generate token output. The four record planes are
  * read-only, disjoint, and do not overlap either state region.
  */

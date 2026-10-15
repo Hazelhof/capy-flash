@@ -72,12 +72,23 @@ class PrepareRequest:
         default_factory=dict
     )
     source_offsets: tuple[int, ...] = field(init=False)
+    # Parent row where each input starts, when every input is a complete row block of the parent;
+    # None otherwise, and encoded_rows then names the first input that is not.
+    row_offsets: tuple[int, ...] | None = field(init=False)
 
     def __post_init__(self) -> None:
         values = [0]
         for item in self.inputs:
             values.append(values[-1] + prod(item.source.shape))
         object.__setattr__(self, "source_offsets", tuple(values))
+        rows = [0]
+        for item in self.inputs:
+            shape = item.source.shape
+            if len(self.target.shape) != 2 or len(shape) != 2 or shape[1] != self.target.shape[1]:
+                rows = None
+                break
+            rows.append(rows[-1] + shape[0])
+        object.__setattr__(self, "row_offsets", None if rows is None else tuple(rows))
 
     @property
     def source(self) -> LogicalSource:
@@ -113,22 +124,29 @@ class PrepareRequest:
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces)
 
     def encoded_rows(self, begin: int, end: int) -> EncodedRows:
-        pieces = []
-        cursor = 0
-        for item in self.inputs:
-            source = item.source
-            if len(source.shape) != 2 or source.shape[1] != self.target.shape[1]:
-                raise ValueError(
-                    f"{item.parameter}: encoded grouping requires complete rows"
-                )
-            low, high = max(begin, cursor), min(end, cursor + source.shape[0])
-            if low < high:
-                if source.read_encoded is None:
-                    raise ValueError(f"{item.parameter}: encoded rows are unavailable")
-                pieces.append(source.read_encoded(low - cursor, high - cursor))
-            cursor += source.shape[0]
-        if not pieces or end > cursor:
+        offsets = self.row_offsets
+        if offsets is None:
+            for item in self.inputs:
+                shape = item.source.shape
+                if len(shape) != 2 or shape[1] != self.target.shape[1]:
+                    raise ValueError(
+                        f"{item.parameter}: encoded grouping requires complete rows"
+                    )
+        if not 0 <= begin < end <= offsets[-1]:
             raise ValueError("encoded method input range is invalid")
+        pieces = []
+        # A stacked bank has one input per expert; find the first overlapping one directly
+        # instead of walking every input for every chunk.
+        index = bisect_right(offsets, begin) - 1
+        while offsets[index] < end:
+            item = self.inputs[index]
+            cursor = offsets[index]
+            low, high = max(begin, cursor), min(end, offsets[index + 1])
+            if low < high:
+                if item.source.read_encoded is None:
+                    raise ValueError(f"{item.parameter}: encoded rows are unavailable")
+                pieces.append(item.source.read_encoded(low - cursor, high - cursor))
+            index += 1
         first = pieces[0]
         if any(
             (p.format, p.weight_divisor) != (first.format, first.weight_divisor)
@@ -241,14 +259,25 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     return request.job(produce=produce)
 
 
+IMPORT_CHUNK_BYTES = 64 * 1024 * 1024
+
+
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4 source codes, scales and weight divisor."""
+    """Preserve the current FP8/NVFP4 source codes, scales and weight divisors.
+
+    A parent with one divisor requires its sources to agree on it. A stacked NVFP4 parent
+    (``target.divisors`` > 1, one equal row block per source) keeps every source's divisor, and
+    every source's activation divisor stays on that source's own Uses.
+    """
     if (
         request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16")
         or len(request.target.shape) != 2
     ):
         raise ValueError("import_encoded requires a known encoded matrix target")
     _preflight(request, values=False)
+    stacked = request.target.divisors > 1
+    if stacked and request.target.divisors != len(request.inputs):
+        raise ValueError("a stacked NVFP4 parent stores one divisor per source")
     auxiliaries = {}
     weight_divisor = None
     for item in request.inputs:
@@ -261,7 +290,9 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                 f"{item.parameter}: source {first.format} differs from target {request.target.format}"
             )
         if first.format == "nvfp4":
-            if weight_divisor is None:
+            if stacked:
+                pass
+            elif weight_divisor is None:
                 weight_divisor = first.weight_divisor
             elif first.weight_divisor != weight_divisor:
                 raise ValueError(
@@ -279,17 +310,25 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
                     auxiliaries[key] = AuxiliaryValue.activation_divisor(
                         source.input_divisor()
                     )
-    n = request.target.shape[0]
-    chunk = (
-        max(128, request.rows_per_chunk // 128 * 128)
-        if request.target.format == "nvfp4"
-        else request.rows_per_chunk
-    )
+    n, k = request.target.shape
+    # Imported words are copied, not computed, so the chunk is sized by bytes: rows_per_chunk
+    # alone gives the 160-byte rows of an n-gram table tiny chunks and millions of reads. Chunk
+    # boundaries do not change the stored bytes.
+    row_bytes = k // 2 + k // 16 if request.target.format == "nvfp4" else k + 2
+    chunk = max(request.rows_per_chunk, IMPORT_CHUNK_BYTES // row_bytes)
+    if request.target.format == "nvfp4":
+        chunk = max(128, chunk // 128 * 128)
 
     def produce(output):
-        for begin in range(0, n, chunk):
-            words = request.encoded_rows(begin, min(n, begin + chunk))
-            output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+        # A stacked plane starts a new run of chunks at every source boundary: a row block
+        # carries one divisor, so a chunk may not straddle two sources.
+        bounds = list(request.row_offsets[1:]) if stacked else [n]
+        cursor = 0
+        for edge in bounds:
+            for begin in range(cursor, edge, chunk):
+                words = request.encoded_rows(begin, min(edge, begin + chunk))
+                output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+            cursor = edge
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
 
@@ -297,9 +336,18 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
 _NVFP4_MSE_TARGETS = (E2M1_MAX, 5.5, 5.0, 4.5, 4.0)
 
 
-def _nvfp4_quantized(request: PrepareRequest, targets: tuple[float, ...]) -> PreparedMethod:
+def _nvfp4_quantized(
+    request: PrepareRequest, targets: tuple[float, ...], *, stacked: bool = False
+) -> PreparedMethod:
     if request.target.format != "nvfp4" or len(request.target.shape) != 2:
         raise ValueError("NVFP4 quantization requires an nvfp4 matrix target")
+    if stacked:
+        if request.target.divisors != len(request.inputs) or request.row_offsets is None:
+            raise ValueError(
+                "stacked NVFP4 quantization stores one divisor per complete source matrix"
+            )
+    elif request.target.divisors != 1:
+        raise ValueError("NVFP4 quantization writes one divisor per parent")
     _preflight(request)
     n, k = request.target.shape
     auxiliaries = {}
@@ -314,21 +362,26 @@ def _nvfp4_quantized(request: PrepareRequest, targets: tuple[float, ...]) -> Pre
                     "recipe.use(..., auxiliaries=...) or use A16Only"
                 )
     rows = max(128, request.rows_per_chunk // 128 * 128)
+    # Row blocks quantised against one divisor: the whole parent, or each source of a stack.
+    blocks = (
+        list(zip(request.row_offsets[:-1], request.row_offsets[1:])) if stacked else [(0, n)]
+    )
 
     def produce(output):
-        amax = 0.0
-        for begin in range(0, n, rows):
-            end = min(n, begin + rows)
-            values = request.values(begin * k, end * k)
-            if not values.dtype.is_floating_point:
-                raise TypeError("NVFP4 quantization source must be floating point")
-            amax = max(amax, float(values.abs().max()))
-        divisor = weight_divisor(amax, targets)
-        for begin in range(0, n, rows):
-            end = min(n, begin + rows)
-            values = request.values(begin * k, end * k).reshape(end - begin, k)
-            words = quantize_nvfp4(values.to(request.device), divisor, targets)
-            output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+        for first, last in blocks:
+            amax = 0.0
+            for begin in range(first, last, rows):
+                end = min(last, begin + rows)
+                values = request.values(begin * k, end * k)
+                if not values.dtype.is_floating_point:
+                    raise TypeError("NVFP4 quantization source must be floating point")
+                amax = max(amax, float(values.abs().max()))
+            divisor = weight_divisor(amax, targets)
+            for begin in range(first, last, rows):
+                end = min(last, begin + rows)
+                values = request.values(begin * k, end * k).reshape(end - begin, k)
+                words = quantize_nvfp4(values.to(request.device), divisor, targets)
+                output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
 
     return request.job(produce=produce, auxiliaries=auxiliaries)
 
@@ -343,6 +396,15 @@ def nvfp4_mse(request: PrepareRequest) -> PreparedMethod:
     return _nvfp4_quantized(request, _NVFP4_MSE_TARGETS)
 
 
+def nvfp4_mse_stacked(request: PrepareRequest) -> PreparedMethod:
+    """nvfp4_mse with one divisor per source matrix of a stacked parent (a routed-expert bank).
+
+    Each source is quantised alone, exactly as nvfp4_mse would quantise it as its own parent, and
+    keeps its divisor word; the recipe planner gives such a parent one divisor per source.
+    """
+    return _nvfp4_quantized(request, _NVFP4_MSE_TARGETS, stacked=True)
+
+
 METHODS: dict[str, Method] = {
     "cast_direct": cast_direct,
     "grouped_absmax": grouped_absmax,
@@ -350,4 +412,5 @@ METHODS: dict[str, Method] = {
     "import_encoded": import_encoded,
     "nvfp4_absmax": nvfp4_absmax,
     "nvfp4_mse": nvfp4_mse,
+    "nvfp4_mse_stacked": nvfp4_mse_stacked,
 }

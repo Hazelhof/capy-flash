@@ -8,13 +8,13 @@
       "nvfp4"
     ],
     "name": "qwen3.8-27b-quasar",
-    "path": "/home/feyd/ninfer-artifacts/qwen3_8_27b_quasar_nvfp4_mtpnv.ninfer",
+    "path": "$ARTIFACTS/qwen3_8_27b_quasar_nvfp4_mtpnv.ninfer",
     "prefill_signature": "51c149290905848a1544b62cc234c88a38909a8f5f30355a5fa06dd1447e303d"
   },
   "corpus": {
     "id": "ninfer-ppl-1m-v1",
     "mode": "quick",
-    "source": "/home/feyd/ninfer-v046/eval/corpora/perplexity-1m/manifest.json",
+    "source": "$SRC/eval/corpora/perplexity-1m/manifest.json",
     "stream_count": 4
   },
   "domains": [

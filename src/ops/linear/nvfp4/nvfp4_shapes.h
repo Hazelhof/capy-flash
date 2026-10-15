@@ -18,4 +18,17 @@ extern const Nvfp4LinearShape kNvfp4N5120K17408;
 extern const Nvfp4LinearShape kNvfp4N17408K5120;
 extern const Nvfp4LinearShape kNvfp4N5120K8704;
 extern const Nvfp4LinearShape kNvfp4N5120K3072;
+extern const Nvfp4LinearShape kNvfp4N8192K2560;
+extern const Nvfp4LinearShape kNvfp4N6656K2560;
+extern const Nvfp4LinearShape kNvfp4N124160K2560;
+extern const Nvfp4LinearShape kNvfp4N512K2560;
+extern const Nvfp4LinearShape kNvfp4N640K2560;
+extern const Nvfp4LinearShape kNvfp4N2560K3072;
+// One-device Qwen3.8-Flash-Next shapes of the NVFP4-dense recipe.
+extern const Nvfp4LinearShape kNvfp4N13312K2560;
+extern const Nvfp4LinearShape kNvfp4N16384K2560;
+extern const Nvfp4LinearShape kNvfp4N1280K2560;
+extern const Nvfp4LinearShape kNvfp4N248320K2560;
+extern const Nvfp4LinearShape kNvfp4N2560K6144;
+extern const Nvfp4LinearShape kNvfp4N2560K640;
 } // namespace ninfer::ops::detail

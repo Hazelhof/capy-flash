@@ -65,6 +65,9 @@ ParameterReference Binder::binding(std::string name, const Binding& binding, Sha
             require_device(part.object);
         } else if (residency == Residency::Host) {
             (void)host_object(part.object);
+        } else if (residency == Residency::HostFile) {
+            reader_.validate_object(part.object);
+            demands_.at(part.object.index).file = true;
         }
     }
     return {std::move(name), std::move(shape), binding, residency};
@@ -235,6 +238,7 @@ MaterializationPlan Binder::finish() && {
         if (demand.host) {
             plan.host_objects.push_back({ObjectHandle{i}, std::move(demand.host_data)});
         }
+        if (demand.file) { plan.file_objects.push_back(ObjectHandle{i}); }
     }
     for (const auto capacity : plan.per_device_capacity_bytes) {
         plan.device_capacity_bytes =

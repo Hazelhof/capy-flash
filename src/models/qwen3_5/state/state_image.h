@@ -23,10 +23,18 @@ struct DFlashLocalStateSpec {
     std::int32_t head_dim  = 0;
 };
 
+// Qwen4Exp PLE convolution history: per PLE layer one BF16 column of `rows` = (kernel-1) *
+// dilation * channels words per slot (the `states` operand of ops::ple_dilated_conv).
+struct PleStateSpec {
+    std::uint32_t layers = 0;
+    std::int32_t rows    = 0;
+};
+
 struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
     std::optional<DFlashLocalStateSpec> dflash_local;
+    std::optional<PleStateSpec> ple;
 };
 
 struct StateImageHostLayout {
@@ -39,13 +47,17 @@ struct StateImageHostLayout {
     std::optional<LayoutRegion> dflash_local_k;
     std::optional<LayoutRegion> dflash_local_v;
     std::size_t dflash_local_layer_bytes = 0;
-    std::size_t image_bytes              = 0;
+    std::optional<LayoutRegion> ple;
+    std::size_t ple_layer_bytes = 0;
+    std::size_t image_bytes     = 0;
 };
 
 struct StateImageDeviceLayout {
     LinearAttentionStatePoolLayout linear;
     TensorRegion continuation_hidden;
     std::optional<CyclicKVCacheLayout> dflash_local;
+    // BF16 [rows, slots, layers]: layer l is the contiguous [rows, slots] states operand.
+    std::optional<TensorRegion> ple;
     StateImageHostLayout host;
 };
 
@@ -149,6 +161,12 @@ public:
     [[nodiscard]] CyclicKVCache* dflash_local() noexcept;
     [[nodiscard]] const CyclicKVCache* dflash_local() const noexcept;
 
+    // PLE convolution states of PLE layer `layer`, BF16 [rows, slots]; requires a PLE spec.
+    [[nodiscard]] Tensor ple_states(std::uint32_t layer) const;
+    [[nodiscard]] std::uint32_t ple_layers() const noexcept {
+        return ple_ ? static_cast<std::uint32_t>(ple_->ne[2]) : 0U;
+    }
+
     [[nodiscard]] const StateImageHostLayout& host_layout() const noexcept { return host_layout_; }
 
     // Tensor-parallel rank 1's replica of this pool. Every zero_slot/zero_all/copy_slot issued
@@ -177,6 +195,7 @@ private:
     LinearAttentionStatePool linear_;
     Tensor continuation_hidden_;
     std::optional<CyclicKVCache> dflash_local_;
+    std::optional<Tensor> ple_;
     StateImageHostLayout host_layout_;
     StateImageDevicePool* mirror_ = nullptr;
     int mirror_device_            = -1;

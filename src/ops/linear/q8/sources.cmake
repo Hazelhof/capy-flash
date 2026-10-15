@@ -28,4 +28,11 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n6144_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n7168_k5120.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n9216_k2048.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/n_low_rank_k10240.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n13312_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n6656_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n2560_k6144.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n2560_k3072.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n640_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n96_k2560.cu"
 )

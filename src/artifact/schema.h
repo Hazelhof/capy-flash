@@ -37,6 +37,9 @@ struct TensorObject {
     std::string layout;
     std::uint64_t offset = 0;
     std::uint64_t bytes  = 0;
+    // Source matrices this NVFP4 plane stacks, each with its own weight divisor (one equal row
+    // block per source). Absent in the directory means one.
+    std::uint64_t divisors = 1;
 };
 
 struct ResourceObject {

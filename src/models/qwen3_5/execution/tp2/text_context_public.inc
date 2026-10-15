@@ -56,7 +56,8 @@ public:
                                   ops::CausalAttentionExecutionEnvelope envelope,
                                   const RankTensors& mtp_hidden);
     // `logits` [V,B] is rank 0's.
-    void mtp_propose_batch(const RankTensors& hidden, Tensor& logits, Tensor& draft_tokens);
+    void mtp_propose_batch(const RankTensors& hidden, Tensor& logits, Tensor& draft_tokens,
+                           Tensor* draft_logprobs = nullptr);
     // The MTP bridge over both ranks: `ids` [T] (rank 0's alone) against each rank's copy of the
     // target hidden [H,T], appending both ranks' MTP K/V at `positions` through each rank's
     // prefill MTP KV row. `rope_positions[r]` are [T], or [T,3] for a visual column. Rank 0 embeds

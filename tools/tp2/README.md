@@ -30,9 +30,9 @@ tools/tp2/gate.sh [--record] [--stages LIST] [--attention] [--out DIR] <build-di
 `--record` writes the reference directory from the given build (it needs `GATE_PROMPTS`, a JSONL
 of `{"id","text"}`, copied into the reference). Every path has a `GATE_*` override
 (`GATE_ARTIFACT`, `GATE_DF2_ARTIFACT`, `GATE_TEST_ARTIFACT`, `GATE_GOLDEN_MODEL`, `GATE_CORPUS`,
-`GATE_DEVICES`, `GATE_PORT`, `GATE_SERVE_FLAGS`, `GATE_DF2_FLAGS`, `GATE_SRC`); the defaults are the
-development workstation's. The script takes no GPU lease itself: wrap it
-(`gpu-lease run ricerca --note ... -- tools/tp2/gate.sh ...`). Output and `summary.txt` go to
+`GATE_DEVICES`, `GATE_PORT`, `GATE_SERVE_FLAGS`, `GATE_DF2_FLAGS`, `GATE_SRC`, `GATE_ARTIFACTS_DIR`);
+artifacts default to `$GATE_ARTIFACTS_DIR` (`$HOME/ninfer-artifacts`). The script does not reserve the
+GPUs: run it on idle GPUs or wrap it in your own scheduler. Output and `summary.txt` go to
 `<build-dir>/gate/<timestamp>/` or `--out`. About 13 minutes on two RTX 5070 Ti.
 
 A WARN on ms/round is not a verdict: rerun the two builds alternated (A B B A) before deciding.

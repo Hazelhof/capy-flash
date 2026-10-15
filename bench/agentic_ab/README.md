@@ -23,9 +23,9 @@ provenance.
 
 ```bash
 bench/agentic_ab/run_linux.sh \
-  --arm-a /home/feyd/ninfer-v011/build/apps/ninfer-serve --label-a v0.1.1 \
-  --arm-b /home/feyd/ninfer-v020/build/apps/ninfer-serve --label-b v0.2.0 \
-  --model /home/feyd/ninfer-artifacts/qwen3_8_27b_quasar_nvfp4.ninfer \
+  --arm-a /path/to/build-a/apps/ninfer-serve --label-a A \
+  --arm-b /path/to/build-b/apps/ninfer-serve --label-b B \
+  --model /path/to/model.ninfer \
   --profile agentic --seeds 42,43,44 --out /path/to/out
 ```
 

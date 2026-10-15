@@ -95,8 +95,8 @@ void mtp_bridge_and_propose_tp2(PrefillContext& state, const Tensor& next_token,
         for (std::size_t r = 0; r < 2; ++r) {
             const cudaStream_t stream = r == 0 ? state.execution.device.stream : rank1.stream;
             const ScopedCurrentDevice scope(r == 0 ? state.execution.device.device : rank1.device);
-            CUDA_CHECK(cudaMemcpyAsync(mtp_hidden[r].data, next_hidden[r].data,
-                                       mtp_hidden[r].bytes(), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(::ninfer::memcpy_device_async(mtp_hidden[r].data, next_hidden[r].data,
+                                       mtp_hidden[r].bytes(), stream));
             Tensor step_position = ar_position[r];
             ops::increment_i32_scalar(step_position, stream);
         }

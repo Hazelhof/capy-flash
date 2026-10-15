@@ -51,7 +51,7 @@ What the mode rejects, and where the first check sits:
 | DFlash2 drafter with full-attention layers | planner (`startup.cpp`): that drafter KV pool would have no rank 1 mirror |
 | KV storage other than `bf16`, `int8` and `nvfp4` | `validate_options`; `TextContext`: the head-local `[256,12,2]` attention geometry is registered for BF16, INT8-G64 and NVFP4-G16 only |
 | nonzero Host State slots or Host KV bytes | `validate_options`; `ninfer-serve` turns omitted values into 0 and rejects explicit nonzero ones ([`serve_options.cpp`](../../src/serve/serve_options.cpp)) |
-| MoE architecture | `validate_tensor_parallel(config)` in `load.cpp`; also `shard_text_config` and the shard rules |
+| the Qwen3.5 MoE architecture (Qwen4Exp has its own placement, §13) | `validate_tensor_parallel(config)` in `load.cpp`; also `shard_text_config` and the shard rules |
 | paired (two-parent) Q4/Q5 input projections | `TextContext` constructor ([`text.cpp`](../../src/models/qwen3_5/execution/text.cpp)); split routes in `attention.cpp` and `gdn.cpp` |
 | a shard shape without a registered problem | the Op's shape registry, as for any unregistered shape |
 
@@ -703,11 +703,119 @@ lists. The `tp2/` directories below are ours throughout.
 | `src/models/qwen3_5/program/{graphs,prefill,decode,storage/context,transactions/commit}.cpp`, `graph_execution.h`, `planning/startup.*`, `speculative/mtp.cpp` | two-device branches: capture and launch, row publication, rank 1 retained hidden, ingress upload, forced tokens, per-rank layouts, the MTP round |
 | `include/ninfer/ops/tp2/`, `src/ops/wrapper/tp2/`, `src/ops/linear/tp2/` | column/row-parallel Op forms (`linear`, `linear_add`, `linear_swiglu`, `attn_input_proj`, `gdn_input_proj`, `gdn_gating_proj`) and the split argmax |
 | `src/ops/{attn_input_proj,gdn_input_proj,linear_swiglu}/tp2/` | shard and half problems compiled from upstream's launcher sources ([Merging upstream §2.4](upstream-merge.md#24-shards-compiled-from-upstreams-own-sources-srcopstp2_shard_cu)) |
-| `include/ninfer/ops/allreduce.h`, `peer_mailbox.h`, `src/ops/common/{allreduce,peer_mailbox}.cu`, `src/ops/kernel/peer_exchange.cuh` | staged collectives, `PeerEvents`, mailbox and its two exchange kernels |
+| `include/ninfer/ops/allreduce.h`, `peer_mailbox.h`, `src/ops/common/{allreduce,peer_mailbox}.cu`, `src/ops/kernel/peer_exchange.cuh` | staged collectives, `PeerEvents`, mailbox and its exchange kernels (BF16 sum, FP32 partial sum) |
+| `include/ninfer/ops/tp2/hyper_connection.h`, `src/ops/hyper_connection/split.cu` | Qwen4Exp hyper-connection mix split by residual streams (§13) |
 | `src/ops/common/split_launch.h`, `src/ops/launcher/{concat_rows,argmax_split}.*` | pair validation, logits interleave, split argmax launches |
 | `src/ops/tp2/sources.cmake` | registration of every tp2 Op source |
 | `src/serve/tp2/operational_log_tp2.inc` | tensor-parallel startup lines and warnings |
 | `tools/tp2/{gate.sh,gate_client.py,mailbox_probe.cu}`, `tools/golden/` | behavior-preservation gate; standalone mailbox check; tp 1 token-identity gate |
+
+## 13. Qwen4Exp (Qwen3.8-Flash-Next) at tp 2
+
+Status: placement, per-rank slicing at load, the per-rank Op shapes, the FP32 partial all-reduce
+and the execution with the replicated hyper-connection mixers: Prefill, CausalScoring and ordinary
+decode (CUDA Graphs, mailbox) run at `--tp 2` through `execution/qwen4_forward.h` over both ranks
+([Qwen4Exp reference, Execution](qwen4-exp-model.md#execution)). The stream-split
+hyper-connection mix exists as Ops with parity tests but has no execution route: the Program
+refuses `tp_hc_split_streams`, so at tp 2 the mixers always run replicated. It is kept on purpose
+(T36 finding M4, decision of 07/10): T30 measured it slower than the replicated mixers, but it
+halves the mixer bytes per rank and may be revived to free VRAM. Until it has an execution route
+and a gate test it is off; a mailbox change must keep its Ops' tests
+(`ninfer_hyper_connection_split_test`) passing.
+
+**Placement** (`qwen4_shard` in [`sharding.cpp`](../../src/models/qwen3_5/load/sharding.cpp),
+documented in [`sharding.h`](../../src/models/qwen3_5/load/sharding.h)). Slicing happens at load,
+from the one artifact, as for the 27B: no per-rank artifact.
+
+| Logical parameter | Placement | Real shape → per-rank shard |
+|---|---|---|
+| `attention/{query,gate}`, `attention/{key,value}` | Rows by query / KV heads (12 Q + 1 KV per rank) | packed q\|k\|gate\|v `[13312,2560]` → `[6656,2560]` |
+| `attention/output` | Columns by query heads | `[2560,6144]` → `[2560,3072]` |
+| `attention/indexer_*` | Replicated (deterministic selection, no exchange) | `[640,2560]`, norms |
+| `gdn/*` | the 27B rules (8 key + 24 value heads per rank) | q\|k\|v\|z `[16384,2560]` → `[8192,2560]`, a\|b `[96,2560]` → `[48,2560]`, conv `[4,10240]` → `[4,5120]`, out `[2560,6144]` → `[2560,3072]` |
+| `moe/router`, `moe/shared_score` | Replicated | `[513,2560]` BF16 |
+| `moe/shared/{gate,up,down}` | SingleDevice(block % 2); MTP block = block 48 → rank 0 | whole: the 640-wide intermediate has no tile-aligned half (NVFP4 rows in 128s, Q8 columns in 128s) |
+| `moe/experts/*` | HostMapped (also at tp 1) | one page-locked copy; rank r computes the experts with `id % 2 == r` |
+| `{attn_hc,ffn_hc}/*`, `{text,mtp}/hc_head/*`, `mtp/hidden_norm` | Replicated; with `hc_split_streams`: Rows (norm, Up) / Columns (Down\|inject) by residual streams | `[324,10240]` → `[324,5120]`, `[10240,320]` → `[5120,320]`, `[10240]` → `[5120]` |
+| `ple/{key,value}`, `ple/table` | Replicated (one parent; every rank needs all value rows); the table is file-mapped host data | `[12800,2560]` |
+| `ple/{key,query,conv}_norm`, `ple/convolution` | Replicated; split by streams with `hc_split_streams` | `[10240]` → `[5120]`, `[4,10240]` → `[4,5120]` |
+| `mtp/{embedding_norm,embedding_projection,hidden_projection}` | Replicated | `[2560,2560]` |
+| `text/token_embedding` | Replicated, or HostMapped with `--embedding-host` | `[248320,2560]` |
+| `text/output_head` | Rows by vocabulary | `[248320,2560]` → `[124160,2560]` |
+
+`execution::shard_text_config(config, 2, hc_split_streams)` gives the per-rank geometry: 12/1
+attention heads, 8/24 GDN heads, half the vocabulary, the MoE geometry unchanged, and with the
+split two hyper-connection streams. `LoadOptions::hc_split_streams` (`EngineOptions::
+tp_hc_split_streams`) selects the stream split; it is ignored at tp 1 and by Qwen3.5.
+
+**Per-rank Op problems.** NVFP4 (`_nvfp4_dense` recipe): `[6656,2560]`, `[8192,2560]`,
+`[2560,3072]`, `[124160,2560]` (registered on the branch since F0-B). Q8 (`qwen3_8_flash_next_nvfp4`
+recipe and the hyper-connection/a|b parents of both): `[6656,2560]`, `[8192,2560]`, `[48,2560]`,
+`[2560,3072]`, and for the stream split `[324,5120]`, `[320,5120]`, `[5120,320]`
+(`q8_dispatch.cpp`, generic hidden-2560 routes, untuned); Q6 `[124160,2560]`. QSA 12/1 and GDN 8/24
+were registered by their Op suites (`qsa_attention`, `gdn_projected_conv_*` C=5120, `gdn_gating`
+H=24, `gdn_replay_fold` 36 x 8/24).
+
+**One block at tp 2** (HC replicated):
+
+```text
+x, inj  = HC_attn(R)                        local on each rank (R, weights replicated)
+y_r     = mixer shard (12/1 QSA with replicated indexer, or 8/24 GDN); o_r = out_proj_r(y_r)
+y       = allreduce_sum(o_0, o_1)            BF16, [2560, T]          exchange 1
+R       = combine(R, inj, y); x, inj = HC_ffn(R)                       local
+ids, w  = router(x)                          replicated, deterministic: both ranks route alike
+p_r     = moe_slots(resident experts with id % 2 == r)  (FP32 Store)
+        + CPU path (missing experts with id % 2 == r)   (FP32, added into p_r)
+        + shared expert, on rank (block % 2) only      (its BF16 output added in FP32)
+y       = allreduce_sum_f32(p_0, p_1) -> BF16          FP32, [2560, T]  exchange 2
+R       = combine(R, inj, y)
+```
+
+The MoE output is rounded to BF16 once, after the cross-rank FP32 sum
+(`ops::allreduce_sum_f32`: `fl32(p_0 + p_1)`, commutative, so both ranks hold the same bits, then
+`RNE`). Everything a rank contributes is accumulated in FP32 before the exchange; the shared
+expert's output is the one BF16-rounded term (it comes out of a BF16 Linear). The attention/GDN
+output keeps the 27B's BF16 all-reduce of BF16 partials (`linear` writes BF16). The partition
+relies on both ranks routing identically: the router input is the same BF16 `x` on both ranks
+(all-reduced block outputs, replicated HC), and the router/top-k kernels are deterministic.
+
+`allreduce_sum_f32` uses the same mailbox slots, flags and per-lane epochs as the BF16 exchange
+(a pipelined FP32 kernel, `peer_exchange_pipelined_f32_kernel`), so BF16 and FP32 exchanges
+interleave in one round; the Program must size the ordinary slot for the FP32 payload,
+`2560 x (K+1) x 4` bytes (40 KiB at MTP-3, the 27B's MTP-3 BF16 slot). A Legacy-kernel mailbox
+has no FP32 form and keeps those exchanges staged.
+
+**Hyper-connections split by streams** (`ops::hyper_connection_mix_split`,
+[`tp2/hyper_connection.h`](../../include/ninfer/ops/tp2/hyper_connection.h)): rank r holds streams
+`[2r, 2r+2)`; per mixer two FP32 all-reduces, the low-rank projection (`(320+4) x T`) and the
+collapsed block input (`2560 x T`, rounded once). The combine stays local
+(`hyper_connection_combine` over the rank's streams and gates). The PLE projection stays
+replicated (every rank needs all value rows), the PLE per-lane ops follow the rank's streams, and
+the MTP stem's one RMS over all four streams needs a cross-rank sum of squares (one more small
+exchange per MTP forward). Two routes: for T <= 8 inside a captured round, one cooperative kernel
+per rank that exchanges both sums mid-kernel through the mailbox slots
+(`PeerMailbox::exchange_slot`, the pipelined protocol's `peer_exchange_lane`); otherwise a
+composition of the general route (norm, Q8 Linear, element kernels) around two
+`allreduce_sum_f32`. Measured on two RTX 5070 Ti (graph of 24 mixers, both GPUs): the fused split
+costs 21.3 / 26.7 / 33.8 µs per mixer at T = 1 / 4 / 8 against 15.7 / 18.3 / 22.4 µs for the
+replicated fused mix: the two latency-bound exchanges (and three grid barriers) cost more than
+half the mixer's weight stream saves. The split therefore trades about 0.5-0.8 ms per target
+forward for 386 MB per rank and stays off by default.
+
+**Exchanges.** HC replicated: two per block (96 per target forward at hidden 2560: 48 BF16 of
+`[2560,T]` and 48 FP32 of `[2560,T]`), two per MTP forward, plus the vocabulary-split head's
+gather or argmax exchange. HC split adds two per mixer: 97 mixers per target forward (2 per block
+and the output mixer), 3 per MTP forward.
+
+**Tests** (two devices; 77 with fewer): `ninfer_allreduce_f32_test` (exact oracle, both
+transports, interleaved with BF16, node counts; `--bench` FP32 vs BF16 payload cost),
+`ninfer_flash_next_tp2_moe_test` (expert-parity partition with CPU-path stand-in vs the
+single-device Op), `ninfer_flash_next_tp2_mixers_test` (QSA 12/1 + replicated indexer vs 24/2, GDN
+8/24 vs 16/48 bit for bit), `ninfer_hyper_connection_split_test` (split mix vs FP64 and vs the
+single-device mix, combine, graph), `ninfer_qwen4_tp2_loading_test --artifact A [--hc-split]`
+(placement of every parameter, per-rank bytes, every device parent byte-compared with the
+host-applied slice), and host-only `ninfer_qwen4_shard_map_test` (rules, slicer acceptance of the
+real parents of both recipes, per-rank bytes of the 48-block model).
 
 ## Open questions
 
