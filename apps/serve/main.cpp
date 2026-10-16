@@ -32,8 +32,8 @@ int main(int argc, char** argv) {
     try {
         options = ninfer::serve::parse_serve_options(argc, argv);
     } catch (const std::invalid_argument& exception) {
-        std::cerr << "ninfer-serve: " << exception.what() << '\n';
-        std::cerr << ninfer::serve::serve_usage_text(argv[0]);
+        std::cerr << "ninfer-serve: " << exception.what() << '\n'
+                  << "run '" << argv[0] << " --help' for every option\n";
         return 1;
     } catch (const std::exception& exception) {
         std::cerr << "ninfer-serve: " << exception.what() << '\n';

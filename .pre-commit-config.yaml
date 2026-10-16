@@ -1,0 +1,27 @@
+# pre-commit install: checks every commit; CI runs the same hooks on the commits of a pull request
+# (.github/workflows/lint.yml). The tree predates these checks, so C/C++/CUDA formatting applies to the
+# changed lines only and Python is checked for errors (pyflakes, syntax), not style.
+exclude: ^third_party/
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+        exclude: ^tools/freq_corpus/fixtures/ranking/ # token rankings, one i64 per vocabulary entry (1.9 MB)
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-json
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
+    hooks:
+      - id: ruff-check
+  - repo: local
+    hooks:
+      - id: clang-format-changed-lines
+        name: clang-format (changed lines)
+        language: python
+        additional_dependencies: [clang-format==21.1.2]
+        entry: tools/dev/clang-format-changed.sh
+        types_or: [c, c++, cuda]
+        pass_filenames: false

@@ -4,6 +4,7 @@ import argparse
 import json
 import signal
 import threading
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
 from rich.console import Console

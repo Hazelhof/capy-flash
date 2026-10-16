@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <set>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace ninfer::artifact {
 
@@ -93,23 +95,72 @@ const Component& Directory::component(std::string_view name) const {
     return found->second;
 }
 
-Json parse_json(std::string_view text, std::string_view label) {
-    std::vector<std::unordered_set<std::string>> member_stack;
-    const auto callback = [&](int, Json::parse_event_t event, Json& parsed) {
-        if (event == Json::parse_event_t::object_start) {
-            member_stack.emplace_back();
-        } else if (event == Json::parse_event_t::key) {
-            const auto& key = parsed.get_ref<const std::string&>();
-            if (!member_stack.back().insert(key).second) {
-                throw ArtifactError(std::string(label) + ": duplicate JSON member " + key);
-            }
-        } else if (event == Json::parse_event_t::object_end) {
-            member_stack.pop_back();
-        }
+namespace {
+
+// Rejects a repeated member of any object, which nlohmann::json would otherwise keep silently
+// (last one wins). A separate SAX pass: the DOM parser's callback hook costs ~100x the parse
+// itself (26 s instead of 0.3 s on the 32 MB Qwen3.8-Flash-Next directory).
+class DuplicateMemberCheck final : public nlohmann::json_sax<Json> {
+public:
+    std::string duplicate;
+    std::string error;
+
+    bool null() override { return true; }
+
+    bool boolean(bool) override { return true; }
+
+    bool number_integer(number_integer_t) override { return true; }
+
+    bool number_unsigned(number_unsigned_t) override { return true; }
+
+    bool number_float(number_float_t, const string_t&) override { return true; }
+
+    bool string(string_t&) override { return true; }
+
+    bool binary(binary_t&) override { return true; }
+
+    bool start_object(std::size_t) override {
+        members_.emplace_back();
         return true;
-    };
+    }
+
+    bool key(string_t& key) override {
+        if (members_.back().insert(key).second) { return true; }
+        duplicate = key;
+        return false;
+    }
+
+    bool end_object() override {
+        members_.pop_back();
+        return true;
+    }
+
+    bool start_array(std::size_t) override { return true; }
+
+    bool end_array() override { return true; }
+
+    bool parse_error(std::size_t, const std::string&,
+                     const nlohmann::detail::exception& exception) override {
+        error = exception.what();
+        return false;
+    }
+
+private:
+    std::vector<std::unordered_set<std::string>> members_;
+};
+
+} // namespace
+
+Json parse_json(std::string_view text, std::string_view label) {
+    DuplicateMemberCheck check;
+    if (!Json::sax_parse(text.begin(), text.end(), &check)) {
+        if (!check.duplicate.empty()) {
+            throw ArtifactError(std::string(label) + ": duplicate JSON member " + check.duplicate);
+        }
+        throw ArtifactError(std::string(label) + ": " + check.error);
+    }
     try {
-        return Json::parse(text.begin(), text.end(), callback);
+        return Json::parse(text.begin(), text.end());
     } catch (const Json::exception& error) {
         throw ArtifactError(std::string(label) + ": " + error.what());
     }

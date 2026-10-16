@@ -14,8 +14,6 @@ from .schema import (
     ArtifactError,
     ArtifactObject,
     Directory,
-    ResourceObject,
-    TensorObject,
     decode_directory,
     integer,
     validate_encoding,

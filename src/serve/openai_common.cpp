@@ -220,7 +220,8 @@ void validate_openai_model(std::string_view requested, std::string_view availabl
     error.type    = "invalid_request_error";
     error.param   = "model";
     error.code    = "model_not_found";
-    error.message = "model '" + std::string(requested) + "' not found";
+    error.message = "model '" + std::string(requested) + "' not found: this server serves '" +
+                    std::string(available) + "' (GET /v1/models; set it with --model-id)";
     throw ApiException(std::move(error));
 }
 

@@ -7,6 +7,7 @@
 #include <array>
 #include <bit>
 #include <iostream>
+#include <stdexcept>
 
 namespace {
 
@@ -129,6 +130,12 @@ void invalid_directories() {
     bad([](Json& root) { root["components"]["text"]["resources"]["tokenizer.json"] = "q5"; });
     rejects([] { (void)parse_json("{\"a\":{\"x\":1,\"x\":2}}", "duplicate"); },
             "duplicate JSON key accepted");
+    rejects([] { (void)parse_json("{\"x\":1,\"x\":1}", "duplicate"); },
+            "duplicate top-level JSON key accepted");
+    rejects([] { (void)parse_json("{\"a\":[1,}", "malformed"); }, "malformed JSON accepted");
+    if (parse_json("{\"a\":{\"x\":1},\"b\":{\"x\":2}}", "siblings").at("b").at("x") != 2) {
+        throw std::runtime_error("the same key in sibling objects was not parsed");
+    }
     fixture.write();
     {
         std::fstream file(fixture.entry, std::ios::binary | std::ios::in | std::ios::out);

@@ -1,6 +1,6 @@
-# Contributing to NInfer
+# Contributing to capy-flash
 
-NInfer welcomes precise problem reports, reproducible performance evidence, and carefully scoped
+capy-flash welcomes precise problem reports, reproducible performance evidence, and carefully scoped
 code contributions. The most useful first contribution is often an Issue that establishes what is
 happening and why it matters. A pull request is an implementation of an agreed change, not the
 place to ask the maintainer to discover the problem, choose its semantics, or redesign its core
@@ -8,7 +8,9 @@ approach.
 
 ## Project scope and decisions
 
-NInfer is an intentionally focused inference engine. Contributions are evaluated against the
+capy-flash is an intentionally focused inference engine (two 16 GB GPUs, Qwen3.8-Flash-Next and
+Qwen3.8-27B); changes that belong to the single-GPU engine it builds on are better proposed to
+[NInfer](https://github.com/Neroued/ninfer). Contributions are evaluated against the
 supported product described in [`README.md`](README.md), the public documentation map in
 [`docs/README.md`](docs/README.md), and the applicable architecture documents. Broader
 compatibility or generality is not a benefit by itself when it adds a product contract or
@@ -39,7 +41,7 @@ a linked, confirmed Issue may be closed without detailed review.
 A bug report must contain enough information for the maintainer to locate and reason about the
 failure. Include, as applicable:
 
-- the exact NInfer commit or release, artifact source, and recipe when using custom weights;
+- the exact capy-flash commit or release, artifact source, and recipe when using custom weights;
 - the GPU, driver, CUDA toolchain, build configuration, and relevant runtime options;
 - the complete command, request, or smallest practical reproduction;
 - the expected behavior and the observed behavior;
@@ -74,8 +76,7 @@ maintainer has accepted both the product direction and the proposed ownership mo
 
 A pull request is appropriate only after its linked Issue has established the problem and the
 maintainer has agreed to its scope and implementation direction. Target pull requests at the
-`master` branch. Before implementation, also review the current `dev` branch to avoid duplicating
-or conflicting with maintainer work that has not yet reached `master`.
+`main` branch.
 
 Each pull request must represent one coherent engineering decision:
 
@@ -112,6 +113,11 @@ Use the existing project workflows:
 - [`docs/maintainer/op-development.md`](docs/maintainer/op-development.md) for numerical Op
   development and qualification.
 
+Run `pre-commit install` once: every commit then checks the lines it changes (clang-format) and
+Python errors (ruff), the same hooks CI runs on a pull request. A change that can alter generated
+tokens also needs the model-level quality check described in [`AGENTS.md`](AGENTS.md)
+(GSM8K and MMLU-Pro, paired per question), unless its output is proven bit-identical.
+
 Run the focused checks needed to establish the changed behavior and its material claims. Record the
 exact commands and summarize the results. If a relevant check could not be run, state that
 limitation and its consequence. Do not claim validation that was not performed.
@@ -119,7 +125,8 @@ limitation and its consequence. Do not claim validation that was not performed.
 ## Contributor responsibility and AI assistance
 
 The contributor is responsible for every submitted change, regardless of which tools were used to
-produce it. Tool choice neither qualifies nor disqualifies a contribution.
+produce it. Tool choice neither qualifies nor disqualifies a contribution, but say in the pull
+request when AI tools wrote a substantial part of it.
 
 The contributor must understand the complete diff, explain the design and its boundary conditions,
 review generated output, perform the stated verification, and respond to technical review. Code

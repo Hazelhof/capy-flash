@@ -530,7 +530,8 @@ void OperationalLog::warmup_failure(double seconds, std::string_view detail) con
 }
 
 void OperationalLog::bind_failure(std::string_view host, int port) const {
-    logger_->error("cannot bind {}:{}", product::format_pretty_text(host), port);
+    logger_->error("cannot bind {}:{} (is another server on that port? choose one with --port)",
+                   product::format_pretty_text(host), port);
 }
 
 void OperationalLog::listen_failure(std::string_view host, int port) const {

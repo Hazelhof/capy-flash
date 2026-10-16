@@ -1,0 +1,18 @@
+# systemd user unit for capy-flash serving Qwen3.8-Flash-Next on 127.0.0.1:8080, with the layout install.sh creates.
+#   cp capy-flash.service ~/.config/systemd/user/ && systemctl --user enable --now capy-flash
+#   journalctl --user -u capy-flash -f
+# ninfer-serve exits with status 2 when the Engine fails; Restart=on-failure reloads the model.
+[Unit]
+Description=capy-flash (Qwen3.8-Flash-Next, OpenAI- and Anthropic-compatible API)
+After=network-online.target
+
+[Service]
+Environment=NINFER_PORT=8080
+ExecStart=%h/capy-flash/current/serve-flash-next.sh %h/capy-flash/models/flash-next/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --model-id capy-flash
+Restart=on-failure
+RestartSec=15
+# Loading takes a minute or two (126.6 GB read from disk the first time).
+TimeoutStartSec=600
+
+[Install]
+WantedBy=default.target

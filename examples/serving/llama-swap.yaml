@@ -1,0 +1,19 @@
+# llama-swap entry for capy-flash (https://github.com/mostlygeek/llama-swap), with the layout install.sh creates.
+# Replace /home/me with your home directory. Flags after the model path override the launcher's; ${PORT} is llama-swap's.
+models:
+  capy-flash:
+    name: "Qwen3.8-Flash-Next (capy-flash)"
+    cmd: |
+      /home/me/capy-flash/current/serve-flash-next.sh
+      /home/me/capy-flash/models/flash-next/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer
+      --port ${PORT} --model-id capy-flash
+    checkEndpoint: /health
+    ttl: 1800
+  capy-27b:
+    name: "Qwen3.8-27B (capy-flash)"
+    cmd: |
+      /home/me/capy-flash/current/serve-tp2.sh
+      /home/me/capy-flash/models/27b/qwen3_8_27b_quasar_nvfp4.ninfer
+      --port ${PORT} --model-id capy-27b
+    checkEndpoint: /health
+    ttl: 1800

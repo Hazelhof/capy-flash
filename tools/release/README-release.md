@@ -36,6 +36,11 @@ sha256sum -c SHA256SUMS
 ./serve-tp2.sh /path/to/qwen3_8_27b_quasar_nvfp4.ninfer                           # Qwen3.8-27B
 NINFER_PORT=8099 ./serve-flash-next.sh /path/to/model.ninfer --api-key secret      # extra flags are appended
 ```
+Requests name the model `capy-flash` (Flash-Next) or `qwen3.8-27b` (27B); `NINFER_MODEL_ID` or `--model-id` changes it:
+```bash
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"capy-flash","messages":[{"role":"user","content":"What is 17*23?"}]}'
+```
 
 Artifacts:
 - Qwen3.8-Flash-Next: `Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash` (126.6 GB, NVIDIA's NVFP4 experts as published,

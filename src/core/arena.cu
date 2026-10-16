@@ -72,14 +72,35 @@ bool registered_pointers_are_device_pointers() {
 
 } // namespace
 
+namespace {
+
+// A device allocation failure at startup is almost always another process holding GPU memory.
+std::string device_allocation_failure(cudaError_t err) {
+    std::string text = cuda_error_message("cudaMalloc failed", err);
+    if (err == cudaErrorMemoryAllocation) {
+        std::size_t free_bytes = 0, total_bytes = 0;
+        if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+            char numbers[96];
+            std::snprintf(numbers, sizeof(numbers), " (%.1f of %.1f GiB free on this GPU",
+                          static_cast<double>(free_bytes) / (1ULL << 30),
+                          static_cast<double>(total_bytes) / (1ULL << 30));
+            text += numbers;
+        } else {
+            text += " (";
+        }
+        text += "; is another process using it? nvidia-smi lists it)";
+    }
+    return text;
+}
+
+} // namespace
+
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
 
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
-    }
+    if (err != cudaSuccess) { throw std::runtime_error(device_allocation_failure(err)); }
     p = ptr;
 }
 
@@ -164,9 +185,7 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes, ZeroFill zero) {
 
     void* ptr       = nullptr;
     cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
-    if (err != cudaSuccess) {
-        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
-    }
+    if (err != cudaSuccess) { throw std::runtime_error(device_allocation_failure(err)); }
     if (zero == ZeroFill::Yes) {
         err = cudaMemset(ptr, 0, capacity_bytes);
         if (err == cudaSuccess) { err = cudaStreamSynchronize(nullptr); }

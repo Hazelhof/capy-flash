@@ -10,7 +10,10 @@ The shortlist is the union of
     Qwen3.6-27B over 72 464 chat conversations, 51.1 M emitted positions, en/zh/other chat, code,
     math; same 248 320-token vocabulary as Qwen3.8-Flash-Next, vocab.json identical); the engine
     copies these rows of the head (the ones above the prefix);
-  * every added (special) token of the tokenizer below the public token count (chat control).
+  * every added (special) token of the tokenizer below the public token count (chat control);
+  * optionally (T186) the --extra-top most frequent tokens of a second ranking (--extra-ranking) not
+    already in the list, e.g. tools/freq_corpus/fixtures/ranking/it.train.counts.i64 for Italian:
+    with the default list 14.5 % of held-out Italian tokens fell outside it, 0.24 % with 8 192 more.
 Reproducible: deterministic (stable sort on counts, ties by lower ID); the output header records
 the inputs and the ranking file's SHA-256. Output: one ID per line, in priority order (specials,
 the prefix ascending, then the ranking's tokens by count).
@@ -33,6 +36,8 @@ ap.add_argument("--ranking", type=Path, default=DEFAULT_RANKING)
 ap.add_argument("--row", type=int, default=0, help="ranking row (0 = total; 1..5 = strata)")
 ap.add_argument("--tokenizer", type=Path, required=True, help="directory with tokenizer.json")
 ap.add_argument("--public", type=int, default=0, help="public token count (default: tokenizer size)")
+ap.add_argument("--extra-ranking", type=Path, help="second ranking whose top tokens are appended")
+ap.add_argument("--extra-top", type=int, default=0, help="new tokens taken from --extra-ranking")
 ap.add_argument("--out", type=Path, required=True)
 a = ap.parse_args()
 
@@ -51,11 +56,25 @@ for i in specials + list(range(min(a.prefix, public))) + top:
     if i not in seen:
         seen.add(i)
         ids.append(i)
+extra_note = ""
+if a.extra_ranking and a.extra_top:
+    extra_raw = a.extra_ranking.read_bytes()
+    extra = np.frombuffer(extra_raw, dtype="<i8").reshape(-1, VOCAB)[0][:public]
+    added_extra = 0
+    for i in np.argsort(-extra, kind="stable"):
+        if added_extra == a.extra_top or extra[i] <= 0:
+            break
+        if int(i) not in seen:
+            seen.add(int(i))
+            ids.append(int(i))
+            added_extra += 1
+    extra_note = (f", extra {added_extra} of {a.extra_ranking.name} "
+                  f"(sha256 {hashlib.sha256(extra_raw).hexdigest()})")
 sha = hashlib.sha256(raw).hexdigest()
 with open(a.out, "w") as f:
     f.write(f"# T43 Qwen4Exp draft shortlist: {len(ids)} token IDs\n")
     f.write(f"# prefix {a.prefix}, count_top {a.count_top} of {a.ranking.name} row {a.row} "
-            f"(sha256 {sha}), {len(specials)} added tokens, public {public}\n")
+            f"(sha256 {sha}){extra_note}, {len(specials)} added tokens, public {public}\n")
     f.write(f"# tokenizer {a.tokenizer} (vocab {base} + {len(added)} added)\n")
     for i in ids:
         f.write(f"{i}\n")

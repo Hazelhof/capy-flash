@@ -3,7 +3,9 @@
 #include "product/tensor_parallel_options.h"
 #include "product/vision_options.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -73,9 +75,90 @@ std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,
     return architecture == "Qwen4ExpForCausalLM" ? 0U : 1U;
 }
 
+namespace {
+
+// Serving profiles: the configurations the release launchers start (two 16 GB boards). They are
+// inserted before the command line's own flags, so an explicit flag overrides its profile value;
+// the KV capacity is left to follow --max-context.
+struct ServeProfile {
+    std::string_view name;
+    std::vector<std::string_view> flags;
+};
+
+const std::vector<ServeProfile>& serve_profiles() {
+    static const std::vector<ServeProfile> profiles{
+        {"flash-next",
+         {"--tp", "2", "--devices", "0,1", "--kv-dtype", "int8", "--elastic", "--max-context",
+          "262144", "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3"}},
+        {"27b",
+         {"--tp",
+          "2",
+          "--devices",
+          "0,1",
+          "--kv-dtype",
+          "int8",
+          "--max-context",
+          "196608",
+          "--device-state-slots",
+          "4",
+          "--max-concurrency",
+          "1",
+          "--spec",
+          "mtp",
+          "--draft-tokens",
+          "3",
+          "--vision",
+          "--vision-device",
+          "0",
+          "--max-vision-tokens",
+          "4096"}},
+    };
+    return profiles;
+}
+
+const ServeProfile& find_profile(std::string_view name) {
+    for (const ServeProfile& profile : serve_profiles()) {
+        if (profile.name == name) { return profile; }
+    }
+    throw std::invalid_argument("unknown --profile " + std::string(name) +
+                                " (known: flash-next, 27b)");
+}
+
+std::string profile_text(std::string_view name) {
+    std::string text;
+    for (const std::string_view flag : find_profile(name).flags) {
+        if (!text.empty()) { text += ' '; }
+        text += flag;
+    }
+    return text;
+}
+
+// argv with every `--profile NAME` replaced by the profile's flags, placed right after the
+// artifact.
+std::vector<std::string> expand_profiles(int argc, char** argv) {
+    std::vector<std::string> head, rest;
+    for (int i = 0; i < argc; ++i) {
+        const std::string arg = argv[i] == nullptr ? "" : argv[i];
+        if (i >= 2 && arg == "--profile") {
+            if (++i >= argc) { throw std::invalid_argument("--profile needs a value"); }
+            for (const std::string_view flag : find_profile(argv[i]).flags) {
+                head.emplace_back(flag);
+            }
+        } else {
+            rest.push_back(arg);
+        }
+    }
+    const auto at =
+        rest.begin() + std::min<std::ptrdiff_t>(2, static_cast<std::ptrdiff_t>(rest.size()));
+    rest.insert(at, head.begin(), head.end());
+    return rest;
+}
+
+} // namespace
+
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer> [--profile flash-next|27b] [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
@@ -93,7 +176,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
-           "[--vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
+           "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
            "[--no-tp-mailbox] [--embedding-host] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
@@ -101,6 +184,14 @@ std::string serve_usage_text(const char* argv0) {
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
+           "       --profile applies the tested two-GPU configuration of a model before the other "
+           "flags, which override it:\n"
+           "         flash-next: " +
+           profile_text("flash-next") +
+           "\n"
+           "         27b:        " +
+           profile_text("27b") +
+           "\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
            " when omitted\n"
@@ -191,6 +282,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         return options;
     }
     if (argc < 2) { throw std::invalid_argument("artifact path is required"); }
+    std::vector<std::string> expanded = expand_profiles(argc, argv);
+    std::vector<char*> expanded_argv;
+    expanded_argv.reserve(expanded.size());
+    for (std::string& arg : expanded) { expanded_argv.push_back(arg.data()); }
+    argc                  = static_cast<int>(expanded_argv.size());
+    argv                  = expanded_argv.data();
     options.artifact_path = argv[1];
     for (int i = 2; i < argc; ++i) {
         const std::string arg    = argv[i];
@@ -409,6 +506,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.default_thinking_budget = static_cast<std::uint32_t>(budget);
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--no-vision") { // also drops a profile's Vision device and token cap
+            options.enable_vision = false;
+            options.vision_device.reset();
+            options.max_vision_tokens.reset();
         } else if (arg == "--vision-device") {
             options.vision_device = product::parse_device_id(require_value("--vision-device"));
         } else if (arg == "--max-vision-tokens") {

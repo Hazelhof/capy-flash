@@ -609,7 +609,6 @@ def _loop(c, rng, area, n, start, copy_at=(), edit_at=(), extra=None):
     """n ordinary agent-loop turns; copy_at/edit_at insert copy-heavy file-writing turns."""
     steps = []
     for k in range(n):
-        idx = start + k
         if k in copy_at:
             path = c.pick_file(rng, area, min_lines=90, max_lines=230)
             _, _, text, delay = obs_read(c, rng, area, 0, path=path, whole=True)

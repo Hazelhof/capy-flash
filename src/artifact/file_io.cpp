@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <utility>
 
 #include <fcntl.h>
@@ -17,7 +18,13 @@ namespace ninfer::artifact {
 namespace {
 
 [[noreturn]] void fail(const std::filesystem::path& path, const char* operation) {
-    throw ArtifactError(path.string() + ": " + operation + ": " + std::strerror(errno));
+    const int error  = errno;
+    std::string text = path.string() + ": " + operation + ": " + std::strerror(error);
+    if (error == ENOENT && path.filename().string().find(".ninfer.part-") != std::string::npos) {
+        text += " (a split artifact needs every .part-NNNN file next to its .ninfer: the download "
+                "is incomplete)";
+    }
+    throw ArtifactError(text);
 }
 
 off_t file_offset(std::uint64_t offset) {

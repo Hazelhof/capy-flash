@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -65,6 +66,112 @@ __global__ void __launch_bounds__(kRouteWarps * 32)
         sum = warp_sum(sum);
         if (lane == 0) { logits[static_cast<std::int64_t>(col) * (E + 1) + row] = sum; }
     }
+}
+
+// Tensor-core router logits for prompt chunks (T >= kMmaMinColumns, T183; default since v0.5.3
+// after the GSM8K/MMLU-Pro check T185; NINFER_QWEN4_ROUTER_MMA=0 restores the SIMT kernel). BF16
+// m16n8k16 MMA with FP32 accumulation, so the logits are still FP32 dot products over the
+// represented BF16 inputs (the Op's numeric contract) but summed in another order than the SIMT
+// kernel: selections can differ where logits are within the FP32 bound. Both operands are
+// K-contiguous (router rows, token columns), and a dot product does not depend on the order of K,
+// so each 32-K step lets lane (g, t) load K 8t..8t+7 of its row/column as one 16-byte vector and
+// feed K 8t..8t+3 to the first MMA and 8t+4..8t+7 to the second, mapping them onto the fragment's
+// logical K (2t, 2t+1, 2t+8, 2t+9) identically for both operands.
+constexpr int kMmaWarps      = 4;  // warps per block, along M
+constexpr int kMmaRows       = 32; // router rows per warp (two m16 tiles)
+constexpr int kMmaCols       = 64; // token columns per warp (eight n8 tiles)
+constexpr int kMmaMinColumns = 64;
+
+__device__ __forceinline__ void mma_bf16_16816(float (&c)[4], std::uint32_t a0, std::uint32_t a1,
+                                               std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
+                                               std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, "
+                 "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+__global__ void __launch_bounds__(kMmaWarps * 32)
+    moe_route_logits_mma_kernel(const __nv_bfloat16* __restrict__ x,
+                                const __nv_bfloat16* __restrict__ router,
+                                float* __restrict__ logits, std::int32_t columns) {
+    const int lane = static_cast<int>(threadIdx.x) & 31;
+    const int warp = static_cast<int>(threadIdx.x) >> 5;
+    const int g    = lane >> 2;
+    const int t    = lane & 3;
+    const int m0   = (static_cast<int>(blockIdx.x) * kMmaWarps + warp) * kMmaRows;
+    const int n0   = static_cast<int>(blockIdx.y) * kMmaCols;
+    if (m0 > E) { return; }
+    const uint4 zero{0U, 0U, 0U, 0U};
+    const uint4* a_row[2][2];
+    bool a_valid[2][2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = m0 + i * 16 + h * 8 + g;
+            a_valid[i][h] = row <= E;
+            a_row[i][h]   = reinterpret_cast<const uint4*>(
+                router + static_cast<std::int64_t>(a_valid[i][h] ? row : 0) * H);
+        }
+    }
+    pdl::wait_for_dependencies();
+    pdl::trigger_dependents();
+    const uint4* b_col[8];
+    bool b_valid[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int col = n0 + j * 8 + g;
+        b_valid[j]    = col < columns;
+        b_col[j] =
+            reinterpret_cast<const uint4*>(x + static_cast<std::int64_t>(b_valid[j] ? col : 0) * H);
+    }
+    float acc[2][8][4] = {};
+    for (int k = 0; k < H / 8; k += 4) { // uint4 index: 32 K per step
+        uint4 a[2][2];
+        uint4 b[8];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                a[i][h] = a_valid[i][h] ? __ldg(a_row[i][h] + k + t) : zero;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { b[j] = b_valid[j] ? __ldg(b_col[j] + k + t) : zero; }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                mma_bf16_16816(acc[i][j], a[i][0].x, a[i][1].x, a[i][0].y, a[i][1].y, b[j].x,
+                               b[j].y);
+                mma_bf16_16816(acc[i][j], a[i][0].z, a[i][1].z, a[i][0].w, a[i][1].w, b[j].z,
+                               b[j].w);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int row = m0 + i * 16 + g + (c >= 2 ? 8 : 0);
+                const int col = n0 + j * 8 + 2 * t + (c & 1);
+                if (row <= E && col < columns) {
+                    logits[static_cast<std::int64_t>(col) * (E + 1) + row] = acc[i][j][c];
+                }
+            }
+        }
+    }
+}
+
+bool router_mma_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_QWEN4_ROUTER_MMA");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
 }
 
 __global__ void __launch_bounds__(256)
@@ -152,15 +259,25 @@ void moe_route_launch(const Tensor& x, const Tensor& router, float* logits, Tens
                       bool last_valid_only, cudaStream_t stream) {
     const int columns = x.ne[1];
     const int width   = valid_columns != nullptr ? columns / valid_columns->ne[0] : columns;
-    const dim3 grid((E + 1 + kRouteWarps - 1) / kRouteWarps,
-                    (columns + kRouteColumns - 1) / kRouteColumns);
     // Both launches are programmatic dependents of their predecessor (T49): each kernel waits
     // before it reads anything a previous kernel wrote.
-    CUDA_CHECK(pdl::launch_dependent({grid, dim3(kRouteWarps * 32), 0, stream},
-                                     moe_route_logits_kernel,
-                                     static_cast<const __nv_bfloat16*>(x.data),
-                                     static_cast<const __nv_bfloat16*>(router.data), logits,
-                                     static_cast<std::int32_t>(columns)));
+    if (columns >= kMmaMinColumns && router_mma_enabled()) {
+        const int warps = (E + 1 + kMmaRows - 1) / kMmaRows;
+        const dim3 grid((warps + kMmaWarps - 1) / kMmaWarps, (columns + kMmaCols - 1) / kMmaCols);
+        CUDA_CHECK(pdl::launch_dependent({grid, dim3(kMmaWarps * 32), 0, stream},
+                                         moe_route_logits_mma_kernel,
+                                         static_cast<const __nv_bfloat16*>(x.data),
+                                         static_cast<const __nv_bfloat16*>(router.data), logits,
+                                         static_cast<std::int32_t>(columns)));
+    } else {
+        const dim3 grid((E + 1 + kRouteWarps - 1) / kRouteWarps,
+                        (columns + kRouteColumns - 1) / kRouteColumns);
+        CUDA_CHECK(pdl::launch_dependent({grid, dim3(kRouteWarps * 32), 0, stream},
+                                         moe_route_logits_kernel,
+                                         static_cast<const __nv_bfloat16*>(x.data),
+                                         static_cast<const __nv_bfloat16*>(router.data), logits,
+                                         static_cast<std::int32_t>(columns)));
+    }
     CUDA_CHECK(pdl::launch_dependent(
         {dim3((columns + 7) / 8), dim3(256), 0, stream}, moe_route_topk_kernel,
         static_cast<const float*>(logits), static_cast<std::int32_t>(columns),

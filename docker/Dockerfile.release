@@ -1,0 +1,42 @@
+# syntax=docker/dockerfile:1
+# capy-flash from a prebuilt release tarball: no compiler, ~1.4 GB, builds in a minute. The model stays outside the
+# image (mount it); the GPU driver comes from the host through the NVIDIA Container Toolkit.
+#
+#   docker build -f docker/Dockerfile.release -t capy-flash .            # latest release; --build-arg VERSION=v0.5.2
+#   docker run --gpus all -p 8080:8080 -v ~/capy-flash/models:/models capy-flash \
+#     /models/flash-next/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --profile flash-next --host 0.0.0.0
+#
+# Flash-Next needs about 70 GiB of free host RAM (page-locked experts); the container gets it unless you limit it.
+# The Dockerfile at the repository root builds the same server from source instead.
+FROM docker.io/library/ubuntu:26.04
+
+ARG VERSION=latest
+ARG REPO=ValerioDolci/capy-flash
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates curl libavcodec62 libavformat62 libavutil60 libcurl4t64 libswscale9 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    if [ "$VERSION" = latest ]; then \
+        VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1); \
+    fi; \
+    tarball=capy-flash-$VERSION-linux-x86_64-sm120a-ubuntu26.04.tar.gz; \
+    cd /tmp; \
+    curl -fsSLO "https://github.com/$REPO/releases/download/$VERSION/$tarball"; \
+    curl -fsSLO "https://github.com/$REPO/releases/download/$VERSION/$tarball.sha256"; \
+    sha256sum -c "$tarball.sha256"; \
+    mkdir /opt/capy-flash; \
+    tar -xzf "$tarball" -C /opt/capy-flash --strip-components 1; \
+    rm "$tarball" "$tarball.sha256"; \
+    cd /opt/capy-flash && sha256sum --quiet -c SHA256SUMS
+
+ENV LD_LIBRARY_PATH=/opt/capy-flash/lib \
+    PATH=/opt/capy-flash/bin:$PATH \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+EXPOSE 8080
+STOPSIGNAL SIGTERM
+HEALTHCHECK --interval=30s --start-period=600s CMD curl -fsS http://127.0.0.1:8080/health || exit 1
+ENTRYPOINT ["ninfer-serve"]
+CMD ["--help"]

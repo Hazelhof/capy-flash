@@ -10,10 +10,14 @@
 //   minus bound, the order must be non-increasing within bound, and the ids distinct.
 // Weights: softmax renormalized over the Op's own chosen ids from FP64 logits, |err| <= 2e-5 (FP32
 // exp of logits shifted by the maximum: a few ulp of values <= 1, plus the logit error times the
-// weight). Shared gate: sigmoid of the FP64 score row, |err| <= 2e-6.
-// Valid columns: a column past its lane's valid count must hold ids -1 and weights 0 exactly (its
-// shared gate is still checked); the other columns are checked as above.
-// Combine: exact against the FP32 fma + RNE defined by the contract.
+// weight). Shared gate: sigmoid of the FP64 score row, |err| <= 2e-6. By default columns >= 64
+// take the tensor-core logits (NINFER_QWEN4_ROUTER_MMA=0, ctest ninfer_moe_route_simt_test, keeps
+// the SIMT kernel everywhere), whose FP32 accumulation is not the SIMT kernel's (T183: gate
+// error 2.9e-6 at T=300). The contract bound then applies to the gate too: |err| <= max(2e-6,
+// bound_E(t) / 4), the FP32 accumulation bound of the score row (as for the logits) times the
+// sigmoid's Lipschitz constant. Valid columns: a column past its lane's valid count must hold ids
+// -1 and weights 0 exactly (its shared gate is still checked); the other columns are checked as
+// above. Combine: exact against the FP32 fma + RNE defined by the contract.
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/moe_route.h"
@@ -22,6 +26,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <numeric>
@@ -125,12 +130,14 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
     const auto gate    = from_device<float>(dgate.data(), static_cast<std::size_t>(tokens));
 
     int failures = 0;
-    double worst_weight = 0, worst_gate = 0, worst_margin_ratio = 0;
+    double worst_weight = 0, worst_gate = 0, worst_gate_ratio = 0, worst_margin_ratio = 0;
+    const char* mma_env      = std::getenv("NINFER_QWEN4_ROUTER_MMA");
+    const bool mma           = (mma_env == nullptr || mma_env[0] != '0') && tokens >= 64;
     int near_tie_differences = 0;
     int masked               = 0;
     for (int t = 0; t < tokens; ++t) {
         std::vector<double> l(E + 1);
-        double max_abs_sum = 0;
+        double max_abs_sum = 0, score_abs_sum = 0;
         for (int e = 0; e <= E; ++e) {
             double sum = 0, abs_sum = 0;
             for (int i = 0; i < H; ++i) {
@@ -141,6 +148,7 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
             }
             l[e]        = sum;
             max_abs_sum = std::max(max_abs_sum, abs_sum);
+            if (e == E) { score_abs_sum = abs_sum; }
         }
         const double bound = 2.0 * H * std::ldexp(1.0, -24) * max_abs_sum;
         std::vector<int> order(E);
@@ -149,7 +157,11 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
         const double tenth = l[order[K - 1]];
         const int* row     = ids.data() + static_cast<std::size_t>(t) * K;
         const double expected_gate = 1.0 / (1.0 + std::exp(-l[E]));
-        worst_gate                 = std::max(worst_gate, std::fabs(gate[t] - expected_gate));
+        const double gate_error    = std::fabs(gate[t] - expected_gate);
+        const double gate_limit =
+            mma ? std::max(2e-6, 0.25 * 2.0 * H * std::ldexp(1.0, -24) * score_abs_sum) : 2e-6;
+        worst_gate       = std::max(worst_gate, gate_error);
+        worst_gate_ratio = std::max(worst_gate_ratio, gate_error / gate_limit);
         if (!routed(t)) {
             for (int k = 0; k < K; ++k) {
                 if (row[k] != -1 || weights[static_cast<std::size_t>(t) * K + k] != 0.0F) {
@@ -206,8 +218,9 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
         std::cerr << label << ": routing weight error " << worst_weight << " > 2e-5\n";
         ++failures;
     }
-    if (worst_gate > 2e-6) {
-        std::cerr << label << ": shared gate error " << worst_gate << " > 2e-6\n";
+    if (worst_gate_ratio > 1.0) {
+        std::cerr << label << ": shared gate error " << worst_gate << " above its limit (x"
+                  << worst_gate_ratio << ")\n";
         ++failures;
     }
     failures += dx.verify_guards(label + " x") + drouter.verify_guards(label + " router") +

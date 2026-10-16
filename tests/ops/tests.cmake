@@ -52,6 +52,10 @@ foreach(op IN LISTS ninfer_op_tests)
     LIBRARIES ninfer_ops)
 endforeach()
 
+# The SIMT router logits (NINFER_QWEN4_ROUTER_MMA=0; tensor cores are the default, T183) through the same test.
+add_test(NAME ninfer_moe_route_simt_test COMMAND ninfer_moe_route_test)
+set_tests_properties(ninfer_moe_route_simt_test PROPERTIES ENVIRONMENT "NINFER_QWEN4_ROUTER_MMA=0")
+
 ninfer_add_op_test(ninfer_linear_topk_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_linear_topk.cu"
   LIBRARIES ninfer_ops)

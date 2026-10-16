@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cstdlib>
 #include <bit>
 #include <cmath>
 #include <cstring>
@@ -88,6 +89,43 @@ PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency reside
                 throw std::invalid_argument("mapped PLE residency needs mapped segments");
             }
         }
+        const char* resident = std::getenv("NINFER_QWEN4_PLE_RESIDENT_SCALES");
+        if (resident == nullptr || resident[0] != '0') { load_scales(); }
+    }
+}
+
+void PleGather::load_scales() {
+    static const std::uintptr_t page = static_cast<std::uintptr_t>(::sysconf(_SC_PAGESIZE));
+    constexpr std::uint64_t kPiece   = 64ULL << 20;
+    const std::uint64_t bytes        = table_.rows * 2U;
+    // A description whose segments stop before the plane (a hash-only table) keeps the mapping
+    // path, which reports the missing bytes if a gather ever reads them.
+    const PleTableSegment& last = table_.segments.back();
+    if (last.object_offset + last.bytes < table_.scale_plane + bytes) { return; }
+    // Read ahead one piece while copying the previous one: sequential reads, unlike the faults of
+    // a random-access mapping (MADV_RANDOM), which would read the plane one page at a time.
+    const auto advise = [&](std::uint64_t done) {
+        if (done >= bytes) { return; }
+        for_each_piece(
+            table_.scale_plane + done, std::min(kPiece, bytes - done),
+            [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
+                const auto address = reinterpret_cast<std::uintptr_t>(segment.data + within);
+                const auto begin   = address & ~(page - 1);
+                (void)::madvise(reinterpret_cast<void*>(begin), address + take - begin,
+                                MADV_WILLNEED);
+            });
+    };
+    scales_.resize(bytes);
+    advise(0);
+    for (std::uint64_t done = 0; done < bytes; done += kPiece) {
+        advise(done + kPiece);
+        std::uint64_t at = done;
+        for_each_piece(
+            table_.scale_plane + done, std::min(kPiece, bytes - done),
+            [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
+                std::memcpy(scales_.data() + at, segment.data + within, take);
+                at += take;
+            });
     }
 }
 
@@ -181,24 +219,34 @@ void PleGather::decode_row(const std::byte* codes, const std::byte* scale_bytes,
 }
 
 // Starts asynchronous reads of every page the rows touch that is not resident, so the faults of
-// the following decode overlap instead of paying one storage latency per row.
+// the following decode overlap instead of paying one storage latency per row. Each distinct page
+// is advised once (rows repeat within a chunk and share pages), runs of adjacent pages together.
 void PleGather::prefetch_mapped(std::span<const std::uint64_t> rows) const {
     static const std::uintptr_t page = static_cast<std::uintptr_t>(::sysconf(_SC_PAGESIZE));
-    const auto advise = [&](const std::byte* address, std::uint64_t bytes) {
-        const auto begin = reinterpret_cast<std::uintptr_t>(address) & ~(page - 1);
-        const auto end   = reinterpret_cast<std::uintptr_t>(address) + bytes;
-        // Advice is a hint: a failure leaves the synchronous fault path, never a wrong value.
-        (void)::madvise(reinterpret_cast<void*>(begin), end - begin, MADV_WILLNEED);
-    };
-    const auto advise_range = [&](std::uint64_t object_offset, std::uint64_t bytes) {
-        for_each_piece(object_offset, bytes,
-                       [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
-                           advise(segment.data + within, take);
-                       });
+    std::vector<std::uintptr_t> pages;
+    pages.reserve(rows.size() * (scales_.empty() ? 2 : 1));
+    const auto add_range = [&](std::uint64_t object_offset, std::uint64_t bytes) {
+        for_each_piece(
+            object_offset, bytes,
+            [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
+                const auto address = reinterpret_cast<std::uintptr_t>(segment.data + within);
+                for (std::uintptr_t p = address & ~(page - 1); p < address + take; p += page) {
+                    pages.push_back(p);
+                }
+            });
     };
     for (const std::uint64_t row : rows) {
-        advise_range(row * table_.row_bytes, table_.row_width);
-        advise_range(table_.scale_plane + row * 2U, 2);
+        add_range(row * table_.row_bytes, table_.row_width);
+        if (scales_.empty()) { add_range(table_.scale_plane + row * 2U, 2); }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    for (std::size_t i = 0; i < pages.size();) {
+        std::size_t j = i + 1;
+        while (j < pages.size() && pages[j] == pages[j - 1] + page) { ++j; }
+        // Advice is a hint: a failure leaves the synchronous fault path, never a wrong value.
+        (void)::madvise(reinterpret_cast<void*>(pages[i]), (j - i) * page, MADV_WILLNEED);
+        i = j;
     }
 }
 
@@ -277,9 +325,11 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
                 const std::byte* codes = reader_ ? streamed(2 * r)
                                                  : locate(rows[r] * table_.row_bytes,
                                                           table_.row_width, bounce.data());
-                const std::byte* scale = reader_ ? streamed(2 * r + 1)
-                                                 : locate(table_.scale_plane + rows[r] * 2U, 2,
-                                                          scale_bounce.data());
+                const std::byte* scale =
+                    reader_ ? streamed(2 * r + 1)
+                    : !scales_.empty()
+                        ? scales_.data() + rows[r] * 2U
+                        : locate(table_.scale_plane + rows[r] * 2U, 2, scale_bounce.data());
                 decode_row(codes, scale,
                            out.data() + i * width_ + static_cast<std::size_t>(head) * table_.row_width);
             }

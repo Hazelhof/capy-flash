@@ -12,6 +12,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdint>
@@ -20,6 +24,7 @@
 #include <sstream>
 #include <cmath>
 #include <exception>
+#include <functional>
 #include <future>
 #include <limits>
 #include <string>
@@ -226,34 +231,100 @@ float read_divisor(const Reader& reader, ObjectHandle handle, const WeightGeomet
     return count == 1 ? first : 0.0F;
 }
 
-// Reads one large object straight into host memory with a few concurrent preads: one buffered
-// stream does not keep an NVMe busy, and the host-mapped Flash-Next expert banks are 65 GiB.
-void parallel_read(const Reader& reader, std::uint64_t offset, std::span<std::byte> destination) {
+// Reads objects straight into host memory (the host-mapped Flash-Next expert banks, 65 GiB in
+// ~100 objects, read as one batch so the streams never wait for each other) with direct reads:
+// the page-locked copy is the only one kept, so the page cache would only add a copy and evict
+// everything else. The objects are not 4 KiB-aligned in the files, so each 64 MiB piece is read
+// (O_DIRECT) into its stream's aligned bounce buffer covering the piece and copied out; two
+// streams keep an NVMe busy (T173, 60 GiB: 13.2 s with 2, 18.4 s with 4, 38.4 s with 8).
+// `progress(bytes read so far)` runs on the calling thread about every 250 ms.
+struct HostRead {
+    std::uint64_t offset; // logical payload offset
+    std::span<std::byte> destination;
+};
+
+void parallel_read(const Reader& reader, std::span<const HostRead> reads,
+                   const std::function<void(std::uint64_t)>& progress) {
     constexpr std::uint64_t kChunk = 64ULL << 20;
-    const std::uint64_t bytes      = destination.size();
-    const std::uint64_t chunks     = (bytes + kChunk - 1) / kChunk;
-    if (chunks <= 1) {
-        reader.read_into(offset, destination);
-        return;
+    constexpr std::size_t kStreams = 2;
+    constexpr std::uint64_t kAlign = kPayloadAlignment;
+
+    struct Piece {
+        std::size_t file;
+        std::uint64_t file_offset;
+        std::span<std::byte> destination;
+    };
+
+    std::vector<Piece> pieces;
+    for (const auto& [offset, destination] : reads) {
+        for (const auto& segment : reader.segments(offset, destination.size())) {
+            const auto to =
+                destination.subspan(static_cast<std::size_t>(segment.destination_offset),
+                                    static_cast<std::size_t>(segment.bytes));
+            for (std::uint64_t at = 0; at < segment.bytes; at += kChunk) {
+                pieces.push_back(
+                    {segment.file_index, segment.file_offset + at,
+                     to.subspan(static_cast<std::size_t>(at),
+                                static_cast<std::size_t>(std::min(kChunk, segment.bytes - at)))});
+            }
+        }
     }
-    const auto workers = static_cast<unsigned>(std::min<std::uint64_t>(
-        chunks, std::max(1U, std::min(8U, std::thread::hardware_concurrency()))));
+    std::atomic<std::uint64_t> read_bytes{0};
+
+    // One bounce buffer per stream: the aligned range covering a piece is at most kChunk plus
+    // one alignment unit at each end.
+    struct Bounce {
+        std::unique_ptr<std::byte, decltype(&std::free)> data{nullptr, &std::free};
+
+        Bounce() {
+            data.reset(static_cast<std::byte*>(std::aligned_alloc(kAlign, kChunk + 2 * kAlign)));
+            if (!data) { throw std::bad_alloc(); }
+        }
+    };
+
+    const auto read_piece = [&](const Piece& piece, Bounce& bounce) {
+        const std::uint64_t begin  = piece.file_offset / kAlign * kAlign;
+        const std::uint64_t head   = piece.file_offset - begin;
+        const std::uint64_t needed = head + piece.destination.size();
+        const std::uint64_t length = (needed + kAlign - 1) / kAlign * kAlign;
+        std::uint64_t got          = 0;
+        while (got < needed) {
+            const auto received = reader.read_direct(
+                piece.file, begin + got,
+                {bounce.data.get() + got, static_cast<std::size_t>(length - got)});
+            if (received == 0) { throw ArtifactError("direct read ended before the object"); }
+            got += received;
+        }
+        std::memcpy(piece.destination.data(), bounce.data.get() + head, piece.destination.size());
+        read_bytes.fetch_add(piece.destination.size(), std::memory_order_relaxed);
+    };
+    // The first read of each file opens its direct descriptor; do it before the streams share it.
+    Bounce first;
+    std::vector<bool> opened(reader.directory().files.size(), false);
+    std::vector<const Piece*> rest;
+    for (const auto& piece : pieces) {
+        if (!opened[piece.file]) {
+            opened[piece.file] = true;
+            read_piece(piece, first);
+        } else {
+            rest.push_back(&piece);
+        }
+    }
     std::vector<std::future<void>> tasks;
-    tasks.reserve(workers);
-    for (unsigned worker = 0; worker < workers; ++worker) {
-        tasks.push_back(std::async(std::launch::async, [&, worker] {
-            for (std::uint64_t chunk = worker; chunk < chunks; chunk += workers) {
-                const std::uint64_t begin = chunk * kChunk;
-                const std::uint64_t count = std::min(kChunk, bytes - begin);
-                reader.read_into(offset + begin,
-                                 destination.subspan(static_cast<std::size_t>(begin),
-                                                     static_cast<std::size_t>(count)));
+    for (std::size_t stream = 0; stream < std::min(kStreams, rest.size()); ++stream) {
+        tasks.push_back(std::async(std::launch::async, [&, stream] {
+            Bounce bounce;
+            for (std::size_t i = stream; i < rest.size(); i += kStreams) {
+                read_piece(*rest[i], bounce);
             }
         }));
     }
     // Every task finishes before an error leaves this frame: they write into `destination`.
     std::exception_ptr failure;
     for (auto& task : tasks) {
+        while (task.wait_for(std::chrono::milliseconds(250)) != std::future_status::ready) {
+            progress(read_bytes.load(std::memory_order_relaxed));
+        }
         try {
             task.get();
         } catch (...) {
@@ -370,8 +441,16 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             total = checked_add(total, copy.bytes, "device payload bytes");
         }
     }
+    // Progress counts the host-mapped bytes too (64.6 GiB for Flash-Next, read before the uploads):
+    // without them the log showed "1.2 % ... ETA 1h" for a 40-second load.
+    std::uint64_t host_total = 0;
+    for (const auto& placement : plan.host_mapped_objects) {
+        host_total = checked_add(host_total, reader.directory().tensor(placement.object).bytes,
+                                 "host-mapped payload bytes");
+    }
+    const std::uint64_t all_total = checked_add(total, host_total, "weight payload bytes");
     StartupPhaseScope phase(observer, StartupPhase::WeightsMaterialize, StartupProgressUnit::Bytes,
-                            total);
+                            all_total);
     DeviceSelection selection(devices);
     MaterializedArtifact out;
     out.objects_.resize(plan.object_count);
@@ -462,30 +541,42 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             mapped[device] = static_cast<const std::byte*>(out.host_mapped_->device_data());
         }
         std::uint64_t end = 0;
+        std::vector<HostRead> reads;
+        reads.reserve(plan.host_mapped_objects.size());
+        std::vector<bool> placed(out.objects_.size(), false);
         for (const auto& placement : plan.host_mapped_objects) {
             reader.validate_object(placement.object);
             const auto& geometry   = reader.geometry(placement.object);
             const auto& descriptor = reader.directory().tensor(placement.object);
-            auto& object           = out.objects_.at(placement.object.index);
+            const auto& object     = out.objects_.at(placement.object.index);
             if (placement.bytes != geometry.bytes || descriptor.bytes > placement.bytes ||
                 !placement.alignment || placement.offset < end ||
                 placement.offset % placement.alignment ||
                 checked_add(placement.offset, placement.bytes, "host-mapped end") >
                     plan.host_mapped_bytes ||
+                placed.at(placement.object.index) ||
                 std::any_of(object.device.begin(), object.device.end(),
                             [](const auto& backing) { return backing.parent.has_value(); })) {
                 throw ArtifactError("invalid or duplicate host-mapped placement");
             }
+            placed[placement.object.index] = true;
             end                = placement.offset + placement.bytes;
             const auto bytes   = std::span(host + placement.offset,
                                            static_cast<std::size_t>(placement.bytes));
             const auto payload = static_cast<std::size_t>(descriptor.bytes);
-            parallel_read(reader, descriptor.offset, bytes.first(payload));
+            reads.push_back({descriptor.offset, bytes.first(payload)});
             // Padding after the stored payload reads as zero, as in a device arena.
             std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(payload), bytes.end(),
                       std::byte{0});
             out.stats_.read_bytes =
                 checked_add(out.stats_.read_bytes, descriptor.bytes, "host-mapped read bytes");
+        }
+        parallel_read(reader, reads, [&](std::uint64_t read) { phase.progress(read, all_total); });
+        for (const auto& placement : plan.host_mapped_objects) {
+            const auto& geometry = reader.geometry(placement.object);
+            auto& object         = out.objects_.at(placement.object.index);
+            const auto bytes =
+                std::span(host + placement.offset, static_cast<std::size_t>(placement.bytes));
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, bytes, out.stats_);
             for (std::size_t device = 0; device < devices.size(); ++device) {
@@ -584,7 +675,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
     }
     if (ranges.empty()) {
-        phase.complete();
+        phase.complete(host_total, all_total);
         return out;
     }
     // Every device byte is written once. Sources may repeat: each device reads its own copy of
@@ -689,7 +780,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                     slot.pending[device] = true;
                 }
             }
-            phase.progress(copied, total);
+            phase.progress(host_total + copied, all_total);
         }
     }
     for (const auto& slot : slots) { slot->wait(); }
@@ -699,7 +790,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     out.stats_.upload_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     slots.clear();
-    phase.complete(copied, total);
+    phase.complete(host_total + copied, all_total);
     return out;
 }
 

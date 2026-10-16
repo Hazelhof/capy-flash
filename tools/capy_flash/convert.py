@@ -5,7 +5,7 @@ From the NVIDIA ModelOpt checkpoint (nvidia/Qwen3.8-Flash-Next-NVFP4) to the ser
   1. tools.convert with the recipe qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 (experts NVFP4 as published, indexer BF16,
      GDN Q8), components text + mtp  ->  <out>/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer
   2. the MTP draft shortlist beside it (tools/qwen4_draft_shortlist.py, --prefix 98304 --count-top 32768 over the
-     repository ranking)  ->  <out>/qwen3_8_flash_next_nvfp4_idxgdnq8.draft_shortlist.txt
+     repository ranking, plus the 8 192 most frequent Italian tokens it lacks: T186)  ->  <out>/qwen3_8_flash_next_nvfp4_idxgdnq8.draft_shortlist.txt
 The engine picks the shortlist up by itself (artifact sidecar).
 
   python tools/capy_flash/convert.py --model <checkpoint dir> --out <dir> [--device cuda] [--skip-convert]
@@ -42,5 +42,6 @@ if not a.skip_convert:
 elif not art.exists():
     sys.exit(f"capy_flash_convert: --skip-convert but {art} does not exist")
 run([sys.executable, ROOT / "tools/qwen4_draft_shortlist.py", "--prefix", "98304", "--count-top", "32768",
+     "--extra-ranking", ROOT / "tools/freq_corpus/fixtures/ranking/it.train.counts.i64", "--extra-top", "8192",
      "--tokenizer", a.model, "--out", a.out / f"{STEM}.draft_shortlist.txt"])
 print(f"capy_flash_convert: ready: {art} (+ draft shortlist)")

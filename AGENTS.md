@@ -38,15 +38,16 @@ approval requirements beyond the user's instructions and the actual execution en
 
 ## Product and architecture
 
-NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance. It implements
-`Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
-use the same architecture, binding and execution path. The implementation targets `sm_120a` and
-is tuned on NVIDIA GeForce RTX 5090.
+capy-flash is a C++/CUDA inference engine built on NInfer (ninfer-tp2, renamed at v0.5.0) for two
+16 GB `sm_120a` boards without P2P, tensor-parallel (`--tp 2`). It serves Qwen3.8-Flash-Next
+(`Qwen4ExpForCausalLM`: NVFP4 routed experts in page-locked host RAM, missing experts computed on
+the CPU with AVX-512 VNNI, n-gram (PLE) table read from disk) and the dense Qwen3.8-27B
+(`Qwen3_5ForCausalLM`) through the same Engine. It is tuned on 2x RTX 5070 Ti, Ryzen 9 9900X,
+96 GB DDR5; `--profile flash-next|27b` is the tested serving configuration of each model.
 
-Generation uses one GPU, one resident model, startup-fixed concurrency of one to eight requests,
-bounded FIFO ingress, no active-request preemption, and one compact decode batch per round. An
-experimental two-GPU tensor-parallel mode (`--tp 2`) exists for two 16 GB boards; it does not
-extend this product boundary.
+Generation uses one resident model, startup-fixed concurrency of one to eight requests (one for
+Flash-Next), bounded FIFO ingress, no active-request preemption, and one compact decode batch per
+round. One GPU (`--tp 1`) remains supported for the models that fit it.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous
@@ -59,7 +60,7 @@ local workflow. Do not derive requirements from a different deployment or trust 
 Keep these ownership boundaries visible when selecting a design:
 
 - v3 `.ninfer` is the only C++ product artifact; CLI, serving, and inference benchmarks use the public
-  Engine. NInfer has no Python model-inference route or installed/exported C++ SDK.
+  Engine. capy-flash has no Python model-inference route or installed/exported C++ SDK.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
 - Models own fixed mathematics, config interpretation, logical parameter binding, frontend
@@ -125,6 +126,12 @@ Choose the affected checks, rather than running this table as a checklist:
 | Performance | measurement at the claimed scope; profiling only for unresolved attribution |
 | Serving | affected schema tests and observable request/stream behavior |
 
+A change that can alter generated tokens (kernels, quantization, routing, expert placement, sampling,
+prefill chunking, speculative decoding) also needs a model-level quality check before release:
+GSM8K (1,319 questions) and MMLU-Pro (1,008 questions) against the recorded reference, paired per
+question (McNemar), not only a perplexity or a smoke prompt. Changes whose output is bit-identical
+(proved by exact comparison of the produced values) need not repeat it; say which case applies.
+
 Record the target, relevant hardware/toolchain, workload or command, and summarized result needed
 to interpret a material claim. Hashes, clean worktrees, full command transcripts, raw report
 inventories, and exact probabilistic outputs are not default requirements. Use exact comparison for
@@ -187,14 +194,17 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
 
-Use the selected Python 3.11 interpreter explicitly. On this machine it is
-`/home/neroued/miniconda3/envs/py311/bin/python`; the default shell's `python3` may be a different
-version. Use `python3` only after selecting the maintainer environment or checking its version.
-Normal resources are `build/`, `out/qwen3_6_27b.ninfer`, its `.conversion.json` report, and
-`profiles/ncu/`, `profiles/nsys/`, `profiles/bench/`; the local toolchain is CUDA 13.1.
+Use a Python 3.11+ interpreter explicitly; check the version of the default `python3` before relying
+on it. The local toolchain is CUDA 13.1 (`-DCMAKE_CUDA_ARCHITECTURES=120a`). The integration tests
+read their artifacts from `NINFER_TEST_QWEN4_ARTIFACT` (a synthetic Flash-Next artifact,
+`tools/capy_flash/make_test_artifact.sh`) and `NINFER_TEST_ARTIFACT` (a Qwen3.8-27B artifact).
+The full Flash-Next model pins 64.6 GiB of host RAM: run one such process at a time, and do not
+build with many jobs while it is loaded.
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
 
-Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
-such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.
+Create commits only when requested. Subjects name the area and the change (`qwen4 PLE: ...`,
+`serve: ...`). Run `pre-commit install` once: the hooks check the lines a commit changes
+(clang-format) and Python errors (ruff), as CI does on pull requests. A commit written with AI
+assistance says so in its trailer (`Co-Authored-By:`), and so does its pull request.

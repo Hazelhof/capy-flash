@@ -365,3 +365,32 @@ same values). Cold random text, same binary, prefetch off/on, 3 arms each: PLE w
 identical (2k and 16k prompts, 1,024-token chunks). The first chunk of a request is not covered; issuing its advice
 from 16 threads instead of one did not help (T168: 1.06-1.28 s vs 1.24-1.28 s at ~15k tokens), so the read latency,
 not the advice, bounds it.
+
+**T170-T172**: the first PLE chunk of new text, which has no previous chunk to hide behind. A CPU-only bench of the
+gather on the real table (T171) put the whole cost in the serial `MADV_WILLNEED` calls, two per row: the FP8 codes
+and the BF16 row multiplier, which lives in a separate plane of the table. The multiplier plane (2 bytes per row,
+640 MB) is now read once at load and kept in RAM, and the gather advises only the code pages, sorted, deduplicated
+and merged into runs (`NINFER_QWEN4_PLE_RESIDENT_SCALES=0` restores the mapping). Values identical (bench hashes, PLE
+test with and without). Server, cold random text: first chunk ~15k tokens 0.78-1.28 s -> 0.38-0.54 s. The reference
+drive (DRAM-less NVMe) serves ~1.2-1.4 M fast random 4 KiB reads and then drops to 25k IOPS until it rests 15-45 s:
+with two reads per row a cold 55k prompt (~1.76 M reads) exhausted that budget, with one it does not.
+
+**T173-T174, T179**: server start. 26 s went to parsing the artifact directory (32 MB of JSON, 74,632 objects):
+nlohmann's parser callback that rejects duplicate members made the parse ~100x slower; the check is now a separate
+SAX pass (Reader 26.5 s -> 0.48 s). The 64.6 GiB of host experts were read with eight buffered streams; they are now
+read as one batch with O_DIRECT from two streams, each 64 MiB piece through an aligned bounce buffer because the
+objects are not 4 KiB-aligned in the files (a first version fell back to buffered reads for that reason). Weights
+phase, cold cache, alternating: 37-44 s -> 20.6-23.4 s; whole start 56-141 s (v0.5.2) -> 26-29 s. The load progress
+now counts the host bytes (it showed "1.2% ... ETA 1h" for a 40-second load).
+
+**T175, T177**: where a decode round goes (short context, product configuration): ~21 ms per round, ~10 ms of pure
+GPU work; 152.5 missing experts per window computed on the CPU (VRAM hit rate 0.903); GPU 0 idle 0.87 ms per round,
+so host synchronizations are worth at most ~4 %.
+
+**T182-T184**: a 58k-token prefill under nsys: GPUs busy 72 %, PCIe link 42 % (27 GB/s while busy); the router
+logits (SIMT) took 1.21 s per GPU. `NINFER_QWEN4_ROUTER_MMA=1` (off by default) computes them on tensor cores for
+chunks of 64+ columns (BF16 MMA, FP32 accumulation): 55k-token prefill 3.66k -> 3.91-4.04k tok/s. Same FP32 contract,
+another summation order: expert selections can change near ties. T185, the quality gate with it on: GSM8K 1319
+0.9765 (GB300 0.9810, 7 vs 1 discordant, McNemar p 0.070, pass), MMLU-Pro 1008 0.8452 (GB300 0.8452, 25 vs 25):
+default since v0.5.3. T186: the draft shortlist gains the 8,192 most frequent Italian tokens it lacked (14.5 % of
+held-out Italian tokens were outside it, 0.24 % after): Italian answers 0.37 -> 0.45 draft acceptance, ~+11 % decode.

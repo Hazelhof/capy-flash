@@ -28,7 +28,12 @@ void validate_options(const EngineOptions& options) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
     if (options.artifact_path.extension() != ".ninfer") {
-        throw std::invalid_argument("NInfer accepts only .ninfer artifacts");
+        const std::string name = options.artifact_path.filename().string();
+        if (const auto part = name.find(".ninfer.part-"); part != std::string::npos) {
+            throw std::invalid_argument(name + " is a continuation of a split artifact: pass " +
+                                        name.substr(0, part + 7) + " (it finds its parts)");
+        }
+        throw std::invalid_argument("NInfer accepts only .ninfer artifacts, not " + name);
     }
     if (options.max_context == 0) {
         throw std::invalid_argument("Engine max_context must be nonzero");

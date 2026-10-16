@@ -524,6 +524,37 @@ int main() {
             !rejects({"ninfer-serve", "model.ninfer", "--vision", "--max-vision-tokens", "64"}),
         "--max-vision-tokens accepted a value outside [64,16384]");
 
+    // --profile: the launcher configuration, overridden by explicit flags in any position.
+    const ServeOptions flash = parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next"});
+    failures += check(
+        flash.tp == 2 && flash.devices == std::vector<int>{0, 1} &&
+            flash.kv_cache == ninfer::KvCacheStorage::Int8Group64 && flash.elastic_kv.enabled &&
+            flash.max_context == 262144 && flash.kv_capacity.explicit_tokens == 262144 &&
+            flash.max_concurrency == 1 &&
+            flash.speculative.backend == ninfer::SpeculativeBackend::Mtp && !flash.enable_vision,
+        "--profile flash-next does not apply the launcher configuration");
+    const ServeOptions shorter = parse({"ninfer-serve", "model.ninfer", "--max-context", "65536",
+                                        "--profile", "flash-next", "--port", "9000"});
+    failures +=
+        check(shorter.max_context == 65536 && shorter.kv_capacity.explicit_tokens == 65536 &&
+                  shorter.port == 9000 && shorter.elastic_kv.enabled,
+              "an explicit flag does not override its --profile value");
+    const ServeOptions dense = parse({"ninfer-serve", "model.ninfer", "--profile", "27b"});
+    failures += check(dense.tp == 2 && dense.max_context == 196608 && dense.enable_vision &&
+                          dense.vision_device == 0 && dense.max_vision_tokens == 4096u &&
+                          !dense.elastic_kv.enabled,
+                      "--profile 27b does not apply the launcher configuration");
+    const ServeOptions blind =
+        parse({"ninfer-serve", "model.ninfer", "--profile", "27b", "--no-vision"});
+    failures += check(!blind.enable_vision && !blind.vision_device && !blind.max_vision_tokens,
+                      "--no-vision does not drop the profile's Vision options");
+    failures += check(rejects({"ninfer-serve", "model.ninfer", "--profile", "huge"}) &&
+                          rejects({"ninfer-serve", "model.ninfer", "--profile"}),
+                      "an unknown or missing --profile was accepted");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("flash-next: --tp 2") != std::string::npos,
+              "the usage text does not list the profiles");
+
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;
 }

@@ -10,6 +10,11 @@
 // one storage latency instead of one per row) or with batched direct reads (Stream: O_DIRECT,
 // nothing enters the page cache). The decoded BF16 embedding `[embed_dim, count]` is written to a
 // caller buffer (pinned for one H2D upload per call).
+//
+// Mapped keeps the BF16 row multipliers (the scale plane, 2 bytes per row = 640 MB) in RAM, read
+// once sequentially at construction (T171): otherwise every cold row costs two random page reads,
+// its codes and its multiplier, and the storage's random-read rate bounds the first prefill
+// chunk. NINFER_QWEN4_PLE_RESIDENT_SCALES=0 reads the multipliers through the mapping instead.
 
 #include <array>
 #include <cstddef>
@@ -104,6 +109,8 @@ private:
     [[nodiscard]] const std::byte* locate(std::uint64_t object_offset, std::uint64_t bytes,
                                           std::byte* bounce) const;
     void prefetch_mapped(std::span<const std::uint64_t> rows) const;
+    // Copies the scale plane `[scale_plane, + rows * 2)` from the mapping into `scales_`.
+    void load_scales();
 
     PleTableView table_;
     PleHashConfig hash_;
@@ -113,6 +120,8 @@ private:
     std::array<float, 256> e4m3_{};
     std::unique_ptr<PleRowReader> reader_;
     std::vector<std::uint64_t> row_scratch_;
+    std::vector<std::byte>
+        scales_; // resident scale plane (Mapped); empty: read through the mapping
 };
 
 } // namespace ninfer::models::qwen3_5::execution

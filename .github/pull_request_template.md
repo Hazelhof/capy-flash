@@ -1,7 +1,7 @@
 <!--
 One PR should complete one agreed change, including its implementation, verification and report.
 Keep independent changes in separate PRs. Follow the applicable verification guidance:
-https://github.com/Neroued/ninfer/blob/master/CONTRIBUTING.md#pull-request-description
+https://github.com/ValerioDolci/capy-flash/blob/main/CONTRIBUTING.md#pull-request-description
 -->
 
 ## Problem and scope
@@ -19,4 +19,7 @@ Related Issue:
 <!--
 Provide reproduction commands and summarized results, or a report containing them.
 State any relevant behavior that remains unverified.
+If the change can alter generated tokens: quality check (GSM8K / MMLU-Pro) or proof of bit-identity.
 -->
+
+AI assistance: <!-- none, or which tools wrote which parts -->
