@@ -526,11 +526,13 @@ struct FakeDiscardResult {
 };
 
 struct FakePhysicalUsage {
-    std::uint32_t device_state_slots      = 0;
-    std::uint32_t host_state_slots        = 0;
-    std::uint32_t device_main_kv_pages    = 0;
-    std::uint32_t device_backend_kv_pages = 0;
-    std::size_t host_kv_bytes             = 0;
+    std::uint32_t device_state_slots            = 0;
+    std::uint32_t host_state_slots              = 0;
+    std::uint32_t device_main_kv_pages          = 0;
+    std::uint32_t device_backend_kv_pages       = 0;
+    std::uint32_t device_main_kv_lease_pages    = 0;
+    std::uint32_t device_backend_kv_lease_pages = 0;
+    std::size_t host_kv_bytes                   = 0;
 };
 
 class FakeProgram;

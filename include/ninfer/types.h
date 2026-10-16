@@ -341,6 +341,10 @@ struct EngineOptions {
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
+    // Device KV lease window (capy-flash): a request reserves its prompt plus this many output
+    // tokens (at least prefill_chunk) and grows the reservation as its answer grows. 0 reserves
+    // the whole max_tokens at admission, as before the lease.
+    std::uint32_t kv_lease_window_tokens = 4096;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
@@ -1185,6 +1189,13 @@ struct RuntimeStats {
     std::uint32_t host_state_occupied_slots            = 0;
     std::uint32_t device_main_kv_occupied_pages        = 0;
     std::uint32_t device_backend_kv_occupied_pages     = 0;
+    // Un-written growth reservation of active requests' Device KV leases, part of the occupied
+    // totals above: KV a running request may still write, as opposed to KV that exists.
+    std::uint32_t device_main_kv_lease_pages    = 0;
+    std::uint32_t device_backend_kv_lease_pages = 0;
+    // Device KV leases extended by releasing retained cache, and answers a lease cut short.
+    std::uint64_t kv_lease_reclaimed_owners            = 0;
+    std::uint64_t kv_lease_shortened_answers           = 0;
     std::size_t host_kv_occupied_bytes                 = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;

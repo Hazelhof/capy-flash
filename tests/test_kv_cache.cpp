@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <optional>
 #include <new>
 #include <span>
 #include <stdexcept>
@@ -453,7 +454,12 @@ int exercise_mirror(ninfer::DeviceContext& context) {
     ninfer::KVExecutionTablePool tables({origin_arena.base(), origin_arena.capacity()}, plan.tables,
                                         pool);
 
-    const ninfer::DeviceKVMirror where{.device = context.device, .stream = context.transfer_stream};
+    // Replays run on the transfer stream here; the mirror's Host copies on the compute stream.
+    ninfer::CudaCompletionEvent transfer_order(context);
+    const ninfer::DeviceKVMirror where{.device          = context.device,
+                                       .stream          = context.transfer_stream,
+                                       .transfer_stream = context.stream,
+                                       .transfer_order  = &transfer_order};
     pool.attach_mirror(mirror_pool, where);
     tables.attach_mirror(mirror_tables, where);
 
@@ -494,12 +500,72 @@ int exercise_mirror(ninfer::DeviceContext& context) {
                                    [](unsigned char byte) { return byte == 0; }),
                        "zero_pages was not replayed on the mirror pool");
 
-    bool host_rejected = false;
+    // Host tier with a mirror: one record per page holds the origin's half, then the mirror's.
+    const ninfer::HostKVPageLayout single = ninfer::plan_host_kv_page_layout(pool.geometry());
+    const ninfer::HostKVPageLayout paired =
+        ninfer::plan_host_kv_page_layout(pool.geometry(), pool.host_replicas());
+    failures += expect(pool.host_replicas() == 2 && paired.replicas == 2 &&
+                           paired.replica_stride == single.page_stride &&
+                           paired.page_stride == 2 * single.page_stride,
+                       "mirrored pool does not plan a two-replica Host record");
+    const ninfer::HostKVPageLayout host_layouts[] = {single, paired};
+    ninfer::HostKVArena host_arena(paired.page_stride * 8,
+                                   std::span<const ninfer::HostKVPageLayout>(host_layouts));
+    failures += expect(host_arena.layout_for(pool.geometry(), 2) != nullptr &&
+                           host_arena.layout_for(pool.geometry(), 2)->replicas == 2 &&
+                           host_arena.layout_for(pool.geometry())->replicas == 1,
+                       "Host arena does not tell the two record layouts apart");
+    const ninfer::DeviceKVPageHandle moved[]     = {pages[0].handle(), pages[1].handle()};
+    std::optional<ninfer::HostKVAllocation> half = host_arena.allocate(single, 2);
+    bool single_rejected                         = false;
     try {
-        pool.copy_to_host(handles(pages), ninfer::HostKVAllocationView{}, context.stream);
-    } catch (const std::invalid_argument&) {
-    } catch (const std::logic_error&) { host_rejected = true; }
-    failures += expect(host_rejected, "Host transfer was accepted with a mirror attached");
+        pool.copy_to_host(moved, host_arena.writable_view(*half), context.stream);
+    } catch (const std::invalid_argument&) { single_rejected = true; }
+    failures += expect(single_rejected, "mirrored pool accepted a one-rank Host record");
+
+    const std::size_t payload          = paired.planes[0].page_payload_bytes;
+    const ninfer::Tensor& origin_plane = pool.plane(0);
+    const auto set_page = [&](const ninfer::Tensor& plane, std::int32_t page, int value) {
+        CUDA_CHECK(cudaMemset(static_cast<unsigned char*>(plane.data) + page * plane.nb[3], value,
+                              plane.nb[3]));
+    };
+    const int origin_values[] = {0x3c, 0x22};
+    const int mirror_values[] = {0xa5, 0x11};
+    for (std::size_t index = 0; index < 2; ++index) {
+        set_page(origin_plane, physical[index], origin_values[index]);
+        set_page(mirror_plane, physical[index], mirror_values[index]);
+    }
+    std::optional<ninfer::HostKVAllocation> both = host_arena.allocate(paired, 2);
+    failures += expect(both.has_value(), "two-replica Host allocation failed");
+    ninfer::HostKVAllocationView both_view = host_arena.writable_view(*both);
+    std::memset(both_view.data(), 0, paired.page_stride * 2);
+    pool.copy_to_host(moved, both_view, context.stream);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const auto filled_with = [](const std::byte* data, std::size_t bytes, int value) {
+        return std::all_of(data, data + bytes,
+                           [&](std::byte byte) { return std::to_integer<int>(byte) == value; });
+    };
+    for (std::size_t index = 0; index < 2; ++index) {
+        const std::byte* record = both_view.data() + index * paired.page_stride;
+        failures +=
+            expect(filled_with(record, payload, origin_values[index]) &&
+                       filled_with(record + paired.replica_stride, payload, mirror_values[index]),
+                   "D2H record does not hold the origin's then the mirror's page");
+    }
+    pool.zero_pages(moved, context.stream);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    pool.copy_from_host(host_arena.view(*both), moved, context.stream);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    for (std::size_t index = 0; index < 2; ++index) {
+        const std::vector<unsigned char> origin = read_page(origin_plane, physical[index]);
+        const std::vector<unsigned char> mirror = read_page(mirror_plane, physical[index]);
+        failures += expect(
+            std::all_of(origin.begin(), origin.begin() + payload,
+                        [&](unsigned char byte) { return byte == origin_values[index]; }) &&
+                std::all_of(mirror.begin(), mirror.begin() + payload,
+                            [&](unsigned char byte) { return byte == mirror_values[index]; }),
+            "H2D did not restore both ranks' halves of the page");
+    }
 
     const ninfer::KVExecutionRowHandle stale = row.handle();
     row.release();

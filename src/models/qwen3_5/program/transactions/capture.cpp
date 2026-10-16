@@ -233,14 +233,16 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
         assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::MainKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
+            plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry(),
+                                     text_kv_pages->physical_pool().host_replicas()),
             added.device.main_kv_pages));
     }
     if (added.device.backend_kv_pages != 0) {
         assessment.transfer_requirements.push_back(kv_transfer_requirement(
             runtime::ContextResourceClass::BackendKV,
             runtime::ContextTransferDirection::DeviceToDevice,
-            plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
+            plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry(),
+                                     backend_kv_pages->physical_pool().host_replicas()),
             added.device.backend_kv_pages));
     }
     assessment.needs_transfer = !assessment.transfer_requirements.empty();
@@ -261,14 +263,16 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
             recovery.push_back(kv_transfer_requirement(
                 runtime::ContextResourceClass::MainKV,
                 runtime::ContextTransferDirection::DeviceToDevice,
-                plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry()),
+                plan_host_kv_page_layout(text_kv_pages->physical_pool().geometry(),
+                                         text_kv_pages->physical_pool().host_replicas()),
                 text_snapshot_shape->copied_pages()));
         }
         if (backend_snapshot_shape && backend_snapshot_shape->copied_pages() != 0) {
             recovery.push_back(kv_transfer_requirement(
                 runtime::ContextResourceClass::BackendKV,
                 runtime::ContextTransferDirection::DeviceToDevice,
-                plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry()),
+                plan_host_kv_page_layout(backend_kv_pages->physical_pool().geometry(),
+                                         backend_kv_pages->physical_pool().host_replicas()),
                 backend_snapshot_shape->copied_pages()));
         }
         assessment.projected_recovery_work.reserve(2);
@@ -742,7 +746,7 @@ void ProgramImpl::enqueue_active_capture_transfers(ActiveCaptureTransaction& tra
             1U << context_resource_index(runtime::ContextResourceClass::BackendKV);
         ++transaction.operations.partial_tail_cow_pages;
     }
-    context_completion_.record(device.transfer_stream);
+    record_context_completion();
     transaction.transfer_enqueue_pending = false;
     transaction.transfer_submitted       = true;
 }
@@ -1181,7 +1185,7 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
                 });
             }
         } catch (...) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
+            synchronize_context_transfer_streams();
             for_each_pending_pressure([&](auto& work) { abort_pressure_work(work); });
             throw;
         }
@@ -1191,13 +1195,13 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         pressure_transition.phase = copies_submitted ? PressureTransitionPhase::CopiesInFlight
                                                      : PressureTransitionPhase::CopyPublication;
         if (copies_submitted) {
-            context_completion_.record(device.transfer_stream);
+            record_context_completion();
             return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
         }
     }
 
     if (pressure_transition.phase == PressureTransitionPhase::CopiesInFlight) {
-        if (!context_completion_.ready()) {
+        if (!context_completion_ready()) {
             return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
         }
         pressure_transition.phase = PressureTransitionPhase::CopyPublication;
@@ -1266,16 +1270,14 @@ ProgramImpl::progress_active_capture_transaction(runtime::CancellationFlagView c
         try {
             enqueue_active_capture_transfers(transaction);
         } catch (...) {
-            if (device.transfer_stream != nullptr) {
-                (void)cudaStreamSynchronize(device.transfer_stream);
-            }
+            synchronize_context_transfer_streams();
             abort_active_capture(transaction);
             transaction.published = true;
             throw;
         }
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }
-    if (transaction.transfer_submitted && !context_completion_.ready()) {
+    if (transaction.transfer_submitted && !context_completion_ready()) {
         return ActiveCaptureResult{.status = runtime::ContextTransactionStatus::InProgress};
     }
     if (transaction.transfer_submitted) {

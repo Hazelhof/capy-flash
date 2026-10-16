@@ -45,7 +45,7 @@ tensor-parallel on the two GPUs. capy-flash **is ninfer-tp2, renamed at v0.5.0**
 of [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every
 piece of prior work it builds on.
 
-Status: **v0.5.3** (2026-10-16). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
+Status: **v0.5.4** (2026-10-16). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
 
 ## What it does
 - Tensor parallel over PCIe on two GPUs **without peer-to-peer** (pinned-host mailbox, FP32 partial sums).
@@ -54,6 +54,12 @@ Status: **v0.5.3** (2026-10-16). Built, tested and measured on one machine (belo
 - MTP speculative decoding (K = 3, draft vocabulary shortlist), INT8 KV with an elastic KV / expert-slot budget up to
   262,144 tokens, prefix cache across turns; OpenAI- and Anthropic-compatible server (`ninfer-serve`).
 - The same binary still serves the dense **Qwen3.8-27B** (NVFP4, entirely on the two GPUs) exactly like ninfer-tp2 v0.4.9.
+- Context cache for agents (v0.5.4): a request reserves its prompt plus a 4,096-token window of KV and grows it as the
+  answer grows (a large `max_tokens` no longer pushes other conversations out of VRAM), and with two GPUs the cache can
+  keep evicted conversations in RAM (`--host-kv-mib`, `--host-state-slots`; on in `--profile 27b` with 8 GiB, off on
+  Flash-Next, whose experts already pin most of the RAM). On an agentic replay of Qwen3.8-27B (3 interleaved sessions
+  and 11 subagents, production flags, 4 lanes): median time to first token 2.14 → 0.98 s, prompt tokens served from
+  cache 67 → 78 %, prompt tokens recomputed −35 %, decode unchanged.
 
 ## Measured
 One machine: AMD Ryzen 9 9900X, 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.0 x8 + x8 (no P2P), Ubuntu, CUDA 13.1.
@@ -163,6 +169,11 @@ texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## Known limits
 - One request at a time (`--max-concurrency 1`); tested only on the machine above.
+- With several requests decoding, an answer that outgrows its KV window when the GPUs are full first moves idle cached
+  conversations to RAM (or drops them without a RAM tier); only if that cannot free a page does it end early with
+  `finish_reason: length` (the request log counts it). `--kv-lease-window 0` restores the full reservation of v0.5.3.
+- Moving a conversation between RAM and the GPUs shares PCIe with the two GPUs' exchange: decode of other requests
+  is slower while a move is in flight (no difference otherwise).
 - Generated tokens per agent task are about 1.6x the GB300 reference (above): the remaining gap with the datacenter
   stack is length of reasoning, not correctness.
 - Output is not bit-reproducible run to run: which experts sit in VRAM (GPU path) or not (CPU path) depends on timing,

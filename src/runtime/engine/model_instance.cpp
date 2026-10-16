@@ -185,14 +185,14 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         return options;
     }
 
-    // At tp 2 the Host tiers are off, so every endpoint, rewrite and anchor checkpoint must fit
-    // in Device StateImages. An in-prefill private capture (TurnClosure rewrite, long anchor)
-    // that finds the Device State pool full first releases idle private continuations without a
-    // live session, least valuable and oldest first, as for every Program with no Host
-    // StateImages; a capture that still does not fit is skipped, and the next turn re-prefills
-    // from an earlier checkpoint or the root. The default pool matches the private catalog, one
-    // checkpoint image per retained continuation; each image costs one StateImage per rank
-    // (about 73 MiB for Qwen3.8 27B).
+    // At tp 2 the Host tiers are off unless asked for (serve: --profile 27b, --host-state-slots),
+    // and then every endpoint, rewrite and anchor checkpoint must fit in Device StateImages. An
+    // in-prefill private capture (TurnClosure rewrite, long anchor) that finds the Device State
+    // pool full first releases idle private continuations without a live session, least valuable
+    // and oldest first, as for every Program with no Host StateImages; a capture that still does
+    // not fit is skipped, and the next turn re-prefills from an earlier checkpoint or the root. The
+    // default pool matches the private catalog, one checkpoint image per retained continuation;
+    // each image costs one StateImage per rank (about 73 MiB for Qwen3.8 27B).
     const std::uint32_t minimum_private = options.tp == 2 ? 8U : 0U;
     const std::uint64_t default_device_states =
         options.tp == 2 ? std::max<std::uint64_t>(2ULL * concurrency, minimum_private)

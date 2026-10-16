@@ -81,7 +81,8 @@ public:
     [[nodiscard]] std::uint32_t occupied() const noexcept { return capacity() - free_count_; }
 
     [[nodiscard]] const HostKVPageLayout& page_layout(const LogicalKVPageStore& pages) const {
-        const HostKVPageLayout* layout = arena_->layout_for(pages.physical_pool().geometry());
+        const HostKVPageLayout* layout = arena_->layout_for(pages.physical_pool().geometry(),
+                                                            pages.physical_pool().host_replicas());
         if (layout == nullptr) {
             throw std::invalid_argument("Host KV page store has no arena layout");
         }

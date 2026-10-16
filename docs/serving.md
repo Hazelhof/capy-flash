@@ -26,6 +26,19 @@ See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_C
 The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
 240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
 when running alone, and two requests run concurrently when their complete reservations fit.
+In capy-flash a request's Device KV reservation is a lease: its prompt plus a window of up to
+4,096 output tokens (or the prefill chunk, if larger), extended at a decode-round boundary as the
+answer grows, up to the request's own `max_tokens`. A client that asks for 64k output tokens and
+uses 300 therefore no longer keeps 64k tokens of KV away from retained conversations. When the pool
+cannot extend a lease, idle retained conversations and idle automatic shared prefixes are released,
+least valuable first; only if that is not enough does the answer end early with `finish_reason`
+`length`. The request log reports the leased pages (`device_*_kv_lease_pages`), the owners released
+for a lease and the answers cut short. `--kv-lease-window N` sets the window (default 4096);
+`--kv-lease-window 0` reserves the whole `max_tokens` at admission, as earlier releases did.
+
+The Host tiers are pinned RAM that the kernel cannot page out. The server refuses to start when
+`--host-kv-mib` plus the Host state slots would leave less than max(4 GiB, 5 % of RAM) available,
+and says how many MiB fit (`NINFER_HOST_TIER_RAM_GUARD=0` skips the check).
 
 With `C=2` and two extra Device checkpoint slots, the process owns two active StateImage guarantees
 plus a global pool of two Device-resident checkpoints. Eight pinned Host State slots and 8 GiB of
@@ -814,8 +827,8 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B) for the KV pool, identical results; see [Two GPUs](#two-gpus) | off |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
-| `--host-state-slots N` | pinned Host StateImage capacity | `8`; `0` at `--tp 2` |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192`; `0` at `--tp 2` |
+| `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`: `8`) |
+| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192`; at `--tp 2` `0` unless set (`--profile 27b`: `8192`) |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
@@ -889,9 +902,14 @@ all-reduce on the copies, for comparison. If a mailbox exchange ever waits too l
 GPU, the two ranks' results have diverged: the round fails with an error, and so does every later
 round, so the server must be restarted.
 
-Rank 1 has no Host copy of its KV or state, so the Host tiers are off: an omitted
-`--host-state-slots` or `--host-kv-mib` becomes `0`, and a nonzero value is rejected. Every
-checkpoint therefore lives in a Device StateImage, and the defaults raise the Device checkpoint pool
+At `--tp 2` the Host tiers hold both ranks' halves of a checkpoint: each pinned Host record keeps
+rank 0's half followed by rank 1's, and each GPU copies its own half on its own transfer stream, so
+the RAM cost per token is the same as on one GPU. They are off unless asked for: an omitted
+`--host-state-slots` or `--host-kv-mib` becomes `0` (on Qwen3.8-Flash-Next the routed experts
+already pin most of the RAM and the PLE table is read through the page cache); `--profile 27b`
+sets `--host-state-slots 8 --host-kv-mib 8192`. With them, a checkpoint that no longer fits on the
+GPUs moves to RAM and comes back when its conversation resumes, as on one GPU. Without them, every
+checkpoint lives in a Device StateImage, and the defaults raise the Device checkpoint pool
 and the private catalog to `max(2 * max-concurrency, 8)`. Without a Host tier, a private checkpoint
 captured during prefill (the turn-closure point a follow-up turn resumes from, a long-prompt anchor)
 that finds the Device pool full first releases idle retained conversations without a live session,

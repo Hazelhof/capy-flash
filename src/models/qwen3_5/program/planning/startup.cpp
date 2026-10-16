@@ -1335,6 +1335,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         "resolved Paged KV capacity exceeds int32"));
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->kv_lease_window_tokens = inputs.kv_lease_window_tokens;
     impl->draft_window        = inputs.draft_window;
     impl->mtp_min_p           = inputs.mtp_min_p;
     impl->mtp_window_rule     = inputs.mtp_window_rule;
@@ -1509,6 +1510,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         .capacity               = options.max_context,
         .max_concurrency        = options.max_concurrency,
         .prefill_chunk          = std::min(options.prefill_chunk, options.max_context),
+        .kv_lease_window_tokens = options.kv_lease_window_tokens,
         .draft_window           = options.speculative.draft_tokens,
         .mtp_min_p              = options.speculative.backend == SpeculativeBackend::Mtp
                                       ? options.speculative.min_draft_probability

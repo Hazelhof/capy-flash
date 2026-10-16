@@ -44,7 +44,7 @@ void increment_generation(std::uint32_t& generation) noexcept {
 
 } // namespace
 
-HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
+HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry, std::uint32_t replicas) {
     if (geometry.page_tokens == 0 || geometry.planes.empty()) {
         throw std::invalid_argument("Host KV page geometry is empty");
     }
@@ -73,7 +73,10 @@ HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry) {
         });
         cursor = checked_add(cursor, page_bytes, "Host KV page payload overflow");
     }
-    out.page_stride = align_up(cursor, kHostKVAlignment, "Host KV page record");
+    if (replicas == 0) { throw std::invalid_argument("Host KV page layout needs a replica"); }
+    out.replicas       = replicas;
+    out.replica_stride = align_up(cursor, kHostKVAlignment, "Host KV page record");
+    out.page_stride    = checked_mul(out.replica_stride, replicas, "Host KV page record overflow");
     return out;
 }
 
@@ -213,7 +216,8 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
     : capacity_bytes_(capacity_bytes),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
-        const HostKVPageLayout planned = plan_host_kv_page_layout(layouts_[index].geometry);
+        const HostKVPageLayout planned =
+            plan_host_kv_page_layout(layouts_[index].geometry, layouts_[index].replicas);
         if (planned != layouts_[index]) {
             throw std::invalid_argument("Host KV arena received an inconsistent page layout");
         }
@@ -253,10 +257,11 @@ HostKVArena::find_layout(const HostKVPageLayout& layout) const noexcept {
     return static_cast<std::uint32_t>(it - layouts_.begin());
 }
 
-const HostKVPageLayout* HostKVArena::layout_for(const KVPageGeometry& geometry) const noexcept {
+const HostKVPageLayout* HostKVArena::layout_for(const KVPageGeometry& geometry,
+                                                std::uint32_t replicas) const noexcept {
     const auto layout =
         std::find_if(layouts_.begin(), layouts_.end(), [&](const HostKVPageLayout& candidate) {
-            return candidate.geometry == geometry;
+            return candidate.geometry == geometry && candidate.replicas == replicas;
         });
     return layout == layouts_.end() ? nullptr : &*layout;
 }

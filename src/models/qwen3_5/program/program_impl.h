@@ -47,6 +47,19 @@ using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
 
+// Device KV is leased on demand: an active request holds a bounded window of its remaining
+// output (EngineOptions::kv_lease_window_tokens) rather than the whole client budget, and extends
+// it at a decode-round boundary; a full window is asked first, a step-sized extension when the
+// pool cannot spare one.
+
+[[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
+    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+[[nodiscard]] constexpr std::uint32_t kv_tokens_for_pages(std::uint32_t pages) noexcept {
+    return pages == 0 ? 0U : (pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize) + 1U;
+}
+
 using ReusePath = ninfer::PrefixReusePath;
 
 [[nodiscard]] constexpr bool is_rewrite_checkpoint_restore(ReusePath path) noexcept {
@@ -421,6 +434,14 @@ struct RequestControl {
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
+    // Device KV lease: the largest frontier the lease may ever cover (the request's own output
+    // ceiling); whether it can no longer be extended; whether that is for lack of pool space, and
+    // the entitlements its full and smallest growth steps asked for.
+    std::uint32_t lease_ceiling = 0;
+    bool lease_settled          = false;
+    bool lease_space_limited    = false;
+    DeviceKVPages lease_full_target;
+    DeviceKVPages lease_minimum_target;
 
     struct Prefill {
         PreparedPromptData prompt;
@@ -576,6 +597,23 @@ public:
 
     [[nodiscard]] qwen3_5::PhysicalUsageSnapshot physical_usage() const noexcept;
 
+    [[nodiscard]] std::optional<std::uint32_t>
+    device_kv_lease_settlement_tokens(SequenceHandle sequence,
+                                      std::uint32_t forced_span_tokens) const noexcept;
+    [[nodiscard]] std::optional<DeviceKVLeaseShortfall>
+    device_kv_lease_shortfall(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] bool resume_device_kv_lease(SequenceHandle sequence) noexcept;
+    [[nodiscard]] DeviceKVPages
+    retained_device_kv_pages(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] DeviceKVPages
+    retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept;
+    [[nodiscard]] std::optional<ContinuationSummary>
+    demote_retained_kv_for_lease(const ContinuationHandle& continuation,
+                                 DeviceKVPages needed) noexcept;
+    [[nodiscard]] std::optional<SharedPrefixSummary>
+    demote_retained_shared_kv_for_lease(const SharedPrefixHandle& shared,
+                                        DeviceKVPages needed) noexcept;
+
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
@@ -594,6 +632,7 @@ public:
     // T42: Qwen4Exp prompt chunks of more than this many columns run on lent workspace and
     // prefill_hidden holds this many columns (0 = off: prefill_hidden holds prefill_chunk).
     const std::uint32_t qwen4_prompt_base_chunk;
+    const std::uint32_t kv_lease_window_tokens; // EngineOptions::kv_lease_window_tokens
     const std::uint32_t draft_window;
     // T41 adaptive MTP window (SpeculativeOptions::min_draft_probability; 0 = off).
     const float mtp_min_p;
@@ -981,6 +1020,12 @@ private:
     std::uint64_t next_materialization_id_ = 1;
     CudaCompletionEvent context_source_ready_;
     CudaCompletionEvent context_completion_;
+    // Context transfers complete on rank 0's transfer stream and, at tp 2, on rank 1's: these
+    // record, poll and await both (tp2/program_impl_tp2.inc).
+    void record_context_completion();
+    [[nodiscard]] bool context_completion_ready() const;
+    void synchronize_context_completion() const;
+    void synchronize_context_transfer_streams() const;
     std::vector<TokenId> materialization_ledger_;
     qwen3_5::detail::ResidentPrefixIdentity materialization_identity_;
     qwen3_5::detail::PrefixShortlistDigests materialization_prefix_digests_;
@@ -1326,6 +1371,35 @@ private:
                                         std::uint32_t backend_pages);
     void bind_sequence_kv(SequenceState& sequence);
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
+
+    // The output window a lease holds and extends by. 0 (--kv-lease-window 0) reserves the
+    // whole max_tokens at admission: the window then covers every answer and nothing grows.
+    [[nodiscard]] std::uint32_t kv_lease_growth_margin_tokens() const noexcept {
+        return kv_lease_window_tokens == 0 ? std::numeric_limits<std::uint32_t>::max()
+                                           : std::max(prefill_chunk, kv_lease_window_tokens);
+    }
+
+    // One round's Backend requirement can sit a whole draft window above the frontier the
+    // previous round checked, so the cushion absorbs that jump before the lease grows again.
+    [[nodiscard]] std::uint32_t kv_lease_cushion_pages() const noexcept {
+        const auto page  = static_cast<std::uint32_t>(kPagedKVPageSize);
+        const auto slack = 2U * draft_window + 2U;
+        return (slack + page - 1U) / page + 1U;
+    }
+
+    // The Backend lease also covers the drafts a round may still verify past the output ceiling,
+    // and one forced control span.
+    [[nodiscard]] std::uint32_t kv_lease_backend_allowance_tokens() const noexcept {
+        return draft_window + std::min(draft_window, qwen3_5::kMtpDecodeMaximumDrafts) + 1U;
+    }
+
+    [[nodiscard]] std::uint32_t kv_lease_pages_for_tokens(std::uint32_t tokens) const noexcept {
+        return kv_pages_for_tokens(tokens) + kv_lease_cushion_pages();
+    }
+
+    [[nodiscard]] bool run_lease_demotion(MaterializationTransaction::PressureWork& work) noexcept;
+    void ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
+                                  std::uint32_t backend_tokens);
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
     void trim_sequence_kv(SequenceState& sequence, std::uint32_t main_tokens,

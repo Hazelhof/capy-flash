@@ -128,13 +128,6 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
                 "tensor-parallel Program requires rank 0 and rank 1 Parameters of one two-device "
                 "Model on its ExecutionContext");
         }
-        // Rank 1's KV pages and StateImages are mirrors of rank 0's and have no Host replica, so
-        // neither Host tier can hold a complete checkpoint.
-        if (plan.context_cache.host_state_slots != 0 ||
-            plan.context_cache.host_kv_capacity_bytes != 0) {
-            throw std::invalid_argument(
-                "tensor-parallel Program requires Host state slots and Host KV capacity of 0");
-        }
         if (speculative_backend == SpeculativeBackend::DFlash) {
             throw std::invalid_argument("tensor-parallel Program supports ordinary, MTP and DFlash2 "
                                         "generation and causal scoring only");
@@ -281,9 +274,18 @@ void ProgramImpl::attach_tensor_parallel_mirrors() {
     // Rank 0's pools own all page, row and slot bookkeeping; every physical mutation they issue
     // (page zero/copy, execution-row acquire/release/publication, StateImage zero/copy) is
     // replayed at the same indices on rank 1's pool, on rank 1's stream. Attached before any
-    // mutation, so both ranks start from the same, empty addressing.
+    // mutation, so both ranks start from the same, empty addressing. Host transfers move rank 1's
+    // half on rank 1's transfer stream; the context transfer events order and await it.
     const DeviceContext& rank1 = peer->device;
-    const DeviceKVMirror where{.device = rank1.device, .stream = rank1.stream};
+    {
+        const ScopedCurrentDevice scope(rank1.device);
+        peer_transfer_order_.emplace(rank1);
+        peer_context_completion_.emplace(rank1);
+    }
+    const DeviceKVMirror where{.device          = rank1.device,
+                               .stream          = rank1.stream,
+                               .transfer_stream = rank1.transfer_stream,
+                               .transfer_order  = &*peer_transfer_order_};
     decoder->text_kv.page_pool().attach_mirror(peer->decoder->text_kv.page_pool(), where);
     decoder->text_kv.execution_tables().attach_mirror(peer->decoder->text_kv.execution_tables(),
                                                       where);
@@ -295,7 +297,32 @@ void ProgramImpl::attach_tensor_parallel_mirrors() {
         mtp->page_pool().attach_mirror(peer_mtp->page_pool(), where);
         mtp->execution_tables().attach_mirror(peer_mtp->execution_tables(), where);
     }
-    state_images->attach_mirror(*peer->state_images, rank1.device, rank1.stream);
+    state_images->attach_mirror(*peer->state_images, rank1.device, rank1.stream,
+                                rank1.transfer_stream, &*peer_transfer_order_);
+}
+
+void ProgramImpl::record_context_completion() {
+    context_completion_.record(device.transfer_stream);
+    if (peer_context_completion_) {
+        peer_context_completion_->record(peer->device.transfer_stream);
+    }
+}
+
+bool ProgramImpl::context_completion_ready() const {
+    return context_completion_.ready() &&
+           (!peer_context_completion_ || peer_context_completion_->ready());
+}
+
+void ProgramImpl::synchronize_context_completion() const {
+    context_completion_.synchronize();
+    if (peer_context_completion_) { peer_context_completion_->synchronize(); }
+}
+
+void ProgramImpl::synchronize_context_transfer_streams() const {
+    if (device.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device.transfer_stream); }
+    if (peer && peer->device.transfer_stream != nullptr) {
+        (void)cudaStreamSynchronize(peer->device.transfer_stream);
+    }
 }
 
 std::optional<execution::TpExecution>

@@ -26,12 +26,6 @@ void validate_tensor_parallel_options(const EngineOptions& options) {
         options.kv_cache != KvCacheStorage::Nvfp4Group16) {
         throw std::invalid_argument("Engine tp 2 supports only bf16, int8 and nvfp4 KV caches");
     }
-    if (options.context_cache.host_state_slots != 0 ||
-        options.context_cache.host_kv_capacity_bytes != 0) {
-        throw std::invalid_argument(
-            "Engine tp 2 requires context_cache host_state_slots and host_kv_capacity_bytes "
-            "of 0: rank 1's KV and state have no Host tier");
-    }
 }
 
 } // namespace

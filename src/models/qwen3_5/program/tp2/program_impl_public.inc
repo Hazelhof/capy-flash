@@ -62,6 +62,11 @@ public:
     ExecutionContext* execution_context          = nullptr;
     const execution::Parameters* peer_parameters = nullptr;
     std::unique_ptr<PeerRuntime> peer;
+    // Host tier at tp 2: rank 1's half of every context transfer runs on its transfer stream.
+    // peer_transfer_order_ orders each one after rank 1's compute stream (the mirrored pools
+    // record and wait it); peer_context_completion_ is context_completion_'s rank 1 twin.
+    std::optional<CudaCompletionEvent> peer_transfer_order_;
+    std::optional<CudaCompletionEvent> peer_context_completion_;
     // The captured all-reduces' pinned-host transport (tp 2 with CUDA Graphs, unless disabled),
     // attached to peer_events. Declared before peer_events, which points to it, and before the
     // graph families, whose kernels address its slab: both are destroyed first.

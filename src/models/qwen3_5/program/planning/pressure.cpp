@@ -171,7 +171,8 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
     const std::uint32_t mapped     = std::min(addresses.mapped_pages(address),
                                               mapped_limit.value_or(addresses.mapped_pages(address)));
     std::vector<std::uint8_t> selected(mapped, 0);
-    const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+    const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry(),
+                                                             pages.physical_pool().host_replicas());
 
     for (const qwen3_5::detail::PressureKVDecision& action : existing_actions) {
         if (action.kind == qwen3_5::detail::PressureKVDecisionKind::None ||
@@ -1703,7 +1704,9 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
                 return false;
             }
             const std::size_t stride =
-                plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                plan_host_kv_page_layout(pages.physical_pool().geometry(),
+                                         pages.physical_pool().host_replicas())
+                    .page_stride;
             for (std::uint32_t offset = 0; offset < protected_pages; ++offset) {
                 const LogicalKVPageHandle page          = addresses.logical_page(address, offset);
                 const std::uint32_t references          = pages.address_references(page);
@@ -1910,8 +1913,9 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
     const auto append_released_pages = [&](LogicalKVPageStore& pages,
                                            const std::vector<PressureSelectedPage>& selected,
                                            runtime::ContextResourceClass resource) {
-        const std::size_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+        const std::size_t stride = plan_host_kv_page_layout(pages.physical_pool().geometry(),
+                                                            pages.physical_pool().host_replicas())
+                                       .page_stride;
         for (const PressureSelectedPage& item : selected) {
             if (pages.address_references(item.page) != item.references ||
                 pages.writer_references(item.page) != 0 || pages.source_pins(item.page) != 0) {
@@ -2050,7 +2054,8 @@ bool ProgramImpl::compose_pressure_candidate(
         for (const qwen3_5::detail::PressureKVDecision& action : changes) {
             append_host_releases(addresses, pages, address, action);
             if (action.kind == qwen3_5::detail::PressureKVDecisionKind::DemoteToHost) {
-                host_layouts.push_back(plan_host_kv_page_layout(pages.physical_pool().geometry()));
+                host_layouts.push_back(plan_host_kv_page_layout(
+                    pages.physical_pool().geometry(), pages.physical_pool().host_replicas()));
                 host_requests.push_back(
                     {.layout = &host_layouts.back(), .pages = action.page_count});
             }
@@ -2634,13 +2639,19 @@ bool ProgramImpl::persistent_backfill_safe(
 
 qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
     const detail::PhysicalResources usage = physical_occupancy();
+    // The growth reservation of active leases, broken out of the occupied totals.
+    const auto lease = [](const std::unique_ptr<LogicalKVPageStore>& store) noexcept {
+        return store == nullptr ? 0U : store->physical_pool().reserved_pages();
+    };
     return qwen3_5::PhysicalUsageSnapshot{
-        .resource_revision       = resource_revision_,
-        .device_state_slots      = usage.device.state_slots,
-        .host_state_slots        = usage.host.state_slots,
-        .device_main_kv_pages    = usage.device.main_kv_pages,
-        .device_backend_kv_pages = usage.device.backend_kv_pages,
-        .host_kv_bytes           = usage.host.kv_bytes,
+        .resource_revision             = resource_revision_,
+        .device_state_slots            = usage.device.state_slots,
+        .host_state_slots              = usage.host.state_slots,
+        .device_main_kv_pages          = usage.device.main_kv_pages,
+        .device_backend_kv_pages       = usage.device.backend_kv_pages,
+        .device_main_kv_lease_pages    = lease(text_kv_pages),
+        .device_backend_kv_lease_pages = lease(backend_kv_pages),
+        .host_kv_bytes                 = usage.host.kv_bytes,
     };
 }
 

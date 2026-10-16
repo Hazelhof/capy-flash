@@ -111,7 +111,11 @@ const std::vector<ServeProfile>& serve_profiles() {
           "--vision-device",
           "0",
           "--max-vision-tokens",
-          "4096"}},
+          "4096",
+          "--host-state-slots",
+          "8",
+          "--host-kv-mib",
+          "8192"}},
     };
     return profiles;
 }
@@ -161,7 +165,7 @@ std::string serve_usage_text(const char* argv0) {
            " <model.ninfer> [--profile flash-next|27b] [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
-           "[--prefill-chunk N] [--log-stats-interval-ms N] [--device N] "
+           "[--prefill-chunk N] [--kv-lease-window N] [--log-stats-interval-ms N] [--device N] "
            "[--tp 1|2 --devices A,B] "
            "[--context-cost-presets FILE] "
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
@@ -239,7 +243,11 @@ std::string serve_usage_text(const char* argv0) {
            "ordinary, --spec mtp or --spec dflash2 --lm-head-draft decoding, with or without "
            "--vision, with bf16, int8 or nvfp4 KV; "
            "it defaults device-state to "
-           "max(2x concurrency,8), private to max(2x concurrency,8) and the Host tiers to 0\n"
+           "max(2x concurrency,8), private to max(2x concurrency,8) and the Host tiers to 0 "
+           "unless set (--profile 27b: 8 slots, 8192 MiB)\n"
+           "       --kv-lease-window N: a request reserves its prompt plus N output tokens of "
+           "Device KV (default 4096) and grows as its answer grows; 0 reserves the whole "
+           "max_tokens at admission\n"
            "       --no-tp-mailbox keeps the captured --tp 2 all-reduces on cross-device copies\n"
            "       --embedding-host keeps the token embedding table in one copy in pinned host "
            "memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees "
@@ -328,6 +336,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--pending-timeout-ms") {
             options.pending_timeout_ms = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--pending-timeout-ms"), "pending-timeout-ms"));
+        } else if (arg == "--kv-lease-window") {
+            options.kv_lease_window_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-lease-window"), "kv-lease-window"));
         } else if (arg == "--prefill-chunk") {
             options.prefill_chunk = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--prefill-chunk"), "prefill-chunk"));
@@ -596,18 +607,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     product::validate_vision_options(options.enable_vision, options.vision_device,
                                      options.max_vision_tokens, options.devices);
     if (options.tp == 2) {
-        // Rank 1's KV pages and StateImages have no Host tier, so a tensor-parallel server keeps
-        // every checkpoint in Device StateImages. Unset Host capacities default to 0 (the Engine
-        // rejects nonzero ones); the Device StateImage and private catalog floors (Engine
-        // defaults) keep a long prompt's endpoint and anchors resident together.
-        if (host_state_explicit && options.context_cache.host_state_slots != 0) {
-            throw std::invalid_argument("--host-state-slots must be 0 with --tp 2");
-        }
-        if (host_kv_explicit && options.context_cache.host_kv_capacity_bytes != 0) {
-            throw std::invalid_argument("--host-kv-mib must be 0 with --tp 2");
-        }
-        options.context_cache.host_state_slots       = 0;
-        options.context_cache.host_kv_capacity_bytes = 0;
+        // The Host tier holds both ranks' halves of a checkpoint (one pinned record per page and
+        // per StateImage), so --host-kv-mib and --host-state-slots work as at tp 1. Unset, they
+        // stay 0 at tp 2: on Qwen3.8-Flash-Next the routed experts already pin most of the RAM,
+        // and the PLE table is read through the page cache. --profile 27b turns them on.
+        if (!host_state_explicit) { options.context_cache.host_state_slots = 0; }
+        if (!host_kv_explicit) { options.context_cache.host_kv_capacity_bytes = 0; }
     }
     if (options.port <= 0 || options.port > 65535) {
         throw std::invalid_argument("--port must be in [1,65535]");

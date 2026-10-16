@@ -184,6 +184,48 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     expect(host.release(*reused), "HostStatePool releases the reused slot");
 }
 
+// tp 2: rank 1's pool mirrors rank 0's slots; a Host image holds rank 0's image, then rank 1's
+// (here without the drafter rings, as when the DFlash2 drafter is whole on rank 0).
+void test_mirrored_host_roundtrip(ninfer::DeviceContext& device, bool dflash, bool ple) {
+    PlannedPool origin_plan = plan_pool(dflash, 2, false, ple);
+    PlannedPool mirror_plan = plan_pool(false, 2, false, ple);
+    ninfer::DeviceArena origin_arena(origin_plan.bytes);
+    ninfer::DeviceArena mirror_arena(mirror_plan.bytes);
+    q36::StateImageDevicePool origin({origin_arena.base(), origin_arena.capacity()},
+                                     origin_plan.layout);
+    q36::StateImageDevicePool mirror({mirror_arena.base(), mirror_arena.capacity()},
+                                     mirror_plan.layout);
+    ninfer::CudaCompletionEvent order(device);
+    origin.attach_mirror(mirror, device.device, device.stream, device.transfer_stream, &order);
+    const q36::StateImageHostLayout& paired = origin.host_layout();
+    expect(paired.peer_offset == origin_plan.layout.host.image_bytes &&
+               paired.peer_bytes == mirror_plan.layout.host.image_bytes &&
+               paired.image_bytes == paired.peer_offset + paired.peer_bytes,
+           "mirrored StateImage Host image holds rank 0's image, then rank 1's");
+
+    fill_slot(origin, 0, 0x21);
+    fill_slot(mirror, 0, 0x71);
+    origin.zero_slot(1, device.stream);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    expect_zero_slot(mirror, 1, "mirrored zero_slot replayed on rank 1");
+
+    q36::HostStatePool single(origin_plan.layout.host, 1);
+    bool single_rejected = false;
+    try {
+        origin.copy_to_host(0, single.writable_view(*single.allocate()), device.transfer_stream);
+    } catch (const std::invalid_argument&) { single_rejected = true; }
+    expect(single_rejected, "mirrored StateImage rejects a one-rank Host image");
+
+    q36::HostStatePool host(paired, 1);
+    const auto handle = host.allocate();
+    origin.copy_to_host(0, host.writable_view(*handle), device.transfer_stream);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    origin.copy_from_host(host.view(*handle), 1, device.transfer_stream);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    expect_slot(origin, 1, 0x21, "mirrored Host roundtrip, rank 0");
+    expect_slot(mirror, 1, 0x71, "mirrored Host roundtrip, rank 1");
+}
+
 } // namespace
 
 int main() {
@@ -252,6 +294,9 @@ int main() {
         expect_slot(ple_pool, 0, 0x13, "StateImage PLE source isolation");
         test_host_roundtrip(false, device, false, true);
     }
+    test_mirrored_host_roundtrip(device, false, false);
+    test_mirrored_host_roundtrip(device, true, false);
+    test_mirrored_host_roundtrip(device, false, true);
 
     return failures == 0 ? 0 : 1;
 }

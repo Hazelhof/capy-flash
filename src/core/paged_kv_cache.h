@@ -106,6 +106,8 @@ struct KVExecutionTableLayout {
 class DeviceKVPagePool;
 class KVExecutionTablePool;
 class HostKVAllocationView;
+struct HostKVPageLayout;
+class CudaCompletionEvent;
 class HostKVAllocationConstView;
 
 /**
@@ -117,6 +119,11 @@ class HostKVAllocationConstView;
 struct DeviceKVMirror {
     int device          = -1;
     cudaStream_t stream = nullptr;
+    // Rank 1's Host transfers run here, so a spill or restore does not stall its compute stream.
+    // Each one first waits, through `transfer_order`, for everything already issued on `stream`
+    // (rank 1's kernels and the replayed page copies); the caller awaits its completion.
+    cudaStream_t transfer_stream        = nullptr;
+    CudaCompletionEvent* transfer_order = nullptr;
 };
 
 /** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
@@ -253,13 +260,18 @@ public:
     [[nodiscard]] std::uint32_t allocated_extent() const noexcept;
 
     // Every zero_pages/copy_page issued here is repeated at the same physical indices on `mirror`
-    // (another device's pool of identical page capacity) on `where.stream`. Host transfers are
-    // rejected while a mirror is attached: the Host tiers are not tensor-parallel aware.
+    // (another device's pool of identical page capacity) on `where.stream`. Host transfers move
+    // both ranks' halves: a Host page record holds host_replicas() copies of the page, rank 0's
+    // first, and the mirror's half travels on `where.transfer_stream`.
     void attach_mirror(const DeviceKVPagePool& mirror, DeviceKVMirror where);
 
     void zero_pages(std::span<const DeviceKVPageHandle> pages, cudaStream_t stream = nullptr) const;
     void copy_page(DeviceKVPageHandle source, DeviceKVPageHandle destination,
                    cudaStream_t stream = nullptr) const;
+
+    [[nodiscard]] std::uint32_t host_replicas() const noexcept {
+        return mirror_ != nullptr ? 2U : 1U;
+    }
 
     void copy_to_host(std::span<const DeviceKVPageHandle> source, HostKVAllocationView destination,
                       cudaStream_t stream = nullptr) const;
@@ -278,6 +290,15 @@ private:
     void copy_run(std::int32_t source_index, std::int32_t destination_index,
                   cudaStream_t stream) const;
     void require_no_mirror(const char* what) const;
+    void require_host_replicas(const HostKVPageLayout& host) const;
+    void order_mirror_transfer() const;
+    void copy_to_host_local(std::span<const DeviceKVPageHandle> source, std::byte* destination,
+                            const HostKVPageLayout& host, std::size_t replica_offset,
+                            cudaStream_t stream) const;
+    void copy_from_host_local(const std::byte* source, const HostKVPageLayout& host,
+                              std::size_t replica_offset,
+                              std::span<const DeviceKVPageHandle> destination,
+                              cudaStream_t stream) const;
     void validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
                                  const char* duplicate_message) const;
     void consume_free_run(std::size_t run_index, std::int32_t begin, std::uint32_t count) noexcept;

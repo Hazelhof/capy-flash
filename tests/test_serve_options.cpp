@@ -478,12 +478,25 @@ int main() {
     };
     failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2"}),
                       "--tp 2 was accepted without --devices");
-    failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
-                               "--host-state-slots", "4"}),
-                      "--tp 2 accepted nonzero Host state slots");
-    failures += check(rejects({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
-                               "--host-kv-mib", "1024"}),
-                      "--tp 2 accepted a nonzero Host KV capacity");
+    const ServeOptions split_host =
+        parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
+               "--host-state-slots", "4", "--host-kv-mib", "1024"});
+    failures += check(split_host.context_cache.host_state_slots == 4 &&
+                          split_host.context_cache.host_kv_capacity_bytes == (1024ULL << 20),
+                      "--tp 2 did not keep explicit Host tier capacities");
+    const ServeOptions profile_27b = parse({"ninfer-serve", "model.ninfer", "--profile", "27b"});
+    failures += check(profile_27b.context_cache.host_state_slots == 8 &&
+                          profile_27b.context_cache.host_kv_capacity_bytes == (8192ULL << 20),
+                      "--profile 27b did not turn the Host tier on");
+    failures += check(defaults.kv_lease_window_tokens == 4096 &&
+                          parse({"ninfer-serve", "model.ninfer", "--kv-lease-window", "0"})
+                                  .kv_lease_window_tokens == 0,
+                      "--kv-lease-window is not 4096 by default or does not take 0");
+    const ServeOptions profile_flash =
+        parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next"});
+    failures += check(profile_flash.context_cache.host_state_slots == 0 &&
+                          profile_flash.context_cache.host_kv_capacity_bytes == 0,
+                      "--profile flash-next turned the Host tier on");
     failures += check(
         rejects({"ninfer-serve", "model.ninfer", "--device", "1", "--tp", "2", "--devices", "0,1"}),
         "--device disagreeing with the rank 0 device was accepted");

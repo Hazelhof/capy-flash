@@ -32,16 +32,33 @@ struct CaptureAssessmentImpl;
 } // namespace detail
 
 // Read-only diagnostics sampled from the real Program stores.  This is not an accounting input.
+// The `_lease_pages` fields split the un-written growth reservation of active requests out of the
+// corresponding `device_*_kv_pages` totals: KV that exists versus KV a request may still write.
 struct PhysicalUsageSnapshot {
     runtime::ProgramResourceRevision resource_revision;
-    std::uint32_t device_state_slots      = 0;
-    std::uint32_t host_state_slots        = 0;
-    std::uint32_t device_main_kv_pages    = 0;
-    std::uint32_t device_backend_kv_pages = 0;
-    std::size_t host_kv_bytes             = 0;
+    std::uint32_t device_state_slots            = 0;
+    std::uint32_t host_state_slots              = 0;
+    std::uint32_t device_main_kv_pages          = 0;
+    std::uint32_t device_backend_kv_pages       = 0;
+    std::uint32_t device_main_kv_lease_pages    = 0;
+    std::uint32_t device_backend_kv_lease_pages = 0;
+    std::size_t host_kv_bytes                   = 0;
 
     [[nodiscard]] friend constexpr bool operator==(const PhysicalUsageSnapshot&,
                                                    const PhysicalUsageSnapshot&) noexcept = default;
+};
+
+// Device KV pages a settled lease still needs beyond what its pools can currently reserve.
+struct DeviceKVLeaseShortfall {
+    std::uint32_t main_pages            = 0; // the full growth step
+    std::uint32_t backend_pages         = 0;
+    std::uint32_t minimum_main_pages    = 0; // the smallest growth step
+    std::uint32_t minimum_backend_pages = 0;
+};
+
+struct DeviceKVPages {
+    std::uint32_t main    = 0;
+    std::uint32_t backend = 0;
 };
 
 enum class TextPhase {
@@ -962,6 +979,39 @@ public:
     // abort when the Program cannot retain it.
     [[nodiscard]] FinishResult finish_cancelled(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
+    // Device KV lease (capy-flash, after ninfer-custom 9f108db7): an active sequence holds its
+    // prompt plus a bounded window of its output, extended at a decode-round boundary up to its
+    // own output ceiling. When the pools cannot extend it the lease settles: the sequence then
+    // finishes at the frontier the lease covers with its generation limit reason, instead of
+    // failing a launch on coverage. This reports how many further model tokens that finish
+    // licenses (`forced_span_tokens`: the largest forced control span the caller may still
+    // apply); absent while the lease can grow.
+    [[nodiscard]] std::optional<std::uint32_t>
+    device_kv_lease_settlement_tokens(SequenceHandle sequence,
+                                      std::uint32_t forced_span_tokens) const noexcept;
+    // A lease settled for lack of pool space (not its ceiling): the pages its next growth step
+    // still misses. The caller may free retained cache and resume the lease first.
+    [[nodiscard]] std::optional<DeviceKVLeaseShortfall>
+    device_kv_lease_shortfall(SequenceHandle sequence) const noexcept;
+    // Re-opens growth once the smallest step fits; false while it still does not.
+    [[nodiscard]] bool resume_device_kv_lease(SequenceHandle sequence) noexcept;
+    // Device KV pages that releasing this retained owner would return to the pools.
+    [[nodiscard]] DeviceKVPages
+    retained_device_kv_pages(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] DeviceKVPages
+    retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept;
+    // Moves `needed` Device KV pages of an idle retained continuation to the Host tier (the
+    // admission pressure's DemoteToHost option, run synchronously), so a lease can take them
+    // without losing the conversation. Returns its summary after the move; absent when there is
+    // no Host tier, no room in it, or the owner cannot be moved now (nothing then changes).
+    [[nodiscard]] std::optional<ContinuationSummary>
+    demote_retained_kv_for_lease(const ContinuationHandle& continuation,
+                                 DeviceKVPages needed) noexcept;
+    // The same for an idle shared prefix: shared and private owners hold the same prefix pages,
+    // so freeing them takes both moves.
+    [[nodiscard]] std::optional<SharedPrefixSummary>
+    demote_retained_shared_kv_for_lease(const SharedPrefixHandle& shared,
+                                        DeviceKVPages needed) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     // Drops one long anchor of an idle catalogued continuation and keeps the rest of it. Returns
     // the continuation's new summary, or nothing (and no change) when the drop is not possible now.

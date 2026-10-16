@@ -394,3 +394,14 @@ another summation order: expert selections can change near ties. T185, the quali
 0.9765 (GB300 0.9810, 7 vs 1 discordant, McNemar p 0.070, pass), MMLU-Pro 1008 0.8452 (GB300 0.8452, 25 vs 25):
 default since v0.5.3. T186: the draft shortlist gains the 8,192 most frequent Italian tokens it lacked (14.5 % of
 held-out Italian tokens were outside it, 0.24 % after): Italian answers 0.37 -> 0.45 draft acceptance, ~+11 % decode.
+
+**T187-T192** (v0.5.4, issue #3): the context cache for agents on Qwen3.8-27B at `--tp 2`. A RAM tier for both
+GPUs' halves of a checkpoint (each GPU copies its half on its own transfer stream; restored turns match an all-VRAM
+run token for token, MTP/int8 and DFlash2/nvfp4); `--profile 27b` turns it on with 8 GiB, Flash-Next keeps it off
+(8 GiB of it costs ~8 % of prefill on the third 64k prompt in a row, by shrinking the page cache the PLE table is read
+through). A request leases its prompt plus a 4,096-token window of KV and grows it at a round boundary, after
+ninfer-custom 9f108db7; an answer that outgrows its window with the GPUs full moves idle cached conversations to RAM
+first and is bounded only at the edge. Agentic replay (3 sessions, 11 subagents, production flags, 4 lanes): median
+TTFT 2.14 -> 0.98 s, prompt tokens from cache 67 -> 78 %, recomputed prompt tokens -35 %, decode unchanged (two
+concurrent decodes: 220 tok/s each with and without the RAM tier). Guardrails: `--kv-lease-window 0` restores the
+full reservation; the server refuses a RAM tier that would leave less than max(4 GiB, 5 %) of RAM available.

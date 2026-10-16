@@ -170,6 +170,7 @@ struct SequencePlanningInputs {
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
+    std::uint32_t kv_lease_window_tokens    = 0; // 0: whole max_tokens reserved at admission
     std::uint32_t draft_window              = 0;
     float mtp_min_p                         = 0.0F;
     MtpWindowRule mtp_window_rule           = MtpWindowRule::Chain;
@@ -219,6 +220,7 @@ struct SequencePlanImpl {
     // T42: > 0 when Qwen4Exp prompt chunks wider than this run on lent workspace: the general
     // arena and prefill_hidden are planned for this width, prefill_chunk is the prompt chunk.
     std::uint32_t qwen4_base_chunk          = 0;
+    std::uint32_t kv_lease_window_tokens    = 0; // 0: whole max_tokens reserved at admission
     std::uint32_t draft_window              = 0;
     float mtp_min_p                         = 0.0F;
     MtpWindowRule mtp_window_rule           = MtpWindowRule::Chain;

@@ -25,11 +25,16 @@ struct HostKVPageLayout {
     KVPageGeometry geometry;
     std::vector<HostKVPlaneLayout> planes;
     std::size_t page_stride = 0;
+    // A tensor-parallel page record holds one copy of `planes` per rank, each rank's at
+    // `rank * replica_stride` (rank 0 first); page_stride = replicas * replica_stride.
+    std::uint32_t replicas     = 1;
+    std::size_t replica_stride = 0;
 
     friend bool operator==(const HostKVPageLayout&, const HostKVPageLayout&) = default;
 };
 
-[[nodiscard]] HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry);
+[[nodiscard]] HostKVPageLayout plan_host_kv_page_layout(const KVPageGeometry& geometry,
+                                                        std::uint32_t replicas = 1);
 
 [[nodiscard]] TransferWork plan_host_kv_transfer_work(const HostKVPageLayout& layout,
                                                       std::uint32_t pages,
@@ -209,7 +214,8 @@ public:
         return capacity_bytes_ - occupied_bytes_;
     }
 
-    [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry) const noexcept;
+    [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry,
+                                                     std::uint32_t replicas = 1) const noexcept;
 
     [[nodiscard]] bool can_allocate(const HostKVPageLayout& layout,
                                     std::uint32_t pages) const noexcept;

@@ -14,6 +14,10 @@
 #include <optional>
 #include <vector>
 
+namespace ninfer {
+class CudaCompletionEvent;
+}
+
 namespace ninfer::models::qwen3_5 {
 
 struct DFlashLocalStateSpec {
@@ -49,6 +53,10 @@ struct StateImageHostLayout {
     std::size_t dflash_local_layer_bytes = 0;
     std::optional<LayoutRegion> ple;
     std::size_t ple_layer_bytes = 0;
+    // At tp 2 a Host image holds rank 1's own image (its layout, its half of the GDN heads) at
+    // peer_offset, after rank 0's; image_bytes covers both. Zero without a mirror.
+    std::size_t peer_offset     = 0;
+    std::size_t peer_bytes      = 0;
     std::size_t image_bytes     = 0;
 };
 
@@ -174,7 +182,10 @@ public:
     // rank 1's GDN/hidden continuation state follows rank 0's slot lifecycle. DFlash local state is
     // mirrored when the mirror has it (the split DFlash2 drafter: rank 1's rings of its own KV
     // heads) and is rank-0-only otherwise; Host transfers are rejected while a mirror is attached.
-    void attach_mirror(StateImageDevicePool& mirror, int device, cudaStream_t stream);
+    // `stream` replays slot mutations; `transfer_stream` carries rank 1's Host copies, each
+    // ordered after everything already issued on `stream` through `transfer_order`.
+    void attach_mirror(StateImageDevicePool& mirror, int device, cudaStream_t stream,
+                       cudaStream_t transfer_stream, CudaCompletionEvent* transfer_order);
 
     void zero_slot(std::int32_t slot, cudaStream_t stream = nullptr);
     void zero_all(cudaStream_t stream = nullptr);
@@ -191,6 +202,9 @@ private:
     void zero_slot_local(std::int32_t slot, cudaStream_t stream);
     void zero_all_local(cudaStream_t stream);
     void copy_slot_local(std::int32_t source, std::int32_t destination, cudaStream_t stream);
+    void copy_to_host_local(std::int32_t source, std::byte* destination, cudaStream_t stream) const;
+    void copy_from_host_local(const std::byte* source, std::int32_t destination,
+                              cudaStream_t stream);
 
     LinearAttentionStatePool linear_;
     Tensor continuation_hidden_;
@@ -200,6 +214,8 @@ private:
     StateImageDevicePool* mirror_ = nullptr;
     int mirror_device_            = -1;
     cudaStream_t mirror_stream_   = nullptr;
+    cudaStream_t mirror_transfer_stream_        = nullptr;
+    CudaCompletionEvent* mirror_transfer_order_ = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5

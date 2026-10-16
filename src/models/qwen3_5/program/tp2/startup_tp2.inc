@@ -470,11 +470,6 @@ void validate_tensor_parallel_options(const execution::Parameters& parameters,
             throw std::invalid_argument(
                 "tensor-parallel attention supports only bf16, int8 and nvfp4 KV caches");
         }
-        if (options.context_cache.host_state_slots != 0 ||
-            options.context_cache.host_kv_capacity_bytes != 0) {
-            throw std::invalid_argument("tensor-parallel execution requires Host state slots and "
-                                        "Host KV capacity of 0");
-        }
         // A candidate selector on rank 1 selects among the candidates of the split proposal head,
         // which both ranks merge; a head whole on rank 0 leaves rank 1 without them.
         if (options.speculative.backend == SpeculativeBackend::DFlash2 && peer_parameters->draft &&

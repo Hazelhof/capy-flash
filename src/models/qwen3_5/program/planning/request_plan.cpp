@@ -39,10 +39,6 @@ ops::SamplingConfig translate_sampling(const ResolvedSamplingParameters& source)
     return out;
 }
 
-std::uint32_t pages_for_tokens(std::uint32_t tokens) noexcept {
-    return tokens == 0 ? 0U : 1U + (tokens - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-}
-
 std::uint64_t segmented_prefill_chunks(std::uint32_t begin, std::uint32_t end,
                                        std::uint32_t prefill_chunk,
                                        std::span<const CaptureGroup> captures,
@@ -256,17 +252,41 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
-    const std::uint32_t reserved_context_tokens =
-        base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
-                                           ? 0U
-                                           : base->summary.effective_output_tokens - 1U);
-    base->text_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+    // The lease covers a bounded window of the output, not the whole client budget: a client that
+    // asks for far more output than it uses would otherwise keep that KV out of the pool (and away
+    // from retained conversations) for the request's whole life. The window grows at a
+    // decode-round boundary, up to the request's own output ceiling (ensure_sequence_kv_lease).
+    const std::uint32_t leased_output_tokens =
+        std::min(base->summary.effective_output_tokens, kv_lease_growth_margin_tokens());
+    // The window carries the growth cushion and stops at the lease's reach (the output ceiling
+    // plus the drafts a round may verify past it), as ensure_sequence_kv_lease would: an answer
+    // that fits its window never grows mid-decode, so its admission settles every page it needs
+    // through admission pressure (which can demote retained checkpoints to the Host tier).
+    const std::uint32_t lease_ceiling = std::min(
+        capacity, base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
+                                                     ? 0U
+                                                     : base->summary.effective_output_tokens - 1U));
+    const std::uint32_t lease_reach = kv_pages_for_tokens(
+        std::min(capacity, lease_ceiling + kv_lease_backend_allowance_tokens()));
+    const auto window_pages = [&](std::uint32_t window_tokens) {
+        return std::min(lease_reach,
+                        kv_lease_pages_for_tokens(
+                            std::min(capacity, base->summary.prompt_tokens + window_tokens - 1U)));
+    };
+    const std::uint32_t main_window_tokens = std::max(leased_output_tokens, draft_window + 1U);
+    base->text_kv_page_entitlement         = window_pages(main_window_tokens);
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        const std::uint32_t mtp_tokens    = static_cast<std::uint32_t>(std::min<std::uint64_t>(
-            capacity, static_cast<std::uint64_t>(reserved_context_tokens) + draft_window - 1ULL));
-        base->backend_kv_page_entitlement = pages_for_tokens(mtp_tokens);
+        const std::uint32_t backend_window_tokens =
+            std::max(leased_output_tokens,
+                     draft_window + std::min(draft_window, qwen3_5::kMtpDecodeMaximumDrafts));
+        base->backend_kv_page_entitlement = window_pages(backend_window_tokens);
     } else if (speculative_backend == SpeculativeBackend::DFlash) {
-        base->backend_kv_page_entitlement = pages_for_tokens(reserved_context_tokens);
+        // DFlash maps its Full backend KV in the context append (decode.cpp), outside the lease
+        // growth: it keeps the whole reservation.
+        base->backend_kv_page_entitlement = kv_pages_for_tokens(
+            base->summary.prompt_tokens + (base->summary.effective_output_tokens == 0
+                                               ? 0U
+                                               : base->summary.effective_output_tokens - 1U));
     }
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
@@ -773,7 +793,8 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                                      const LogicalKVPageStore& pages, std::uint32_t page_count,
                                      std::uint32_t contiguous_runs = 1) {
         if (page_count == 0) { return; }
-        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        const HostKVPageLayout layout = plan_host_kv_page_layout(
+            pages.physical_pool().geometry(), pages.physical_pool().host_replicas());
         const TransferWork work =
             direction == runtime::ContextTransferDirection::DeviceToDevice
                 ? plan_device_kv_copy_work(layout, page_count)
@@ -853,7 +874,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 partial_tail_cow_required(*backend_kv_addresses, *source_kv->backend,
                                           backend_frontier);
         }
-        const std::uint32_t main_required = pages_for_tokens(plan->reuse_base);
+        const std::uint32_t main_required = kv_pages_for_tokens(plan->reuse_base);
         const std::uint32_t main_device =
             device_kv_prefix_pages(*text_kv_addresses, source_kv->text, plan->reuse_base);
         if (main_device > main_required) {
@@ -871,7 +892,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                             main_missing, main_contiguous_runs);
         }
         if (source_kv->backend && backend_frontier != 0) {
-            const std::uint32_t backend_required = pages_for_tokens(backend_frontier);
+            const std::uint32_t backend_required = kv_pages_for_tokens(backend_frontier);
             const std::uint32_t backend_device   = device_kv_prefix_pages(
                 *backend_kv_addresses, *source_kv->backend, backend_frontier);
             if (backend_device > backend_required) {
@@ -939,7 +960,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 },
         };
         detail::PhysicalResources source_replica_additions;
-        const std::uint32_t main_required = pages_for_tokens(plan->reuse_base);
+        const std::uint32_t main_required = kv_pages_for_tokens(plan->reuse_base);
         const std::uint32_t main_device =
             device_kv_prefix_pages(*text_kv_addresses, source_kv->text, plan->reuse_base);
         if (main_device > main_required) {
@@ -948,7 +969,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
         source_replica_additions.device.main_kv_pages = main_required - main_device;
         if (source_kv->backend) {
             const std::uint32_t backend_required =
-                backend_frontier == 0 ? 0U : pages_for_tokens(backend_frontier);
+                backend_frontier == 0 ? 0U : kv_pages_for_tokens(backend_frontier);
             const std::uint32_t backend_device = device_kv_prefix_pages(
                 *backend_kv_addresses, *source_kv->backend, backend_frontier);
             if (backend_device > backend_required) {
@@ -964,7 +985,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 KVAddressSpaceHandle address, std::uint32_t frontier, std::uint32_t active_pages,
                 std::uint32_t missing_source_pages, bool prefix_fork, bool& staged,
                 runtime::ContextResourceClass resource) {
-                const std::uint32_t required = pages_for_tokens(frontier);
+                const std::uint32_t required = kv_pages_for_tokens(frontier);
                 const std::uint64_t final_without_release =
                     static_cast<std::uint64_t>(required) + active_pages;
                 const std::uint32_t capacity = pages.physical_pool().capacity_pages();
@@ -991,7 +1012,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 preparation = missing_source_pages + 1U;
                 if (!pages.host_resident(tail)) {
                     const std::size_t stride =
-                        plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+                        plan_host_kv_page_layout(pages.physical_pool().geometry(),
+                                                 pages.physical_pool().host_replicas())
+                            .page_stride;
                     if (stride > std::numeric_limits<std::size_t>::max() -
                                      retained_tail_added.host.kv_bytes) {
                         throw std::overflow_error("retained KV tail Host backup size overflow");
@@ -1091,7 +1114,7 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 frontier % static_cast<std::uint32_t>(kPagedKVPageSize) == 0) {
                 return out;
             }
-            const std::uint32_t required = pages_for_tokens(frontier);
+            const std::uint32_t required = kv_pages_for_tokens(frontier);
             if (required > addresses.mapped_pages(address)) {
                 throw std::logic_error("checkpoint KV requirement exceeds address membership");
             }
@@ -1101,7 +1124,9 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
                 throw std::logic_error("private COW tail has no restorable replica");
             }
             out.first  = 1;
-            out.second = plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+            out.second = plan_host_kv_page_layout(pages.physical_pool().geometry(),
+                                                  pages.physical_pool().host_replicas())
+                             .page_stride;
             return out;
         };
     if (source != nullptr) {

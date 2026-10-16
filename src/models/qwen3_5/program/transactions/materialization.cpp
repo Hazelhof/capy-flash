@@ -396,7 +396,7 @@ void ProgramImpl::release_materialization_staging(
         MaterializationTransaction::PressureWork& work = transaction.shared_pressure[position];
         if (work.submitted) {
             try {
-                context_completion_.synchronize();
+                synchronize_context_completion();
             } catch (...) { std::terminate(); }
         }
         abort_pressure_work(work);
@@ -407,7 +407,7 @@ void ProgramImpl::release_materialization_staging(
         MaterializationTransaction::PressureWork& work = transaction.pressure[position];
         if (work.submitted) {
             try {
-                context_completion_.synchronize();
+                synchronize_context_completion();
             } catch (...) { std::terminate(); }
         }
         abort_pressure_work(work);
@@ -997,7 +997,7 @@ void ProgramImpl::prepare_prefix_forks(MaterializationTransaction& transaction) 
     }
 
     if (copied_tail) {
-        context_completion_.record(device.transfer_stream);
+        record_context_completion();
         transaction.prefix_tail_submitted = true;
         transaction.transfer_submitted    = true;
     } else {
@@ -1049,7 +1049,7 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
     const bool any = transaction.state_restore.has_value() || !transaction.text_restores.empty() ||
                      !transaction.backend_restores.empty();
     if (any) {
-        context_completion_.record(device.transfer_stream);
+        record_context_completion();
         transaction.transfer_submitted = true;
     } else if (transaction.plan && transaction.plan->impl_ &&
                (transaction.plan->impl_->text_prefix_fork_required ||
@@ -1060,7 +1060,7 @@ void ProgramImpl::enqueue_materialization_transfers(MaterializationTransaction& 
 
 void ProgramImpl::record_materialization_transfer_observations(
     MaterializationTransaction& transaction) {
-    if (!transaction.transfer_submitted || !context_completion_.ready()) {
+    if (!transaction.transfer_submitted || !context_completion_ready()) {
         throw std::logic_error("materialization transfer observation is not complete");
     }
     const auto record = [&](runtime::ContextResourceClass resource,
@@ -1073,7 +1073,8 @@ void ProgramImpl::record_materialization_transfer_observations(
         transaction.transfer_timer_mask &= static_cast<std::uint8_t>(~bit);
     };
     const auto host_layout = [](const LogicalKVPageStore& pages) {
-        return plan_host_kv_page_layout(pages.physical_pool().geometry());
+        return plan_host_kv_page_layout(pages.physical_pool().geometry(),
+                                        pages.physical_pool().host_replicas());
     };
     const auto restore_copy_runs = [](const auto& restores, const auto& destinations,
                                       const LogicalKVPageStore& pages) {
@@ -1172,7 +1173,7 @@ void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& 
                     runtime::ContextResourceClass::BackendKV);
         }
         if (submitted) {
-            context_completion_.record(device.transfer_stream);
+            record_context_completion();
             transaction.retained_tail_backup_submitted = true;
             transaction.transfer_submitted             = true;
         }
@@ -1265,7 +1266,7 @@ void ProgramImpl::abort_materialization_transfers(
     MaterializationTransaction& transaction) noexcept {
     try {
         if (transaction.transfer_submitted) {
-            context_completion_.synchronize();
+            synchronize_context_completion();
             record_materialization_transfer_observations(transaction);
         }
         if (transaction.state_restore) {
@@ -2030,7 +2031,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
                     });
             }
         } catch (...) {
-            (void)cudaStreamSynchronize(device.transfer_stream);
+            synchronize_context_transfer_streams();
             for_each_pending_pressure(
                 [&](MaterializationTransaction::PressureWork& work) { abort_pressure_work(work); });
             throw;
@@ -2043,14 +2044,14 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
         pressure_transition.phase = copies_submitted ? PressureTransitionPhase::CopiesInFlight
                                                      : PressureTransitionPhase::CopyPublication;
         if (copies_submitted) {
-            context_completion_.record(device.transfer_stream);
+            record_context_completion();
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
     }
 
     if (pressure_transition.phase == PressureTransitionPhase::CopiesInFlight) {
-        if (!context_completion_.ready()) {
+        if (!context_completion_ready()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }
@@ -2130,7 +2131,7 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
 
     if (transaction.transfer_submitted) {
-        if (!context_completion_.ready()) {
+        if (!context_completion_ready()) {
             out.status = runtime::ContextTransactionStatus::InProgress;
             return out;
         }

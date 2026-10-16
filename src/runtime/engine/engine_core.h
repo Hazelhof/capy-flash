@@ -19,6 +19,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <future>
@@ -74,9 +75,10 @@ public:
                      options.context_cache.enabled,
                      options.context_cache.max_long_anchors_per_continuation.value_or(0),
                      std::move(context_cost),
-                     // tp 2 has no Host StateImage tier, so a prefill checkpoint has nowhere to
-                     // go when the Device pool is full. tp 1 keeps upstream's behaviour.
-                     options.tp > 1) {
+                     // A tp 2 server without Host StateImages has nowhere to put a prefill
+                     // checkpoint when the Device pool is full. With them, and at tp 1, the
+                     // checkpoint spills to the Host as upstream's does.
+                     options.tp > 1 && options.context_cache.host_state_slots == 0) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
             options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
@@ -1823,6 +1825,44 @@ private:
         publish_runtime_stats();
     }
 
+    // Device KV lease (capy-flash, after ninfer-custom 9f108db7): a sequence whose lease can no
+    // longer grow finishes at the frontier the lease covers. When the pool ran out of space,
+    // retained cache is released first so the answer can continue; only a lease that still cannot
+    // take its smallest step has its remaining budget bounded, so the finish carries the
+    // request's generation limit reason instead of a launch failing on coverage.
+    void apply_device_kv_lease_settlements() {
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr || !request->is_decode_ready() || !request->sequence ||
+                !request->budget) {
+                continue;
+            }
+            if (const auto shortfall =
+                    instance_.program->device_kv_lease_shortfall(*request->sequence)) {
+                const std::uint32_t released = resources_.reclaim_device_kv_for_lease(
+                    *instance_.program, shortfall->main_pages, shortfall->backend_pages,
+                    shortfall->minimum_main_pages, shortfall->minimum_backend_pages);
+                cumulative_stats_.kv_lease_reclaimed_owners += released;
+                if (instance_.program->resume_device_kv_lease(*request->sequence)) { continue; }
+                if (!request->lease_shortfall_reported) {
+                    request->lease_shortfall_reported = true;
+                    ++cumulative_stats_.kv_lease_shortened_answers;
+                    std::fprintf(stderr,
+                                 "[engine] warning: Device KV lease of lane %u cannot grow after "
+                                 "releasing %u retained cache owner(s); still short %u main / %u "
+                                 "backend pages for its smallest step, so the answer ends early "
+                                 "with output_limit\n",
+                                 lane, released, shortfall->minimum_main_pages,
+                                 shortfall->minimum_backend_pages);
+                }
+            }
+            const std::uint32_t control = request->output.control_suffix_tokens();
+            const std::optional<std::uint32_t> limit =
+                instance_.program->device_kv_lease_settlement_tokens(*request->sequence, control);
+            if (limit) { request->budget->cap_remaining(*limit); }
+        }
+    }
+
     void run_control_batch(const ControlMembership& membership) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
@@ -1976,6 +2016,7 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                apply_device_kv_lease_settlements();
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =

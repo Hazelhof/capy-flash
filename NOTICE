@@ -74,6 +74,18 @@ under the Apache License, Version 2.0:
     (linux.py, run_linux.sh) and, in analyze.py, named arms, the serve-log
     cross-check and the phase table; runner.py records phase events.
 
+Device KV lease: prior work
+---------------------------
+The on-demand Device KV lease (the windowed admission reservation, the growth
+in ensure_sequence_kv_lease, the settlement and shortfall API of the Program,
+the retained-cache release at the round boundary and the bounded budget) is
+adapted from the same fork, licensed under the Apache License, Version 2.0:
+
+  * Wallawalla47 (Ian Ranson) -- https://github.com/Wallawalla47/ninfer-custom
+    (commit 9f108db7, "grow each answer's Device KV lease instead of reserving
+    max_tokens"). This tree reclaims through its own eviction order and keeps
+    the reservation of an answer that fits its window whole at admission.
+
 Qwen3.8-Flash-Next (Qwen4Exp): prior work
 -----------------------------------------
 The Qwen4Exp configuration, converter adapter, ModelOpt source readers, stacked

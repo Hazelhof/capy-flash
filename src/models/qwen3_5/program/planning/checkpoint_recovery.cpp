@@ -145,7 +145,8 @@ ProgramImpl::checkpoint_restore_requirements(const SequenceKVBundle& kv,
             ++missing;
         }
         if (missing == 0) { return; }
-        const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
+        const HostKVPageLayout layout = plan_host_kv_page_layout(
+            pages.physical_pool().geometry(), pages.physical_pool().host_replicas());
         requirements.push_back(kv_transfer_requirement(
             resource, runtime::ContextTransferDirection::HostToDevice, layout, missing, runs));
     };
@@ -415,8 +416,8 @@ bool ProgramImpl::pressure_checkpoint_recovery_impacts(
                 previous_replica = replica;
             }
             if (missing != 0) {
-                const HostKVPageLayout layout =
-                    plan_host_kv_page_layout(pages.physical_pool().geometry());
+                const HostKVPageLayout layout = plan_host_kv_page_layout(
+                    pages.physical_pool().geometry(), pages.physical_pool().host_replicas());
                 append_requirement(kv_transfer_requirement(
                     resource, runtime::ContextTransferDirection::HostToDevice, layout, missing,
                     runs));
@@ -647,8 +648,9 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_checkpoint
         if (!addresses.can_truncate_inactive_prefix(address, retained_frontier)) { return false; }
         const std::uint32_t retained_pages = kv_pages_for_frontier(retained_frontier);
         const std::uint32_t mapped         = addresses.mapped_pages(address);
-        const std::size_t stride =
-            plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
+        const std::size_t stride = plan_host_kv_page_layout(pages.physical_pool().geometry(),
+                                                            pages.physical_pool().host_replicas())
+                                       .page_stride;
         for (std::uint32_t page = retained_pages; page < mapped; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.address_references(logical) != 1) { continue; }

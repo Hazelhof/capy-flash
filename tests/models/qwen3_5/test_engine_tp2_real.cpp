@@ -20,6 +20,16 @@
 //     retained checkpoints than the pool holds) are served four at a time, then a new two-turn
 //     conversation must still reuse at least 80 % of its first prompt. Without a Host tier the
 //     pool would otherwise stay full of old continuations and skip the new turn-closure capture.
+//   * Host tier: four sessions (A1..D1, then A2..D2) on one Device StateImage and a 512-token
+//     KV, so MTP turn-closure checkpoints (StateImage, main and MTP KV, both ranks' halves) go to
+//     the pinned Host records and come back for the second turns. The oracle is the same sequence
+//     on an Engine without a Host tier and with Device room to keep every checkpoint: same path,
+//     same reused prompt tokens, same 16 greedy output tokens per second turn.
+//   * Device KV lease (8k context and KV, one lane): a request asking for 6,000 output tokens
+//     holds its prompt plus a 4,096-token window, so a retained ~2.5k-token conversation stays on
+//     the Device while it answers in a few tokens, and that conversation's next turn reuses it.
+//     Then a 6,000-token answer outgrows its window: the lease grows, and when the pool runs out it
+//     takes the retained conversation's pages instead of ending the answer early.
 //
 // Returns 77 without the artifact or below two CUDA devices.
 
@@ -315,6 +325,282 @@ int exercise_reuse_after_one_shots(ninfer::Engine& engine, const char* label) {
     return failures + exercise_long_prefix_reuse(engine, label, "Trento", 40, 512);
 }
 
+// The configurations of the Host tier check: MTP with int8 KV (the --profile 27b shape), and
+// DFlash2 with nvfp4 KV (the drafter's local rings travel in the StateImage; nvfp4 pages carry
+// their scale planes).
+enum class HostVariant { MtpInt8, DFlash2Nvfp4 };
+
+ninfer::EngineOptions host_restore_options(const char* artifact, bool host_tier,
+                                           HostVariant variant) {
+    ninfer::EngineOptions options = engine_options(artifact);
+    // One lane: the KV capacity is max_context, so the oracle gets room through a longer context.
+    options.max_context   = host_tier ? 512 : 4096;
+    options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context);
+    options.prefill_chunk = 256;
+    const bool dflash2    = variant == HostVariant::DFlash2Nvfp4;
+    options.speculative.backend =
+        dflash2 ? ninfer::SpeculativeBackend::DFlash2 : ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = dflash2 ? 4 : 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    if (dflash2) { options.kv_cache = ninfer::KvCacheStorage::Nvfp4Group16; }
+    options.max_concurrency                                 = 1;
+    options.max_pending_requests                            = 1;
+    options.context_cache.device_state_slots                = host_tier ? 1 : 8;
+    options.context_cache.host_state_slots                  = host_tier ? 8 : 0;
+    options.context_cache.host_kv_capacity_bytes            = host_tier ? (256ULL << 20) : 0;
+    options.context_cache.max_private_continuations         = 8;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    return options;
+}
+
+struct HostRestoreRun {
+    std::vector<ninfer::GenerationResult> resumed; // the sessions' second turns, in order
+    ninfer::RuntimeStats stats;
+};
+
+// Four sessions (A1..D1, then A2..D2) on one Device StateImage and a 512-token KV: the first turns'
+// checkpoints must leave the Device for the next session, and come back for the second turns.
+HostRestoreRun run_host_restore(const char* artifact, bool host_tier, HostVariant variant) {
+    ninfer::Engine engine(host_restore_options(artifact, host_tier, variant));
+    const auto request = [](std::uint32_t outputs) {
+        ninfer::RequestOptions options      = greedy(outputs, true);
+        options.stop.include_model_defaults = false;
+        return options;
+    };
+    const auto first_turn = [](const char* word, const char* session) {
+        std::string text;
+        for (int index = 0; index < 300; ++index) { text += std::string(word) + " "; }
+        ninfer::PromptInput input       = user_prompt(std::move(text));
+        input.context_cache.session_key = session;
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return input;
+    };
+    const auto second_turn = [](ninfer::PromptInput input, const ninfer::GenerationResult& first) {
+        ninfer::ChatMessage assistant;
+        assistant.role              = ninfer::ChatRole::Assistant;
+        assistant.reasoning_content = first.reasoning;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = first.content, .media = {}});
+        input.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage followup;
+        followup.role = ninfer::ChatRole::User;
+        followup.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = "Continue briefly.", .media = {}});
+        input.messages.push_back(std::move(followup));
+        return input;
+    };
+    const char* const words[]    = {"alpha", "beta", "gamma", "delta"};
+    const char* const sessions[] = {"tp2-host-a", "tp2-host-b", "tp2-host-c", "tp2-host-d"};
+    std::vector<ninfer::GenerationResult> first;
+    for (std::size_t index = 0; index < 4; ++index) {
+        first.push_back(
+            engine.generate(engine.prepare(first_turn(words[index], sessions[index])), request(5)));
+    }
+    HostRestoreRun run;
+    for (std::size_t index = 0; index < 4; ++index) {
+        run.resumed.push_back(engine.generate(
+            engine.prepare(second_turn(first_turn(words[index], sessions[index]), first[index])),
+            request(16)));
+    }
+    run.stats = engine.runtime_stats();
+    return run;
+}
+
+int exercise_host_restore(const char* artifact, HostVariant variant) {
+    const HostRestoreRun host   = run_host_restore(artifact, true, variant);
+    const HostRestoreRun device = run_host_restore(artifact, false, variant);
+    const bool backend_kv       = variant == HostVariant::MtpInt8; // DFlash2: no backend KV
+    int failures                = 0;
+    const auto print            = [](const char* label, const ninfer::RuntimeStats& stats) {
+        std::cerr << "  " << label << ": state d2h " << stats.state_d2h_count << " h2d "
+                  << stats.state_h2d_count << " moves " << stats.state_moves << " forks "
+                  << stats.state_forks << " restores " << stats.state_restores << "; main d2h "
+                  << stats.main_kv_d2h_pages << " h2d " << stats.main_kv_h2d_pages
+                  << "; backend d2h " << stats.backend_kv_d2h_pages << " h2d "
+                  << stats.backend_kv_h2d_pages << "; degraded "
+                  << stats.pressure_private_owners_degraded << " evicted "
+                  << stats.pressure_private_owners_evicted << '\n';
+    };
+    if (host.stats.state_h2d_count == 0 || host.stats.main_kv_h2d_pages == 0 ||
+        (backend_kv && host.stats.backend_kv_h2d_pages == 0)) {
+        std::cerr << "Host tier: no checkpoint came back from the Host\n";
+        print("Host tier", host.stats);
+        ++failures;
+    }
+    if (device.stats.state_h2d_count != 0 || device.stats.main_kv_h2d_pages != 0) {
+        std::cerr << "Host tier oracle restored from a Host tier it does not have\n";
+        print("oracle", device.stats);
+        ++failures;
+    }
+    for (std::size_t turn = 0; turn < host.resumed.size(); ++turn) {
+        const ninfer::GenerationResult& got      = host.resumed[turn];
+        const ninfer::GenerationResult& expected = device.resumed[turn];
+        if (got.prefix_reuse_path == ninfer::PrefixReusePath::Root ||
+            got.prefix_reuse_path != expected.prefix_reuse_path ||
+            got.reused_prompt_tokens != expected.reused_prompt_tokens) {
+            std::cerr << "Host tier: session " << turn << " resumed on path "
+                      << static_cast<int>(got.prefix_reuse_path) << " reusing "
+                      << got.reused_prompt_tokens << ", Device oracle path "
+                      << static_cast<int>(expected.prefix_reuse_path) << " reusing "
+                      << expected.reused_prompt_tokens << '\n';
+            ++failures;
+        }
+        if (got.generated_token_ids != expected.generated_token_ids ||
+            got.generated_token_ids.size() != 16) {
+            std::cerr << "Host tier: session " << turn
+                      << " tokens differ from the Device oracle (\"" << got.content << "\" vs \""
+                      << expected.content << "\")\n";
+            ++failures;
+        }
+    }
+    if (failures == 0) { print("Host tier", host.stats); }
+    return failures;
+}
+
+ninfer::EngineOptions lease_options(const char* artifact) {
+    ninfer::EngineOptions options     = engine_options(artifact);
+    options.max_context               = kMaxContext;
+    options.kv_capacity               = ninfer::KvCapacityPolicy::explicit_capacity(kMaxContext);
+    options.max_concurrency           = 1;
+    options.max_pending_requests      = 2;
+    options.kv_cache                  = ninfer::KvCacheStorage::Int8Group64;
+    options.speculative.backend       = ninfer::SpeculativeBackend::Mtp;
+    options.speculative.draft_tokens  = 3;
+    options.speculative.proposal_head = ninfer::ProposalHead::Optimized;
+    options.context_cache.device_state_slots = 8;
+    return options;
+}
+
+int exercise_kv_lease(const char* artifact, std::uint32_t window = 4096, bool host = false) {
+    ninfer::EngineOptions options  = lease_options(artifact);
+    options.kv_lease_window_tokens = window;
+    if (host) {
+        options.context_cache.host_state_slots       = 8;
+        options.context_cache.host_kv_capacity_bytes = 2ULL << 30;
+    }
+    ninfer::Engine engine(std::move(options));
+    int failures               = 0;
+    const std::string document = long_document("Bolzano", 100);
+    const auto conversation    = [&] {
+        ninfer::PromptInput input =
+            user_prompt(document + "\nQuestion: what is 17*23? Answer with the number only.");
+        mark_like_chat_completions(input);
+        return input;
+    };
+    const auto followup = [&](const ninfer::GenerationResult& first) {
+        ninfer::PromptInput input = conversation();
+        input.context_cache       = {};
+        ninfer::ChatMessage assistant;
+        assistant.role = ninfer::ChatRole::Assistant;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = first.content, .media = {}});
+        input.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage question;
+        question.role = ninfer::ChatRole::User;
+        question.parts.push_back(
+            ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                .text  = "What is 12*12? Answer with the number only.",
+                                .media = {}});
+        input.messages.push_back(std::move(question));
+        mark_like_chat_completions(input);
+        return input;
+    };
+
+    // 1. A short answer under a 6,000-token budget leaves the retained conversation alone.
+    const ninfer::GenerationResult first =
+        engine.generate(engine.prepare(conversation()), greedy(32, true));
+    failures += check_answer(first, "391", "lease: first turn");
+    const ninfer::GenerationResult short_answer =
+        engine.generate(engine.prepare(user_prompt("What is 6*7? Answer with the number only.")),
+                        greedy(6000, true));
+    failures += check_answer(short_answer, "42", "lease: short answer, large budget");
+    const ninfer::GenerationResult second =
+        engine.generate(engine.prepare(followup(first)), greedy(32, true));
+    failures += check_answer(second, "144", "lease: second turn");
+    if (window == 0) {
+        // --kv-lease-window 0: the whole budget is reserved at admission, as before the lease,
+        // so the 6,000-token request has to take the retained conversation's pages.
+        if (static_cast<std::uint64_t>(second.reused_prompt_tokens) * 5U >=
+            static_cast<std::uint64_t>(first.prompt.prompt_tokens) * 4U) {
+            std::cerr << "lease off: the second turn still reused " << second.reused_prompt_tokens
+                      << " tokens: --kv-lease-window 0 did not reserve the whole budget\n";
+            ++failures;
+        }
+        std::cerr << "  lease off: second turn reused " << second.reused_prompt_tokens << " of "
+                  << first.prompt.prompt_tokens << '\n';
+        return failures;
+    }
+    if (static_cast<std::uint64_t>(second.reused_prompt_tokens) * 5U <
+        static_cast<std::uint64_t>(first.prompt.prompt_tokens) * 4U) {
+        std::cerr << "lease: the second turn reused " << second.reused_prompt_tokens << " of "
+                  << first.prompt.prompt_tokens
+                  << " tokens: the large budget evicted the retained conversation\n";
+        ++failures;
+    }
+
+    // 2. A long answer grows its lease past the window and takes the retained pages.
+    const ninfer::RuntimeStats before          = engine.runtime_stats();
+    ninfer::RequestOptions long_request        = greedy(6000, true);
+    long_request.stop.include_model_defaults   = false;
+    const ninfer::GenerationResult long_answer = engine.generate(
+        engine.prepare(user_prompt("Write the numbers from 1 to 5000, separated by spaces.")),
+        long_request);
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    if (long_answer.generated_token_ids.size() != 6000 ||
+        after.kv_lease_reclaimed_owners <= before.kv_lease_reclaimed_owners ||
+        after.kv_lease_shortened_answers != before.kv_lease_shortened_answers) {
+        std::cerr << "lease: the long answer produced " << long_answer.generated_token_ids.size()
+                  << " of 6000 tokens; reclaimed owners "
+                  << after.kv_lease_reclaimed_owners - before.kv_lease_reclaimed_owners
+                  << ", shortened answers "
+                  << after.kv_lease_shortened_answers - before.kv_lease_shortened_answers << '\n';
+        ++failures;
+    }
+    std::cerr << "  lease" << (host ? " + Host tier" : "") << ": second turn reused "
+              << second.reused_prompt_tokens << " of " << first.prompt.prompt_tokens
+              << "; long answer " << long_answer.generated_token_ids.size()
+              << " tokens, reclaimed owners "
+              << after.kv_lease_reclaimed_owners - before.kv_lease_reclaimed_owners << ", degraded "
+              << after.pressure_private_owners_degraded - before.pressure_private_owners_degraded
+              << ", evicted "
+              << after.pressure_private_owners_evicted - before.pressure_private_owners_evicted
+              << '\n';
+    if (host) {
+        // 3. With a Host tier the long answer moved the conversation to the Host instead of
+        // dropping it: its next turn resumes from there.
+        ninfer::PromptInput third = followup(first);
+        ninfer::ChatMessage assistant;
+        assistant.role = ninfer::ChatRole::Assistant;
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = second.content, .media = {}});
+        third.messages.push_back(std::move(assistant));
+        ninfer::ChatMessage question;
+        question.role = ninfer::ChatRole::User;
+        question.parts.push_back(
+            ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                .text  = "What is 5*5? Answer with the number only.",
+                                .media = {}});
+        third.messages.push_back(std::move(question));
+        mark_like_chat_completions(third);
+        const ninfer::RuntimeStats before_third = engine.runtime_stats();
+        const ninfer::GenerationResult third_turn =
+            engine.generate(engine.prepare(std::move(third)), greedy(32, true));
+        const ninfer::RuntimeStats after_third = engine.runtime_stats();
+        failures += check_answer(third_turn, "25", "lease + Host tier: third turn");
+        std::cerr << "  lease + Host tier: third turn reused " << third_turn.reused_prompt_tokens
+                  << " of " << third_turn.prompt.prompt_tokens << " (main KV h2d "
+                  << after_third.main_kv_h2d_pages - before_third.main_kv_h2d_pages << ")\n";
+        if (static_cast<std::uint64_t>(third_turn.reused_prompt_tokens) * 5U <
+                static_cast<std::uint64_t>(second.prompt.prompt_tokens) * 4U ||
+            after_third.main_kv_h2d_pages == before_third.main_kv_h2d_pages) {
+            std::cerr << "lease + Host tier: the conversation did not come back from the Host\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -355,6 +641,42 @@ int main() {
         if (failures != 0) { return 1; }
     } catch (const std::exception& error) {
         std::cerr << "tp 2 Engine failed: " << error.what() << '\n';
+        return 1;
+    }
+    {
+        // Guardrail: a Host tier larger than the RAM the machine can spare is refused at startup
+        // with a message that says what fits, instead of pinning it and courting an OOM kill.
+        ninfer::EngineOptions options                = lease_options(artifact);
+        options.context_cache.host_kv_capacity_bytes = 1ULL << 40;
+        bool refused                                 = false;
+        try {
+            ninfer::Engine engine(std::move(options));
+        } catch (const std::invalid_argument& error) {
+            refused =
+                std::string_view(error.what()).find("--host-kv-mib") != std::string_view::npos;
+            if (!refused) { std::cerr << "Host tier RAM guard message: " << error.what() << '\n'; }
+        } catch (const std::exception& error) {
+            std::cerr << "Host tier RAM guard: unexpected failure: " << error.what() << '\n';
+        }
+        if (!refused) {
+            std::cerr << "Host tier RAM guard: a 1 TiB Host KV tier was not refused\n";
+            return 1;
+        }
+    }
+    try {
+        if (exercise_kv_lease(artifact) != 0) { return 1; }
+        if (exercise_kv_lease(artifact, 0) != 0) { return 1; }
+        if (exercise_kv_lease(artifact, 4096, true) != 0) { return 1; }
+    } catch (const std::exception& error) {
+        std::cerr << "tp 2 Device KV lease Engine failed: " << error.what() << '\n';
+        return 1;
+    }
+    try {
+        if (exercise_host_restore(artifact, HostVariant::MtpInt8) != 0) { return 1; }
+        std::cerr << "  Host tier, DFlash2 with nvfp4 KV:\n";
+        if (exercise_host_restore(artifact, HostVariant::DFlash2Nvfp4) != 0) { return 1; }
+    } catch (const std::exception& error) {
+        std::cerr << "tp 2 Host tier Engine failed: " << error.what() << '\n';
         return 1;
     }
     std::cout << "ok\n";

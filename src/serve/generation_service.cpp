@@ -266,6 +266,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.max_pending_requests     = options_.max_pending_requests;
     engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
     engine_options.prefill_chunk            = options_.prefill_chunk;
+    engine_options.kv_lease_window_tokens   = options_.kv_lease_window_tokens;
     engine_options.kv_cache                 = options_.kv_cache;
     engine_options.elastic_kv               = options_.elastic_kv;
     if (options_.miss_split) { engine_options.routed_experts.miss_split.mode = *options_.miss_split; }

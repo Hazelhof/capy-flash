@@ -98,9 +98,10 @@
 >   - the DFlash2 drafter lives whole on the first GPU, so with the official NVFP4 artifact DFlash2
 >     stops at about 150,000 tokens; at 131,072 it starts with 2 device state slots. The QUASAR-QAT
 >     artifact with the drafter added starts at 196,608 with `--vision` and 4 slots (not at 262,144).
-> - **No host tier.** `--host-state-slots` and `--host-kv-mib` must be 0 at `--tp 2`: retained
->   conversations live only in the device state slots. With many conversations in parallel the
->   oldest idle ones are evicted, and their next turn is prefilled again.
+> - **Host tier off by default.** At `--tp 2` `--host-state-slots` and `--host-kv-mib` are 0
+>   unless set (capy-flash: both ranks' halves go to RAM; `--profile 27b` turns them on). Without
+>   them, retained conversations live only in the device state slots: with many conversations in
+>   parallel the oldest idle ones are evicted, and their next turn is prefilled again.
 > - **Speculative decoding.** DFlash2 needs `--lm-head-draft` and a drafter without
 >   full-attention layers (the published drafter has none). `--spec dflash` is not supported.
 > - **KV cache types.** `bf16`, `int8` and (since v0.4.2) `nvfp4`; `fp8` and `k8v4` are rejected. `int8` is the
@@ -185,8 +186,8 @@ cmake --build build -j
 ```
 
 **Fork note — two 16 GB boards.** The single-GPU examples below need a 5090; on two 16 GB boards
-use the two-GPU mode instead (this is the configuration verified in this fork; `fp8` KV and the
-host tiers are rejected at `--tp 2`):
+use the two-GPU mode instead (this is the configuration verified in this fork; `fp8` KV is
+rejected at `--tp 2`):
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_quasar_nvfp4.ninfer \

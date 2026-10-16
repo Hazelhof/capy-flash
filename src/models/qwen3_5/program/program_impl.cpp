@@ -23,6 +23,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -32,6 +33,55 @@ namespace ninfer::models::qwen3_5::detail {
 static_assert(std::is_nothrow_move_assignable_v<SpeculativeStats>);
 
 namespace {
+
+// Guardrail (capy-flash): the Host tiers are pinned at startup and the kernel cannot page them
+// out. Pinning more than the machine can spare does not fail here but later, as an OOM kill of
+// the server or of something else (Qwen3.8-Flash-Next already pins its routed experts). Refuse
+// to start when the tiers would leave less than max(4 GiB, 5 % of RAM) available, and say how
+// much fits. NINFER_HOST_TIER_RAM_GUARD=0 disables the check.
+std::uint64_t meminfo_bytes(const char* key) {
+    std::FILE* file = std::fopen("/proc/meminfo", "r");
+    if (file == nullptr) { return 0; }
+    char line[256];
+    std::uint64_t kib            = 0;
+    const std::size_t key_length = std::strlen(key);
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        if (std::strncmp(line, key, key_length) == 0 && line[key_length] == ':') {
+            kib = std::strtoull(line + key_length + 1, nullptr, 10);
+            break;
+        }
+    }
+    std::fclose(file);
+    return kib * 1024ULL;
+}
+
+void require_host_tier_fits_ram(std::uint64_t state_bytes, std::uint64_t kv_bytes) {
+    const std::uint64_t pinned = state_bytes + kv_bytes;
+    if (pinned == 0) { return; }
+    if (const char* guard = std::getenv("NINFER_HOST_TIER_RAM_GUARD");
+        guard != nullptr && std::string_view(guard) == "0") {
+        return;
+    }
+    const std::uint64_t available = meminfo_bytes("MemAvailable");
+    const std::uint64_t total     = meminfo_bytes("MemTotal");
+    if (available == 0 || total == 0) { return; }
+    const std::uint64_t reserve = std::max<std::uint64_t>(4ULL << 30, total / 20U);
+    if (available >= pinned + reserve) { return; }
+    const auto gib = [](std::uint64_t bytes) {
+        char text[32];
+        std::snprintf(text, sizeof(text), "%.1f", static_cast<double>(bytes) / (1ULL << 30));
+        return std::string(text);
+    };
+    const std::uint64_t fits =
+        available > reserve + state_bytes ? available - reserve - state_bytes : 0;
+    throw std::invalid_argument(
+        "the Host context tiers would pin " + gib(pinned) + " GiB of RAM (state " +
+        gib(state_bytes) + " GiB, KV " + gib(kv_bytes) + " GiB) but only " + gib(available) +
+        " GiB are available and " + gib(reserve) +
+        " GiB must stay free: lower --host-kv-mib (at most " + std::to_string(fits >> 20) +
+        " MiB with these state slots) or --host-state-slots, or set "
+        "NINFER_HOST_TIER_RAM_GUARD=0 to skip this check");
+}
 
 std::uint32_t normalized_private_capacity(const ContextCacheOptions& options);
 
@@ -71,8 +121,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_capacity(normalized_private_capacity(plan.context_cache)),
       shared_prefix_capacity(plan.context_cache.max_shared_prefixes.value_or(0)),
       prefill_chunk(plan.prefill_chunk), qwen4_prompt_base_chunk(plan.qwen4_base_chunk),
-      draft_window(plan.draft_window), mtp_min_p(plan.mtp_min_p),
-      mtp_window_rule(plan.mtp_window_rule),
+      kv_lease_window_tokens(plan.kv_lease_window_tokens), draft_window(plan.draft_window),
+      mtp_min_p(plan.mtp_min_p), mtp_window_rule(plan.mtp_window_rule),
       speculative_backend(plan.speculative_backend), kv_storage(plan.kv_storage),
       proposal_head(plan.proposal_head), vision_enabled(plan.features.vision),
       vision_rank(plan.features.vision_rank), use_cuda_graph(plan.use_cuda_graph),
@@ -139,7 +189,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     const auto address_capacity      = static_cast<std::uint32_t>(address_capacity64 + 1U);
     const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
-        const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
+        const HostKVPageLayout host_layout =
+            plan_host_kv_page_layout(pool.geometry(), pool.host_replicas());
         const std::uint64_t host_pages =
             plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
         const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
@@ -151,16 +202,23 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
 
     decoder = std::make_unique<qwen3_5::DecoderState>(
         backing, plan.persistent.decoder, elastic_arena ? elastic_arena->span() : DeviceSpan{});
+    state_images =
+        std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
+    // Mirrors first: a mirrored pool's Host records hold both ranks' halves, so every Host layout
+    // and logical capacity below depends on them.
+    if (peer) { attach_tensor_parallel_mirrors(); }
     text_host_kv_page_stride =
-        plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()).page_stride;
+        plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry(),
+                                 decoder->text_kv.page_pool().host_replicas())
+            .page_stride;
     text_kv_pages = std::make_unique<LogicalKVPageStore>(
         decoder->text_kv.page_pool(), logical_page_capacity(decoder->text_kv.page_pool()));
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
-    state_images =
-        std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
-    if (peer) { attach_tensor_parallel_mirrors(); }
+    require_host_tier_fits_ram(static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
+                                   plan.context_cache.host_state_slots,
+                               plan.context_cache.host_kv_capacity_bytes);
     if (plan.context_cache.host_state_slots != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
@@ -207,8 +265,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("DFlash state does not match the frozen sequence plan");
     }
     if (qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
-        backend_host_kv_page_stride =
-            plan_host_kv_page_layout(backend->page_pool().geometry()).page_stride;
+        backend_host_kv_page_stride = plan_host_kv_page_layout(backend->page_pool().geometry(),
+                                                               backend->page_pool().host_replicas())
+                                          .page_stride;
         backend_kv_pages = std::make_unique<LogicalKVPageStore>(
             backend->page_pool(), logical_page_capacity(backend->page_pool()));
         backend_kv_addresses = std::make_unique<KVAddressSpaceStore>(
@@ -223,10 +282,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (plan.context_cache.host_kv_capacity_bytes != 0) {
         std::vector<HostKVPageLayout> layouts;
-        layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()));
+        layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry(),
+                                                   decoder->text_kv.page_pool().host_replicas()));
         if (const qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
-            HostKVPageLayout backend_layout =
-                plan_host_kv_page_layout(backend->page_pool().geometry());
+            HostKVPageLayout backend_layout = plan_host_kv_page_layout(
+                backend->page_pool().geometry(), backend->page_pool().host_replicas());
             if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
         }
         StartupPhaseScope host_kv_phase(
