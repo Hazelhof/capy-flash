@@ -65,7 +65,7 @@ Status: **v0.6.0** (2026-10-19). Built, tested and measured on one machine (belo
   to the GPUs from 256 tokens (`--stream-min-tokens`). The post-prompt slowdown of v0.5.x (~250 ms per turn) is gone.
 - MTP draft head re-distilled on this engine's own output (v0.6): +18 % decode in Italian, +4-8 % in English and code.
 - Vision on Flash-Next (v0.6, opt-in): `--vision` with an artifact converted by `tools/capy_flash/convert.py --vision`
-  (Q8 tower, 0.45 GiB of VRAM, ~3 % decode); without `--vision` nothing changes.
+  (Q8 tower, 0.45 GiB of VRAM, ~4 % decode); without `--vision` nothing changes.
 - NVIDIA's FP4-Local checkpoint runs too (recipe `qwen3_8_flash_next_fp4_local`), ~19 % slower than the default artifact.
 
 ## Measured
@@ -138,6 +138,10 @@ python tools/capy_flash/convert.py --model <checkpoint dir> --out <dir>
 It runs `python -m tools.convert --recipe qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 --components text,mtp` (experts NVFP4
 as published, indexer BF16, GDN Q8, about 5 minutes on a GPU, 118 GB) and `tools/qwen4_draft_shortlist.py`.
 
+With images (`--vision`, see below): [`Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash)
+(the same artifact plus the Q8 vision tower, capy-flash v0.6.0 or newer). The previous text artifact, with NVIDIA's MTP
+head, stays available as revision `v0.5.4` of the first repository (`hf download ... --revision v0.5.4`).
+
 ## Serve
 ```
 build/apps/ninfer-serve <dir>/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --profile flash-next --port 8098 --model-id capy-flash
@@ -149,8 +153,9 @@ profile's, in any order (`ninfer-serve --help` lists both). To keep it running: 
 in [examples/serving](examples/serving).
 
 **Images (opt-in).** Flash-Next is multimodal: convert with `--vision` (`python tools/capy_flash/convert.py --model
-<checkpoint dir> --out <dir> --vision`, i.e. `tools.convert ... --components text,vision,mtp`; the Text and MTP objects
-are byte-identical to the text-only artifact, the tower is stored Q8) and start with `--profile flash-next --vision`
+<checkpoint dir> --out <dir> --vision`, i.e. `tools.convert ... --components text,vision,mtp`; the Text and MTP parts
+come from the same conversion as the text-only artifact, the tower is stored Q8; ready-made on
+[Hugging Face](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash)) and start with `--profile flash-next --vision`
 (tower on GPU 0, `--vision-device 1` moves it, `--max-vision-tokens N` caps one image). Images and videos are accepted
 in the chat APIs and a conversation with an image resumes its cached prefix. Measured here (`--max-vision-tokens
 4096`): tower 0.45 GiB on its GPU, 4 expert slots per layer fewer (66 to 62), decode about 4 % slower on short prompts,
