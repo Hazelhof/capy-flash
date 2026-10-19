@@ -236,7 +236,56 @@ inline int peer_exchange_blocks(std::size_t bytes) {
 // 5 blocks of 256: 6.2 against 6.8 us per 40 KiB exchange, 3.8 against 4.4 at 10 KiB, on two
 // RTX 5070 Ti over PCIe 5.0 x8 (tools/tp2/mailbox_probe.cu --sweep; 1, 4 or 8 vectors per lane
 // are within 0.4 us, the early relaxed probe plus fence 0.6-1 us slower, the poll sleep neutral).
-inline constexpr int kPeerPipelinedThreads     = 64;
+inline constexpr int kPeerPipelinedThreads = 64;
+
+// L2 PREFETCH (q27/dexch). A decode exchange keeps the DRAM of its device idle for its whole PCIe
+// round trip (~5 us once both ranks arrived, 140 per 27B decode round), and the kernel that follows
+// it (after an RMSNorm) is a weight-streaming GEMM whose weights depend on nothing the exchange
+// produces. The owner may therefore name up to kPeerPrefetchRanges byte ranges of those weights
+// (PeerMailbox::set_l2_prefetch); the exchange launch then carries extra blocks after its own,
+// which do nothing but issue bulk L2 prefetches of the ranges (cp.async.bulk.prefetch.L2, one
+// kPeerPrefetchChunk per thread and pass) and exit. They touch no exchange state: no epoch, flag,
+// payload or partial, so the protocol, its lockstep and its arithmetic are unchanged and the
+// prefetch cannot change a result bit -- only which weight lines the next GEMM finds in L2.
+inline constexpr int kPeerPrefetchRanges          = 4;
+inline constexpr std::uint32_t kPeerPrefetchChunk = 4096u;
+inline constexpr int kPeerPrefetchMaxBlocks       = 32;
+
+struct PeerL2Prefetch {
+    const void* data[kPeerPrefetchRanges]    = {};
+    std::uint32_t bytes[kPeerPrefetchRanges] = {}; // multiples of 16, data 16-byte aligned
+    int ranges                               = 0;
+    int first_block = 0; // blocks [first_block, gridDim.x) prefetch; the exchange's come first
+};
+
+// The prefetching blocks' whole body: worker w issues chunks w, w + workers, ... of every range.
+__device__ __forceinline__ void peer_prefetch_l2(const PeerL2Prefetch& prefetch) {
+    const auto first   = static_cast<std::uint64_t>(prefetch.first_block);
+    const auto worker  = (blockIdx.x - first) * blockDim.x + threadIdx.x;
+    const auto workers = (gridDim.x - first) * blockDim.x;
+    for (int r = 0; r < prefetch.ranges; ++r) {
+        const auto* base = static_cast<const std::uint8_t*>(prefetch.data[r]);
+        for (std::uint64_t offset = worker * kPeerPrefetchChunk; offset < prefetch.bytes[r];
+             offset += workers * kPeerPrefetchChunk) {
+            const auto bytes = static_cast<std::uint32_t>(
+                min(static_cast<std::uint64_t>(kPeerPrefetchChunk), prefetch.bytes[r] - offset));
+            asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(base + offset),
+                         "r"(bytes)
+                         : "memory");
+        }
+    }
+}
+
+// Blocks of `threads` that prefetch `prefetch`'s ranges: one chunk per thread, at most
+// kPeerPrefetchMaxBlocks (each thread then loops). 0 without ranges.
+inline int peer_prefetch_blocks(const PeerL2Prefetch& prefetch, int threads) {
+    std::uint64_t chunks = 0;
+    for (int r = 0; r < prefetch.ranges; ++r) {
+        chunks += (prefetch.bytes[r] + kPeerPrefetchChunk - 1) / kPeerPrefetchChunk;
+    }
+    const std::uint64_t blocks = (chunks + threads - 1) / threads;
+    return static_cast<int>(blocks < kPeerPrefetchMaxBlocks ? blocks : kPeerPrefetchMaxBlocks);
+}
 
 // Launch knobs of one pipelined exchange. Production passes the defaults; the standalone probe
 // varies them and, with kTimed, collects every warp's phase timestamps.
@@ -246,6 +295,8 @@ struct PeerPipelinedTuning {
     unsigned long long* stamps = nullptr; // kTimed only: kPeerStampCount words per warp
     // Release the next kernel in the stream at entry (PeerMailbox::set_release_dependents, T45).
     bool release_dependents = false;
+    // Weight ranges the blocks after the exchange's own prefetch into L2 (L2 PREFETCH above).
+    PeerL2Prefetch prefetch{};
 };
 
 // kTimed stamps, per warp (lane 0): globaltimer at entry, clock64 at entry, after the publish
@@ -282,6 +333,10 @@ __global__ __launch_bounds__(256) void peer_exchange_pipelined_kernel(
     // on the peer (T45: the next hyper-connection mixer requests its weights then); it must not
     // read the exchanged data before its dependency wait.
     if (tuning.release_dependents && threadIdx.x == 0) { pdl::trigger_dependents(); }
+    if (tuning.prefetch.ranges > 0 && static_cast<int>(blockIdx.x) >= tuning.prefetch.first_block) {
+        peer_prefetch_l2(tuning.prefetch); // block-uniform: a prefetching block exchanges nothing
+        return;
+    }
 
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
@@ -289,7 +344,7 @@ __global__ __launch_bounds__(256) void peer_exchange_pipelined_kernel(
     if (warp * (32 * G) >= vecs) { return; } // warp-uniform: the grid's last warps may be idle
 
     unsigned long long stamp[5] = {};
-    const bool timed = kTimed && lane == 0 && tuning.stamps != nullptr;
+    const bool timed            = kTimed && lane == 0 && tuning.stamps != nullptr;
     if (timed) {
         stamp[0] = peer_globaltimer();
         stamp[1] = clock64();
@@ -327,9 +382,7 @@ __global__ __launch_bounds__(256) void peer_exchange_pipelined_kernel(
         if (timed) { stamp[3] = clock64(); }
         const SystemWord peer(peer_flags[warp * kPeerFlagStride]);
         const SystemWord fault(*hang);
-        if constexpr (kPoll == kPeerPollAcquire) {
-            seen = peer.load(cuda::memory_order_acquire);
-        }
+        if constexpr (kPoll == kPeerPollAcquire) { seen = peer.load(cuda::memory_order_acquire); }
         while (static_cast<std::int32_t>(seen - target) < 0) {
             __nanosleep(tuning.sleep_ns);
             ++spins;
@@ -391,17 +444,19 @@ __global__ __launch_bounds__(256) void peer_exchange_pipelined_kernel(
     }
 }
 
-// ---- pipelined FP32 partial-sum kernel ------------------------------------------------------------
+// ---- pipelined FP32 partial-sum kernel
+// ------------------------------------------------------------
 //
-// The same pipelined protocol (per slot, per warp lane epochs and 64-byte release lines, all loads in
-// flight, the HANG GUARD per warp) over FP32 partials: a 16-byte vector is four floats. The combine
-// is one IEEE FP32 add per element, fl(mine + peer), which is commutative, so both ranks compute the
-// same bits from the same two partials; the sum replaces the partial in place, and when `bf16_out`
-// is non-null it is also stored there rounded once to BF16 (round to nearest even). This is the
-// exchange of row-parallel partials that are themselves FP32 (the Qwen4Exp MoE: resident-expert,
-// CPU-path and shared-expert contributions accumulated in FP32 per rank), so the block output is
-// rounded once, after the cross-rank sum. A slot set mixes BF16 and FP32 exchanges freely: both
-// kernels move 16-byte vectors with the same lane geometry and advance the same per-lane epochs.
+// The same pipelined protocol (per slot, per warp lane epochs and 64-byte release lines, all loads
+// in flight, the HANG GUARD per warp) over FP32 partials: a 16-byte vector is four floats. The
+// combine is one IEEE FP32 add per element, fl(mine + peer), which is commutative, so both ranks
+// compute the same bits from the same two partials; the sum replaces the partial in place, and when
+// `bf16_out` is non-null it is also stored there rounded once to BF16 (round to nearest even). This
+// is the exchange of row-parallel partials that are themselves FP32 (the Qwen4Exp MoE:
+// resident-expert, CPU-path and shared-expert contributions accumulated in FP32 per rank), so the
+// block output is rounded once, after the cross-rank sum. A slot set mixes BF16 and FP32 exchanges
+// freely: both kernels move 16-byte vectors with the same lane geometry and advance the same
+// per-lane epochs.
 
 template <int G>
 __global__ __launch_bounds__(256) void peer_exchange_pipelined_f32_kernel(
@@ -409,6 +464,10 @@ __global__ __launch_bounds__(256) void peer_exchange_pipelined_f32_kernel(
     std::uint32_t* peer_flags, std::uint32_t* epochs, std::uint32_t* hang, int vecs,
     __nv_bfloat16* bf16_out, PeerPipelinedTuning tuning) {
     if (tuning.release_dependents && threadIdx.x == 0) { pdl::trigger_dependents(); } // as above
+    if (tuning.prefetch.ranges > 0 && static_cast<int>(blockIdx.x) >= tuning.prefetch.first_block) {
+        peer_prefetch_l2(tuning.prefetch);
+        return;
+    }
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     const int base = warp * (32 * G) + lane;

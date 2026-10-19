@@ -40,7 +40,7 @@ InputFile::InputFile(std::filesystem::path path) : path_(std::move(path)) {
     fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd_ < 0) { fail(path_, "open"); }
 
-    struct stat status {};
+    struct stat status{};
 
     if (::fstat(fd_, &status) != 0) {
         const auto error = errno;

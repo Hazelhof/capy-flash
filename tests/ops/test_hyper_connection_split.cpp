@@ -99,11 +99,11 @@ struct Fixture {
     bool inject;
     std::int32_t rows;
     std::vector<float> norm, down_source, up_source;
-    quantized_weight::PackedWeight down, up;               // whole
+    quantized_weight::PackedWeight down, up; // whole
     std::array<quantized_weight::PackedWeight, 2> down_r, up_r;
     std::array<std::vector<float>, 2> norm_r;
-    DeviceWeights whole;                                   // device 0
-    std::array<DeviceWeights, 2> shard;                    // device r
+    DeviceWeights whole;                // device 0
+    std::array<DeviceWeights, 2> shard; // device r
 
     Fixture(const ExecutionContext& ec, bool with_inject, std::uint32_t seed)
         : inject(with_inject), rows(kRank + (with_inject ? kStreams : 0)) {
@@ -120,11 +120,12 @@ struct Fixture {
             down_r[r] = quantized_weight::pack_q8_g32_row_split(
                 columns_of(down_source, rows, kWide, r * kLocal, kLocal), rows, kLocal);
             up_r[r] = quantized_weight::pack_q8_g32_row_split(
-                std::vector<float>(up_source.begin() + static_cast<std::ptrdiff_t>(r) * kLocal * kRank,
-                                   up_source.begin() +
-                                       static_cast<std::ptrdiff_t>(r + 1) * kLocal * kRank),
+                std::vector<float>(
+                    up_source.begin() + static_cast<std::ptrdiff_t>(r) * kLocal * kRank,
+                    up_source.begin() + static_cast<std::ptrdiff_t>(r + 1) * kLocal * kRank),
                 kLocal, kRank);
-            norm_r[r] = std::vector<float>(norm.begin() + r * kLocal, norm.begin() + (r + 1) * kLocal);
+            norm_r[r] =
+                std::vector<float>(norm.begin() + r * kLocal, norm.begin() + (r + 1) * kLocal);
         }
         set_device(ec, 0);
         whole = upload(norm, down, up, kWide);
@@ -134,15 +135,16 @@ struct Fixture {
         }
     }
 
-    static DeviceWeights upload(const std::vector<float>& n, const quantized_weight::PackedWeight& d,
+    static DeviceWeights upload(const std::vector<float>& n,
+                                const quantized_weight::PackedWeight& d,
                                 const quantized_weight::PackedWeight& u, std::int32_t width) {
         DeviceWeights w;
-        w.norm            = to_device(bits(n));
-        w.down            = to_device(d.payload);
-        w.up              = to_device(u.payload);
-        w.weights.norm    = Tensor(w.norm.p, DType::BF16, {width});
-        w.weights.down    = d.device_weight(w.down.p);
-        w.weights.up      = u.device_weight(w.up.p);
+        w.norm         = to_device(bits(n));
+        w.down         = to_device(d.payload);
+        w.up           = to_device(u.payload);
+        w.weights.norm = Tensor(w.norm.p, DType::BF16, {width});
+        w.weights.down = d.device_weight(w.down.p);
+        w.weights.up   = u.device_weight(w.up.p);
         return w;
     }
 
@@ -231,8 +233,10 @@ struct Call {
         residual = random_bf16(static_cast<std::size_t>(kWide) * t, seed, -0.75F, 0.75F);
         set_device(ec, 0);
         whole_residual = to_device(bits(residual));
-        whole_mixed    = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(kHidden) * t * 2);
-        whole_inject   = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(kStreams) * t * 4);
+        whole_mixed =
+            std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(kHidden) * t * 2);
+        whole_inject =
+            std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(kStreams) * t * 4);
         whole_workspace = std::make_unique<WorkspaceArena>(
             ops::hyper_connection_mix_workspace_bytes(t, t, f.inject));
         for (int r = 0; r < 2; ++r) {
@@ -243,8 +247,10 @@ struct Call {
                             kLocal, half.begin() + static_cast<std::ptrdiff_t>(c) * kLocal);
             }
             residual_r[r] = to_device(bits(half));
-            mixed_r[r]  = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(kHidden) * t * 2);
-            inject_r[r] = std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(2) * t * 4);
+            mixed_r[r] =
+                std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(kHidden) * t * 2);
+            inject_r[r] =
+                std::make_unique<GuardedDeviceBuffer>(static_cast<std::size_t>(2) * t * 4);
             mixed_r[r]->fill(0xff);
             inject_r[r]->fill(0xff);
             workspace[r] = std::make_unique<WorkspaceArena>(
@@ -289,8 +295,9 @@ Observed observe(const ExecutionContext& ec, Call& call, int& failures, const st
     const std::size_t narrow = static_cast<std::size_t>(kHidden) * call.tokens;
     for (int r = 0; r < 2; ++r) {
         set_device(ec, r);
-        o.mixed[r]  = from_device<std::uint16_t>(call.mixed_r[r]->data(), narrow);
-        o.inject[r] = from_device<float>(call.inject_r[r]->data(), static_cast<std::size_t>(2) * call.tokens);
+        o.mixed[r] = from_device<std::uint16_t>(call.mixed_r[r]->data(), narrow);
+        o.inject[r] =
+            from_device<float>(call.inject_r[r]->data(), static_cast<std::size_t>(2) * call.tokens);
         failures += call.mixed_r[r]->verify_guards(label + " mixed rank " + std::to_string(r));
         failures += call.inject_r[r]->verify_guards(label + " inject rank " + std::to_string(r));
     }
@@ -313,14 +320,16 @@ int check_call(const ExecutionContext& ec, const Fixture& f, Call& call, const O
     const auto whole_mixed = from_device_bf16(call.whole_mixed->data(), narrow);
     failures += verify_reduction(label + " mixed vs 1 GPU", mixed, whole_mixed, kMixedParity);
     if (f.inject) {
-        const auto whole_gates = read_f32(call.whole_inject->data(), static_cast<std::size_t>(kStreams) * T);
+        const auto whole_gates =
+            read_f32(call.whole_inject->data(), static_cast<std::size_t>(kStreams) * T);
         for (int r = 0; r < 2; ++r) {
             std::vector<double> got, ref, whole;
             for (int t = 0; t < T; ++t) {
                 for (int s = 0; s < 2; ++s) {
                     got.push_back(o.inject[r][static_cast<std::size_t>(t) * 2 + s]);
                     ref.push_back(gates_ref[static_cast<std::size_t>(t) * kStreams + 2 * r + s]);
-                    whole.push_back(whole_gates[static_cast<std::size_t>(t) * kStreams + 2 * r + s]);
+                    whole.push_back(
+                        whole_gates[static_cast<std::size_t>(t) * kStreams + 2 * r + s]);
                 }
             }
             failures += verify_pointwise(label + " inject rank " + std::to_string(r) + " vs FP64",
@@ -337,8 +346,9 @@ int check_call(const ExecutionContext& ec, const Fixture& f, Call& call, const O
             std::copy_n(call.residual.begin() + static_cast<std::ptrdiff_t>(c) * kWide + r * kLocal,
                         kLocal, half.begin() + static_cast<std::ptrdiff_t>(c) * kLocal);
         }
-        failures += verify_exact((label + " residual preserved").c_str(),
-                                 from_device<std::uint16_t>(call.residual_r[r], half.size()), bits(half));
+        failures +=
+            verify_exact((label + " residual preserved").c_str(),
+                         from_device<std::uint16_t>(call.residual_r[r], half.size()), bits(half));
     }
     return failures;
 }
@@ -396,8 +406,8 @@ int same(const Observed& a, const Observed& b, const std::string& label, bool in
 // bit: same kernels, the mailbox and the staged path add identically).
 int run_case(const ExecutionContext& ec, const Fixture& f, std::int32_t T, std::uint32_t seed,
              const ops::PeerEvents& staged, const ops::PeerEvents& mailbox_events) {
-    const std::string label = std::string("hc split ") + (f.inject ? "inject" : "head") +
-                              " T=" + std::to_string(T);
+    const std::string label =
+        std::string("hc split ") + (f.inject ? "inject" : "head") + " T=" + std::to_string(T);
     int failures = 0;
     Call call(ec, f, T, seed);
     call.run_split(ec, f, staged);
@@ -412,8 +422,8 @@ int run_case(const ExecutionContext& ec, const Fixture& f, std::int32_t T, std::
         std::cerr << label << ": " << nodes << " graph nodes, expected the fused route's 2\n";
         ++failures;
     }
-    std::cout << label << ": default captured route " << (nodes == 2 ? "fused" : "composed")
-              << " (" << nodes << " nodes)\n";
+    std::cout << label << ": default captured route " << (nodes == 2 ? "fused" : "composed") << " ("
+              << nodes << " nodes)\n";
     const Observed first = replay(ec, call, fused, failures, label + " graph");
     failures += check_call(ec, f, call, first, label + (expect_fused ? " graph fused" : " graph"));
     const Observed second = replay(ec, call, fused, failures, label + " graph replay 2");
@@ -454,8 +464,8 @@ int combine_mix_case(const ExecutionContext& ec, const Fixture& f, std::int32_t 
                                               *call.whole_workspace, ec.dev[0]->stream);
             cuda_check(cudaStreamSynchronize(ec.dev[0]->stream), "whole combine_mix");
         }
-        const auto whole_mixed = from_device_bf16(call.whole_mixed->data(),
-                                                  static_cast<std::size_t>(kHidden) * T);
+        const auto whole_mixed =
+            from_device_bf16(call.whole_mixed->data(), static_cast<std::size_t>(kHidden) * T);
         // The exact combine (FP64) of the residual, rounded once: the oracle's input.
         std::vector<float> committed(call.residual.size());
         for (int c = 0; c < T; ++c)
@@ -463,8 +473,9 @@ int combine_mix_case(const ExecutionContext& ec, const Fixture& f, std::int32_t 
                 for (int h = 0; h < kHidden; ++h) {
                     const std::size_t i = static_cast<std::size_t>(c) * kWide + s * kHidden + h;
                     committed[i]        = bf16_to_f32(f32_to_bf16(static_cast<float>(
-                        double(call.residual[i]) + double(gates[static_cast<std::size_t>(c) * kStreams + s]) *
-                                                       double(y[static_cast<std::size_t>(c) * kHidden + h]))));
+                        double(call.residual[i]) +
+                        double(gates[static_cast<std::size_t>(c) * kStreams + s]) *
+                            double(y[static_cast<std::size_t>(c) * kHidden + h]))));
                 }
         std::array<DeviceBuffer, 2> dy, dg;
         std::array<Tensor, 2> ty, tg;
@@ -484,8 +495,8 @@ int combine_mix_case(const ExecutionContext& ec, const Fixture& f, std::int32_t 
         const auto run = [&](const ops::PeerEvents& events) {
             ops::hyper_connection_combine_mix_split(
                 call.residual_t, ty, tg, {f.shard[0].weights, f.shard[1].weights}, kEps,
-                call.mixed_t, call.inject_t, {call.workspace[0].get(), call.workspace[1].get()},
-                ec, events);
+                call.mixed_t, call.inject_t, {call.workspace[0].get(), call.workspace[1].get()}, ec,
+                events);
         };
         if (graph) {
             // The devices were prepared by the eager calls of run_case: the fused route for T <= 8.
@@ -511,22 +522,27 @@ int combine_mix_case(const ExecutionContext& ec, const Fixture& f, std::int32_t 
         std::vector<double> mixed_ref, gates_ref;
         f.reference(committed, T, mixed_ref, gates_ref);
         set_device(ec, 0);
-        const auto mixed0 = from_device_bf16(call.mixed_r[0]->data(), static_cast<std::size_t>(kHidden) * T);
+        const auto mixed0 =
+            from_device_bf16(call.mixed_r[0]->data(), static_cast<std::size_t>(kHidden) * T);
         failures += verify_reduction(mode + " mixed vs FP64", mixed0, mixed_ref, kMixed);
         failures += verify_reduction(mode + " mixed vs 1 GPU", mixed0, whole_mixed, kMixedParity);
         for (int r = 0; r < 2; ++r) {
             set_device(ec, r);
-            std::vector<double> got = from_device_bf16(call.residual_r[r], static_cast<std::size_t>(kLocal) * T);
+            std::vector<double> got =
+                from_device_bf16(call.residual_r[r], static_cast<std::size_t>(kLocal) * T);
             std::vector<double> want(got.size());
             for (int c = 0; c < T; ++c)
                 for (int i = 0; i < kLocal; ++i)
                     want[static_cast<std::size_t>(c) * kLocal + i] =
-                        double(call.residual[static_cast<std::size_t>(c) * kWide + r * kLocal + i]) +
-                        double(gates[static_cast<std::size_t>(c) * kStreams + 2 * r + i / kHidden]) *
+                        double(
+                            call.residual[static_cast<std::size_t>(c) * kWide + r * kLocal + i]) +
+                        double(
+                            gates[static_cast<std::size_t>(c) * kStreams + 2 * r + i / kHidden]) *
                             double(y[static_cast<std::size_t>(c) * kHidden + i % kHidden]);
             failures += verify_pointwise(mode + " committed residual rank " + std::to_string(r),
                                          got, want, PointwiseCriterion{1.0e-6, 1.0 / 128.0});
-            const auto m = from_device<std::uint16_t>(call.mixed_r[r]->data(), static_cast<std::size_t>(kHidden) * T);
+            const auto m = from_device<std::uint16_t>(call.mixed_r[r]->data(),
+                                                      static_cast<std::size_t>(kHidden) * T);
             set_device(ec, 0);
             failures += verify_exact((mode + " ranks agree").c_str(), m,
                                      from_device<std::uint16_t>(call.mixed_r[0]->data(), m.size()));
@@ -538,11 +554,12 @@ int combine_mix_case(const ExecutionContext& ec, const Fixture& f, std::int32_t 
 // Combine over the split residual equals the whole combine's rows bit for bit.
 int combine_case(const ExecutionContext& ec, std::int32_t T, std::uint32_t seed) {
     const auto residual = random_bf16(static_cast<std::size_t>(kWide) * T, seed, -2.0F, 2.0F);
-    const auto y        = random_bf16(static_cast<std::size_t>(kHidden) * T, seed + 1U, -1.0F, 1.0F);
+    const auto y = random_bf16(static_cast<std::size_t>(kHidden) * T, seed + 1U, -1.0F, 1.0F);
     std::vector<float> inject(static_cast<std::size_t>(kStreams) * T);
     fill_uniform(inject, seed + 2U, 0.0F, 2.0F);
     set_device(ec, 0);
-    DeviceBuffer whole = to_device(bits(residual)), dy0 = to_device(bits(y)), di = to_device(inject);
+    DeviceBuffer whole = to_device(bits(residual)), dy0 = to_device(bits(y)),
+                 di = to_device(inject);
     Tensor tw(whole.p, DType::BF16, {kWide, T});
     ops::hyper_connection_combine(Tensor(dy0.p, DType::BF16, {kHidden, T}),
                                   Tensor(di.p, DType::FP32, {kStreams, T}), tw, nullptr);
@@ -551,7 +568,8 @@ int combine_case(const ExecutionContext& ec, std::int32_t T, std::uint32_t seed)
     int failures          = 0;
     for (int r = 0; r < 2; ++r) {
         set_device(ec, r);
-        std::vector<float> half(static_cast<std::size_t>(kLocal) * T), gates(static_cast<std::size_t>(2) * T);
+        std::vector<float> half(static_cast<std::size_t>(kLocal) * T),
+            gates(static_cast<std::size_t>(2) * T);
         std::vector<std::uint16_t> want(half.size());
         for (int c = 0; c < T; ++c) {
             for (int i = 0; i < kLocal; ++i) {
@@ -560,18 +578,19 @@ int combine_case(const ExecutionContext& ec, std::int32_t T, std::uint32_t seed)
                 want[static_cast<std::size_t>(c) * kLocal + i] =
                     whole_bits[static_cast<std::size_t>(c) * kWide + r * kLocal + i];
             }
-            gates[static_cast<std::size_t>(c) * 2]     = inject[static_cast<std::size_t>(c) * kStreams + 2 * r];
-            gates[static_cast<std::size_t>(c) * 2 + 1] = inject[static_cast<std::size_t>(c) * kStreams + 2 * r + 1];
+            gates[static_cast<std::size_t>(c) * 2] =
+                inject[static_cast<std::size_t>(c) * kStreams + 2 * r];
+            gates[static_cast<std::size_t>(c) * 2 + 1] =
+                inject[static_cast<std::size_t>(c) * kStreams + 2 * r + 1];
         }
         DeviceBuffer dr = to_device(bits(half)), dy = to_device(bits(y)), dg = to_device(gates);
         Tensor tr(dr.p, DType::BF16, {kLocal, T});
         ops::hyper_connection_combine(Tensor(dy.p, DType::BF16, {kHidden, T}),
                                       Tensor(dg.p, DType::FP32, {2, T}), tr, nullptr);
         cuda_check(cudaDeviceSynchronize(), "split combine");
-        failures += verify_exact(("hc split combine T=" + std::to_string(T) + " rank " +
-                                  std::to_string(r))
-                                     .c_str(),
-                                 from_device<std::uint16_t>(dr, half.size()), want);
+        failures += verify_exact(
+            ("hc split combine T=" + std::to_string(T) + " rank " + std::to_string(r)).c_str(),
+            from_device<std::uint16_t>(dr, half.size()), want);
     }
     return failures;
 }
@@ -596,13 +615,14 @@ void bench(const ExecutionContext& ec, const Fixture& f) {
         std::array<ops::HyperConnectionWeights, 2> weights;
         for (int r = 0; r < 2; ++r) {
             set_device(ec, r);
-            res[r]  = to_device(bits(call.residual));
-            mix[r]  = DeviceBuffer(static_cast<std::size_t>(kHidden) * T * 2);
-            inj[r]  = DeviceBuffer(static_cast<std::size_t>(kStreams) * T * 4);
-            ws[r]   = std::make_unique<WorkspaceArena>(ops::hyper_connection_mix_workspace_bytes(T, T, true));
-            norm[r] = to_device(bits(f.norm));
-            down[r] = to_device(f.down.payload);
-            up[r]   = to_device(f.up.payload);
+            res[r] = to_device(bits(call.residual));
+            mix[r] = DeviceBuffer(static_cast<std::size_t>(kHidden) * T * 2);
+            inj[r] = DeviceBuffer(static_cast<std::size_t>(kStreams) * T * 4);
+            ws[r]  = std::make_unique<WorkspaceArena>(
+                ops::hyper_connection_mix_workspace_bytes(T, T, true));
+            norm[r]         = to_device(bits(f.norm));
+            down[r]         = to_device(f.down.payload);
+            up[r]           = to_device(f.up.payload);
             weights[r].norm = Tensor(norm[r].p, DType::BF16, {kWide});
             weights[r].down = f.down.device_weight(down[r].p);
             weights[r].up   = f.up.device_weight(up[r].p);
@@ -646,11 +666,12 @@ void bench(const ExecutionContext& ec, const Fixture& f) {
                     Tensor tr(res[r].p, DType::BF16, {kWide, T});
                     Tensor tm(mix[r].p, DType::BF16, {kHidden, T});
                     Tensor ti(inj[r].p, DType::FP32, {kStreams, T});
-                    ops::hyper_connection_mix(tr, weights[r], kEps, tm, &ti, *ws[r], ec.dev[r]->stream);
+                    ops::hyper_connection_mix(tr, weights[r], kEps, tm, &ti, *ws[r],
+                                              ec.dev[r]->stream);
                 }
             }
         });
-        const double split = time_graph([&] {
+        const double split      = time_graph([&] {
             for (int m = 0; m < kMixers; ++m) { call.run_split(ec, f, mailbox_events); }
         });
         std::printf("  %d  %8.2f  %8.2f\n", T, replicated, split);

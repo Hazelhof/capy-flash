@@ -32,8 +32,7 @@ struct PlannedPool {
     std::size_t bytes = 0;
 };
 
-PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
-                      bool ple = false) {
+PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false, bool ple = false) {
     q36::StateImageSpec spec{
         .linear =
             {

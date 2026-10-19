@@ -167,12 +167,12 @@ public:
         // The mailbox is qualified between GPUs without peer access, where the staged copies go
         // through host memory. With direct P2P the copies stay the captured transport.
         if (peer_access) { options.tp_mailbox = false; }
-        auto constructed  = runtime::construct_model(options, execution);
-        active            = std::move(constructed.instance);
-        load              = std::move(constructed.load);
+        auto constructed    = runtime::construct_model(options, execution);
+        active              = std::move(constructed.instance);
+        load                = std::move(constructed.load);
         load.cuda_sync_mode = device.sync_mode();
         load.peer_access    = peer_access;
-        sampling_defaults = active->frontend.sampling_defaults();
+        sampling_defaults   = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         if (options.purpose == EnginePurpose::CausalScoring) {
             core = std::make_unique<ScoringCore>(*active, device);

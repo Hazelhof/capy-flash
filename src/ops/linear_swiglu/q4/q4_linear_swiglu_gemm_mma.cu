@@ -66,7 +66,7 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x,
     // most kNarrowTailCols columns measured cheaper on the narrow routes than a second 128-wide
     // tile that would be almost entirely empty, so that remainder is launched on its own; any wider
     // remainder keeps the single wide launch.
-    constexpr std::int32_t kBlockCols     = GateUpC128Cfg::BN;
+    constexpr std::int32_t kBlockCols      = GateUpC128Cfg::BN;
     constexpr std::int32_t kNarrowTailCols = 40;
     constexpr std::int32_t kExactTailCols  = 24;
 
@@ -79,8 +79,8 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x,
     }
 
     const std::int32_t wide_cols = blocks * kBlockCols;
-    const Tensor x_wide = x.slice(1, 0, wide_cols);
-    Tensor out_wide     = out.slice(1, 0, wide_cols);
+    const Tensor x_wide          = x.slice(1, 0, wide_cols);
+    Tensor out_wide              = out.slice(1, 0, wide_cols);
     q4_linear_swiglu_mma_split_half_pair_r32_c128_launch(x_wide, weight, out_wide, stream);
     const Tensor x_tail = x.slice(1, wide_cols, tail);
     Tensor out_tail     = out.slice(1, wide_cols, tail);

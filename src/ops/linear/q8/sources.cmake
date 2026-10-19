@@ -3,6 +3,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/q8_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8_simt.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8_gemv.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/q8_warp_row.cu"
   "${CMAKE_CURRENT_LIST_DIR}/q8_dispatch.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k2048.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/n1024_k5120.cpp"
@@ -35,4 +36,5 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n2560_k3072.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n640_k2560.cu"
   "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_n96_k2560.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/shapes/qwen4_warp_row.cpp"
 )

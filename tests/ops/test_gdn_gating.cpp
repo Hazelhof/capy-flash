@@ -82,15 +82,17 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
     std::vector<std::uint16_t> ab_bits(2 * elements);
     for (std::int32_t t = 0; t < tokens; ++t) {
         for (std::int32_t h = 0; h < heads; ++h) {
-            ab_bits[static_cast<std::size_t>(t) * 2 * heads + h] = a_bits[static_cast<std::size_t>(t) * heads + h];
-            ab_bits[static_cast<std::size_t>(t) * 2 * heads + heads + h] = b_bits[static_cast<std::size_t>(t) * heads + h];
+            ab_bits[static_cast<std::size_t>(t) * 2 * heads + h] =
+                a_bits[static_cast<std::size_t>(t) * heads + h];
+            ab_bits[static_cast<std::size_t>(t) * 2 * heads + heads + h] =
+                b_bits[static_cast<std::size_t>(t) * heads + h];
         }
     }
-    DeviceBuffer device_ab                  = to_device(ab_bits);
-    DeviceBuffer device_a                   = to_device(a_bits);
-    DeviceBuffer device_b                   = to_device(b_bits);
-    DeviceBuffer device_a_log               = to_device(a_log);
-    DeviceBuffer device_dt_bias             = to_device(dt_bias);
+    DeviceBuffer device_ab      = to_device(ab_bits);
+    DeviceBuffer device_a       = to_device(a_bits);
+    DeviceBuffer device_b       = to_device(b_bits);
+    DeviceBuffer device_a_log   = to_device(a_log);
+    DeviceBuffer device_dt_bias = to_device(dt_bias);
     GuardedDeviceBuffer device_g(elements * sizeof(float));
     GuardedDeviceBuffer device_beta(elements * sizeof(float));
     device_g.fill(0xff);
@@ -112,10 +114,9 @@ int run_case(std::int32_t tokens, std::uint32_t seed, bool stress_transcendental
                     nullptr);
     cuda_synchronize();
 
-    const std::string label = std::string("gdn_gating H=") + std::to_string(heads) +
-                              " T=" + std::to_string(tokens) +
-                              (stress_transcendentals ? " transcendental-range" : "") +
-                              (packed ? " packed a|b" : "");
+    const std::string label =
+        std::string("gdn_gating H=") + std::to_string(heads) + " T=" + std::to_string(tokens) +
+        (stress_transcendentals ? " transcendental-range" : "") + (packed ? " packed a|b" : "");
     int failures = 0;
     failures += verify_pointwise((label + " g").c_str(), read_fp32(device_g.data(), elements),
                                  reference_g, kGdnGatingFp32);

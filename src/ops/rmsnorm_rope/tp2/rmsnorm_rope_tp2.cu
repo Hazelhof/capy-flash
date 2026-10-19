@@ -18,10 +18,10 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr int kHeadDim     = 128;
-constexpr int kQueryHeads  = 16;
-constexpr int kKeyHeads    = 4;
-constexpr int kQueryCtas   = kQueryHeads / 8;
+constexpr int kHeadDim    = 128;
+constexpr int kQueryHeads = 16;
+constexpr int kKeyHeads   = 4;
+constexpr int kQueryCtas  = kQueryHeads / 8;
 
 __global__ __launch_bounds__(256) void rmsnorm_rope_d128_head_block_kernel(
     const std::int32_t* __restrict__ positions, const __nv_bfloat16* __restrict__ q_norm,
@@ -47,10 +47,10 @@ __global__ __launch_bounds__(256) void rmsnorm_rope_d128_head_block_kernel(
     if (!query && head >= kKeyHeads) { return; }
     const std::int64_t base =
         (static_cast<std::int64_t>(token) * (query ? kQueryHeads : kKeyHeads) + head) * kPairs;
-    const auto out = detail::rmsnorm_rope_d128_head(data[base + lane], data[base + lane + 32],
-                                                    weight_cache[lane], weight_cache[lane + 32],
-                                                    cos_cache, sin_cache, lane);
-    data[base + lane]      = out.first;
+    const auto out    = detail::rmsnorm_rope_d128_head(data[base + lane], data[base + lane + 32],
+                                                       weight_cache[lane], weight_cache[lane + 32],
+                                                       cos_cache, sin_cache, lane);
+    data[base + lane] = out.first;
     data[base + lane + 32] = out.second;
 }
 
@@ -93,8 +93,8 @@ void rmsnorm_rope_head_block(const Tensor& positions, const Tensor& q_norm_weigh
     rmsnorm_rope_d128_head_block_kernel<<<grid, 256, 0, stream>>>(
         static_cast<const std::int32_t*>(positions.data),
         static_cast<const __nv_bfloat16*>(q_norm_weight.data),
-        static_cast<const __nv_bfloat16*>(k_norm_weight.data),
-        static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data));
+        static_cast<const __nv_bfloat16*>(k_norm_weight.data), static_cast<__nv_bfloat16*>(q.data),
+        static_cast<__nv_bfloat16*>(k.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

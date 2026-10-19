@@ -12,8 +12,8 @@ namespace ninfer::ops::detail::nvfp4_qwen4 {
 // NINFER_T49_NVFP4=<v> selects a candidate for every shape here; unset = the shape's selection.
 using PZ = Nvfp4ActivationStage;
 template <int KWarps, int MinBlocks, int Stages, int RowTiles>
-using Sliced = Nvfp4A16SlicedKMmaSchedule<KWarps, 8, MinBlocks, Cache::ca, Cache::cg, PZ::PaddedZero,
-                                          Stages, RowTiles>;
+using Sliced = Nvfp4A16SlicedKMmaSchedule<KWarps, 8, MinBlocks, Cache::ca, Cache::cg,
+                                          PZ::PaddedZero, Stages, RowTiles>;
 
 inline int variant() {
     static const int v = [] {
@@ -28,16 +28,26 @@ Nvfp4Launch candidate(int v) {
     constexpr int K = Geometry::kInputRows;
     using Base      = Nvfp4SlicedInstance<8, 8, 2>;
     switch (v) {
-    case 1: return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 2, 2, 2>>;   // 32 rows per CTA
-    case 2: return nvfp4_linear_a16_sliced_k<Geometry, Sliced<4, 3, 2, 1>>;   // BlockK 256
-    case 3: return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 3, 2, 1>>;   // 3 CTAs per SM
-    case 4: return nvfp4_linear_a16_sliced_k<Geometry, Sliced<4, 2, 2, 2>>;   // BlockK 256, 32 rows
-    case 5: return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 2, 1, 1>>;   // one stage
+    case 1:
+        return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 2, 2, 2>>; // 32 rows per CTA
+    case 2:
+        return nvfp4_linear_a16_sliced_k<Geometry, Sliced<4, 3, 2, 1>>; // BlockK 256
+    case 3:
+        return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 3, 2, 1>>; // 3 CTAs per SM
+    case 4:
+        return nvfp4_linear_a16_sliced_k<Geometry, Sliced<4, 2, 2, 2>>; // BlockK 256, 32 rows
+    case 5:
+        return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 2, 1, 1>>; // one stage
     case 6:
-        if constexpr (K % 1024 == 0) { return nvfp4_linear_a16_sliced_k<Geometry, Sliced<16, 1, 2, 1>>; }
-        else { return nvfp4_linear_a16_sliced_k<Geometry, Base>; }
-    case 7: return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 4, 2, 1>>;   // 4 CTAs per SM
-    default: return nvfp4_linear_a16_sliced_k<Geometry, Base>;
+        if constexpr (K % 1024 == 0) {
+            return nvfp4_linear_a16_sliced_k<Geometry, Sliced<16, 1, 2, 1>>;
+        } else {
+            return nvfp4_linear_a16_sliced_k<Geometry, Base>;
+        }
+    case 7:
+        return nvfp4_linear_a16_sliced_k<Geometry, Sliced<8, 4, 2, 1>>; // 4 CTAs per SM
+    default:
+        return nvfp4_linear_a16_sliced_k<Geometry, Base>;
     }
 }
 

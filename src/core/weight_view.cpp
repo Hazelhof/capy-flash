@@ -84,7 +84,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     WeightGeometry out;
     out.format        = format;
     out.divisor_count = divisors;
-    out.layout = layout;
+    out.layout        = layout;
     out.shape.assign(shape.begin(), shape.end());
     out.elements = weight_element_count(shape);
     if (layout == QuantLayout::Contiguous) {
@@ -146,6 +146,30 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_bytes_per_row = k / 16;
         out.code_bytes          = out.elements / 2;
         out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::BlockScaleK32) {
+        // MXFP8: row-major N x K E4M3FN codes, then (256-aligned) row-major N x K/32 UE8M0 scales.
+        if (format != QType::MXFP8_E4M3FN_G32_UE8M0 || k % 32) {
+            throw std::invalid_argument("MXFP8 BlockScaleK32 requires K%32=0");
+        }
+        out.group_size          = 32;
+        out.code_bytes_per_row  = k;
+        out.scale_bytes_per_row = k / 32;
+        out.code_bytes          = out.elements;
+        out.scale_offset        = aligned(out.code_bytes, 256);
+    } else if (layout == QuantLayout::RowInterleaved) {
+        // Row-scaled NVFP4 is one plane of N rows of K/2 + K/16 bytes: the E2M1 codes (element 2j
+        // in the low nibble of byte j), then the row's E4M3FN group scales. code_bytes_per_row is
+        // that row stride and scale_offset the scales' offset inside a row; there is no separate
+        // scale plane (scale_bytes = 0). The FP32 tensor multiplier is a separate parameter.
+        if (format != QType::NVFP4_ROW_E4M3_G16 || k % 16) {
+            throw std::invalid_argument("row-scaled NVFP4 RowInterleaved requires K%16=0");
+        }
+        out.group_size          = 16;
+        out.code_bytes_per_row  = k / 2 + k / 16;
+        out.scale_bytes_per_row = k / 16;
+        out.scale_offset        = k / 2;
+        out.bytes = out.code_bytes = mul(n, out.code_bytes_per_row);
+        return out;
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
@@ -186,7 +210,7 @@ std::vector<ByteSpan> weight_row_block_spans(const WeightGeometry& g, std::uint6
             out.push_back({offset, bytes});
         }
     };
-    if (g.layout == QuantLayout::Contiguous) {
+    if (g.layout == QuantLayout::Contiguous || g.layout == QuantLayout::RowInterleaved) {
         const auto row_bytes = g.code_bytes / rows;
         push(mul(row_begin, row_bytes), mul(row_count, row_bytes));
         return out;
@@ -260,6 +284,12 @@ std::uint64_t weight_scale_offset(const WeightGeometry& geometry, std::uint64_t 
         return geometry.scale_offset + (row / 128 * (geometry.shape[1] / 64) + group / 4) * 512 +
                inner % 32 * 16 + inner / 32 * 4 + group % 4;
     }
+    if (geometry.layout == QuantLayout::RowInterleaved) {
+        return row * geometry.code_bytes_per_row + geometry.scale_offset + group;
+    }
+    if (geometry.layout == QuantLayout::BlockScaleK32) {
+        return geometry.scale_offset + row * geometry.scale_bytes_per_row + group;
+    }
     return geometry.scale_offset + row * geometry.scale_bytes_per_row + group * 2;
 }
 
@@ -282,6 +312,12 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
         out.high = parent.data + g.high_offset + out.row_begin * out.high_row_bytes;
     }
     out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4;
+    if (g.layout == QuantLayout::RowInterleaved) {
+        // One interleaved plane: both pointers advance by the row stride.
+        out.scales          = out.codes + g.scale_offset;
+        out.scale_row_bytes = g.code_bytes_per_row;
+        return out;
+    }
     if (g.scale_bytes) {
         out.scales = parent.data + g.scale_offset +
                      (out.swizzled_scales ? 0 : out.row_begin * out.scale_row_bytes);
@@ -330,6 +366,10 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         throw std::invalid_argument(
             "a stacked NVFP4 plane has one divisor per source matrix; no native linear reads it");
     }
+    if (g.layout == QuantLayout::RowInterleaved) {
+        throw std::invalid_argument(
+            "a row-scaled NVFP4 table is read by row gathers, not as a native Weight");
+    }
     const auto planes = weight_row_planes(region);
     if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&
         !is_complete_weight(view)) {
@@ -358,6 +398,14 @@ Weight native_weight(const WeightView& view, float input_divisor) {
         out.scale_nb[1] = out.scale_nb[2] = out.scale_nb[3] = static_cast<std::int64_t>(out.n) * 2;
     } else if (g.layout == QuantLayout::BlockScaleK16M128x4) {
         out.scale_dtype = DType::FP8_E4M3FN;
+    } else if (g.layout == QuantLayout::BlockScaleK32) {
+        // MXFP8: row-major UE8M0 words, K/32 per row; a row view starts at its own rows.
+        out.scale_dtype = DType::U8;
+        out.scale_ne[0] = dimension(g.scale_bytes_per_row);
+        out.scale_ne[1] = out.n;
+        out.scale_nb[0] = 1;
+        out.scale_nb[1] = static_cast<std::int64_t>(g.scale_bytes_per_row);
+        out.scale_nb[2] = out.scale_nb[3] = out.scale_nb[1] * out.n;
     }
     return out;
 }

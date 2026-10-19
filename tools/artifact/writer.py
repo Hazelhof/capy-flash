@@ -39,31 +39,18 @@ def layout_directory(
     integer(max_file_bytes, "maximum file bytes", positive=True)
     value = deepcopy(description)
     value["files"] = [{"path": None, "payload_bytes": payload_bytes}]
-    reserve = (
-        align_up(HEADER.size + len(encode_directory(value)), PAYLOAD_ALIGNMENT)
-        - HEADER.size
-    )
+    reserve = align_up(HEADER.size + len(encode_directory(value)), PAYLOAD_ALIGNMENT) - HEADER.size
     while True:
         entry_start = integer(HEADER.size + reserve, "entry payload offset")
         if entry_start >= max_file_bytes:
-            raise ArtifactError(
-                "maximum file bytes cannot contain the entry metadata and payload"
-            )
+            raise ArtifactError("maximum file bytes cannot contain the entry metadata and payload")
         if entry_start + payload_bytes <= max_file_bytes:
             files = [{"path": None, "payload_bytes": payload_bytes}]
         else:
-            entry_capacity = (
-                (max_file_bytes - entry_start) // PAYLOAD_ALIGNMENT * PAYLOAD_ALIGNMENT
-            )
-            part_capacity = (
-                (max_file_bytes - PAYLOAD_ALIGNMENT)
-                // PAYLOAD_ALIGNMENT
-                * PAYLOAD_ALIGNMENT
-            )
+            entry_capacity = (max_file_bytes - entry_start) // PAYLOAD_ALIGNMENT * PAYLOAD_ALIGNMENT
+            part_capacity = (max_file_bytes - PAYLOAD_ALIGNMENT) // PAYLOAD_ALIGNMENT * PAYLOAD_ALIGNMENT
             if min(entry_capacity, part_capacity) <= 0:
-                raise ArtifactError(
-                    "maximum file bytes cannot contain a positive aligned segment"
-                )
+                raise ArtifactError("maximum file bytes cannot contain a positive aligned segment")
             files = [{"path": None, "payload_bytes": entry_capacity}]
             remaining = payload_bytes - entry_capacity
             while remaining:
@@ -90,13 +77,9 @@ class _Coverage:
     def add(self, begin: int, end: int, label: str) -> None:
         index = bisect_left(self.ranges, (begin, end))
         if index and self.ranges[index - 1][1] > begin:
-            raise ArtifactError(
-                f"{label}: duplicate output coverage at [{begin},{end})"
-            )
+            raise ArtifactError(f"{label}: duplicate output coverage at [{begin},{end})")
         if index < len(self.ranges) and self.ranges[index][0] < end:
-            raise ArtifactError(
-                f"{label}: duplicate output coverage at [{begin},{end})"
-            )
+            raise ArtifactError(f"{label}: duplicate output coverage at [{begin},{end})")
         if index and self.ranges[index - 1][1] == begin:
             begin = self.ranges.pop(index - 1)[0]
             index -= 1
@@ -142,9 +125,7 @@ class ArtifactWriter:
         self._prefixes = [0]
         for file in self.directory.files:
             self._prefixes.append(self._prefixes[-1] + file.payload_bytes)
-        self._destinations = [self.path] + [
-            self.path.parent / file.path for file in self.directory.files[1:]
-        ]
+        self._destinations = [self.path] + [self.path.parent / file.path for file in self.directory.files[1:]]
         for target in self._destinations:
             if target.exists():
                 raise FileExistsError(target)
@@ -156,12 +137,8 @@ class ArtifactWriter:
         self._failed = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            for index, (target, file) in enumerate(
-                zip(self._destinations, self.directory.files)
-            ):
-                fd, temporary = tempfile.mkstemp(
-                    prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
-                )
+            for index, (target, file) in enumerate(zip(self._destinations, self.directory.files)):
+                fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
                 self._fds.append(fd)
                 self._temporary.append(Path(temporary))
                 start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
@@ -202,9 +179,7 @@ class ArtifactWriter:
             cursor += count
             offset += count
 
-    def write_region(
-        self, object_id: str, offset: int, data: bytes | bytearray | memoryview
-    ) -> None:
+    def write_region(self, object_id: str, offset: int, data: bytes | bytearray | memoryview) -> None:
         if not self._fds or self._finished or self._failed:
             raise ArtifactError("writer is closed or has failed")
         try:
@@ -215,9 +190,7 @@ class ArtifactWriter:
         view = memoryview(data).cast("B")
         end = integer(offset + len(view), f"{object_id} output end")
         if end > obj.bytes:
-            raise ArtifactError(
-                f"{object_id}: output [{offset},{end}) exceeds {obj.bytes} bytes"
-            )
+            raise ArtifactError(f"{object_id}: output [{offset},{end}) exceeds {obj.bytes} bytes")
         if not view:
             return
         try:
@@ -258,9 +231,7 @@ class ArtifactWriter:
                 start = self.payload_offset if index == 0 else PAYLOAD_ALIGNMENT
                 expected = start + self.directory.files[index].payload_bytes
                 if os.fstat(fd).st_size != expected:
-                    raise ArtifactError(
-                        f"file {index}: output length does not match directory"
-                    )
+                    raise ArtifactError(f"file {index}: output length does not match directory")
             self._writeback.flush()
             while self._fds:
                 os.close(self._fds.pop())

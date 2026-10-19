@@ -263,6 +263,16 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
         parent[r] = nvfp4_a16_parent_row<Schedule>(block, local0 + r, rows, policy);
+    // As in the SIMT kernel: lane r reads the residual of row r before the K loop.
+    constexpr bool kPreload = LinearPreloadedEpilogue<Epilogue> && !Rows::kPaired;
+    float preloaded         = 0.0f;
+    if constexpr (kPreload) {
+        int row = parent[0];
+#pragma unroll
+        for (int i = 1; i < Schedule::kRowsPerWarp; ++i)
+            if (lane == i) row = parent[i];
+        if (lane < Schedule::kRowsPerWarp) preloaded = epilogue.load(row, 0);
+    }
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, alpha, parent, local0, lane,
                                            accumulators);
@@ -273,6 +283,18 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 #pragma unroll
         for (int c = 0; c < Schedule::kAccumulatorChains; ++c) sum += accumulators[r][c];
         totals[r] = warp_reduce_sum(sum);
+    }
+    if constexpr (kPreload) {
+        float loaded[Schedule::kRowsPerWarp];
+#pragma unroll
+        for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+            loaded[r] = __shfl_sync(0xffffffffU, preloaded, r);
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+                output.store(parent[r], 0, epilogue.apply_loaded(totals[r], loaded[r]));
+        }
+        return;
     }
     if (lane == 0) {
 #pragma unroll

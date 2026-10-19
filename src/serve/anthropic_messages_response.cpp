@@ -192,7 +192,7 @@ std::string encode_thinking_signature(std::string_view reasoning) {
     for (std::size_t i = 0; i < reasoning.size(); i += 3) {
         const std::size_t left = reasoning.size() - i;
         std::uint32_t group    = static_cast<std::uint32_t>(static_cast<std::uint8_t>(reasoning[i]))
-                                 << 16;
+                              << 16;
         if (left > 1) {
             group |= static_cast<std::uint32_t>(static_cast<std::uint8_t>(reasoning[i + 1])) << 8;
         }

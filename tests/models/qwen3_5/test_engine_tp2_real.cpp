@@ -170,8 +170,8 @@ int exercise_concurrent(ninfer::Engine& engine) {
 
 int exercise_prefix_reuse(ninfer::Engine& engine) {
     const auto conversation = [] {
-        ninfer::PromptInput input = user_prompt(
-            "Remember the code 4817 and the color green. For now, reply only: OK.");
+        ninfer::PromptInput input =
+            user_prompt("Remember the code 4817 and the color green. For now, reply only: OK.");
         input.context_cache.session_key = "tp2-real";
         input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
         return input;

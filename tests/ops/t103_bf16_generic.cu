@@ -27,7 +27,8 @@ using namespace ninfer;
 namespace {
 
 void check(cudaError_t e, const char* what) {
-    if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
+    if (e != cudaSuccess)
+        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
 std::uint16_t to_bf16(float f) {
@@ -46,7 +47,11 @@ float from_bf16(std::uint16_t h) {
 
 struct Device {
     void* p = nullptr;
-    explicit Device(std::size_t bytes) { check(cudaMalloc(&p, std::max<std::size_t>(bytes, 16)), "malloc"); }
+
+    explicit Device(std::size_t bytes) {
+        check(cudaMalloc(&p, std::max<std::size_t>(bytes, 16)), "malloc");
+    }
+
     ~Device() { cudaFree(p); }
 };
 
@@ -58,14 +63,15 @@ Weight bf16_weight(const void* data, int n, int k) {
     w.ndim          = 2;
     w.n = w.shape[0] = w.padded_shape[0] = n;
     w.k = w.shape[1] = w.padded_shape[1] = k;
-    w.layout        = QuantLayout::Contiguous;
-    w.qdata         = data;
+    w.layout                             = QuantLayout::Contiguous;
+    w.qdata                              = data;
     return w;
 }
 
 bool run_case(int n, int k, int tokens, std::mt19937& rng, bool versus_registered) {
     std::normal_distribution<float> normal(0.0F, 1.0F);
-    std::vector<std::uint16_t> hw(static_cast<std::size_t>(n) * k), hx(static_cast<std::size_t>(k) * tokens);
+    std::vector<std::uint16_t> hw(static_cast<std::size_t>(n) * k),
+        hx(static_cast<std::size_t>(k) * tokens);
     const float ws = 1.0F / std::sqrt(static_cast<float>(k));
     for (auto& v : hw) v = to_bf16(normal(rng) * ws);
     for (auto& v : hx) v = to_bf16(normal(rng) * 2.0F);
@@ -119,7 +125,7 @@ bool run_case(int n, int k, int tokens, std::mt19937& rng, bool versus_registere
         const std::uint16_t* wr = hw.data() + static_cast<std::size_t>(r) * k;
         for (int t = 0; t < tokens; ++t) {
             const double* xc = xf.data() + static_cast<std::size_t>(t) * k;
-            double s = 0;
+            double s         = 0;
             for (int c = 0; c < k; ++c) s += static_cast<double>(from_bf16(wr[c])) * xc[c];
             const double g = from_bf16(got[static_cast<std::size_t>(t) * n + r]);
             num += (g - s) * (g - s);
@@ -131,8 +137,8 @@ bool run_case(int n, int k, int tokens, std::mt19937& rng, bool versus_registere
     const double rel = std::sqrt(num / std::max(den, 1e-30));
     // One BF16 rounding of the output is ~2^-9 relative on average (relL2 ~2.3e-3 at most).
     const bool ok = rel < 4e-3 && maxd <= maxr * 8e-3 + 1e-6;
-    std::printf("%s n=%d k=%d T=%d rows=%zu relL2 %.2e max|d|/max|ref| %.2e\n", ok ? "PASS" : "FAIL", n, k,
-                tokens, rows.size(), rel, maxd / std::max(maxr, 1e-30));
+    std::printf("%s n=%d k=%d T=%d rows=%zu relL2 %.2e max|d|/max|ref| %.2e\n",
+                ok ? "PASS" : "FAIL", n, k, tokens, rows.size(), rel, maxd / std::max(maxr, 1e-30));
     return ok;
 }
 
@@ -141,14 +147,16 @@ bool run_case(int n, int k, int tokens, std::mt19937& rng, bool versus_registere
 int main() {
     try {
         std::mt19937 rng(103);
+
         struct Shape {
             int n, k;
         };
+
         // Flash-Next BF16 projections (tp 1 and the tp 2 shards), then odd shapes (scalar route,
         // partial tiles).
-        const Shape shapes[] = {{640, 2560},  {324, 10240}, {320, 10240}, {10240, 320},
-                                {16384, 2560}, {8192, 2560}, {2560, 6144}, {2560, 3072},
-                                {100, 72},    {33, 37},     {4100, 200}};
+        const Shape shapes[]     = {{640, 2560},   {324, 10240}, {320, 10240}, {10240, 320},
+                                    {16384, 2560}, {8192, 2560}, {2560, 6144}, {2560, 3072},
+                                    {100, 72},     {33, 37},     {4100, 200}};
         const int token_counts[] = {1, 2, 3, 4, 7, 8, 9, 16, 17, 63, 64, 65, 300, 1024};
         int failures = 0, cases = 0;
         for (const auto& s : shapes) {

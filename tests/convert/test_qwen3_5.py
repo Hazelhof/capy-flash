@@ -38,13 +38,7 @@ def _config(*, moe=False):
     else:
         text["intermediate_size"] = 24
     return {
-        "architectures": [
-            (
-                "Qwen3_5MoeForConditionalGeneration"
-                if moe
-                else "Qwen3_5ForConditionalGeneration"
-            )
-        ],
+        "architectures": [("Qwen3_5MoeForConditionalGeneration" if moe else "Qwen3_5ForConditionalGeneration")],
         "text_config": text,
         "vision_config": {
             "depth": 1,
@@ -69,16 +63,12 @@ def _checkpoint(path, config, tensors):
         "generation_config.json": {},
         "preprocessor_config.json": {
             "patch_size": config.get("vision_config", {}).get("patch_size", 16),
-            "temporal_patch_size": config.get("vision_config", {}).get(
-                "temporal_patch_size", 2
-            ),
+            "temporal_patch_size": config.get("vision_config", {}).get("temporal_patch_size", 2),
             "merge_size": config.get("vision_config", {}).get("spatial_merge_size", 2),
         },
         "video_preprocessor_config.json": {
             "patch_size": config.get("vision_config", {}).get("patch_size", 16),
-            "temporal_patch_size": config.get("vision_config", {}).get(
-                "temporal_patch_size", 2
-            ),
+            "temporal_patch_size": config.get("vision_config", {}).get("temporal_patch_size", 2),
             "merge_size": config.get("vision_config", {}).get("spatial_merge_size", 2),
         },
     }.items():
@@ -110,32 +100,18 @@ def test_model_mapping_preserves_query_gate_gdn_mtp_and_vision_axes(tmp_path):
         model = build_model(source, components=("text", "mtp", "vision"))
         expected_query = q_gate.reshape(2, 2, 8, 16)[:, 0].reshape(16, 16)
         expected_gate = q_gate.reshape(2, 2, 8, 16)[:, 1].reshape(16, 16)
-        assert torch.equal(
-            _values(model, "text/layers/1/attention/query"), expected_query
-        )
-        assert torch.equal(
-            _values(model, "text/layers/1/attention/gate"), expected_gate
-        )
-        assert torch.equal(
-            _values(model, "mtp/layers/0/attention/query"), expected_query + 1000
-        )
+        assert torch.equal(_values(model, "text/layers/1/attention/query"), expected_query)
+        assert torch.equal(_values(model, "text/layers/1/attention/gate"), expected_gate)
+        assert torch.equal(_values(model, "mtp/layers/0/attention/query"), expected_query + 1000)
         for role, indices in (
             ("query", slice(0, 4)),
             ("key", slice(4, 8)),
             ("value", slice(8, 16)),
         ):
-            assert torch.equal(
-                _values(model, f"text/layers/0/gdn/{role}"), qkv[indices]
-            )
-        assert torch.equal(
-            _values(model, "text/layers/0/gdn/convolution"), conv[:, 0, :].T
-        )
-        assert torch.equal(
-            _values(model, "vision/patch_embedding"), patch.reshape(8, 12)
-        )
-        assert torch.equal(
-            _values(model, "vision/layers/0/attention/key_bias"), vision_bias[8:16]
-        )
+            assert torch.equal(_values(model, f"text/layers/0/gdn/{role}"), qkv[indices])
+        assert torch.equal(_values(model, "text/layers/0/gdn/convolution"), conv[:, 0, :].T)
+        assert torch.equal(_values(model, "vision/patch_embedding"), patch.reshape(8, 12))
+        assert torch.equal(_values(model, "vision/layers/0/attention/key_bias"), vision_bias[8:16])
         assert model.parameters["text/output_head"].inputs == (
             "text/final_hidden",
             "mtp/final_hidden",
@@ -192,9 +168,7 @@ def test_optional_components_are_selected_before_sources_are_required(tmp_path):
 
 
 @pytest.mark.parametrize("architecture", ["DFlashDraftModel", "DFlash2DraftModel"])
-def test_draft_query_context_and_dynamic_weights_keep_their_uses(
-    tmp_path, architecture
-):
+def test_draft_query_context_and_dynamic_weights_keep_their_uses(tmp_path, architecture):
     backend = "dflash2" if architecture == "DFlash2DraftModel" else "dflash"
     draft = {
         "architectures": [architecture],
@@ -230,25 +204,15 @@ def test_draft_query_context_and_dynamic_weights_keep_their_uses(
             },
         ) as companion,
     ):
-        model = build_model(
-            base, components=("text", backend), companions={backend: companion}
-        )
+        model = build_model(base, components=("text", backend), companions={backend: companion})
         prefix = f"{backend}/layers/0/attention/"
         assert torch.equal(_values(model, prefix + "key"), key)
         assert torch.equal(_values(model, prefix + "context_key"), key)
-        assert model.parameters[prefix + "key"].inputs == (
-            f"{backend}/layers/0/query_projection_input",
-        )
-        assert model.parameters[prefix + "context_key"].inputs == (
-            f"{backend}/context_input",
-        )
-        assert model.components[backend]["config"]["dflash_config"][
-            "target_layer_ids"
-        ] == [1, 0]
+        assert model.parameters[prefix + "key"].inputs == (f"{backend}/layers/0/query_projection_input",)
+        assert model.parameters[prefix + "context_key"].inputs == (f"{backend}/context_input",)
+        assert model.components[backend]["config"]["dflash_config"]["target_layer_ids"] == [1, 0]
         if backend == "dflash2":
-            assert torch.equal(
-                _values(model, f"{backend}/layers/0/attention_conv/base_kernel"), kernel
-            )
+            assert torch.equal(_values(model, f"{backend}/layers/0/attention_conv/base_kernel"), kernel)
         other_config = deepcopy(draft)
         other_config["dflash_config"].update(mask_token_id=6, selector_top_k=3)
         features = torch.arange(16 * 32).float().reshape(16, 32)
@@ -331,9 +295,7 @@ def test_additional_source_checks_mapping_geometry_without_release_pinning(tmp_p
         query = "text/layers/1/attention/query"
         selected = model.source(query, other).values().reshape(16, 16)
         assert torch.equal(selected, torch.cat((q_gate[:8], q_gate[16:24])))
-        assert torch.equal(
-            model.source(query, tensor_only).values().reshape(16, 16), selected
-        )
+        assert torch.equal(model.source(query, tensor_only).values().reshape(16, 16), selected)
         # Shape alone cannot distinguish [2 heads, 2 projections, 8 rows]
         # from [4 heads, 2 projections, 4 rows]. Never silently reuse row ranges.
         with pytest.raises(ValueError, match="additional source head_dim differs"):
@@ -373,9 +335,7 @@ def test_rope_aliases_preserve_supported_parameters_and_reject_changed_mathemati
     assert result["rope_parameters"] == {"rope_theta": 500_000}
     assert result["layer_types"] == ["full_attention"] * 5 + ["sliding_attention"]
     del draft["max_window_layers"]
-    assert (
-        draft_config(draft, target, "dflash")["layer_types"] == ["full_attention"] * 6
-    )
+    assert draft_config(draft, target, "dflash")["layer_types"] == ["full_attention"] * 6
     draft["layer_types"] = ["sliding_attention"] * 6
     assert draft_config(draft, target, "dflash")["layer_types"] == draft["layer_types"]
     draft["rope_scaling"] = {"rope_type": "linear", "factor": 2, "rope_theta": 500_000}
@@ -385,16 +345,10 @@ def test_rope_aliases_preserve_supported_parameters_and_reject_changed_mathemati
 
 def test_selected_vision_processor_geometry_is_checked_before_conversion(tmp_path):
     bad = tmp_path / "custom-processor.json"
-    bad.write_text(
-        json.dumps({"patch_size": 99, "temporal_patch_size": 1, "merge_size": 2})
-    )
-    with _checkpoint(
-        tmp_path / "source", _config(), {"unused": torch.ones(1)}
-    ) as source:
+    bad.write_text(json.dumps({"patch_size": 99, "temporal_patch_size": 1, "merge_size": 2}))
+    with _checkpoint(tmp_path / "source", _config(), {"unused": torch.ones(1)}) as source:
         for role in ("preprocessor_config.json", "video_preprocessor_config.json"):
-            with pytest.raises(
-                ValueError, match="patch_size differs from Vision config"
-            ):
+            with pytest.raises(ValueError, match="patch_size differs from Vision config"):
                 build_model(
                     source,
                     components=("text", "vision"),

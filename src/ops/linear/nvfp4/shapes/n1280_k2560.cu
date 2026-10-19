@@ -4,14 +4,16 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
-// Qwen3.8-Flash-Next at one device (NVFP4-dense recipe): shared expert gate|up. A16 only; schedules inherited from
-// n14336_k5120.cu through n8192_k2560.cu, not re-measured at this shape. No A4 route: uses_a4 is always false.
+// Qwen3.8-Flash-Next at one device (NVFP4-dense recipe): shared expert gate|up. A16 only; schedules
+// inherited from n14336_k5120.cu through n8192_k2560.cu, not re-measured at this shape. No A4
+// route: uses_a4 is always false.
 namespace {
 using Geometry = Nvfp4Geometry<1280, 2560>;
-using Gemv = Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+using Gemv =
+    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 using C2 = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+                                Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;

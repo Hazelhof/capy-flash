@@ -1,5 +1,5 @@
-// Translation-unit fragment of src/ops/wrapper/gdn_input_proj.cpp, included once at its end (after its
-// closing namespace), so the two-device code below shares that file's private helpers without
+// Translation-unit fragment of src/ops/wrapper/gdn_input_proj.cpp, included once at its end (after
+// its closing namespace), so the two-device code below shares that file's private helpers without
 // copying them. Not a header. Our file; see docs/maintainer/upstream-merge.md.
 //
 // Two-device (tp 2) forms of gdn_input_proj, declared in ninfer/ops/tp2/gdn_input_proj.h.
@@ -100,8 +100,7 @@ std::size_t conv_shard_projection_bytes(QType qtype, LinearPolicy policy, std::i
         return detail::nvfp4_a4_workspace_capacity_bytes(columns, kShardHidden);
     }
     return detail::fp8_a8_workspace_capacity_bytes(
-        columns, kShardHidden,
-        detail::fp8_gdn_input_shard_partial_capacity_bytes(columns));
+        columns, kShardHidden, detail::fp8_gdn_input_shard_partial_capacity_bytes(columns));
 }
 
 } // namespace
@@ -151,8 +150,8 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
         Tensor qkv_out  = qkv[slot];
         Tensor z_out    = z[slot];
         if (query_key_value_z_weight[slot].qtype == QType::NVFP4) {
-            detail::nvfp4_gdn_input_shard_dispatch(x[slot], query_key_value_z_weight[slot],
-                                                   qkv_out, z_out, policy, workspace[slot],
+            detail::nvfp4_gdn_input_shard_dispatch(x[slot], query_key_value_z_weight[slot], qkv_out,
+                                                   z_out, policy, workspace[slot],
                                                    ec.dev[slot]->stream);
         } else {
             detail::fp8_gdn_input_shard_dispatch(x[slot], query_key_value_z_weight[slot], qkv_out,

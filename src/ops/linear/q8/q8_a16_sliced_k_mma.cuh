@@ -381,7 +381,7 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             } else if constexpr (requires {
                                      epilogue.apply_row(
                                          output, cta_row0, column_offset,
-                                         *reinterpret_cast<const float(*)[ActiveCols]>(partial),
+                                         *reinterpret_cast<const float (*)[ActiveCols]>(partial),
                                          live_columns);
                                  }) {
                 if (col0 < ActiveCols) {
@@ -407,9 +407,10 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
             }
         }
         if constexpr (requires {
-                          epilogue.apply_row(output, cta_row0, column_offset,
-                                             *reinterpret_cast<const float(*)[ActiveCols]>(partial),
-                                             live_columns);
+                          epilogue.apply_row(
+                              output, cta_row0, column_offset,
+                              *reinterpret_cast<const float (*)[ActiveCols]>(partial),
+                              live_columns);
                       }) {
             __syncwarp();
             if (lane < kRowsPerCta && (FullWeights || cta_row0 + lane < operands.rows)) {

@@ -49,15 +49,14 @@ __global__ void ple_gate_kernel(const __nv_bfloat16* __restrict__ residual,
                                 __nv_bfloat16* __restrict__ gated, std::int32_t width,
                                 std::int32_t streams, float eps) {
     __shared__ float scratch[32];
-    const std::int32_t s      = static_cast<std::int32_t>(blockIdx.x) % streams;
-    const std::int64_t column = static_cast<std::int64_t>(blockIdx.x) / streams;
-    const std::int64_t base =
-        column * width * streams + static_cast<std::int64_t>(s) * width;
+    const std::int32_t s         = static_cast<std::int32_t>(blockIdx.x) % streams;
+    const std::int64_t column    = static_cast<std::int64_t>(blockIdx.x) / streams;
+    const std::int64_t base      = column * width * streams + static_cast<std::int64_t>(s) * width;
     const std::int64_t norm_base = static_cast<std::int64_t>(s) * width;
     // key_value column: [key (S*H) ; value (H)].
-    const __nv_bfloat16* key   = key_value + column * width * (streams + 1) + norm_base;
-    const __nv_bfloat16* value = key_value + column * width * (streams + 1) +
-                                 static_cast<std::int64_t>(streams) * width;
+    const __nv_bfloat16* key = key_value + column * width * (streams + 1) + norm_base;
+    const __nv_bfloat16* value =
+        key_value + column * width * (streams + 1) + static_cast<std::int64_t>(streams) * width;
     float qq = 0.0F, kk = 0.0F, qk = 0.0F;
     for (int h = static_cast<int>(threadIdx.x); h < width; h += blockDim.x) {
         const float q = __bfloat162float(residual[base + h]);
@@ -67,15 +66,15 @@ __global__ void ple_gate_kernel(const __nv_bfloat16* __restrict__ residual,
         qk            = fmaf(q * (1.0F + __bfloat162float(query_norm[norm_base + h])),
                              k * (1.0F + __bfloat162float(key_norm[norm_base + h])), qk);
     }
-    qq                 = block_sum(qq, scratch);
-    kk                 = block_sum(kk, scratch);
-    qk                 = block_sum(qk, scratch);
-    const float inv_h  = 1.0F / static_cast<float>(width);
-    const float g      = qk * rsqrtf(qq * inv_h + eps) * rsqrtf(kk * inv_h + eps) *
+    qq                = block_sum(qq, scratch);
+    kk                = block_sum(kk, scratch);
+    qk                = block_sum(qk, scratch);
+    const float inv_h = 1.0F / static_cast<float>(width);
+    const float g     = qk * rsqrtf(qq * inv_h + eps) * rsqrtf(kk * inv_h + eps) *
                     rsqrtf(static_cast<float>(width));
-    const float root   = sqrtf(fmaxf(fabsf(g), 1e-6F));
-    const float sign   = g > 0.0F ? 1.0F : (g < 0.0F ? -1.0F : 0.0F);
-    const float gate   = sigmoid(sign * root);
+    const float root = sqrtf(fmaxf(fabsf(g), 1e-6F));
+    const float sign = g > 0.0F ? 1.0F : (g < 0.0F ? -1.0F : 0.0F);
+    const float gate = sigmoid(sign * root);
     for (int h = static_cast<int>(threadIdx.x); h < width; h += blockDim.x) {
         gated[base + h] = __float2bfloat16_rn(gate * __bfloat162float(value[h]));
     }
@@ -120,17 +119,14 @@ __global__ void ple_dilated_conv_kernel(const __nv_bfloat16* __restrict__ normed
 // One thread per (lane, channel). The block spans every lane for its channel tile, so a lane's
 // source rows are snapshotted into registers before the barrier: reads never observe another
 // lane's destination write (a lane's source slot may equal another lane's destination slot).
-__global__ void ple_conv_advance_kernel(const __nv_bfloat16* __restrict__ normed,
-                                        const std::int32_t* __restrict__ valid_columns,
-                                        __nv_bfloat16* __restrict__ states,
-                                        const std::int32_t* __restrict__ source_slots,
-                                        const std::int32_t* __restrict__ destination_slots,
-                                        std::int32_t channels, std::int32_t width,
-                                        std::int32_t lanes, std::int32_t tile,
-                                        std::int32_t history) {
+__global__ void ple_conv_advance_kernel(
+    const __nv_bfloat16* __restrict__ normed, const std::int32_t* __restrict__ valid_columns,
+    __nv_bfloat16* __restrict__ states, const std::int32_t* __restrict__ source_slots,
+    const std::int32_t* __restrict__ destination_slots, std::int32_t channels, std::int32_t width,
+    std::int32_t lanes, std::int32_t tile, std::int32_t history) {
     const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x) / tile;
     const std::int32_t c    = static_cast<std::int32_t>(blockIdx.x) * tile +
-                              static_cast<std::int32_t>(threadIdx.x) % tile;
+                           static_cast<std::int32_t>(threadIdx.x) % tile;
     __nv_bfloat16 values[kMaximumHistory];
     if (c < channels) {
         std::int32_t count = width;
@@ -138,12 +134,11 @@ __global__ void ple_conv_advance_kernel(const __nv_bfloat16* __restrict__ normed
         const std::int64_t source = source_slots[lane];
         for (std::int32_t r = 0; r < history; ++r) {
             const std::int32_t index = count + r;
-            values[r] =
-                index < history
-                    ? states[(source * history + index) * channels + c]
-                    : normed[(static_cast<std::int64_t>(lane) * width + (index - history)) *
-                                 channels +
-                             c];
+            values[r]                = index < history
+                                           ? states[(source * history + index) * channels + c]
+                                           : normed[(static_cast<std::int64_t>(lane) * width + (index - history)) *
+                                         channels +
+                                     c];
         }
     }
     __syncthreads();

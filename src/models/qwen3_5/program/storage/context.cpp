@@ -1770,6 +1770,64 @@ ProgramImpl::demote_retained_shared_kv_for_lease(const SharedPrefixHandle& share
     } catch (...) { std::terminate(); }
 }
 
+bool ProgramImpl::idle_device_kv_offload() const noexcept {
+    return qwen4_elastic != nullptr && host_kv_extents != nullptr;
+}
+
+std::optional<std::size_t>
+ProgramImpl::idle_device_kv_host_bytes(const ContinuationHandle& continuation) const noexcept {
+    if (!idle_device_kv_offload() || !valid_continuation(continuation)) { return std::nullopt; }
+    try {
+        const SequenceState& sequence = continuation_states[ContractAccess::index(continuation)];
+        if (sequence.state.fork_pending || !sequence.kv) { return std::nullopt; }
+        detail::PhysicalResources deficit;
+        deficit.device.main_kv_pages    = std::numeric_limits<std::uint32_t>::max();
+        deficit.device.backend_kv_pages = std::numeric_limits<std::uint32_t>::max();
+        const std::optional<qwen3_5::detail::PressureDecision> option =
+            inspect_pressure_option(sequence, deficit, nullptr, nullptr, {}, {}, nullptr);
+        if (!option || (option->main_kv_changes.empty() && option->backend_kv_changes.empty())) {
+            return std::nullopt;
+        }
+        return option->effect.added.host.kv_bytes;
+    } catch (...) { return std::nullopt; }
+}
+
+std::size_t ProgramImpl::host_kv_free_bytes() const noexcept {
+    return host_kv_arena ? host_kv_arena->free_bytes() : 0U;
+}
+
+DeviceKVCompaction ProgramImpl::compact_device_kv() {
+    DeviceKVCompaction out;
+    if (!idle_device_kv_offload() || has_context_transaction() || pending_transaction_) {
+        return out;
+    }
+    for (const RequestControl& request : requests) {
+        // A prompt in flight still borrows expert slots and maps its KV chunk by chunk.
+        if (request.lifecycle != Lifecycle::Empty && request.lifecycle != Lifecycle::Active) {
+            return out;
+        }
+    }
+    out.ran            = true;
+    out.columns_before = qwen4_elastic->stats().columns;
+    // Physical moves only: every copy is ordered on the compute streams before any later launch,
+    // and the execution rows of the active addresses name the new pages before it.
+    out.moved_pages = text_kv_pages->compact_device_replicas(device.stream);
+    if (backend_kv_pages) {
+        out.moved_pages += backend_kv_pages->compact_device_replicas(device.stream);
+    }
+    if (out.moved_pages != 0) {
+        text_kv_addresses->republish_active(device.stream);
+        if (backend_kv_addresses) { backend_kv_addresses->republish_active(device.stream); }
+    }
+    if (qwen4_elastic->shrinkable()) {
+        // The released granules held pages read by the copies above.
+        synchronize_devices();
+        qwen4_elastic->shrink_to_live();
+    }
+    out.columns_after = qwen4_elastic->stats().columns;
+    return out;
+}
+
 DeviceKVPages
 ProgramImpl::retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept {
     if (!valid_shared_prefix(shared)) { return {}; }

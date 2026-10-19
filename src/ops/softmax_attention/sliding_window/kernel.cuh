@@ -11,7 +11,9 @@ struct SlidingWindowAttentionPolicy {
     int padded_context;
     int window_mask;
 
-    __device__ __forceinline__ int context_count(int value) const { return min(value, window_mask); }
+    __device__ __forceinline__ int context_count(int value) const {
+        return min(value, window_mask);
+    }
 
     __device__ __forceinline__ int query_position(int token) const { return positions[token]; }
 
@@ -53,24 +55,21 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
     SlidingWindowAttentionPolicy policy{
         .positions      = batch_positions,
         .padded_context = padded_context,
-        .window_mask = window_mask,
+        .window_mask    = window_mask,
     };
-    context_query_split_partial_body<SlidingWindowAttentionPolicy, Tokens, WarpsPerCta,
-                                     KeyBlock, DirectOutput, float, QHeads, KVHeads>(
+    context_query_split_partial_body<SlidingWindowAttentionPolicy, Tokens, WarpsPerCta, KeyBlock,
+                                     DirectOutput, float, QHeads, KVHeads>(
         q, query_k, query_v, valid_columns, context_k, context_v, policy,
         DirectOutput && valid_columns[batch] == 0 ? 0 : batch_positions[0], max_context,
         split_capacity, scale, partial_acc, partial_m, partial_l, out);
 }
 
 template <int Tokens, int KeyBlock, int WarpsPerBlock, int QHeads = kContextQueryQHeads>
-__launch_bounds__(WarpsPerBlock * 32, 2) __global__
-    void sliding_window_attention_reduce_kernel(const float* __restrict__ partial_acc,
-                                                const float* __restrict__ partial_m,
-                                                const float* __restrict__ partial_l,
-                                                const std::int32_t* __restrict__ positions,
-                                                const std::int32_t* __restrict__ valid_columns,
-                                                int window_mask, int max_context, int split_capacity,
-                                                __nv_bfloat16* __restrict__ out) {
+__launch_bounds__(WarpsPerBlock * 32, 2) __global__ void sliding_window_attention_reduce_kernel(
+    const float* __restrict__ partial_acc, const float* __restrict__ partial_m,
+    const float* __restrict__ partial_l, const std::int32_t* __restrict__ positions,
+    const std::int32_t* __restrict__ valid_columns, int window_mask, int max_context,
+    int split_capacity, __nv_bfloat16* __restrict__ out) {
     static_assert(WarpsPerBlock >= 1 && WarpsPerBlock <= 8);
     constexpr int MaxSplits = 32;
     constexpr unsigned Mask = 0xffffffffu;
@@ -97,7 +96,7 @@ __launch_bounds__(WarpsPerBlock * 32, 2) __global__
     if (length < 0 || length > max_context || token >= valid_columns[batch]) {
 #pragma unroll
         for (int item = 0; item < 4; ++item) {
-            const int d                                  = lane + item * 32;
+            const int d                                          = lane + item * 32;
             out[context_query_q_index<QHeads>(q_head, d, token)] = __float2bfloat16(0.0f);
         }
         return;

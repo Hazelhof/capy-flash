@@ -1,7 +1,8 @@
-// Translation-unit fragment of src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu,
-// included once at its end (after its closing namespace): the finish half of the materialized route
-// as its own Op (ninfer/ops/tp2/dynamic_grouped_conv.h), launching that file's finish_kernel.
-// Not a header. Our file; see docs/maintainer/upstream-merge.md.
+// Translation-unit fragment of
+// src/ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_materialized.cu, included once at its
+// end (after its closing namespace): the finish half of the materialized route as its own Op
+// (ninfer/ops/tp2/dynamic_grouped_conv.h), launching that file's finish_kernel. Not a header. Our
+// file; see docs/maintainer/upstream-merge.md.
 
 #include "ninfer/ops/tp2/dynamic_grouped_conv.h"
 

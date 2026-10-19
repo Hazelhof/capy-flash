@@ -31,35 +31,58 @@ namespace {
 
 const char* update_result_name(cudaGraphExecUpdateResult result) noexcept {
     switch (result) {
-    case cudaGraphExecUpdateSuccess: return "success";
-    case cudaGraphExecUpdateError: return "error";
-    case cudaGraphExecUpdateErrorTopologyChanged: return "topology changed";
-    case cudaGraphExecUpdateErrorNodeTypeChanged: return "node type changed";
-    case cudaGraphExecUpdateErrorFunctionChanged: return "function changed";
-    case cudaGraphExecUpdateErrorParametersChanged: return "parameters changed";
-    case cudaGraphExecUpdateErrorNotSupported: return "not supported";
-    case cudaGraphExecUpdateErrorUnsupportedFunctionChange: return "unsupported function change";
-    case cudaGraphExecUpdateErrorAttributesChanged: return "attributes changed";
+    case cudaGraphExecUpdateSuccess:
+        return "success";
+    case cudaGraphExecUpdateError:
+        return "error";
+    case cudaGraphExecUpdateErrorTopologyChanged:
+        return "topology changed";
+    case cudaGraphExecUpdateErrorNodeTypeChanged:
+        return "node type changed";
+    case cudaGraphExecUpdateErrorFunctionChanged:
+        return "function changed";
+    case cudaGraphExecUpdateErrorParametersChanged:
+        return "parameters changed";
+    case cudaGraphExecUpdateErrorNotSupported:
+        return "not supported";
+    case cudaGraphExecUpdateErrorUnsupportedFunctionChange:
+        return "unsupported function change";
+    case cudaGraphExecUpdateErrorAttributesChanged:
+        return "attributes changed";
     }
     return "unknown";
 }
 
 const char* node_type_name(cudaGraphNodeType type) noexcept {
     switch (type) {
-    case cudaGraphNodeTypeKernel: return "kernel";
-    case cudaGraphNodeTypeMemcpy: return "memcpy";
-    case cudaGraphNodeTypeMemset: return "memset";
-    case cudaGraphNodeTypeHost: return "host";
-    case cudaGraphNodeTypeGraph: return "child graph";
-    case cudaGraphNodeTypeEmpty: return "empty";
-    case cudaGraphNodeTypeWaitEvent: return "event wait";
-    case cudaGraphNodeTypeEventRecord: return "event record";
-    case cudaGraphNodeTypeExtSemaphoreSignal: return "external semaphore signal";
-    case cudaGraphNodeTypeExtSemaphoreWait: return "external semaphore wait";
-    case cudaGraphNodeTypeMemAlloc: return "memory allocation";
-    case cudaGraphNodeTypeMemFree: return "memory free";
-    case cudaGraphNodeTypeConditional: return "conditional";
-    default: return "other";
+    case cudaGraphNodeTypeKernel:
+        return "kernel";
+    case cudaGraphNodeTypeMemcpy:
+        return "memcpy";
+    case cudaGraphNodeTypeMemset:
+        return "memset";
+    case cudaGraphNodeTypeHost:
+        return "host";
+    case cudaGraphNodeTypeGraph:
+        return "child graph";
+    case cudaGraphNodeTypeEmpty:
+        return "empty";
+    case cudaGraphNodeTypeWaitEvent:
+        return "event wait";
+    case cudaGraphNodeTypeEventRecord:
+        return "event record";
+    case cudaGraphNodeTypeExtSemaphoreSignal:
+        return "external semaphore signal";
+    case cudaGraphNodeTypeExtSemaphoreWait:
+        return "external semaphore wait";
+    case cudaGraphNodeTypeMemAlloc:
+        return "memory allocation";
+    case cudaGraphNodeTypeMemFree:
+        return "memory free";
+    case cudaGraphNodeTypeConditional:
+        return "conditional";
+    default:
+        return "other";
     }
 }
 
@@ -72,10 +95,14 @@ std::string pointer_residence(const void* pointer) {
         return "unknown";
     }
     switch (attributes.type) {
-    case cudaMemoryTypeDevice: return "device " + std::to_string(attributes.device);
-    case cudaMemoryTypeHost: return "host";
-    case cudaMemoryTypeManaged: return "managed";
-    default: return "unregistered host";
+    case cudaMemoryTypeDevice:
+        return "device " + std::to_string(attributes.device);
+    case cudaMemoryTypeHost:
+        return "host";
+    case cudaMemoryTypeManaged:
+        return "managed";
+    default:
+        return "unregistered host";
     }
 }
 
@@ -83,7 +110,7 @@ std::string pointer_residence(const void* pointer) {
 // nothing when it named none. Diagnostic only: a failing query is reported, never thrown.
 std::string describe_node(const char* label, cudaGraphNode_t node) {
     if (node == nullptr) { return {}; }
-    std::string text = std::string(", ") + label + " node ";
+    std::string text       = std::string(", ") + label + " node ";
     cudaGraphNodeType type = cudaGraphNodeTypeEmpty;
     if (cudaGraphNodeGetType(node, &type) != cudaSuccess) {
         (void)cudaGetLastError();
@@ -126,8 +153,8 @@ std::string describe_node(const char* label, cudaGraphNode_t node) {
 
 std::string describe_update_failure(cudaError_t err, const cudaGraphExecUpdateResultInfo& info) {
     return std::string(cudaGetErrorName(err)) + " (update result " +
-           std::to_string(static_cast<int>(info.result)) + ", " +
-           update_result_name(info.result) + describe_node("rejected", info.errorNode) +
+           std::to_string(static_cast<int>(info.result)) + ", " + update_result_name(info.result) +
+           describe_node("rejected", info.errorNode) +
            describe_node("installed", info.errorFromNode) + ")";
 }
 

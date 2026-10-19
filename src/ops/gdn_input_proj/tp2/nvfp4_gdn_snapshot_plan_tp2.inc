@@ -1,8 +1,10 @@
-// Translation-unit fragment of src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp, included once at its end (after its
-// closing namespace), so the two-device code below shares that file's private helpers without
-// copying them. Not a header. Our file; see docs/maintainer/upstream-merge.md.
+// Translation-unit fragment of src/ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan.cpp, included
+// once at its end (after its closing namespace), so the two-device code below shares that file's
+// private helpers without copying them. Not a header. Our file; see
+// docs/maintainer/upstream-merge.md.
 //
-// The A4 frontier of the snapshot and record forms, for the two-device shard (nvfp4_gdn_input_shard.h).
+// The A4 frontier of the snapshot and record forms, for the two-device shard
+// (nvfp4_gdn_input_shard.h).
 
 #include "ops/gdn_input_proj/tp2/nvfp4_gdn_input_shard.h"
 

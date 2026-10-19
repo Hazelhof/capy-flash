@@ -5,19 +5,23 @@
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
-// Qwen3.8-Flash-Next: GDN in_proj qkv+z, one TP2 rank (10240/2 + 6144/2). A16 only (decode); schedules inherited from n14336_k5120.cu,
-// not re-measured at this shape. No A4 route: uses_a4 is always false.
+// Qwen3.8-Flash-Next: GDN in_proj qkv+z, one TP2 rank (10240/2 + 6144/2). A16 only (decode);
+// schedules inherited from n14336_k5120.cu, not re-measured at this shape. No A4 route: uses_a4 is
+// always false.
 namespace {
 using Geometry = Nvfp4Geometry<8192, 2560>;
-using Gemv = Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+using Gemv =
+    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
 using C2 = Nvfp4A16SimtSchedule<8, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+                                Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 
 Nvfp4Launch select_a16(int tokens) {
     if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
     if (tokens <= 2) return nvfp4_linear_a16_simt<Geometry, 2, C2, true>;
-    if (tokens <= 8) return nvfp4_qwen4::select_t8<Geometry>(1); // T49 sweep: 32-row CTAs, 24.6 -> 22.5 us at T=4
+    if (tokens <= 8)
+        return nvfp4_qwen4::select_t8<Geometry>(
+            1); // T49 sweep: 32-row CTAs, 24.6 -> 22.5 us at T=4
     if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2>>;
     if (tokens <= 64)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<32, 64, 128, 16, 16, 1, 3>>;

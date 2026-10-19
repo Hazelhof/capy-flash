@@ -22,24 +22,14 @@ from tools.convert.sources.logical import EncodedRows, LogicalSource, array_sour
 def _model(names=("query", "key", "gate", "value")):
     model = Model({"text": {"config": {}}})
     for index, name in enumerate(names):
-        values = (
-            ((index + 1) * torch.tensor([1, 2, 4, 8], dtype=torch.bfloat16))[:, None]
-            .expand(4, 128)
-            .contiguous()
-        )
-        model.add(
-            Parameter(name, (4, 128), array_source(values, name), inputs=("input",))
-        )
-    model.packing_groups = [
-        group for group in (tuple(names), tuple(names[:2]), tuple(names[2:])) if group
-    ]
+        values = ((index + 1) * torch.tensor([1, 2, 4, 8], dtype=torch.bfloat16))[:, None].expand(4, 128).contiguous()
+        model.add(Parameter(name, (4, 128), array_source(values, name), inputs=("input",)))
+    model.packing_groups = [group for group in (tuple(names), tuple(names[:2]), tuple(names[2:])) if group]
     return model
 
 
 def _write(path, model, prepared):
-    specs = [job.spec for job in prepared.weights] + [
-        spec for spec, _ in prepared.auxiliaries
-    ]
+    specs = [job.spec for job in prepared.weights] + [spec for spec, _ in prepared.auxiliaries]
     with ArtifactWriter(
         path,
         specs,
@@ -57,19 +47,12 @@ def _assert_quantized_rows(artifact, part, amplitudes, format):
     object_id, begin, end = part
     obj = artifact.object(object_id)
     assert obj.format == format and end - begin == len(amplitudes) * 128
-    scales, codes = decode_row_split_codes(
-        artifact.read_object(object_id), format, obj.shape
-    )
+    scales, codes = decode_row_split_codes(artifact.read_object(object_id), format, obj.shape)
     first, last = begin // 128, end // 128
     maximum = {"q4_g64_fp16": 7, "q5_g64_fp16": 15}[format]
     assert bool((codes[first:last] == maximum).all())
-    expected = [
-        struct.unpack("<H", struct.pack("<e", value / maximum))[0]
-        for value in amplitudes
-    ]
-    assert scales[first:last].view(torch.int16).tolist() == [
-        [word, word] for word in expected
-    ]
+    expected = [struct.unpack("<H", struct.pack("<e", value / maximum))[0] for value in amplitudes]
+    assert scales[first:last].view(torch.int16).tolist() == [[word, word] for word in expected]
 
 
 def test_mixed_attention_uses_two_parents_and_distinct_permissions(tmp_path):
@@ -92,8 +75,7 @@ def test_mixed_attention_uses_two_parents_and_distinct_permissions(tmp_path):
     _write(path, model, prepared)
     with Artifact(path) as artifact:
         parts = {
-            name: binding_parts(binding, artifact.by_id)[0]
-            for name, binding in artifact.directory.bindings.items()
+            name: binding_parts(binding, artifact.by_id)[0] for name, binding in artifact.directory.bindings.items()
         }
         assert parts["query"][0] == parts["key"][0]
         assert parts["gate"][0] == parts["value"][0]
@@ -108,10 +90,7 @@ def test_mixed_attention_uses_two_parents_and_distinct_permissions(tmp_path):
                 [(index + 1) * row for row in (1, 2, 4, 8)],
                 format,
             )
-        assert {
-            use["parameter"]: use["activation_policy"]
-            for use in artifact.directory.uses
-        } == {
+        assert {use["parameter"]: use["activation_policy"] for use in artifact.directory.uses} == {
             "query": "AllowA4",
             "key": "AllowA4",
             "gate": "AllowA8",
@@ -131,9 +110,7 @@ def test_row_overrides_preserve_binding_order_and_coverage(tmp_path):
     with Artifact(path) as artifact:
         parts = binding_parts(artifact.directory.bindings["weight"], artifact.by_id)
         assert len(parts) == 3
-        for part, amplitudes, format in zip(
-            parts, ([1], [2, 4], [8]), ("q4_g64_fp16", "q5_g64_fp16", "q4_g64_fp16")
-        ):
+        for part, amplitudes, format in zip(parts, ([1], [2, 4], [8]), ("q4_g64_fp16", "q5_g64_fp16", "q4_g64_fp16")):
             _assert_quantized_rows(artifact, part, amplitudes, format)
 
 
@@ -156,12 +133,8 @@ def test_shared_weight_keeps_use_independent_and_can_be_overridden():
 
 
 def _encoded_source(name, divisor, shift=0):
-    codes = (
-        (torch.arange(128 * 32) + shift).remainder(256).to(torch.uint8).reshape(128, 32)
-    )
-    scales = (
-        (torch.arange(128 * 4) + shift).remainder(127).to(torch.uint8).reshape(128, 4)
-    )
+    codes = (torch.arange(128 * 32) + shift).remainder(256).to(torch.uint8).reshape(128, 32)
+    scales = (torch.arange(128 * 4) + shift).remainder(127).to(torch.uint8).reshape(128, 4)
     word = struct.pack("<f", divisor)
 
     def no_values(begin, end):
@@ -172,9 +145,7 @@ def _encoded_source(name, divisor, shift=0):
             (128, 64),
             name,
             no_values,
-            lambda begin, end: EncodedRows(
-                "nvfp4", codes[begin:end], scales[begin:end], word
-            ),
+            lambda begin, end: EncodedRows("nvfp4", codes[begin:end], scales[begin:end], word),
             lambda: word,
         ),
         codes,
@@ -209,9 +180,7 @@ def test_nvfp4_encoded_only_import_streams_complete_parent_tiles(tmp_path):
     )
     with Artifact(path) as artifact:
         assert artifact.read_object(prepared.weights[0].spec.id) == expected
-        assert artifact.read_object(prepared.auxiliaries[0][0].id) == struct.pack(
-            "<f", 1.5
-        )
+        assert artifact.read_object(prepared.auxiliaries[0][0].id) == struct.pack("<f", 1.5)
 
 
 def test_incompatible_nvfp4_divisors_keep_default_parents_separate(tmp_path):
@@ -242,9 +211,9 @@ def test_incompatible_nvfp4_divisors_keep_default_parents_separate(tmp_path):
         code_bytes, scale_bytes = single.code_plane_bytes, single.scale_plane_bytes
         assert raw[index * code_bytes : (index + 1) * code_bytes] == own[:code_bytes]
         first = stacked.scale_plane_offset + index * scale_bytes
-        assert raw[first : first + scale_bytes] == own[
-            single.scale_plane_offset : single.scale_plane_offset + scale_bytes
-        ]
+        assert (
+            raw[first : first + scale_bytes] == own[single.scale_plane_offset : single.scale_plane_offset + scale_bytes]
+        )
         word = stacked.weight_divisor_offset + 4 * index
         assert raw[word : word + 4] == own[single.weight_divisor_offset :]
     # A stack needs complete sources of equal rows.

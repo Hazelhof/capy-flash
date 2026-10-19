@@ -12,6 +12,7 @@ silent bug after an upstream change, and this script fails on both:
    would be processed with the renames in the shard's translation unit and differ from the parent's.
 
 Exit 0 when clean, 1 with a report otherwise."""
+
 import os
 import re
 import sys

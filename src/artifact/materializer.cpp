@@ -54,8 +54,10 @@ void require_host_memory(std::uint64_t bytes) {
         if (key == "MemTotal:") { total_kib = value; }
         if (key == "MemAvailable:") { available_kib = value; }
     }
-    if (total_kib == 0 || available_kib == 0) { return; } // unreadable: no guard rather than a false refusal
-    constexpr std::uint64_t kGiB = 1ULL << 30;
+    if (total_kib == 0 || available_kib == 0) {
+        return;
+    } // unreadable: no guard rather than a false refusal
+    constexpr std::uint64_t kGiB  = 1ULL << 30;
     const std::uint64_t total     = total_kib * 1024;
     const std::uint64_t available = available_kib * 1024;
     const std::uint64_t reserve   = std::max<std::uint64_t>(2 * kGiB, total / 20);
@@ -69,7 +71,8 @@ void require_host_memory(std::uint64_t bytes) {
     };
     throw ArtifactError("not enough free RAM for the host-mapped weights: they need " + gib(bytes) +
                         " of page-locked memory plus a " + gib(reserve) + " reserve, and " +
-                        gib(available) + " is available (MemAvailable). Free memory (another model "
+                        gib(available) +
+                        " is available (MemAvailable). Free memory (another model "
                         "still loaded?) or set NINFER_RAM_GUARD=0 to start anyway");
 #else
     (void)bytes;
@@ -127,8 +130,8 @@ public:
     Slot(std::size_t bytes, const DeviceSelection& selection)
         : buffer(bytes + kPayloadAlignment),
           data(static_cast<std::byte*>(buffer.data()) +
-               (kPayloadAlignment - reinterpret_cast<std::uintptr_t>(buffer.data()) %
-                                        kPayloadAlignment) %
+               (kPayloadAlignment -
+                reinterpret_cast<std::uintptr_t>(buffer.data()) % kPayloadAlignment) %
                    kPayloadAlignment) {
         try {
             for (std::size_t i = 0; i < selection.size(); ++i) {
@@ -526,9 +529,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
         }
         require_host_memory(plan.host_mapped_bytes);
         try {
-            out.host_mapped_ = std::make_unique<PinnedHostBuffer>(
-                static_cast<std::size_t>(plan.host_mapped_bytes), HostMapping::Yes,
-                PinnedHostPages::Huge);
+            out.host_mapped_ =
+                std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(plan.host_mapped_bytes),
+                                                   HostMapping::Yes, PinnedHostPages::Huge);
         } catch (const std::exception& error) {
             throw ArtifactError("host-mapped weight buffer of " +
                                 std::to_string(plan.host_mapped_bytes) + " bytes: " + error.what());
@@ -560,9 +563,9 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 throw ArtifactError("invalid or duplicate host-mapped placement");
             }
             placed[placement.object.index] = true;
-            end                = placement.offset + placement.bytes;
-            const auto bytes   = std::span(host + placement.offset,
-                                           static_cast<std::size_t>(placement.bytes));
+            end                            = placement.offset + placement.bytes;
+            const auto bytes =
+                std::span(host + placement.offset, static_cast<std::size_t>(placement.bytes));
             const auto payload = static_cast<std::size_t>(descriptor.bytes);
             reads.push_back({descriptor.offset, bytes.first(payload)});
             // Padding after the stored payload reads as zero, as in a device arena.
@@ -740,8 +743,7 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             const auto remaining = span.end - source;
             const auto request   = static_cast<std::size_t>(std::min<std::uint64_t>(
                 slot_bytes, align_up(remaining, kPayloadAlignment, "direct block bytes")));
-            const auto received  = reader.read_direct(
-                span.file, source, {slot.data, request});
+            const auto received  = reader.read_direct(span.file, source, {slot.data, request});
             if (received < std::min<std::uint64_t>(request, remaining)) {
                 throw ArtifactError("direct read ended before the required payload");
             }
@@ -762,13 +764,12 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                     const auto end    = std::min(chunk_end, range.end);
                     if (range.device != device || begin >= end) { continue; }
                     if (!fed) { selection.select(device); }
-                    check_cuda(cudaMemcpyAsync(range.destination + (begin - range.begin),
-                                               static_cast<const std::byte*>(slot.data) +
-                                                   (begin - source),
-                                               static_cast<std::size_t>(end - begin),
-                                               cudaMemcpyHostToDevice,
-                                               devices[device]->transfer_stream),
-                               "upload weight bytes");
+                    check_cuda(
+                        cudaMemcpyAsync(range.destination + (begin - range.begin),
+                                        static_cast<const std::byte*>(slot.data) + (begin - source),
+                                        static_cast<std::size_t>(end - begin),
+                                        cudaMemcpyHostToDevice, devices[device]->transfer_stream),
+                        "upload weight bytes");
                     copied = checked_add(copied, end - begin, "copied bytes");
                     out.stats_.per_device_h2d_bytes[device] += end - begin;
                     fed = true;

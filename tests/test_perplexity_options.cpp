@@ -32,7 +32,7 @@ int check(bool condition, const char* message) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures                             = 0;
     const ninfer::perplexity::Options single = parse({});
     failures += check(single.tp == 1 && single.device == 0 && single.devices == std::vector<int>{0},
                       "default is not one rank on device 0");
@@ -46,8 +46,8 @@ int main() {
                       "--tp 2 --devices did not select both ranks with rank 0 first");
     failures += check(parse({"--device", "0", "--tp", "2", "--devices", "0,1"}).device == 0,
                       "--device equal to the rank 0 device was rejected");
-    failures += check(rejects([] { (void)parse({"--tp", "2"}); }),
-                      "--tp 2 was accepted without --devices");
+    failures +=
+        check(rejects([] { (void)parse({"--tp", "2"}); }), "--tp 2 was accepted without --devices");
     failures += check(rejects([] { (void)parse({"--tp", "2", "--devices", "0"}); }),
                       "--devices with fewer ids than --tp was accepted");
     failures += check(rejects([] { (void)parse({"--devices", "0,1"}); }),
@@ -58,8 +58,8 @@ int main() {
     failures += check(rejects([] { (void)parse({"--tp", "3", "--devices", "0,1,2"}); }),
                       "--tp 3 was accepted");
     failures += check(rejects([] { (void)parse({"--tp"}); }), "--tp without a value was accepted");
-    failures += check(ninfer::perplexity::usage_text().find("--tp 1|2 --devices A,B") !=
-                          std::string::npos,
-                      "help omits --tp and --devices");
+    failures +=
+        check(ninfer::perplexity::usage_text().find("--tp 1|2 --devices A,B") != std::string::npos,
+              "help omits --tp and --devices");
     return failures == 0 ? 0 : 1;
 }

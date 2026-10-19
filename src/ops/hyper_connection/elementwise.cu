@@ -162,8 +162,9 @@ __global__ void grouped_offset_rmsnorm_vector_kernel(const __nv_bfloat16* __rest
         }
     }
     const float inv = rsqrtf(block_sum(sum, scratch) / static_cast<float>(width) + eps);
-    const auto* w   = reinterpret_cast<const uint4*>(weight + static_cast<std::int64_t>(group) * width);
-    auto* target    = reinterpret_cast<uint4*>(out + base);
+    const auto* w =
+        reinterpret_cast<const uint4*>(weight + static_cast<std::int64_t>(group) * width);
+    auto* target = reinterpret_cast<uint4*>(out + base);
 #pragma unroll
     for (int c = 0; c < kVectorChunks; ++c) {
         const int chunk = static_cast<int>(threadIdx.x) + c * static_cast<int>(blockDim.x);
@@ -207,11 +208,11 @@ __device__ __forceinline__ uint4 pack8(const float (&f)[8]) {
     return v;
 }
 
-__global__ void hyper_connection_collapse_vector_kernel(const __nv_bfloat16* __restrict__ up,
-                                                        const __nv_bfloat16* __restrict__ normalized,
-                                                        __nv_bfloat16* __restrict__ mixed,
-                                                        std::int32_t width, std::int32_t streams,
-                                                        std::int64_t columns) {
+__global__ void
+hyper_connection_collapse_vector_kernel(const __nv_bfloat16* __restrict__ up,
+                                        const __nv_bfloat16* __restrict__ normalized,
+                                        __nv_bfloat16* __restrict__ mixed, std::int32_t width,
+                                        std::int32_t streams, std::int64_t columns) {
     const std::int32_t chunks = width / 8;
     const std::int64_t total  = static_cast<std::int64_t>(chunks) * columns;
     const float inv_streams   = 1.0F / static_cast<float>(streams);
@@ -263,7 +264,8 @@ __global__ void hyper_connection_combine_vector_kernel(const __nv_bfloat16* __re
 }
 
 bool vector_ready(std::int32_t width, std::int64_t columns, std::initializer_list<const void*> p) {
-    // NINFER_HC_SCALAR=1 keeps the scalar kernels at every width (A/B runs on one binary; same bits).
+    // NINFER_HC_SCALAR=1 keeps the scalar kernels at every width (A/B runs on one binary; same
+    // bits).
     static const bool scalar = [] {
         const char* v = std::getenv("NINFER_HC_SCALAR");
         return v != nullptr && v[0] == '1';
@@ -337,7 +339,8 @@ void hyper_connection_combine_launch(const Tensor& y, const Tensor& inject, Tens
                                      cudaStream_t stream) {
     const std::int64_t columns = y.numel() / y.ne[0];
     if (vector_ready(y.ne[0], columns, {y.data, residual.data})) {
-        hyper_connection_combine_vector_kernel<<<grid_for(residual.numel() / 8), kBlock, 0, stream>>>(
+        hyper_connection_combine_vector_kernel<<<grid_for(residual.numel() / 8), kBlock, 0,
+                                                 stream>>>(
             static_cast<const __nv_bfloat16*>(y.data), static_cast<const float*>(inject.data),
             static_cast<__nv_bfloat16*>(residual.data), y.ne[0], inject.ne[0], columns);
         CUDA_CHECK(cudaGetLastError());

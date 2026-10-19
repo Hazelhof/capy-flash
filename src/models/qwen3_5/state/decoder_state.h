@@ -93,6 +93,7 @@ public:
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
     [[nodiscard]] bool has_qsa_index() const noexcept { return qsa_index_; }
+
     // The QSA index planes of attention layer `layer`, with the batched execution tables (the K/V
     // tables: every row addresses the same pages in every plane). Requires has_qsa_index().
     [[nodiscard]] ops::QsaIndexPlanes qsa_index_planes(std::uint32_t layer) const;

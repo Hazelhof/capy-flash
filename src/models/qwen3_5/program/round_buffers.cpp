@@ -300,14 +300,14 @@ MtpDecodeState::MtpDecodeState(DeviceSpan backing, const MtpDecodeStateLayout& l
         egress_tensor(offsetof(MtpDecodeEgress, accepted_drafts), DType::I32, {batch});
     next_drafts =
         egress_tensor(offsetof(MtpDecodeEgress, next_drafts), DType::I32, {batch, drafts});
-    next_extents     = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
-    next_draft_logprobs = egress_tensor(offsetof(MtpDecodeEgress, next_draft_logprobs),
-                                        DType::FP32, {batch, drafts});
-    verify_ids       = layout.verify_ids.bind(backing);
-    target_positions = layout.target_positions.bind(backing);
-    target_argmax    = layout.target_argmax.bind(backing);
-    target_logits    = layout.target_logits.bind(backing);
-    target_hidden    = layout.target_hidden.bind(backing);
+    next_extents = egress_tensor(offsetof(MtpDecodeEgress, next_extents), DType::I32, {batch});
+    next_draft_logprobs =
+        egress_tensor(offsetof(MtpDecodeEgress, next_draft_logprobs), DType::FP32, {batch, drafts});
+    verify_ids                 = layout.verify_ids.bind(backing);
+    target_positions           = layout.target_positions.bind(backing);
+    target_argmax              = layout.target_argmax.bind(backing);
+    target_logits              = layout.target_logits.bind(backing);
+    target_hidden              = layout.target_hidden.bind(backing);
     target_continuation_hidden = layout.target_continuation_hidden.bind(backing);
     proposal_logits            = layout.proposal_logits.bind(backing);
     alignment_ids              = layout.alignment_ids.bind(backing);

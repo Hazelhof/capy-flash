@@ -13,8 +13,8 @@ namespace {
 
 void require_split_vector(const Tensor& t, DType dtype, std::int32_t rows, std::int32_t columns,
                           const char* op, const char* label) {
-    if (t.dtype != dtype || t.ne[0] != rows || t.ne[1] != columns || t.ne[2] != 1 ||
-        t.ne[3] != 1 || !t.is_contiguous() || t.data == nullptr) {
+    if (t.dtype != dtype || t.ne[0] != rows || t.ne[1] != columns || t.ne[2] != 1 || t.ne[3] != 1 ||
+        !t.is_contiguous() || t.data == nullptr) {
         throw std::invalid_argument(std::string(op) + ": " + label + " must be contiguous " +
                                     (dtype == DType::BF16 ? "BF16 [" : "I32 [") +
                                     std::to_string(rows) + "," + std::to_string(columns) + "]");

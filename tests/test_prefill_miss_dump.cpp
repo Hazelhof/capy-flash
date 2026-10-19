@@ -43,7 +43,7 @@ std::string fake_detokenize(std::span<const ninfer::TokenId> tokens) {
 } // namespace
 
 int main() {
-    int failures = 0;
+    int failures   = 0;
     const Tokens a = iota_tokens(10, 0);
     failures += check(common_prefix_length(a, a) == 10, "common prefix of identical sequences");
     failures += check(common_prefix_length(a, Tokens{0, 1, 9}) == 2, "common prefix stops early");
@@ -83,21 +83,20 @@ int main() {
                           "summary recomputed shared tokens");
         failures += check(summary.at("divergence").at("inside_old_prompt") == true,
                           "summary divergence position");
-        failures += check(summary.at("divergence").at("new_after").get<std::string>().rfind(
-                              "500000 ", 0) == 0,
-                          "summary new text after the divergence");
-        failures += check(summary.at("reading").dump().find("server:") !=
-                              std::string::npos,
+        failures += check(
+            summary.at("divergence").at("new_after").get<std::string>().rfind("500000 ", 0) == 0,
+            "summary new text after the divergence");
+        failures += check(summary.at("reading").dump().find("server:") != std::string::npos,
                           "summary reading for a server-side miss");
     }
 
     // 3. Appending 12000 new tokens to the previous prompt with all of it reused is not a miss.
     const Tokens third        = concat(second, iota_tokens(12000, 700000));
     const Tokens third_output = iota_tokens(500, 950000);
-    failures += check(!dump.observe(third, third_output, static_cast<std::uint32_t>(second.size()),
-                                    "finished")
-                           .has_value(),
-                      "appended-only prompt reported as a miss");
+    failures += check(
+        !dump.observe(third, third_output, static_cast<std::uint32_t>(second.size()), "finished")
+             .has_value(),
+        "appended-only prompt reported as a miss");
 
     // 4. Under half of the prompt shared with any context: not compared.
     const Tokens fourth = concat(iota_tokens(2000, 0), iota_tokens(30000, 800000));
@@ -107,15 +106,14 @@ int main() {
     // 5. Agent turn: the previous output (thinking) is re-rendered differently and a 15300-token
     //    tool result follows, everything shared reused: a long append, not a miss.
     const Tokens fifth = concat(third, iota_tokens(15300, 300000));
-    failures += check(!dump.observe(fifth, {}, static_cast<std::uint32_t>(third.size()),
-                                    "finished")
-                           .has_value(),
-                      "a long tool result after a re-rendered output was dumped");
+    failures += check(
+        !dump.observe(fifth, {}, static_cast<std::uint32_t>(third.size()), "finished").has_value(),
+        "a long tool result after a re-rendered output was dumped");
 
     // 6. The client rewrites history from token 16000 on (31300 tokens of the closest context
     //    after the divergence), the server reuses everything shared: client-side change.
-    const Tokens sixth = concat(Tokens(third.begin(), third.begin() + 16000),
-                                iota_tokens(14000, 400000));
+    const Tokens sixth =
+        concat(Tokens(third.begin(), third.begin() + 16000), iota_tokens(14000, 400000));
     const auto changed = dump.observe(sixth, {}, 16000, "finished");
     failures += check(changed.has_value(), "client-side rewrite not reported");
     if (changed.has_value()) {
@@ -125,8 +123,7 @@ int main() {
         const nlohmann::json summary = nlohmann::json::parse(in);
         failures += check(summary.at("old_tokens_after_divergence") == 31300,
                           "summary old tokens after the divergence");
-        failures += check(summary.at("reading").dump().find("client:") !=
-                              std::string::npos,
+        failures += check(summary.at("reading").dump().find("client:") != std::string::npos,
                           "summary reading for a client-side change");
     }
 

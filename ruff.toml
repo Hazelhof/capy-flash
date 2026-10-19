@@ -1,3 +1,8 @@
-# Errors only (pyflakes, syntax); Python formatting is not enforced yet (.pre-commit-config.yaml).
+# Python: ruff format (line length 120) + lint for errors (F, E9) and statement/import style (E4, E7).
+# E731 (assigned lambdas) and E741 (names like l, O, I) are left as written: renaming is not worth the churn.
+line-length = 120
+extend-exclude = ["third_party"]
+
 [lint]
-select = ["F", "E9"]
+select = ["F", "E4", "E7", "E9"]
+ignore = ["E731", "E741"]

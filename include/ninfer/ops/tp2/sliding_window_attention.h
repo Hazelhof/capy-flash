@@ -1,7 +1,7 @@
 #pragma once
 
-// Two-device (tp 2) form of sliding_window_attention. Our file: ninfer/ops/sliding_window_attention.h
-// is upstream's and carries no hook.
+// Two-device (tp 2) form of sliding_window_attention. Our file:
+// ninfer/ops/sliding_window_attention.h is upstream's and carries no hook.
 
 #include "ninfer/ops/sliding_window_attention.h"
 

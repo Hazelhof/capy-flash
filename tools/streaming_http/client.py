@@ -201,9 +201,7 @@ class StreamingHttpClient:
                 self._host, self._port, timeout=self._timeout
             )
         else:
-            connection = http.client.HTTPConnection(
-                self._host, self._port, timeout=self._timeout
-            )
+            connection = http.client.HTTPConnection(self._host, self._port, timeout=self._timeout)
         connection.connect()
         return connection
 

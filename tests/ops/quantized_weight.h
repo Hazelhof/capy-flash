@@ -318,8 +318,8 @@ struct PatternedWeightOptions {
     // of the parent matrix's block that starts there, because every code and scale is a function
     // of the global coordinate. It is a standalone tensor of the narrowed shape, as a two-device
     // shard is, never a view into the parent payload. NVFP4 needs `row_origin % 128 == 0` and
-    // `column_origin % 64 == 0` (the scale tile); row-split formats need `column_origin % 128 == 0`.
-    // Hashed row-split codes key on the flat group index and reject a non-zero origin. Zero
+    // `column_origin % 64 == 0` (the scale tile); row-split formats need `column_origin % 128 ==
+    // 0`. Hashed row-split codes key on the flat group index and reject a non-zero origin. Zero
     // origins reproduce the unsharded payload byte for byte.
     std::int32_t row_origin    = 0;
     std::int32_t column_origin = 0;
@@ -573,8 +573,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
     const auto group_shift = static_cast<std::uint64_t>(column_origin / spec.group_size);
     if (options.row_split_codes == RowSplitCodePattern::Coordinate) {
         for (std::uint64_t group_index = 0; group_index < groups; ++group_index) {
-            const std::uint64_t row =
-                pattern_row(static_cast<std::int64_t>(group_index / static_cast<std::uint64_t>(kg)));
+            const std::uint64_t row = pattern_row(
+                static_cast<std::int64_t>(group_index / static_cast<std::uint64_t>(kg)));
             const std::uint64_t group = group_index % static_cast<std::uint64_t>(kg);
             if (group >= static_cast<std::uint64_t>(logical_groups)) { continue; }
             const std::uint64_t global_group =
@@ -670,8 +670,8 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         const std::uint64_t scale_index =
             options.row_split_codes == RowSplitCodePattern::Hashed
                 ? (detail::mix64(i ^ (static_cast<std::uint64_t>(seed) << 17)) >> 8) & 3U
-                : (row ^ (row >> 8) ^
-                   pattern_group(static_cast<std::int64_t>(group), group_shift) ^ seed) &
+                : (row ^ (row >> 8) ^ pattern_group(static_cast<std::int64_t>(group), group_shift) ^
+                   seed) &
                       3U;
         detail::store_u16_le(packed.payload,
                              static_cast<std::size_t>(packed.scale_plane_offset + i * 2),

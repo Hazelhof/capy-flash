@@ -87,16 +87,12 @@ def test_result_record_parses_request_host_exposure() -> None:
         },
     }
 
-    record = build_result_record(
-        spec, "measured-prefill-bindings", payload, response, event
-    )
+    record = build_result_record(spec, "measured-prefill-bindings", payload, response, event)
     assert record["schema_version"] == 8
     assert record["kv_dtype"] == "fp8"
     assert record["metrics"]["engine_host_exposed_ms"] == pytest.approx(15.0)
     assert record["metrics"]["decode_host_us_per_round"] == pytest.approx(5000.0)
-    assert record["metrics"]["decode_device_wait_us_per_round"] == pytest.approx(
-        100000.0
-    )
+    assert record["metrics"]["decode_device_wait_us_per_round"] == pytest.approx(100000.0)
 
 
 def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -> None:
@@ -119,22 +115,15 @@ def test_arbitrary_artifact_labels_reach_the_requested_backend(tmp_path: Path) -
         ("org%2Fcustom", "dflash"),
         ("org%2Fcustom", "dflash2"),
     ]
-    assert all(
-        point.artifact == artifact and point.model_id == point.target
-        for point in points
-    )
+    assert all(point.artifact == artifact and point.model_id == point.target for point in points)
     assert len({point.key for point in points}) == len(points)
     for point in points:
         (tmp_path / f"{point.key}.json").write_text("{}")
 
 
-@pytest.mark.parametrize(
-    "kv_dtype,cache_name", [("int8", "int8-group64"), ("fp8", "fp8-e4m3-row256")]
-)
+@pytest.mark.parametrize("kv_dtype,cache_name", [("int8", "int8-group64"), ("fp8", "fp8-e4m3-row256")])
 @pytest.mark.parametrize("concurrent", [False, True])
-def test_selected_kv_reaches_server_and_is_verified(
-    tmp_path, kv_dtype, cache_name, concurrent
-):
+def test_selected_kv_reaches_server_and_is_verified(tmp_path, kv_dtype, cache_name, concurrent):
     artifact = tmp_path / "model.ninfer"
     artifact.touch()
     common = [
@@ -170,13 +159,9 @@ def test_selected_kv_reaches_server_and_is_verified(
         "server_instance_id": "instance",
     }
     if concurrent:
-        args = concurrency.parse_args(
-            common + ["--suite", "decode-saturation", "--concurrency", "1"]
-        )
+        args = concurrency.parse_args(common + ["--suite", "decode-saturation", "--concurrency", "1"])
         point = build_points([("model", artifact)], args)[0]
-        command = concurrency.server_command(
-            Path("serve"), point, tmp_path / "log", args
-        )
+        command = concurrency.server_command(Path("serve"), point, tmp_path / "log", args)
         engine.update(
             kv_capacity_mode="explicit",
             max_concurrency=1,
@@ -199,9 +184,7 @@ def test_selected_kv_reaches_server_and_is_verified(
             Fixture("fixture", [], False, 8, "test"),
             7,
         )
-        command = corpus.server_command(
-            Path("serve"), spec, tmp_path / "log", args.port, args.device
-        )
+        command = corpus.server_command(Path("serve"), spec, tmp_path / "log", args.port, args.device)
         validate = lambda: corpus.validate_server_start(event, spec, args.device)
     assert command[command.index("--kv-dtype") + 1] == kv_dtype
     assert validate() == ("instance", "bindings")

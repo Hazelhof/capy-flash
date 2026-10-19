@@ -497,9 +497,9 @@ void host_mapped_upload(const Fixture& fixture, std::span<DeviceContext* const> 
     binder.set_shard_resolver([&reader](ObjectHandle object, const WeightGeometry&) {
         return host_mapped_resolver(reader, object);
     });
-    const auto parameters = bind_all(binder);
-    auto plan             = std::move(binder).finish();
-    const auto expected   = plan;
+    const auto parameters    = bind_all(binder);
+    auto plan                = std::move(binder).finish();
+    const auto expected      = plan;
     std::uint64_t mapped_end = 0;
     std::uint64_t mapped     = 0;
     std::uint64_t capacity   = 0;

@@ -44,7 +44,7 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 
 int run_case(std::int32_t qk_heads, std::int32_t value_heads, std::int32_t width,
              std::int32_t batch, std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    const bool dense                = valid_columns.empty();
+    const bool dense = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
     const std::int32_t slots         = 8;

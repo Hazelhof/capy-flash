@@ -15,6 +15,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <numeric>
 #include <thread>
 #include <cinttypes>
 #include <stdexcept>
@@ -23,10 +24,10 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
-constexpr std::int32_t kExperts = 512;
-constexpr std::int32_t kTopK    = ops::kMoeSlotsTopK;
-constexpr std::int32_t kHidden  = ops::kMoeSlotsHidden;
-constexpr std::int32_t kInter   = ops::kMoeSlotsIntermediate;
+constexpr std::int32_t kExperts        = 512;
+constexpr std::int32_t kTopK           = ops::kMoeSlotsTopK;
+constexpr std::int32_t kHidden         = ops::kMoeSlotsHidden;
+constexpr std::int32_t kInter          = ops::kMoeSlotsIntermediate;
 constexpr std::int32_t kGateUpDivisors = 2 * kExperts;
 // Routing-log room of a later (MTP) layer beyond one call of the widest kind: a prompt window logs
 // its chunk's call (<= prompt_tokens columns) and then one column per draft (<= 5); a decode window
@@ -42,11 +43,11 @@ Tensor divisor_tensor(const float* data, std::int32_t count) {
 
 ops::MoeSlotsLayer slots_layer(const Qwen4ExpertBank& bank, const float* gate_up_divisors,
                                const float* down_divisors, const Tensor& table) {
-    return ops::MoeSlotsLayer{.slot_table              = table,
-                              .gate_up_divisors        = divisor_tensor(gate_up_divisors, kGateUpDivisors),
-                              .down_divisors           = divisor_tensor(down_divisors, kExperts),
-                              .gate_up_input_divisor   = bank.gate_up_input_divisor,
-                              .down_input_divisor      = bank.down_input_divisor};
+    return ops::MoeSlotsLayer{.slot_table       = table,
+                              .gate_up_divisors = divisor_tensor(gate_up_divisors, kGateUpDivisors),
+                              .down_divisors    = divisor_tensor(down_divisors, kExperts),
+                              .gate_up_input_divisor = bank.gate_up_input_divisor,
+                              .down_input_divisor    = bank.down_input_divisor};
 }
 
 void require_operands(const Tensor& x, const Tensor& ids, const Tensor& weights,
@@ -89,9 +90,9 @@ ops::host::HostExpertLayer host_layer(const Qwen4ExpertBank& bank) {
         .k                = kInter,
         .rows_per_divisor = kHidden,
     };
-    layer.experts      = kExperts;
-    layer.hidden       = kHidden;
-    layer.intermediate = kInter;
+    layer.experts               = kExperts;
+    layer.hidden                = kHidden;
+    layer.intermediate          = kInter;
     layer.gate_up_input_divisor = bank.gate_up_input_divisor; // T98 W4A4 emulation only
     layer.down_input_divisor    = bank.down_input_divisor;
     return layer;
@@ -147,18 +148,20 @@ void write_stats(std::FILE* f, const Qwen4OffloadWindowStats& w, double n) {
                  static_cast<double>(w.fills_pending) / n, w.wall_us / n, w.observe_us / n,
                  w.cpu_us / n, static_cast<double>(w.cpu_experts) / n, w.gpu_resident_us / n,
                  w.gpu_wait_us / n, w.doorbell_us / n, w.bell_after_flag_us / n);
-    std::fprintf(f,
-                 ",\"prefetch_issued\":%.3f,\"prefetch_landed\":%.3f,\"prefetch_used\":%.3f,"
-                 "\"prefetch_used_routes\":%.3f,\"streamed_experts\":%.3f,\"streamed_bytes\":%.1f,"
-                 "\"streamed_layers\":%.3f",
-                 static_cast<double>(w.prefetch_issued) / n, static_cast<double>(w.prefetch_landed) / n,
-                 static_cast<double>(w.prefetch_used) / n,
-                 static_cast<double>(w.prefetch_used_routes) / n);
+    std::fprintf(
+        f,
+        ",\"prefetch_issued\":%.3f,\"prefetch_landed\":%.3f,\"prefetch_used\":%.3f,"
+        "\"prefetch_used_routes\":%.3f,\"streamed_experts\":%.3f,\"streamed_bytes\":%.1f,"
+        "\"streamed_layers\":%.3f",
+        static_cast<double>(w.prefetch_issued) / n, static_cast<double>(w.prefetch_landed) / n,
+        static_cast<double>(w.prefetch_used) / n, static_cast<double>(w.prefetch_used_routes) / n);
     std::fprintf(f, ",\"gpu_read_experts\":%.3f,\"gpu_read_routes\":%.3f,\"host_experts\":%.3f",
-                 static_cast<double>(w.gpu_read_experts) / n, static_cast<double>(w.gpu_read_routes) / n,
+                 static_cast<double>(w.gpu_read_experts) / n,
+                 static_cast<double>(w.gpu_read_routes) / n,
                  static_cast<double>(w.host_experts) / n);
     std::fprintf(f, ",\"streamed_experts\":%.3f,\"streamed_bytes\":%.1f,\"streamed_layers\":%.3f",
-                 static_cast<double>(w.streamed_experts) / n, static_cast<double>(w.streamed_bytes) / n,
+                 static_cast<double>(w.streamed_experts) / n,
+                 static_cast<double>(w.streamed_bytes) / n,
                  static_cast<double>(w.streamed_layers) / n);
 }
 
@@ -167,6 +170,7 @@ void write_stats(std::FILE* f, const Qwen4OffloadWindowStats& w, double n) {
 namespace {
 // Arena allocations round up to this (core/arena.h kArenaAlign is 256).
 constexpr std::size_t kAllocSlack = 256;
+
 std::size_t partial_bytes(std::int32_t columns) {
     return static_cast<std::size_t>(kHidden) * static_cast<std::size_t>(columns) * sizeof(float) +
            kAllocSlack;
@@ -175,7 +179,8 @@ std::size_t partial_bytes(std::int32_t columns) {
 
 std::size_t Qwen4RoutedExperts::workspace_bytes(std::int32_t tokens) {
     const std::int32_t T = std::clamp<std::int32_t>(tokens, 1, ops::kMoeSlotsMaxTokens);
-    const std::size_t slots = 2 * (ops::moe_slots_nvfp4_workspace_bytes(T) + kAllocSlack) + partial_bytes(T);
+    const std::size_t slots =
+        2 * (ops::moe_slots_nvfp4_workspace_bytes(T) + kAllocSlack) + partial_bytes(T);
     // Wider calls may stream the layer and run it grouped (Qwen4OffloadExperts::stream_call).
     if (tokens <= ops::kMoeSlotsMaxTokens) { return slots; }
     return std::max(slots, ops::moe_grouped_nvfp4_workspace_bytes(tokens) + kAllocSlack);
@@ -203,10 +208,18 @@ ops::host::HostMoeSplit host_miss_split(const MissSplitOptions& split) noexcept 
     using Mode = ops::host::HostMoeSplit::Mode;
     ops::host::HostMoeSplit h;
     switch (split.mode) {
-    case MissSplitMode::Off: h.mode = Mode::Off; break;
-    case MissSplitMode::Auto: h.mode = Mode::Cost; break;
-    case MissSplitMode::Fraction: h.mode = Mode::Fraction; break;
-    case MissSplitMode::Count: h.mode = Mode::Count; break;
+    case MissSplitMode::Off:
+        h.mode = Mode::Off;
+        break;
+    case MissSplitMode::Auto:
+        h.mode = Mode::Cost;
+        break;
+    case MissSplitMode::Fraction:
+        h.mode = Mode::Fraction;
+        break;
+    case MissSplitMode::Count:
+        h.mode = Mode::Count;
+        break;
     }
     h.count              = static_cast<std::int32_t>(split.count);
     h.fraction           = split.fraction;
@@ -273,8 +286,8 @@ ops::MoeSlotPool slot_pool(const std::array<std::byte*, 4>& base,
 } // namespace
 
 std::array<std::int64_t, 4> Qwen4OffloadExperts::pool_plane_bytes(std::int32_t layers,
-                                                                   std::int32_t slots_per_layer,
-                                                                   std::int32_t extra_slots) {
+                                                                  std::int32_t slots_per_layer,
+                                                                  std::int32_t extra_slots) {
     const std::int64_t slots = static_cast<std::int64_t>(layers) * slots_per_layer + extra_slots;
     return {slots * ops::kMoeSlotsGateUpCodeBytes, slots * ops::kMoeSlotsGateUpScaleBytes,
             slots * ops::kMoeSlotsDownCodeBytes, slots * ops::kMoeSlotsDownScaleBytes};
@@ -296,7 +309,9 @@ std::int64_t Qwen4OffloadExperts::elastic_column_bytes(std::int32_t plane) const
 }
 
 void Qwen4OffloadExperts::set_active_columns(std::int32_t columns) {
-    if (open_) { throw std::logic_error("Qwen4Exp offload experts: elastic resize inside a window"); }
+    if (open_) {
+        throw std::logic_error("Qwen4Exp offload experts: elastic resize inside a window");
+    }
     const auto streams = window_streams(streams_[0]);
     cache_->set_active_columns(columns, streams);
 }
@@ -314,10 +329,11 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
       peer_stream_(peer != nullptr ? peer->stream : nullptr),
       text_layers_(options.text_layers > 0 ? options.text_layers
                                            : static_cast<std::int32_t>(banks.size())),
-      log_tokens_(std::max(options.prompt_tokens, ops::kMoeSlotsMaxTokens) +
-                  (options.text_layers > 0 && options.text_layers < static_cast<std::int32_t>(banks.size())
-                       ? kExtraLayerLogTokens
-                       : 0)),
+      log_tokens_(
+          std::max(options.prompt_tokens, ops::kMoeSlotsMaxTokens) +
+          (options.text_layers > 0 && options.text_layers < static_cast<std::int32_t>(banks.size())
+               ? kExtraLayerLogTokens
+               : 0)),
       options_(options), memory_(memory) {
     if (text_layers_ > layers_) {
         throw std::invalid_argument("Qwen4Exp offload experts: more Text layers than banks");
@@ -328,26 +344,43 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         options_.slots_per_layer + options_.elastic_columns > kExperts ||
         options_.cpu_threads < 1 || options_.insert_cap < 0 || options_.admit_threshold < 0.0 ||
         !(options_.half_life_tokens > 0.0) || !(options_.evict_tau_windows >= 0.0) ||
-        options_.prompt_tokens < 1 ||
-        options_.stream_min_tokens < 0 || options_.stream_ring_slots < kExperts) {
+        options_.prompt_tokens < 1 || options_.stream_min_tokens < 0 ||
+        options_.stream_ring_slots < kExperts) {
         throw std::invalid_argument("Qwen4Exp offload experts: invalid options");
     }
+    layer_base_ = layer_slot_profile(layers_, text_layers_, options_.slots_per_layer,
+                                     options_.elastic_columns, partitions_);
+    layer_offset_.assign(static_cast<std::size_t>(layers_) + 1, 0);
+    for (std::int32_t l = 0; l < layers_; ++l) {
+        layer_offset_[static_cast<std::size_t>(l) + 1] =
+            layer_offset_[static_cast<std::size_t>(l)] + layer_base_[static_cast<std::size_t>(l)];
+    }
+    if (layer_base_ != std::vector<std::int32_t>(layer_base_.size(), options_.slots_per_layer)) {
+        const auto [lo, hi] = std::minmax_element(layer_base_.begin(), layer_base_.end());
+        std::fprintf(stderr,
+                     "Qwen4Exp offload experts: per-layer slot profile, %d..%d base slots per "
+                     "layer (mean %d) + %d elastic\n",
+                     *lo, *hi, options_.slots_per_layer, options_.elastic_columns);
+    }
     {
-        using Mode         = ops::host::HostMoeSplit::Mode;
-        const auto& sp     = options_.split;
-        const auto mode    = static_cast<std::int32_t>(sp.mode);
-        const auto finite  = [](float v) { return std::isfinite(v) && v >= 0.0F; };
+        using Mode        = ops::host::HostMoeSplit::Mode;
+        const auto& sp    = options_.split;
+        const auto mode   = static_cast<std::int32_t>(sp.mode);
+        const auto finite = [](float v) { return std::isfinite(v) && v >= 0.0F; };
         if (mode < 0 || mode > static_cast<std::int32_t>(Mode::Cost) || sp.count < 0 ||
             sp.count > ops::host::HostMoeSplit::kMaxReads || sp.max_reads < 0 ||
-            sp.max_reads > ops::host::HostMoeSplit::kMaxReads || !(sp.fraction >= 0.0F && sp.fraction <= 1.0F) ||
-            sp.min_misses < 0 || !(sp.host_read_slowdown >= 1.0F) || !finite(sp.host_fixed_us) ||
-            !finite(sp.host_expert_us) || !finite(sp.host_column_us) || !finite(sp.device_fixed_us) ||
-            !finite(sp.device_expert_us) || !finite(sp.device_column_us)) {
+            sp.max_reads > ops::host::HostMoeSplit::kMaxReads ||
+            !(sp.fraction >= 0.0F && sp.fraction <= 1.0F) || sp.min_misses < 0 ||
+            !(sp.host_read_slowdown >= 1.0F) || !finite(sp.host_fixed_us) ||
+            !finite(sp.host_expert_us) || !finite(sp.host_column_us) ||
+            !finite(sp.device_fixed_us) || !finite(sp.device_expert_us) ||
+            !finite(sp.device_column_us)) {
             throw std::invalid_argument("Qwen4Exp offload experts: invalid miss split");
         }
     }
     if (memory_.table == nullptr || memory_.divisors == nullptr || memory_.identity == nullptr ||
-        memory_.reads == nullptr || (options_.stream_min_tokens > 0 && memory_.stream_tables == nullptr) ||
+        memory_.reads == nullptr ||
+        (options_.stream_min_tokens > 0 && memory_.stream_tables == nullptr) ||
         std::any_of(memory_.pool.begin(), memory_.pool.end(),
                     [](const std::byte* p) { return p == nullptr; })) {
         throw std::invalid_argument("Qwen4Exp offload experts: device memory is missing");
@@ -363,23 +396,25 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         (memory_.stage_table == nullptr || memory_.picks == nullptr ||
          std::any_of(memory_.staging.begin(), memory_.staging.end(),
                      [](const std::byte* p) { return p == nullptr; }))) {
-        throw std::invalid_argument("Qwen4Exp offload experts: the staged miss split needs scratch slots");
+        throw std::invalid_argument(
+            "Qwen4Exp offload experts: the staged miss split needs scratch slots");
     }
     device_ids_[0] = device;
     banks_.assign(banks.begin(), banks.end());
-    split_on_peer_ = peer != nullptr && options_.split_on_peer && splitting() && options_.split_staged;
-    if (split_on_peer_ &&
-        (peer->mirror == nullptr || peer->reads == nullptr || peer->stage_table == nullptr ||
-         peer->picks == nullptr ||
-         std::any_of(peer->staging.begin(), peer->staging.end(),
-                     [](const std::byte* p) { return p == nullptr; }))) {
-        throw std::invalid_argument("Qwen4Exp offload experts: rank 1 miss-split memory is missing");
+    split_on_peer_ =
+        peer != nullptr && options_.split_on_peer && splitting() && options_.split_staged;
+    if (split_on_peer_ && (peer->mirror == nullptr || peer->reads == nullptr ||
+                           peer->stage_table == nullptr || peer->picks == nullptr ||
+                           std::any_of(peer->staging.begin(), peer->staging.end(),
+                                       [](const std::byte* p) { return p == nullptr; }))) {
+        throw std::invalid_argument(
+            "Qwen4Exp offload experts: rank 1 miss-split memory is missing");
     }
     if (peer != nullptr) {
-        peer_ = *peer;
-        peer_pool_      = peer->pool;
-        peer_divisors_  = peer->divisors;
-        device_ids_[1]  = peer->device;
+        peer_          = *peer;
+        peer_pool_     = peer->pool;
+        peer_divisors_ = peer->divisors;
+        device_ids_[1] = peer->device;
     }
     if (!ops::host::host_avx512_vnni_supported()) {
         throw std::runtime_error(
@@ -395,30 +430,34 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         float* d = memory_.divisors + static_cast<std::size_t>(l) * kDivisorsPerLayer;
         CUDA_CHECK(cudaMemcpyAsync(d, bank.gate_up_divisors, sizeof(float) * kGateUpDivisors,
                                    cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d + kGateUpDivisors, bank.down_divisors, sizeof(float) * kExperts,
-                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d + kGateUpDivisors, bank.down_divisors,
+                                   sizeof(float) * kExperts, cudaMemcpyHostToDevice, stream));
         host_layers.push_back(host_layer(bank));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
     if (peer != nullptr) {
         // Rank 1's copy of the divisors: its expert kernel reads them from its own memory.
         const ScopedCurrentDevice rank1(peer->device);
-        CUDA_CHECK(cudaMemcpyAsync(peer->divisors, memory_.divisors,
-                                   sizeof(float) * kDivisorsPerLayer *
-                                       static_cast<std::size_t>(layers_),
-                                   cudaMemcpyDefault, peer->stream));
+        CUDA_CHECK(
+            cudaMemcpyAsync(peer->divisors, memory_.divisors,
+                            sizeof(float) * kDivisorsPerLayer * static_cast<std::size_t>(layers_),
+                            cudaMemcpyDefault, peer->stream));
         CUDA_CHECK(cudaStreamSynchronize(peer->stream));
     }
 
     expert_cache::PolicyConfig policy;
-    policy.layers           = layers_;
-    policy.experts          = kExperts;
+    policy.layers  = layers_;
+    policy.experts = kExperts;
     // Partition p (GPU p) holds the experts e % partitions == p in its own slots_per_layer slots.
-    policy.partitions       = partitions_;
-    policy.slots_per_layer  = options_.slots_per_layer * partitions_;
-    policy.admission        = options_.admit_threshold > 0.0;
-    policy.admit_threshold  = options_.admit_threshold;
-    policy.half_life_tokens = options_.half_life_tokens;
+    policy.partitions      = partitions_;
+    policy.slots_per_layer = options_.slots_per_layer * partitions_;
+    // Every GPU holds the same base slots per layer (layer_slot_profile).
+    for (const std::int32_t base : layer_base_) {
+        policy.layer_slots.push_back(base * partitions_);
+    }
+    policy.admission         = options_.admit_threshold > 0.0;
+    policy.admit_threshold   = options_.admit_threshold;
+    policy.half_life_tokens  = options_.half_life_tokens;
     policy.evict_tau_windows = options_.evict_tau_windows;
     // T69 (NINFER_QWEN4_PROMPT_FREQ_WEIGHT=0: full-weight prompt counts, as before).
     policy.recency_weighted_prompts = true;
@@ -426,9 +465,9 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         policy.recency_weighted_prompts = std::atoi(v) != 0;
     }
     // The cap is per GPU (each fills over its own link).
-    policy.insert_cap       = options_.insert_cap * partitions_;
-    policy.rule             = expert_cache::Rule::kEngine;
-    policy.elastic_columns  = options_.elastic_columns;
+    policy.insert_cap      = options_.insert_cap * partitions_;
+    policy.rule            = expert_cache::Rule::kEngine;
+    policy.elastic_columns = options_.elastic_columns;
 
     expert_cache::ExpertLayout layout;
     layout.planes      = 4;
@@ -469,14 +508,17 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     }
     // Elastic columns follow the base slots and the prefetch staging slots (T64).
     policy.elastic_gap = staging_slots_;
-    cache_ = std::make_unique<expert_cache::ExpertCache>(
+    cache_             = std::make_unique<expert_cache::ExpertCache>(
         policy, std::move(layout),
         std::span<const expert_cache::GpuBinding>(bindings.data(),
-                                                  static_cast<std::size_t>(partitions_)));
+                                                              static_cast<std::size_t>(partitions_)));
     if (!options_.snapshot_load.empty()) {
         // T59: residency snapshots, one block per request (see Qwen4OffloadOptions).
         std::ifstream in(options_.snapshot_load);
-        if (!in) { throw std::invalid_argument("NINFER_QWEN4_EXPERT_SNAPSHOT: cannot read " + options_.snapshot_load); }
+        if (!in) {
+            throw std::invalid_argument("NINFER_QWEN4_EXPERT_SNAPSHOT: cannot read " +
+                                        options_.snapshot_load);
+        }
         for (std::string line; std::getline(in, line);) {
             std::istringstream row(line);
             std::string first;
@@ -492,13 +534,19 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
             auto& list = snapshot_blocks_.back()[static_cast<std::size_t>(layer)];
             for (std::int32_t e = 0; row >> e;) { list.push_back(e); }
         }
-        if (snapshot_blocks_.empty()) { throw std::invalid_argument("NINFER_QWEN4_EXPERT_SNAPSHOT: empty file"); }
+        if (snapshot_blocks_.empty()) {
+            throw std::invalid_argument("NINFER_QWEN4_EXPERT_SNAPSHOT: empty file");
+        }
         cache_->initialize(snapshot_blocks_.front());
         std::int64_t listed = 0;
-        for (const auto& l : snapshot_blocks_.front()) { listed += static_cast<std::int64_t>(l.size()); }
-        std::fprintf(stderr, "qwen4 experts: snapshot %s, %zu blocks, block 0: %" PRId64
-                     " experts listed, %" PRId64 " inserted\n", options_.snapshot_load.c_str(),
-                     snapshot_blocks_.size(), listed, cache_->counters().inserts);
+        for (const auto& l : snapshot_blocks_.front()) {
+            listed += static_cast<std::int64_t>(l.size());
+        }
+        std::fprintf(stderr,
+                     "qwen4 experts: snapshot %s, %zu blocks, block 0: %" PRId64
+                     " experts listed, %" PRId64 " inserted\n",
+                     options_.snapshot_load.c_str(), snapshot_blocks_.size(), listed,
+                     cache_->counters().inserts);
     } else {
         cache_->initialize({});
     }
@@ -515,8 +563,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
 
     const bool tracing = !options_.trace_path.empty();
     ops::host::HostMoeMailboxConfig config;
-    config.device           = device;
-    config.layers           = layers_;
+    config.device = device;
+    config.layers = layers_;
     // Decode calls hand over <= 8 columns, prefill chunks their whole width in one call.
     config.max_tokens       = std::max(options_.prompt_tokens, ops::kMoeSlotsMaxTokens);
     config.top_k            = kTopK;
@@ -527,11 +575,12 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     config.gpu_stamps       = tracing;
     // One record per publish: the Text layers once per window, every later (MTP) layer once per
     // call (a prompt chunk and its drafts, or an alignment and the AR drafts of a round; T36 m10).
-    config.trace_capacity   = tracing ? static_cast<std::int64_t>(text_layers_) +
-                                            static_cast<std::int64_t>(layers_ - text_layers_) *
-                                                kExtraLayerCalls
-                                      : 0;
-    mailbox_ = std::make_unique<ops::host::HostMoeMailbox>(std::move(config), std::move(host_layers));
+    config.trace_capacity =
+        tracing ? static_cast<std::int64_t>(text_layers_) +
+                      static_cast<std::int64_t>(layers_ - text_layers_) * kExtraLayerCalls
+                : 0;
+    mailbox_ =
+        std::make_unique<ops::host::HostMoeMailbox>(std::move(config), std::move(host_layers));
     if (const char* v = std::getenv("NINFER_QWEN4_FILLS_AFTER_HOST"); v != nullptr && *v != 0) {
         options_.fills_after_host = std::atoi(v) != 0;
     }
@@ -544,6 +593,18 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     if (const char* v = std::getenv("NINFER_QWEN4_LEND_KEEP_ELASTIC"); v != nullptr && *v != 0) {
         options_.lend_keep_elastic = std::atoi(v) != 0;
     }
+    if (const char* v = std::getenv("NINFER_QWEN4_PROMPT_KEEP"); v != nullptr && *v != 0) {
+        options_.keep_decode_residency = std::atoi(v) != 0;
+    }
+    if (const char* v = std::getenv("NINFER_QWEN4_PROMPT_KEEP_MIN_CACHED");
+        v != nullptr && *v != 0) {
+        options_.keep_min_cached = std::atof(v);
+    }
+    if (const char* v = std::getenv("NINFER_QWEN4_PROMPT_NEW_CAP"); v != nullptr && *v != 0) {
+        options_.new_prompt_cap = std::max(std::atoi(v), -1);
+    }
+    // The validation aid decides the residency by the prompt windows (T98): the old rule.
+    if (options_.freeze_after_prompt) { options_.keep_decode_residency = false; }
     if (const char* v = std::getenv("NINFER_QWEN4_SCALE_WORKSPACE"); v != nullptr && *v != 0) {
         options_.scale_workspace = std::atoi(v) != 0;
     }
@@ -554,6 +615,9 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         options_.boost_cap = std::atoi(v);
     }
     served_at_begin_.assign(static_cast<std::size_t>(layers_), 0);
+    pending_counts_.assign(static_cast<std::size_t>(layers_),
+                           std::vector<std::int32_t>(kExperts, 0));
+    pending_tokens_.assign(static_cast<std::size_t>(layers_), 0);
     // Prefill streaming: the ring is the slots of the last Text layers' cache rows (whole layers,
     // so lending empties them in the policy); at least half the Text layers keep their residents.
     // At tp 2 each GPU streams its partition (e % 2) into its own ring over its own link (T42).
@@ -562,34 +626,39 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         const std::int32_t K = options_.slots_per_layer;
         // T56: at tp 2 a GPU streams only its partition (<= 256 experts a layer), so its ring
         // needs half the slots: fewer lent layers keep their residents during the prompt.
-        // NINFER_QWEN4_TP2_HALF_RING=0 keeps the 1-GPU ring size (A/B runs; same bits).
-        std::int32_t ring = options_.stream_ring_slots;
-        if (partitions_ == 2) {
-            const char* v = std::getenv("NINFER_QWEN4_TP2_HALF_RING");
-            if (v == nullptr || std::string(v) != "0") { ring = (ring + 1) / 2; }
-        }
-        lend_count_ = (ring + K - 1) / K;
-        lend_first_          = text_layers_ - lend_count_;
+        const std::int32_t ring = ring_slots_for(options_.stream_ring_slots, partitions_);
+        lend_count_ =
+            ring_layers(options_.stream_ring_slots, layer_base_, text_layers_, partitions_);
+        lend_first_ = text_layers_ - lend_count_;
         if (options_.base_chunk > 0 && options_.prompt_workspace_bytes > 0) {
-            const std::int64_t layer_bytes = static_cast<std::int64_t>(K) * kLendPlaneBytes;
-            workspace_layers_ = static_cast<std::int32_t>(
-                (options_.prompt_workspace_bytes + layer_bytes - 1) / layer_bytes);
-            if (lend_count_ + workspace_layers_ > max_lent_layers(text_layers_)) {
-                std::fprintf(stderr, "Qwen4Exp offload experts: no room to lend a %lld-byte prompt "
-                                     "workspace (%d slots per layer); prompt chunks "
-                                     "stay at %d columns\n",
+            workspace_layers_ = layers_below(
+                layer_base_, lend_first_,
+                (options_.prompt_workspace_bytes + kLendPlaneBytes - 1) / kLendPlaneBytes);
+            if (!may_lend(layer_base_, text_layers_, lend_count_ + workspace_layers_)) {
+                std::fprintf(stderr,
+                             "Qwen4Exp offload experts: no room to lend a %lld-byte prompt "
+                             "workspace (%d slots per layer); prompt chunks "
+                             "stay at %d columns\n",
                              static_cast<long long>(options_.prompt_workspace_bytes), K,
                              options_.base_chunk);
                 workspace_layers_ = 0;
+            } else if (!options_.prompt_workspace_steps.empty()) {
+                std::fprintf(stderr,
+                             "Qwen4Exp offload experts: prompt chunks up to %d columns, lending "
+                             "%d workspace + %d ring layers of %d slots on average\n",
+                             options_.prompt_workspace_steps.back().first, workspace_layers_,
+                             lend_count_, K);
             }
         }
         if (lend_count_ > text_layers_ / 2) {
-            std::fprintf(stderr, "Qwen4Exp offload experts: %d slots per layer are too few to lend a "
-                                 "%d-slot streaming ring; prefill streaming is off\n",
+            std::fprintf(stderr,
+                         "Qwen4Exp offload experts: %d slots per layer are too few to lend a "
+                         "%d-slot streaming ring; prefill streaming is off\n",
                          K, ring);
             workspace_layers_ = 0;
         } else if (peer != nullptr && peer->stream_tables == nullptr) {
-            throw std::invalid_argument("Qwen4Exp offload experts: rank 1 streaming tables are missing");
+            throw std::invalid_argument(
+                "Qwen4Exp offload experts: rank 1 streaming tables are missing");
         } else {
             const auto make_stream = [&](int rank) {
                 Qwen4ExpertStream::Config sc;
@@ -607,12 +676,13 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                         sc.bank_base.push_back(static_cast<const std::byte*>(plane->base));
                     }
                 }
-                sc.pool_base   = rank == 0 ? memory_.pool : peer->pool;
-                sc.ring_first  = lend_first_ * K;
-                sc.ring_slots  = lend_count_ * K;
-                sc.tables      = rank == 0 ? memory_.stream_tables : peer->stream_tables;
-                sc.partitions  = partitions_;
-                sc.partition   = rank;
+                sc.pool_base  = rank == 0 ? memory_.pool : peer->pool;
+                sc.ring_first = static_cast<std::int32_t>(base_offset(lend_first_));
+                sc.ring_slots =
+                    static_cast<std::int32_t>(base_offset(text_layers_) - base_offset(lend_first_));
+                sc.tables     = rank == 0 ? memory_.stream_tables : peer->stream_tables;
+                sc.partitions = partitions_;
+                sc.partition  = rank;
                 return std::make_unique<Qwen4ExpertStream>(std::move(sc));
             };
             stream_ = make_stream(0);
@@ -622,7 +692,7 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                 // (Qwen4ExpertStream::set_defer_to_exchange); NINFER_QWEN4_STREAM_DEFER=0 keeps
                 // them at release (A/B runs on one binary; same bits).
                 const char* defer_env = std::getenv("NINFER_QWEN4_STREAM_DEFER");
-                const bool defer = defer_env == nullptr || std::string(defer_env) != "0";
+                const bool defer      = defer_env == nullptr || std::string(defer_env) != "0";
                 stream_->set_defer_to_exchange(defer);
                 peer_stream_obj_->set_defer_to_exchange(defer);
                 // The host computes nothing of a streamed chunk at tp 2: no CPU tail (its partial
@@ -644,7 +714,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     if (!options_.routing_path.empty()) {
         routing_ = std::fopen(options_.routing_path.c_str(), "wb");
         if (routing_ == nullptr) {
-            throw std::runtime_error("Qwen4Exp routing dump: cannot write " + options_.routing_path);
+            throw std::runtime_error("Qwen4Exp routing dump: cannot write " +
+                                     options_.routing_path);
         }
     }
     if (tracing) {
@@ -653,29 +724,30 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
             throw std::runtime_error("Qwen4Exp expert trace: cannot write " + options_.trace_path);
         }
         clock_offset_ = mailbox_->calibrate_clock(stream);
-        std::fprintf(trace_,
-                     "{\"config\":{\"layers\":%d,\"slots_per_layer\":%d,\"cpu_threads\":%d,"
-                     "\"insert_cap\":%d,\"admit_threshold\":%g,\"half_life_tokens\":%g,"
-                     "\"evict_tau_windows\":%g,"
-                     "\"prompt_tokens\":%d,\"slot_pool_bytes\":%" PRId64 ",\"prefetch_slots\":%d,"
-                     "\"prefetch_candidates\":%d,\"prefetch_min_score\":%g,"
-                     "\"prefetch_first_layer\":%d,\"prefetch_gbps\":%g,\"prefetch_lead\":%g,"
-                     "\"warm_start\":%d,\"split\":{\"mode\":%d,"
-                     "\"staged\":%d,\"count\":%d,\"fraction\":%g,\"min_misses\":%d,\"max_reads\":%d,"
-                     "\"host_us\":[%g,%g,%g,%g],\"device_us\":[%g,%g,%g]}}}\n",
-                     layers_, options_.slots_per_layer, options_.cpu_threads, options_.insert_cap,
-                     options_.admit_threshold, options_.half_life_tokens,
-                     options_.evict_tau_windows, options_.prompt_tokens,
-                     slot_bytes(layers_) * options_.slots_per_layer,
-                     options_.prefetch.slots_per_layer, options_.prefetch.candidates,
-                     static_cast<double>(options_.prefetch.min_score), options_.prefetch.first_layer,
-                     options_.prefetch.link_gbps, options_.prefetch.lead, options_.warm_start ? 1 : 0,
-                     static_cast<int>(options_.split.mode), options_.split_staged ? 1 : 0,
-                     options_.split.count, options_.split.fraction, options_.split.min_misses,
-                     options_.split.max_reads, options_.split.host_fixed_us,
-                     options_.split.host_expert_us, options_.split.host_column_us,
-                     options_.split.host_read_slowdown, options_.split.device_fixed_us,
-                     options_.split.device_expert_us, options_.split.device_column_us);
+        std::fprintf(
+            trace_,
+            "{\"config\":{\"layers\":%d,\"slots_per_layer\":%d,\"cpu_threads\":%d,"
+            "\"insert_cap\":%d,\"admit_threshold\":%g,\"half_life_tokens\":%g,"
+            "\"evict_tau_windows\":%g,"
+            "\"prompt_tokens\":%d,\"slot_pool_bytes\":%" PRId64 ",\"prefetch_slots\":%d,"
+            "\"prefetch_candidates\":%d,\"prefetch_min_score\":%g,"
+            "\"prefetch_first_layer\":%d,\"prefetch_gbps\":%g,\"prefetch_lead\":%g,"
+            "\"warm_start\":%d,\"prompt_keep\":%d,\"stream_min_tokens\":%d,\"split\":{\"mode\":%d,"
+            "\"staged\":%d,\"count\":%d,\"fraction\":%g,\"min_misses\":%d,\"max_reads\":%d,"
+            "\"host_us\":[%g,%g,%g,%g],\"device_us\":[%g,%g,%g]}}}\n",
+            layers_, options_.slots_per_layer, options_.cpu_threads, options_.insert_cap,
+            options_.admit_threshold, options_.half_life_tokens, options_.evict_tau_windows,
+            options_.prompt_tokens, slot_bytes(layers_) * options_.slots_per_layer,
+            options_.prefetch.slots_per_layer, options_.prefetch.candidates,
+            static_cast<double>(options_.prefetch.min_score), options_.prefetch.first_layer,
+            options_.prefetch.link_gbps, options_.prefetch.lead, options_.warm_start ? 1 : 0,
+            options_.keep_decode_residency ? 1 : 0, options_.stream_min_tokens,
+            static_cast<int>(options_.split.mode), options_.split_staged ? 1 : 0,
+            options_.split.count, options_.split.fraction, options_.split.min_misses,
+            options_.split.max_reads, options_.split.host_fixed_us, options_.split.host_expert_us,
+            options_.split.host_column_us, options_.split.host_read_slowdown,
+            options_.split.device_fixed_us, options_.split.device_expert_us,
+            options_.split.device_column_us);
         std::fflush(trace_);
     }
 }
@@ -690,7 +762,10 @@ void Qwen4OffloadExperts::snapshot_save_block() {
         cache_->poll();
     }
     std::FILE* f = std::fopen(options_.snapshot_save.c_str(), "a");
-    if (f == nullptr) { throw std::runtime_error("NINFER_QWEN4_EXPERT_SNAPSHOT_SAVE: cannot open " + options_.snapshot_save); }
+    if (f == nullptr) {
+        throw std::runtime_error("NINFER_QWEN4_EXPERT_SNAPSHOT_SAVE: cannot open " +
+                                 options_.snapshot_save);
+    }
     std::fprintf(f, "snap %" PRId64 "\n", snapshot_saved_++);
     for (std::int32_t layer = 0; layer < layers_; ++layer) {
         std::fprintf(f, "%d", layer);
@@ -705,16 +780,16 @@ Qwen4OffloadExperts::~Qwen4OffloadExperts() {
         // One line per backend (stderr): the experts each side computed over the decode windows.
         const Qwen4OffloadSplitCounters c = split_counters();
         const double w                    = static_cast<double>(c.decode_windows);
-        std::fprintf(stderr,
-                     "qwen4 experts: %" PRId64 " decode windows, per window %.1f routes, device hit "
-                     "%.4f, missing %.1f, GPU share %.1f experts (%.1f routes), CPU %.1f experts; "
-                     "split mode %d%s\n",
-                     c.decode_windows, static_cast<double>(c.accesses) / w,
-                     c.accesses ? static_cast<double>(c.device_hits) / static_cast<double>(c.accesses) : 0.0,
-                     static_cast<double>(c.missing) / w, static_cast<double>(c.gpu_experts) / w,
-                     static_cast<double>(c.gpu_routes) / w,
-                     static_cast<double>(c.cpu_experts) / w,
-                     static_cast<int>(options_.split.mode), options_.split_staged ? " staged" : "");
+        std::fprintf(
+            stderr,
+            "qwen4 experts: %" PRId64 " decode windows, per window %.1f routes, device hit "
+            "%.4f, missing %.1f, GPU share %.1f experts (%.1f routes), CPU %.1f experts; "
+            "split mode %d%s\n",
+            c.decode_windows, static_cast<double>(c.accesses) / w,
+            c.accesses ? static_cast<double>(c.device_hits) / static_cast<double>(c.accesses) : 0.0,
+            static_cast<double>(c.missing) / w, static_cast<double>(c.gpu_experts) / w,
+            static_cast<double>(c.gpu_routes) / w, static_cast<double>(c.cpu_experts) / w,
+            static_cast<int>(options_.split.mode), options_.split_staged ? " staged" : "");
     }
     if (trace_ != nullptr) {
         if (decode_windows_ > 0) {
@@ -801,13 +876,15 @@ void Qwen4OffloadExperts::fork_device_reads(std::int32_t layer, const Qwen4Exper
         // Every byte of the picked experts crosses the link once, into VRAM scratch slots; the
         // expert kernel then reads them there (scratch table: picked id -> slot, else -1).
         const ops::MoeSlotPool& b = bank.bank;
-        ops::host::stage_device_share(
-            side_, memory_.picks,
-            {static_cast<const std::byte*>(b.gate_up_codes.base), static_cast<const std::byte*>(b.gate_up_scales.base),
-             static_cast<const std::byte*>(b.down_codes.base), static_cast<const std::byte*>(b.down_scales.base)},
-            memory_.staging,
-            {ops::kMoeSlotsGateUpCodeBytes, ops::kMoeSlotsGateUpScaleBytes, ops::kMoeSlotsDownCodeBytes,
-             ops::kMoeSlotsDownScaleBytes});
+        ops::host::stage_device_share(side_, memory_.picks,
+                                      {static_cast<const std::byte*>(b.gate_up_codes.base),
+                                       static_cast<const std::byte*>(b.gate_up_scales.base),
+                                       static_cast<const std::byte*>(b.down_codes.base),
+                                       static_cast<const std::byte*>(b.down_scales.base)},
+                                      memory_.staging,
+                                      {ops::kMoeSlotsGateUpCodeBytes,
+                                       ops::kMoeSlotsGateUpScaleBytes, ops::kMoeSlotsDownCodeBytes,
+                                       ops::kMoeSlotsDownScaleBytes});
         const ops::MoeSlotPool pool{
             .gate_up_codes  = {memory_.staging[0], ops::kMoeSlotsGateUpCodeBytes},
             .gate_up_scales = {memory_.staging[1], ops::kMoeSlotsGateUpScaleBytes},
@@ -826,7 +903,9 @@ void Qwen4OffloadExperts::fork_device_reads(std::int32_t layer, const Qwen4Exper
 
 void Qwen4OffloadExperts::ahead(std::int32_t layer, const Tensor& wide, const Tensor& next_norm,
                                 const Tensor& next_router, float eps, cudaStream_t stream) {
-    if (!prefetch_ || !prefetch_->predicts(layer) || wide.ne[1] > ops::kMoeSlotsMaxTokens) { return; }
+    if (!prefetch_ || !prefetch_->predicts(layer) || wide.ne[1] > ops::kMoeSlotsMaxTokens) {
+        return;
+    }
     prefetch_->predict(layer, wide, next_norm, next_router, eps,
                        memory_.table + static_cast<std::size_t>(layer + 1) * kExperts, stream);
 }
@@ -849,20 +928,20 @@ void Qwen4OffloadExperts::routed(std::int32_t layer, const Qwen4ExpertBank& bank
     // At tp 2 the publish reads rank 0's residency mirror of both GPUs (T33).
     const std::int32_t* row = residency_table(layer);
     if (prefetch_ && prefetch_->stages(layer)) {
-        row = prefetch_->overlay(layer, row, static_cast<const std::int32_t*>(ids.data),
-                                 kTopK * T, stream);
+        row = prefetch_->overlay(layer, row, static_cast<const std::int32_t*>(ids.data), kTopK * T,
+                                 stream);
         overlay_layer_ = layer;
         overlay_row_   = row;
     }
     // The doorbell rings before the shared expert, so the host starts while the GPU works.
-    mailbox_->publish_table(stream, layer, T, static_cast<const __nv_bfloat16*>(x.data),
-                            static_cast<const std::int32_t*>(ids.data),
-                            static_cast<const float*>(weights.data), row,
-                            kExperts, log_offset(layer, T), options_.split,
-                            ops::host::HostMoeDeviceShare{
-                                .reads       = memory_.reads,
-                                .picks       = options_.split_staged ? memory_.picks : nullptr,
-                                .stage_table = options_.split_staged ? memory_.stage_table : nullptr});
+    mailbox_->publish_table(
+        stream, layer, T, static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const std::int32_t*>(ids.data), static_cast<const float*>(weights.data), row,
+        kExperts, log_offset(layer, T), options_.split,
+        ops::host::HostMoeDeviceShare{.reads = memory_.reads,
+                                      .picks = options_.split_staged ? memory_.picks : nullptr,
+                                      .stage_table =
+                                          options_.split_staged ? memory_.stage_table : nullptr});
     published_layer_ = layer;
     if (splitting() && !split_on_peer_) {
         side_partial_ = work.alloc(DType::FP32, {kHidden, T});
@@ -883,18 +962,19 @@ void Qwen4OffloadExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, c
         return;
     }
     // A decode call of a staged layer reads the effective row routed() built (T25).
-    const bool staged  = T <= ops::kMoeSlotsMaxTokens && overlay_layer_ == layer;
-    const Tensor table = staged ? Tensor(const_cast<std::int32_t*>(overlay_row_), DType::I32, {kExperts})
-                                : layer_table(layer);
-    overlay_layer_     = -1;
+    const bool staged = T <= ops::kMoeSlotsMaxTokens && overlay_layer_ == layer;
+    const Tensor table =
+        staged ? Tensor(const_cast<std::int32_t*>(overlay_row_), DType::I32, {kExperts})
+               : layer_table(layer);
+    overlay_layer_        = -1;
     const float* divisors = memory_.divisors + static_cast<std::size_t>(layer) * kDivisorsPerLayer;
     const ops::MoeSlotsLayer view = slots_layer(bank, divisors, divisors + kGateUpDivisors, table);
     const ops::MoeSlotPool pool =
         slot_pool(memory_.pool, planar_strides(),
                   layers_ * (options_.slots_per_layer + options_.elastic_columns) + staging_slots_);
-    auto scope           = work.scope();
-    WorkspaceArena scratch(work.alloc_bytes(ops::moe_slots_nvfp4_workspace_bytes(
-        std::min<std::int32_t>(T, ops::kMoeSlotsMaxTokens))));
+    auto scope = work.scope();
+    WorkspaceArena scratch(work.alloc_bytes(
+        ops::moe_slots_nvfp4_workspace_bytes(std::min<std::int32_t>(T, ops::kMoeSlotsMaxTokens))));
     if (T <= ops::kMoeSlotsMaxTokens) {
         if (published_layer_ != layer) {
             throw std::logic_error("Qwen4Exp offload experts: run() without routed() of the layer");
@@ -916,8 +996,8 @@ void Qwen4OffloadExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, c
     // missing expert once for all its columns), the resident experts in calls of <= 8 columns.
     mailbox_->publish_table(stream, layer, T, static_cast<const __nv_bfloat16*>(x.data),
                             static_cast<const std::int32_t*>(ids.data),
-                            static_cast<const float*>(weights.data),
-                            residency_table(layer), kExperts, log_offset(layer, T));
+                            static_cast<const float*>(weights.data), residency_table(layer),
+                            kExperts, log_offset(layer, T));
     for (std::int32_t begin = 0; begin < T; begin += ops::kMoeSlotsMaxTokens) {
         const std::int32_t count = std::min(ops::kMoeSlotsMaxTokens, T - begin);
         Tensor out               = partial.slice(1, begin, count);
@@ -940,6 +1020,7 @@ void Qwen4OffloadExperts::open_stream(std::int32_t tokens) {
     // (mid-window: no kernel of this window reads the lent layers through the cache table, every
     // Text layer of a chunk takes this path), then open each GPU's stream window.
     if (!cache_->lending()) {
+        save_lent_residency(lend_first_, lend_count_);
         (void)cache_->lend_layers(lend_first_, lend_count_, options_.lend_keep_elastic);
     }
     // The copies into the ring wait for every fill issued before the lend (begin_window may have
@@ -969,7 +1050,8 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
                                       const Tensor& x, const Tensor& ids, const Tensor& weights,
                                       Tensor& partial, WorkspaceArena& work, cudaStream_t stream) {
     if (!open_ || kind_ != Qwen4Window::Prompt) {
-        throw std::logic_error("Qwen4Exp offload experts: a streamed call needs an open prompt window");
+        throw std::logic_error(
+            "Qwen4Exp offload experts: a streamed call needs an open prompt window");
     }
     const std::int32_t T = x.ne[1];
     if (!streaming_) { open_stream(T); }
@@ -987,7 +1069,7 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
     }
     const Tensor table(const_cast<std::int32_t*>(s.table(layer)), DType::I32, {kExperts});
     const float* divisor_base = rank == 0 ? memory_.divisors : peer_divisors_;
-    const float* divisors = divisor_base + static_cast<std::size_t>(layer) * kDivisorsPerLayer;
+    const float* divisors     = divisor_base + static_cast<std::size_t>(layer) * kDivisorsPerLayer;
     const ops::MoeSlotsLayer view = slots_layer(bank, divisors, divisors + kGateUpDivisors, table);
     const ops::MoeSlotPool pool =
         slot_pool(rank == 0 ? memory_.pool : peer_pool_, planar_strides(),
@@ -995,11 +1077,10 @@ void Qwen4OffloadExperts::stream_call(int rank, std::int32_t layer, const Qwen4E
                       (rank == 0 ? staging_slots_ : 0));
     if (rank == 0) {
         if (host_experts) {
-            mailbox_->publish_table(stream, layer, T, static_cast<const __nv_bfloat16*>(x.data),
-                                    static_cast<const std::int32_t*>(ids.data),
-                                    static_cast<const float*>(weights.data),
-                                    static_cast<const std::int32_t*>(table.data), kExperts,
-                                    log_offset(layer, T));
+            mailbox_->publish_table(
+                stream, layer, T, static_cast<const __nv_bfloat16*>(x.data),
+                static_cast<const std::int32_t*>(ids.data), static_cast<const float*>(weights.data),
+                static_cast<const std::int32_t*>(table.data), kExperts, log_offset(layer, T));
         } else {
             // The routing still reaches the cache policy (the prompt warms the decode cache).
             mailbox_->log_routes(stream, layer, T, static_cast<const std::int32_t*>(ids.data),
@@ -1065,7 +1146,7 @@ void Qwen4OffloadExperts::select_cpu_tail(std::int32_t tokens) {
             order.emplace_back(scale * counts[static_cast<std::size_t>(e)], e);
         }
         std::stable_sort(order.begin(), order.end());
-        double cpu = 0.0;
+        double cpu    = 0.0;
         auto streamed = static_cast<double>(order.size());
         for (const auto& [routes, e] : order) {
             const double cost = a * std::min(1.0, routes) + b * routes;
@@ -1091,7 +1172,7 @@ void Qwen4OffloadExperts::close_stream() noexcept {
     window_.streamed_experts = s.streamed;
     window_.streamed_bytes   = s.bytes;
     window_.streamed_layers  = s.layers;
-    streaming_ = false;
+    streaming_               = false;
 }
 
 std::int32_t Qwen4OffloadExperts::log_offset(std::int32_t layer, std::int32_t tokens) {
@@ -1115,10 +1196,25 @@ void Qwen4OffloadExperts::require_executor() const {
 void Qwen4OffloadExperts::reclaim_lent(std::int32_t layers) {
     const auto first = static_cast<std::size_t>(cache_->lent_first());
     const auto count = static_cast<std::size_t>(layers);
+    refill_lent(layers);
+    if (options_.keep_decode_residency) {
+        // T211: the saved residency is spent; the next lending saves the layers' new one.
+        for (std::size_t i = first; i < first + count; ++i) { lent_profile_[i].clear(); }
+    }
+}
+
+void Qwen4OffloadExperts::refill_lent(std::int32_t layers) {
+    const auto first = static_cast<std::size_t>(cache_->lent_first());
+    const auto count = static_cast<std::size_t>(layers);
+    // The refill profile of each lent layer: T211 (keep_decode_residency) the residency it held
+    // when lent, most recently used first; otherwise the last prompt window's routing, hottest
+    // first.
     const std::span<const std::vector<std::int32_t>> lent(lent_profile_.data() + first, count);
     bool profiled = true;
     for (const auto& p : lent) { profiled = profiled && !p.empty(); }
-    if (!profiled) {
+    // A frozen cache (NINFER_QWEN4_EXPERT_FREEZE=all, validation) refills nothing either, so its
+    // residency does not depend on how many elastic columns are active when the prompt ends.
+    if (!profiled || cache_->frozen()) {
         cache_->reclaim_front(layers, {});
         return;
     }
@@ -1131,24 +1227,141 @@ void Qwen4OffloadExperts::reclaim_lent(std::int32_t layers) {
     // targets), instead of layer by layer coldest first: the first decode windows find every
     // layer's hottest experts early.
     refill_rank_.assign(static_cast<std::size_t>(layers_) * kExperts, kExperts);
-    if (options_.warm_start && prompt_rank_.size() == refill_rank_.size()) { refill_rank_ = prompt_rank_; }
+    if (options_.warm_start && !options_.keep_decode_residency &&
+        prompt_rank_.size() == refill_rank_.size()) {
+        refill_rank_ = prompt_rank_;
+    }
     for (std::size_t i = 0; i < count; ++i) {
         const auto& profile = lent[i];
         std::int32_t* rank  = refill_rank_.data() + (first + i) * kExperts;
         std::fill(rank, rank + kExperts, kExperts);
-        for (std::size_t r = 0; r < profile.size(); ++r) { rank[profile[r]] = static_cast<std::int32_t>(r); }
+        for (std::size_t r = 0; r < profile.size(); ++r) {
+            rank[profile[r]] = static_cast<std::int32_t>(r);
+        }
     }
     cache_->reclaim_front(layers, lent, refill_rank_);
 }
 
+std::int32_t Qwen4OffloadExperts::ring_slots_for(std::int32_t ring_slots, std::int32_t partitions) {
+    if (partitions == 2) {
+        // NINFER_QWEN4_TP2_HALF_RING=0 keeps the 1-GPU ring size (A/B runs; same bits).
+        const char* v = std::getenv("NINFER_QWEN4_TP2_HALF_RING");
+        if (v == nullptr || std::string(v) != "0") { return (ring_slots + 1) / 2; }
+    }
+    return ring_slots;
+}
+
+std::int32_t Qwen4OffloadExperts::ring_layers(std::int32_t ring_slots,
+                                              std::span<const std::int32_t> layer_base,
+                                              std::int32_t text_layers, std::int32_t partitions) {
+    return layers_below(layer_base, text_layers, ring_slots_for(ring_slots, partitions));
+}
+
+std::int32_t Qwen4OffloadExperts::layers_below(std::span<const std::int32_t> layer_base,
+                                               std::int32_t end, std::int64_t slots) {
+    std::int64_t held = 0;
+    std::int32_t n    = 0;
+    while (held < slots) {
+        if (n == end) { return end + 1; }
+        ++n;
+        held += layer_base[static_cast<std::size_t>(end - n)];
+    }
+    return n;
+}
+
+bool Qwen4OffloadExperts::may_lend(std::span<const std::int32_t> layer_base,
+                                   std::int32_t text_layers, std::int32_t layers) {
+    if (layers < 0 || layers > text_layers) { return false; }
+    std::int64_t lent  = 0;
+    std::int64_t total = 0;
+    for (std::int32_t l = 0; l < text_layers; ++l) {
+        total += layer_base[static_cast<std::size_t>(l)];
+        if (l >= text_layers - layers) { lent += layer_base[static_cast<std::size_t>(l)]; }
+    }
+    return 4 * lent <= 3 * total;
+}
+
+std::vector<std::int32_t> Qwen4OffloadExperts::layer_slot_profile(std::int32_t layers,
+                                                                  std::int32_t text_layers,
+                                                                  std::int32_t slots_per_layer,
+                                                                  std::int32_t elastic_columns,
+                                                                  std::int32_t partitions) {
+    // prod/cache (17/10): one GPU's base slots per layer at 66 slots per layer + 21 elastic
+    // columns (Flash-Next production, tp 2, MTP layer last), fitted greedily on the replayed
+    // routing of 30 T186 prompts through this cache policy (marginal CPU experts per slot, at
+    // least 29 base slots a layer). Held-out (32 T194 prompts): 130.1 -> 112.9 CPU experts per
+    // decode round, 74.1 -> 69.1 insertions.
+    static constexpr std::array<std::int16_t, 49> kWeights = {
+        149, 119, 114, 59, 74, 89, 99, 99, 64, 49, 79, 59, 89, 84, 59, 29, 29,
+        59,  94,  59,  59, 79, 99, 44, 60, 49, 69, 54, 84, 69, 59, 29, 29, 54,
+        84,  54,  44,  66, 89, 29, 29, 39, 59, 34, 49, 44, 54, 59, 109};
+    std::vector<std::int32_t> base(static_cast<std::size_t>(std::max(layers, 0)), slots_per_layer);
+    const char* env = std::getenv("NINFER_QWEN4_SLOT_PROFILE");
+    const auto cap =
+        static_cast<std::int64_t>(kExperts / std::max(partitions, 1)) - elastic_columns;
+    if ((env != nullptr && std::string(env) == "0") || partitions != 2 || text_layers != 48 ||
+        (layers != 48 && layers != 49) || slots_per_layer < 1 || cap < slots_per_layer) {
+        return base;
+    }
+    // Scale the weights to layers * slots_per_layer, clamping at `cap` (water filling), then round
+    // by largest remainder (ties to the lower layer) so the total is exact.
+    const std::int64_t total = static_cast<std::int64_t>(layers) * slots_per_layer;
+    std::vector<double> target(base.size(), 0.0);
+    std::vector<bool> clamped(base.size(), false);
+    for (bool changed = true; changed;) {
+        changed          = false;
+        double weights   = 0.0;
+        double remaining = static_cast<double>(total);
+        for (std::size_t l = 0; l < base.size(); ++l) {
+            if (clamped[l]) {
+                remaining -= static_cast<double>(cap);
+            } else {
+                weights += kWeights[l];
+            }
+        }
+        for (std::size_t l = 0; l < base.size(); ++l) {
+            if (clamped[l]) { continue; }
+            target[l] = std::max(1.0, kWeights[l] * remaining / weights);
+            if (target[l] > static_cast<double>(cap)) {
+                target[l]  = static_cast<double>(cap);
+                clamped[l] = true;
+                changed    = true;
+            }
+        }
+    }
+    std::int64_t sum = 0;
+    for (std::size_t l = 0; l < base.size(); ++l) {
+        base[l] = static_cast<std::int32_t>(std::floor(target[l]));
+        sum += base[l];
+    }
+    std::vector<std::size_t> order(base.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return target[a] - std::floor(target[a]) > target[b] - std::floor(target[b]);
+    });
+    for (std::size_t i = 0; sum < total && i < order.size(); ++i) {
+        if (base[order[i]] < cap) {
+            ++base[order[i]];
+            ++sum;
+        }
+    }
+    for (std::size_t i = 0; sum > total && i < order.size(); ++i) {
+        const std::size_t l = order[order.size() - 1 - i];
+        if (base[l] > 1) {
+            --base[l];
+            --sum;
+        }
+    }
+    return base;
+}
+
 std::int32_t Qwen4OffloadExperts::workspace_layers_for(std::int32_t columns) const noexcept {
     if (!options_.scale_workspace || workspace_layers_ == 0) { return workspace_layers_; }
-    const std::int64_t layer_bytes =
-        static_cast<std::int64_t>(options_.slots_per_layer) * kLendPlaneBytes;
     for (const auto& [width, bytes] : options_.prompt_workspace_steps) {
         if (columns <= width) {
             return std::min(workspace_layers_,
-                            static_cast<std::int32_t>((bytes + layer_bytes - 1) / layer_bytes));
+                            layers_below(layer_base_, lend_first_,
+                                         (bytes + kLendPlaneBytes - 1) / kLendPlaneBytes));
         }
     }
     return workspace_layers_;
@@ -1161,12 +1374,79 @@ void Qwen4OffloadExperts::lend_prompt_layers(std::int32_t first) {
         // comes from the last prompt window), so the lending restarts lower.
         cache_->reclaim_layers({});
     }
-    const auto events = cache_->lend_layers(first, text_layers_ - first, options_.lend_keep_elastic);
+    if (options_.keep_decode_residency) {
+        // T211: the layers lent earlier in this prompt keep the residency saved when they were
+        // first lent; the newly lent ones save theirs now.
+        save_lent_residency(first, text_layers_ - first);
+    } else {
+        for (auto& profile : lent_profile_) { profile.clear(); }
+    }
+    const auto events =
+        cache_->lend_layers(first, text_layers_ - first, options_.lend_keep_elastic);
     for (std::size_t p = 0; p < events.size(); ++p) { lend_waited_[p] = false; }
-    for (auto& profile : lent_profile_) { profile.clear(); }
 }
 
-void Qwen4OffloadExperts::prepare_prompt(std::int32_t columns) { prompt_columns_ = columns; }
+void Qwen4OffloadExperts::save_lent_residency(std::int32_t first, std::int32_t count) {
+    if (!options_.keep_decode_residency) { return; }
+    prompt_lent_from_                             = std::min(prompt_lent_from_, first);
+    const expert_cache::ExpertCachePolicy& policy = cache_->policy();
+    for (std::int32_t l = first; l < first + count; ++l) {
+        auto& profile = lent_profile_[static_cast<std::size_t>(l)];
+        if (!profile.empty()) { continue; }
+        // Most recently used first, the partitions interleaved (each GPU's refill queue then
+        // ranks its experts by their own recency).
+        std::array<std::vector<std::int32_t>, 2> lru;
+        std::size_t longest = 0;
+        for (std::int32_t p = 0; p < partitions_; ++p) {
+            lru[static_cast<std::size_t>(p)] = policy.recency(l, p);
+            longest = std::max(longest, lru[static_cast<std::size_t>(p)].size());
+        }
+        for (std::size_t r = 0; r < longest; ++r) {
+            for (std::int32_t p = 0; p < partitions_; ++p) {
+                const auto& v = lru[static_cast<std::size_t>(p)];
+                if (r < v.size()) { profile.push_back(v[v.size() - 1 - r]); }
+            }
+        }
+    }
+}
+
+void Qwen4OffloadExperts::prepare_prompt(std::int32_t columns, std::int64_t begin,
+                                         std::int64_t prompt_tokens) {
+    prompt_columns_ = columns;
+    if (!text_prompt_seen_ || begin < prompt_next_begin_) {
+        // T211b: the request's first text chunk (the first after a decode window, or one that
+        // starts before the previous chunk ended: a request without a decode window came first)
+        // decides how its prompt windows treat the cache. The update a request without a decode
+        // window left pending is dropped.
+        text_prompt_seen_ = true;
+        prompt_new_       = options_.keep_decode_residency && prompt_tokens > 0 &&
+                      static_cast<double>(begin) <
+                          options_.keep_min_cached * static_cast<double>(prompt_tokens);
+        pending_prompt_   = false;
+        prompt_lent_from_ = std::numeric_limits<std::int32_t>::max();
+        std::fill(pending_tokens_.begin(), pending_tokens_.end(), 0);
+        for (auto& c : pending_counts_) { std::fill(c.begin(), c.end(), 0); }
+    }
+    prompt_next_begin_ = begin + columns;
+}
+
+void Qwen4OffloadExperts::apply_pending_prompt() {
+    pending_prompt_ = false;
+    for (std::int32_t l = 0; l < layers_; ++l) {
+        auto& tokens = pending_tokens_[static_cast<std::size_t>(l)];
+        auto& counts = pending_counts_[static_cast<std::size_t>(l)];
+        if (tokens > 0 && (l >= text_layers_ || l < prompt_lent_from_)) {
+            routed_.clear();
+            for (std::int32_t e = 0; e < kExperts; ++e) {
+                const std::int32_t c = counts[static_cast<std::size_t>(e)];
+                if (c > 0) { routed_.push_back(expert_cache::Routed{e, c}); }
+            }
+            cache_->apply_prompt(l, routed_, tokens, options_.new_prompt_cap);
+        }
+        tokens = 0;
+        std::fill(counts.begin(), counts.end(), 0);
+    }
+}
 
 std::int32_t Qwen4OffloadExperts::prompt_arena_columns() const noexcept {
     return workspace_layers_ > 0 ? options_.base_chunk : std::numeric_limits<std::int32_t>::max();
@@ -1185,11 +1465,10 @@ Qwen4OffloadExperts::prompt_workspace(std::span<const cudaStream_t> streams) {
     if (streams.size() != static_cast<std::size_t>(partitions_)) {
         throw std::invalid_argument("Qwen4Exp offload experts: one compute stream per GPU");
     }
-    // The workspace: slots [first * K, lend_first_ * K) of each GPU's gate/up code plane (planar
-    // pool: one contiguous region), the lent layers below the ring.
-    const std::int64_t K     = options_.slots_per_layer;
-    const std::int64_t begin = static_cast<std::int64_t>(first) * K * kLendPlaneBytes;
-    const std::int64_t end   = static_cast<std::int64_t>(lend_first_) * K * kLendPlaneBytes;
+    // The workspace: the base slots of layers [first, lend_first_) in each GPU's gate/up code
+    // plane (planar pool: one contiguous region), the lent layers below the ring.
+    const std::int64_t begin = base_offset(first) * kLendPlaneBytes;
+    const std::int64_t end   = base_offset(lend_first_) * kLendPlaneBytes;
     const auto events        = cache_->lend_events();
     std::array<DeviceSpan, 2> spans{};
     for (std::int32_t p = 0; p < partitions_; ++p) {
@@ -1236,13 +1515,24 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
         cache_->set_insert_cap(options_.insert_cap * partitions_);
     }
     after_prompt_ = kind == Qwen4Window::Prompt;
+    if (kind == Qwen4Window::Decode) {
+        text_prompt_seen_ = false;
+        prompt_new_       = false;
+    }
     if (kind == Qwen4Window::Decode && cache_->lending()) {
         // The prompt is over: the ring (and the borrowed workspace) goes back to the cache, its
         // layers refilled with the last prompt window's most routed experts.
         reclaim_lent(cache_->lent_count());
         // T98 (validation): under NINFER_QWEN4_EXPERT_FREEZE=1 the refill lands before the first
         // decode window, so the decode residency no longer depends on copy timing.
-        if (cache_->frozen() && std::getenv("NINFER_QWEN4_FREEZE_FLUSH") != nullptr) { cache_->flush(); }
+        if (cache_->frozen() && std::getenv("NINFER_QWEN4_FREEZE_FLUSH") != nullptr) {
+            cache_->flush();
+        }
+    }
+    if (kind == Qwen4Window::Decode && pending_prompt_) {
+        // T211b: the new conversation's prompt updates the residency now that it is over (its
+        // lent layers were just restored).
+        apply_pending_prompt();
     }
     chunk_workspace_layers_ = 0;
     if (kind == Qwen4Window::Prompt && stream_ != nullptr && prompt_columns_ > 0) {
@@ -1288,14 +1578,14 @@ void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
     for (std::int32_t l = 0; l < layers_; ++l) {
         served_at_begin_[static_cast<std::size_t>(l)] = mailbox_->served(l);
     }
-    open_      = true;
-    kind_      = kind;
-    observed_  = 0;
-    begin_ns_  = ops::host::HostMoeMailbox::now_ns();
+    open_                 = true;
+    kind_                 = kind;
+    observed_             = 0;
+    begin_ns_             = ops::host::HostMoeMailbox::now_ns();
     host_served_at_begin_ = mailbox_->host_experts_served();
-    at_begin_  = cache_->counters();
-    window_      = Qwen4OffloadWindowStats{};
-    window_.kind = kind;
+    at_begin_             = cache_->counters();
+    window_               = Qwen4OffloadWindowStats{};
+    window_.kind          = kind;
 }
 
 void Qwen4OffloadExperts::observe_layer(std::int32_t layer) {
@@ -1308,13 +1598,14 @@ void Qwen4OffloadExperts::observe_layer(std::int32_t layer) {
                                " tokens");
     }
     expert_cache::count_routed(
-        std::span<const std::int32_t>(log.ids, static_cast<std::size_t>(tokens) * kTopK),
-        kExperts, routed_);
+        std::span<const std::int32_t>(log.ids, static_cast<std::size_t>(tokens) * kTopK), kExperts,
+        routed_);
     if (routing_ != nullptr) {
         const std::int32_t header[4] = {static_cast<std::int32_t>(routing_windows_),
                                         kind_ == Qwen4Window::Prompt ? 1 : 0, layer, tokens};
         std::fwrite(header, sizeof(header), 1, routing_);
-        std::fwrite(log.ids, sizeof(std::int32_t), static_cast<std::size_t>(tokens) * kTopK, routing_);
+        std::fwrite(log.ids, sizeof(std::int32_t), static_cast<std::size_t>(tokens) * kTopK,
+                    routing_);
     }
     // Columns that route nothing (ids -1: the verify and MTP columns past a lane's valid count,
     // moe_route) are not tokens of the window for the policy.
@@ -1345,7 +1636,8 @@ void Qwen4OffloadExperts::observe_layer(std::int32_t layer) {
         }
     }
     if (kind_ == Qwen4Window::Prompt) {
-        if (cache_->lent(layer) && layer < static_cast<std::int32_t>(lent_profile_.size())) {
+        if (!options_.keep_decode_residency && cache_->lent(layer) &&
+            layer < static_cast<std::int32_t>(lent_profile_.size())) {
             std::vector<expert_cache::Routed> hot(routed_.begin(), routed_.end());
             std::stable_sort(hot.begin(), hot.end(),
                              [](const auto& a, const auto& b) { return a.count > b.count; });
@@ -1375,7 +1667,18 @@ void Qwen4OffloadExperts::observe_layer(std::int32_t layer) {
                 rank[order[r].expert] = static_cast<std::int32_t>(r);
             }
         }
-        (void)cache_->observe_prompt(layer, routed_, routed_tokens);
+        // T211: by default a prompt window inserts nothing (the decode after it routes much more
+        // like the decode before it than like the prompt).
+        // T211b: a new conversation's prompt (prompt_new_) is counted and applied when its
+        // first decode window begins (apply_pending_prompt).
+        if (prompt_new_ && layer < static_cast<std::int32_t>(pending_counts_.size())) {
+            auto& counts = pending_counts_[static_cast<std::size_t>(layer)];
+            for (const auto& r : routed_) { counts[static_cast<std::size_t>(r.expert)] += r.count; }
+            pending_tokens_[static_cast<std::size_t>(layer)] += routed_tokens;
+            pending_prompt_ = true;
+        }
+        (void)cache_->observe_prompt(layer, routed_, routed_tokens,
+                                     !options_.keep_decode_residency);
     } else if (!options_.freeze_after_prompt) {
         (void)cache_->observe(layer, routed_, routed_tokens);
     }
@@ -1469,7 +1772,8 @@ void Qwen4OffloadExperts::observe_prompt_layers(cudaStream_t stream) {
             const std::int64_t t0 = ops::host::HostMoeMailbox::now_ns();
             if (observed_ > 0) {
                 cache_->submit_fills_unfenced();
-                cache_->prioritize_queue(prompt_rank_);
+                // T211: no prompt fills to rank; the queue holds the lent layers' restore.
+                if (!options_.keep_decode_residency) { cache_->prioritize_queue(prompt_rank_); }
             }
             observe_layer(observed_);
             window_.observe_us +=
@@ -1491,7 +1795,9 @@ void Qwen4OffloadExperts::end_window(cudaStream_t stream) {
         if (*mailbox_->route_log(layer).published != 0) { observe_layer(layer); }
     }
     cache_->submit_fills();
-    if (options_.warm_start && kind_ == Qwen4Window::Prompt) { cache_->prioritize_queue(prompt_rank_); }
+    if (options_.warm_start && kind_ == Qwen4Window::Prompt && !options_.keep_decode_residency) {
+        cache_->prioritize_queue(prompt_rank_);
+    }
     cache_->poll();
     if (prefetch_) {
         prefetch_->end_window();
@@ -1520,15 +1826,15 @@ void Qwen4OffloadExperts::end_window(cudaStream_t stream) {
         window_.fill_wait_us = 1e-3 * static_cast<double>(ops::host::HostMoeMailbox::now_ns() - t0);
     }
 
-    const auto& c        = cache_->counters();
-    window_.wall_us      = 1e-3 * static_cast<double>(ops::host::HostMoeMailbox::now_ns() - begin_ns_);
-    window_.accesses     = c.accesses - at_begin_.accesses;
-    window_.device_hits  = c.device_hits - at_begin_.device_hits;
-    window_.policy_hits  = c.policy_hits - at_begin_.policy_hits;
-    window_.missing      = c.missing - at_begin_.missing;
-    window_.inserts      = c.inserts - at_begin_.inserts;
-    window_.fills_issued = c.fills_issued - at_begin_.fills_issued;
-    window_.fill_bytes   = c.fill_bytes - at_begin_.fill_bytes;
+    const auto& c    = cache_->counters();
+    window_.wall_us  = 1e-3 * static_cast<double>(ops::host::HostMoeMailbox::now_ns() - begin_ns_);
+    window_.accesses = c.accesses - at_begin_.accesses;
+    window_.device_hits   = c.device_hits - at_begin_.device_hits;
+    window_.policy_hits   = c.policy_hits - at_begin_.policy_hits;
+    window_.missing       = c.missing - at_begin_.missing;
+    window_.inserts       = c.inserts - at_begin_.inserts;
+    window_.fills_issued  = c.fills_issued - at_begin_.fills_issued;
+    window_.fill_bytes    = c.fill_bytes - at_begin_.fill_bytes;
     window_.fills_pending = cache_->fills_pending();
     // The service thread finished every doorbell of this window before the device completed it.
     window_.host_experts = mailbox_->host_experts_served() - host_served_at_begin_;
@@ -1580,17 +1886,18 @@ void Qwen4OffloadExperts::run_peer_share(std::int32_t layer, const Tensor& x, co
     ops::host::select_device_share(
         stream, T, kTopK, static_cast<const std::int32_t*>(ids.data),
         peer_.mirror + static_cast<std::size_t>(layer) * kExperts, kExperts, options_.split,
-        ops::host::HostMoeDeviceShare{.reads = peer_.reads, .picks = peer_.picks,
-                                      .stage_table = peer_.stage_table});
+        ops::host::HostMoeDeviceShare{
+            .reads = peer_.reads, .picks = peer_.picks, .stage_table = peer_.stage_table});
     const Qwen4ExpertBank& bank = banks_[static_cast<std::size_t>(layer)];
     const ops::MoeSlotPool& b   = bank.bank;
-    ops::host::stage_device_share(
-        stream, peer_.picks,
-        {static_cast<const std::byte*>(b.gate_up_codes.base), static_cast<const std::byte*>(b.gate_up_scales.base),
-         static_cast<const std::byte*>(b.down_codes.base), static_cast<const std::byte*>(b.down_scales.base)},
-        peer_.staging,
-        {ops::kMoeSlotsGateUpCodeBytes, ops::kMoeSlotsGateUpScaleBytes, ops::kMoeSlotsDownCodeBytes,
-         ops::kMoeSlotsDownScaleBytes});
+    ops::host::stage_device_share(stream, peer_.picks,
+                                  {static_cast<const std::byte*>(b.gate_up_codes.base),
+                                   static_cast<const std::byte*>(b.gate_up_scales.base),
+                                   static_cast<const std::byte*>(b.down_codes.base),
+                                   static_cast<const std::byte*>(b.down_scales.base)},
+                                  peer_.staging,
+                                  {ops::kMoeSlotsGateUpCodeBytes, ops::kMoeSlotsGateUpScaleBytes,
+                                   ops::kMoeSlotsDownCodeBytes, ops::kMoeSlotsDownScaleBytes});
     const float* divisors = peer_divisors_ + static_cast<std::size_t>(layer) * kDivisorsPerLayer;
     const Tensor table(peer_.stage_table, DType::I32, {kExperts});
     const ops::MoeSlotsLayer view = slots_layer(bank, divisors, divisors + kGateUpDivisors, table);
@@ -1610,9 +1917,9 @@ void Qwen4OffloadExperts::run_peer_share(std::int32_t layer, const Tensor& x, co
 
 // ---- Qwen4OffloadPeerExperts ------------------------------------------------------------------
 
-void Qwen4OffloadPeerExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank,
-                                  const Tensor& x, const Tensor& ids, const Tensor& weights,
-                                  Tensor& partial, WorkspaceArena& work, cudaStream_t stream) {
+void Qwen4OffloadPeerExperts::run(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
+                                  const Tensor& ids, const Tensor& weights, Tensor& partial,
+                                  WorkspaceArena& work, cudaStream_t stream) {
     require_operands(x, ids, weights, partial);
     if (layer < 0 || layer >= layers_) {
         throw std::invalid_argument("Qwen4Exp offload experts (rank 1): layer out of range");
@@ -1622,7 +1929,7 @@ void Qwen4OffloadPeerExperts::run(std::int32_t layer, const Qwen4ExpertBank& ban
     const float* divisors =
         memory_.divisors + static_cast<std::size_t>(layer) * Qwen4OffloadExperts::kDivisorsPerLayer;
     const ops::MoeSlotsLayer view = slots_layer(bank, divisors, divisors + kGateUpDivisors, table);
-    const std::int32_t T = x.ne[1];
+    const std::int32_t T          = x.ne[1];
     if (owner_ != nullptr && owner_->streams_call(layer, T)) {
         // A wide prefill call: rank 1 streams its partition into its own ring (T42).
         owner_->run_peer_streamed(layer, bank, x, ids, weights, partial, work, stream);
@@ -1630,15 +1937,15 @@ void Qwen4OffloadPeerExperts::run(std::int32_t layer, const Qwen4ExpertBank& ban
     }
     const ops::MoeSlotPool pool =
         slot_pool(memory_.pool, planar_strides(), layers_ * slots_per_layer_);
-    auto scope           = work.scope();
-    WorkspaceArena scratch(work.alloc_bytes(ops::moe_slots_nvfp4_workspace_bytes(
-        std::min<std::int32_t>(T, ops::kMoeSlotsMaxTokens))));
+    auto scope = work.scope();
+    WorkspaceArena scratch(work.alloc_bytes(
+        ops::moe_slots_nvfp4_workspace_bytes(std::min<std::int32_t>(T, ops::kMoeSlotsMaxTokens))));
     for (std::int32_t begin = 0; begin < T; begin += ops::kMoeSlotsMaxTokens) {
         const std::int32_t count = std::min(ops::kMoeSlotsMaxTokens, T - begin);
         Tensor out               = partial.slice(1, begin, count);
         ops::moe_slots_nvfp4(x.slice(1, begin, count), ids.slice(1, begin, count),
-                             weights.slice(1, begin, count), view, pool,
-                             ops::MoeSlotsOutput::Store, out, scratch, stream);
+                             weights.slice(1, begin, count), view, pool, ops::MoeSlotsOutput::Store,
+                             out, scratch, stream);
     }
     // A decode call's miss-split share computed here instead of rank 0 (T42 rank balance).
     if (owner_ != nullptr && owner_->peer_shares() && T <= ops::kMoeSlotsMaxTokens) {
@@ -1667,7 +1974,8 @@ void Qwen4OffloadExperts::finish_trace() {
             window_.gpu_wait_us += 1e-3 * static_cast<double>(acc - dev);
             if (seen[static_cast<std::size_t>(l)] != 0) {
                 window_.doorbell_us +=
-                    1e-3 * static_cast<double>(seen[static_cast<std::size_t>(l)] - (pub + clock_offset_));
+                    1e-3 *
+                    static_cast<double>(seen[static_cast<std::size_t>(l)] - (pub + clock_offset_));
                 if (flag_seen_ns_[static_cast<std::size_t>(l)] != 0) {
                     window_.bell_after_flag_us +=
                         1e-3 * static_cast<double>(seen[static_cast<std::size_t>(l)] -

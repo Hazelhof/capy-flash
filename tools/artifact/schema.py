@@ -54,9 +54,7 @@ def members(
     missing = required - value.keys()
     extra = value.keys() - required - optional
     if missing or extra:
-        raise ArtifactError(
-            f"{label}: missing {sorted(missing)}, unknown {sorted(extra)}"
-        )
+        raise ArtifactError(f"{label}: missing {sorted(missing)}, unknown {sorted(extra)}")
     return value
 
 
@@ -150,9 +148,7 @@ def validate_encoding(obj: ArtifactObject) -> None:
     """Interpret an object only when a consumer requests its encoding."""
     if isinstance(obj, ResourceObject):
         if obj.encoding != RAW_BYTES_V1:
-            raise ArtifactError(
-                f"{obj.id}: unsupported resource encoding {obj.encoding!r}"
-            )
+            raise ArtifactError(f"{obj.id}: unsupported resource encoding {obj.encoding!r}")
         return
     try:
         size = encoded_size(obj.layout, obj.format, obj.shape, obj.divisors)
@@ -183,15 +179,11 @@ def plan_objects(specs: Sequence[ObjectSpec]) -> tuple[ArtifactObject, ...]:
                 size = encoded_size(spec.layout, spec.format, dims, spec.divisors)
             except (TypeError, ValueError) as error:
                 raise ArtifactError(f"{name}: {error}") from error
-            obj = TensorObject(
-                name, dims, spec.format, spec.layout, start, size, spec.divisors
-            )
+            obj = TensorObject(name, dims, spec.format, spec.layout, start, size, spec.divisors)
         elif isinstance(spec, ResourceSpec):
             obj = ResourceObject(name, spec.encoding, offset, spec.bytes)
         else:
-            raise TypeError(
-                f"expected TensorSpec or ResourceSpec, got {type(spec).__name__}"
-            )
+            raise TypeError(f"expected TensorSpec or ResourceSpec, got {type(spec).__name__}")
         integer(obj.bytes, f"{name} bytes", positive=True)
         offset = integer(obj.offset + obj.bytes, f"{name} end")
         validate_encoding(obj)
@@ -262,9 +254,7 @@ def binding_parts(
             raise ArtifactError(f"{label}: range must contain two integers")
         begin, end = (integer(v, label) for v in bounds)
         if not begin < end <= prod(obj.shape):
-            raise ArtifactError(
-                f"{label}: range {bounds} is outside {obj.id} {obj.shape}"
-            )
+            raise ArtifactError(f"{label}: range {bounds} is outside {obj.id} {obj.shape}")
         total = integer(total + end - begin, f"{label} element count", positive=True)
         result.append((obj.id, begin, end))
     return tuple(result)
@@ -285,13 +275,9 @@ def _files(values: object, entry_name: str | None) -> tuple[FileRecord, ...]:
         else:
             name = identifier(name, f"files[{index}].path")
             if name in (".", "..") or "/" in name or "\\" in name or name in seen:
-                raise ArtifactError(
-                    f"files[{index}]: invalid or duplicate sibling filename {name!r}"
-                )
+                raise ArtifactError(f"files[{index}]: invalid or duplicate sibling filename {name!r}")
             seen.add(name)
-        size = integer(
-            value["payload_bytes"], f"files[{index}] payload bytes", positive=True
-        )
+        size = integer(value["payload_bytes"], f"files[{index}] payload bytes", positive=True)
         total = integer(total + size, "total payload bytes", positive=True)
         result.append(FileRecord(name, size))
     return tuple(result)
@@ -316,9 +302,7 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
         if obj.id in index:
             raise ArtifactError(f"duplicate object id {obj.id!r}")
         if obj.offset < previous_end or obj.offset + obj.bytes > payload_bytes:
-            raise ArtifactError(
-                f"{obj.id}: object ranges overlap, are out of order, or exceed payload"
-            )
+            raise ArtifactError(f"{obj.id}: object ranges overlap, are out of order, or exceed payload")
         previous_end = obj.offset + obj.bytes
         index[obj.id] = obj
 
@@ -341,9 +325,7 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
             identifier(role, f"{name} resource role")
             object_id = identifier(object_id, f"{name}/{role}")
             if not isinstance(index.get(object_id), ResourceObject):
-                raise ArtifactError(
-                    f"{name}/{role}: missing resource object {object_id!r}"
-                )
+                raise ArtifactError(f"{name}/{role}: missing resource object {object_id!r}")
         if "proposal" in component:
             if name != "text":
                 raise ArtifactError("only text may declare proposal")
@@ -367,9 +349,7 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
         raise ArtifactError("uses must be an array")
     seen_uses = set()
     for use in uses:
-        members(
-            use, {"parameter", "input"}, {"activation_policy", "auxiliaries"}, "Use"
-        )
+        members(use, {"parameter", "input"}, {"activation_policy", "auxiliaries"}, "Use")
         name = identifier(use["parameter"], "Use parameter")
         source = identifier(use["input"], f"{name} Use input")
         if name not in bindings or (name, source) in seen_uses:
@@ -391,9 +371,7 @@ def parse_directory(value: object, *, entry_name: str | None = None) -> Director
         raise ArtifactError("metadata and provenance must be objects")
     if "name" in metadata:
         identifier(metadata["name"], "metadata.name")
-    return Directory(
-        components, objects, bindings, tuple(uses), files, metadata, provenance
-    )
+    return Directory(components, objects, bindings, tuple(uses), files, metadata, provenance)
 
 
 def _unique_members(pairs: list[tuple[str, object]]) -> dict:
@@ -424,8 +402,6 @@ def decode_directory(data: bytes, *, entry_name: str | None = None) -> Directory
 def encode_directory(directory: Directory | dict) -> bytes:
     value = directory.to_json() if isinstance(directory, Directory) else directory
     try:
-        return json.dumps(
-            value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).encode("utf-8")
+        return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
     except (UnicodeError, ValueError, TypeError) as error:
         raise ArtifactError(f"cannot encode directory JSON: {error}") from error

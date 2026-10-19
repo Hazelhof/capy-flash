@@ -18,9 +18,7 @@ template <class Attempt>
 std::string failure_message(const Attempt& attempt) {
     try {
         attempt();
-    } catch (const std::invalid_argument& failure) {
-        return failure.what();
-    }
+    } catch (const std::invalid_argument& failure) { return failure.what(); }
     return {};
 }
 

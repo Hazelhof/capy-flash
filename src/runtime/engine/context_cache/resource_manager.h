@@ -1107,6 +1107,142 @@ public:
         return released;
     }
 
+    // Idle KV to the Host (v0.6; the Program has elastic KV and a Host KV tier): the Device keeps
+    // only the KV of active requests. Every idle catalogued owner (no active edge, no open
+    // context transaction) moves its Device KV pages to the Host, private continuations most
+    // valuable first (the capture reclaim's order, reversed), then shared prefixes newest first;
+    // pages an active request reads are not moved (the Program skips pages with an active
+    // reference), and neither is anything else when an owner cannot move now. Only when the Host
+    // tier lacks the room an owner's pages need are idle owners that keep no Device KV pages of
+    // their own released: private continuations less valuable than it, least valuable first, then
+    // shared prefixes without client credit, oldest first (the Host tier is an LRU of
+    // conversations); an owner that still does not fit stays on the Device. Returns the owners
+    // moved and released.
+    struct IdleKvDemotion {
+        std::uint32_t moved_owners    = 0;
+        std::uint32_t released_owners = 0;
+    };
+
+    IdleKvDemotion demote_idle_device_kv(Program& program) {
+        IdleKvDemotion out;
+        if (!std::holds_alternative<std::monostate>(transaction_)) { return out; }
+        constexpr std::uint32_t kAll = std::numeric_limits<std::uint32_t>::max();
+        const auto device_kv         = [](const auto& pages) {
+            return pages.main != 0 || pages.backend != 0;
+        };
+        std::vector<std::uint32_t> order;
+        for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
+            const CatalogEntry& entry = catalog_[slot];
+            if (entry.state == CatalogState::Catalogued && entry.handle &&
+                !private_has_active_edge(slot)) {
+                order.push_back(slot);
+            }
+        }
+        std::sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
+            return reclaim_key(catalog_[b]) < reclaim_key(catalog_[a]);
+        });
+        const auto demote_private = [&](std::uint32_t slot) {
+            CatalogEntry& entry = catalog_[slot];
+            const auto summary  = program.demote_retained_kv_for_lease(
+                *entry.handle, {.main = kAll, .backend = kAll});
+            if (!summary || !valid_continuation_summary(*summary)) { return false; }
+            assign_continuation_summary(entry.summary, *summary);
+            migrate_observations(entry, *summary, entry.retention);
+            advance_revision(entry.revision);
+            refresh_session_owner_revision(entry.id, slot, entry.revision);
+            saturating_increment(context_stats_.pressure_private_owners_degraded);
+            return true;
+        };
+        for (const std::uint32_t slot : order) {
+            if (catalog_[slot].state != CatalogState::Catalogued || !catalog_[slot].handle) {
+                continue;
+            }
+            const std::optional<std::size_t> needed =
+                program.idle_device_kv_host_bytes(*catalog_[slot].handle);
+            if (!needed) { continue; } // nothing of it can leave the Device now
+            bool moved = demote_private(slot);
+            while (!moved && program.host_kv_free_bytes() < *needed) {
+                // Room in the Host tier: the least valuable idle owner below this one that has
+                // already left the Device.
+                std::optional<std::uint32_t> victim;
+                for (std::uint32_t other = 0; other < catalog_count_; ++other) {
+                    const CatalogEntry& candidate = catalog_[other];
+                    if (other == slot || candidate.state != CatalogState::Catalogued ||
+                        !candidate.handle || private_has_active_edge(other) ||
+                        !(reclaim_key(candidate) < reclaim_key(catalog_[slot])) ||
+                        device_kv(program.retained_device_kv_pages(*candidate.handle))) {
+                        continue;
+                    }
+                    if (!victim || reclaim_key(candidate) < reclaim_key(catalog_[*victim])) {
+                        victim = other;
+                    }
+                }
+                if (!victim) {
+                    // Shared prefixes hold Host pages too: the oldest idle one without client
+                    // credit that keeps no Device KV pages of its own.
+                    std::optional<std::uint32_t> shared_victim;
+                    for (std::uint32_t other = 0; other < shared_catalog_count_; ++other) {
+                        const SharedCatalogEntry& candidate = shared_catalog_[other];
+                        if (candidate.state != SharedCatalogState::Catalogued ||
+                            !candidate.handle || candidate.transaction_pins != 0 ||
+                            candidate.explicit_credit || shared_active_edge_count(other) != 0 ||
+                            device_kv(program.retained_device_kv_pages(*candidate.handle))) {
+                            continue;
+                        }
+                        if (!shared_victim || candidate.id < shared_catalog_[*shared_victim].id) {
+                            shared_victim = other;
+                        }
+                    }
+                    if (!shared_victim) { break; }
+                    SharedCatalogEntry& evicted = shared_catalog_[*shared_victim];
+                    const auto result = program.release_shared_prefix(std::move(*evicted.handle));
+                    if (result.status != ConsumeStatus::Consumed) { break; }
+                    clear_shared_entry(evicted);
+                    saturating_increment(context_stats_.pressure_shared_owners_evicted);
+                    record_checkpoint_drops(context_stats_, 1);
+                    ++out.released_owners;
+                    moved = demote_private(slot);
+                    continue;
+                }
+                CatalogEntry& evicted = catalog_[*victim];
+                reclaim_inflation_    = std::max(reclaim_inflation_, reclaim_priority(evicted));
+                const std::uint32_t dropped = continuation_checkpoint_count(evicted.summary);
+                const auto result = program.release_continuation(std::move(*evicted.handle));
+                if (result.status != ConsumeStatus::Consumed) { break; }
+                erase_session_if_owner(evicted.id);
+                clear_catalog_entry(evicted);
+                saturating_increment(context_stats_.pressure_private_owners_evicted);
+                record_checkpoint_drops(context_stats_, dropped);
+                ++out.released_owners;
+                moved = demote_private(slot);
+            }
+            if (moved) { ++out.moved_owners; }
+        }
+        std::vector<std::uint32_t> shared;
+        for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
+            const SharedCatalogEntry& entry = shared_catalog_[slot];
+            if (entry.state == SharedCatalogState::Catalogued && entry.handle &&
+                entry.transaction_pins == 0 && shared_active_edge_count(slot) == 0) {
+                shared.push_back(slot);
+            }
+        }
+        std::sort(shared.begin(), shared.end(), [&](std::uint32_t a, std::uint32_t b) {
+            return shared_catalog_[b].id < shared_catalog_[a].id;
+        });
+        for (const std::uint32_t slot : shared) {
+            SharedCatalogEntry& entry = shared_catalog_[slot];
+            const auto summary        = program.demote_retained_shared_kv_for_lease(
+                *entry.handle, {.main = kAll, .backend = kAll});
+            if (!summary || !valid_shared_prefix_summary(*summary)) { continue; }
+            entry.summary = *summary;
+            advance_revision(entry.revision);
+            saturating_increment(context_stats_.pressure_shared_owners_degraded);
+            ++out.moved_owners;
+        }
+        if (out.moved_owners != 0 || out.released_owners != 0) { rebuild_prefix_index(); }
+        return out;
+    }
+
     [[nodiscard]] bool lease_demote_tried(std::uint32_t slot) const noexcept {
         return slot < lease_demote_tried_.size() && lease_demote_tried_[slot];
     }
@@ -1142,7 +1278,8 @@ public:
             throw std::logic_error("terminal finish overlaps an open resource transaction");
         }
         ActiveEntry& active = active_[lane.value];
-        FinishResult result = cancelled ? program.finish_cancelled(sequence) : program.finish(sequence);
+        FinishResult result =
+            cancelled ? program.finish_cancelled(sequence) : program.finish(sequence);
         if (result.status != ConsumeStatus::Consumed) {
             AbortResult discarded = program.abort(sequence);
             if (discarded.status != ConsumeStatus::Consumed) {
@@ -1847,7 +1984,8 @@ private:
             program.drop_continuation_anchor(*entry.handle, anchor->ref);
         if (!after) { return false; }
         if (!valid_continuation_summary(*after) ||
-            continuation_checkpoint_count(*after) + 1 != continuation_checkpoint_count(entry.summary)) {
+            continuation_checkpoint_count(*after) + 1 !=
+                continuation_checkpoint_count(entry.summary)) {
             throw std::logic_error("Program dropped more than the selected long anchor");
         }
         assign_continuation_summary(entry.summary, *after);
@@ -3710,8 +3848,8 @@ private:
     Planner planner_;
     CapturePlanner capture_planner_;
     RuntimeStats context_stats_;
-    std::uint64_t next_continuation_id_  = 1;
-    std::uint64_t reclaim_inflation_     = 0;
+    std::uint64_t next_continuation_id_ = 1;
+    std::uint64_t reclaim_inflation_    = 0;
     std::vector<bool> lease_demote_tried_; // reclaim_device_kv_for_lease: one demotion per owner
     std::uint64_t next_shared_prefix_id_ = 1;
     std::uint64_t retention_epoch_       = 0;

@@ -58,9 +58,11 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/sparse_attention.h"
+#include "ops/sparse_moe/host/host_moe_mailbox.h"
 
 #include <cuda_runtime.h>
 
@@ -82,32 +84,38 @@ namespace ninfer::models::qwen3_5::execution {
 // Host taps of the wide residual after selected layers (teacher-forcing dumps, eager only).
 class Qwen4Taps {
 public:
-    virtual ~Qwen4Taps() = default;
+    virtual ~Qwen4Taps()                                       = default;
     [[nodiscard]] virtual bool wants(std::int32_t layer) const = 0;
     // `wide` BF16 [S*H, T] committed residual after `layer` (or the head mixer output when
     // layer == -1, BF16 [H,T]); column t is sequence position first_position + t.
     virtual void capture(std::int32_t layer, const Tensor& wide, std::int32_t first_position,
                          cudaStream_t stream) = 0;
+
     // tp 2: the same tap's two rank copies (each on its rank and stream), which the replicated
     // schedule keeps bit-identical (identical routing on both ranks depends on it).
     virtual void compare_ranks(std::int32_t layer, const Tensor& rank0, const Tensor& rank1,
                                cudaStream_t stream0, cudaStream_t stream1) {
         (void)layer, (void)rank0, (void)rank1, (void)stream0, (void)stream1;
     }
+
     // T128: the two rank partials of a TP2 prefill exchange, before the sum (eager only).
     // site 0 = mixer output projection (BF16 [H,T]), 1 = MoE (FP32 [H,T], NINFER_TP_AR=0 path).
     [[nodiscard]] virtual bool wants_exchange() const { return false; }
+
     virtual void capture_exchange(std::int32_t layer, int site, const Tensor& rank0,
                                   const Tensor& rank1, std::int32_t first_position,
                                   cudaStream_t stream0, cudaStream_t stream1) {
         (void)layer, (void)site, (void)rank0, (void)rank1, (void)first_position, (void)stream0,
             (void)stream1;
     }
+
     // MTP teacher forcing (T24): every prompt column runs the whole MTP layer and its draft
     // logits (BF16 [V,1] of the column at `position`, predicting the token at position + 2) are
     // captured, with the prompt tokens.
     [[nodiscard]] virtual bool wants_mtp_logits() const { return false; }
+
     virtual void capture_mtp_logits(const Tensor&, std::int32_t, cudaStream_t) {}
+
     virtual void capture_tokens(std::span<const std::int32_t>) {}
 };
 
@@ -115,8 +123,8 @@ public:
 // layer's activation ranges with it): x BF16 [H,T], ids I32 [10,T], weights FP32 [10,T].
 class Qwen4MoeProbe {
 public:
-    virtual ~Qwen4MoeProbe() = default;
-    [[nodiscard]] virtual bool wants(std::int32_t layer) const = 0;
+    virtual ~Qwen4MoeProbe()                                         = default;
+    [[nodiscard]] virtual bool wants(std::int32_t layer) const       = 0;
     virtual void capture(std::int32_t layer, const Tensor& x, const Tensor& ids,
                          const Tensor& weights, cudaStream_t stream) = 0;
 };
@@ -150,8 +158,14 @@ struct Qwen4Runtime {
     // (pinned, written by the Program before the launch).
     Tensor decode_ple_rows;
     const std::uint16_t* decode_ple_host = nullptr;
-    Qwen4Taps* taps = nullptr;
-    Qwen4MoeProbe* moe_probe = nullptr;
+    // Deferred decode rows (mapped host word of this rank, null = uploaded at the round's start):
+    // the round does not upload them; the PLE layer copies them from `decode_ple_host` itself once
+    // the Program has raised the word (ops::host::consume_host_flag), so the host gathers them
+    // after the launch while the device runs the layers before the PLE layer. Every execution of
+    // such a round (graph or eager) consumes one raise.
+    std::uint32_t* decode_ple_staged = nullptr;
+    Qwen4Taps* taps                  = nullptr;
+    Qwen4MoeProbe* moe_probe         = nullptr;
     // T43: the MTP proposal head over a draft token shortlist (rank 0's at tp 2), null = the full
     // Text output head. Program-owned (qwen4_draft_head.h).
     const Qwen4DraftHead* draft_head = nullptr;
@@ -159,19 +173,19 @@ struct Qwen4Runtime {
 
 // The columns one forward processes: W columns of B sequences (prefill: W = T, B = 1).
 struct Qwen4Columns {
-    std::int32_t width = 0;
-    std::int32_t batch = 0;
+    std::int32_t width            = 0;
+    std::int32_t batch            = 0;
     const Tensor* cache_positions = nullptr; // I32 [T]
     const Tensor* rope_positions  = nullptr; // I32 [T] or [T,3] (axis-major)
     const Tensor* valid_columns   = nullptr; // null or I32 [B]
     // MTP decode (T52): the MoE routes only each lane's last valid column (the alignment of a
     // verified window is read only at the accepted column, ops::MoeRouteColumns::LastValid).
-    bool moe_last_valid_only      = false;
-    const Tensor* table_rows      = nullptr; // I32 [B]
-    std::uint32_t max_visible     = 0;       // envelope: largest visible extent of any column
-    bool prefill                  = true;    // prefill: scalar state slots; else [B] selectors
-    std::int32_t source_slot      = 0;
-    std::int32_t destination_slot = 0;
+    bool moe_last_valid_only        = false;
+    const Tensor* table_rows        = nullptr; // I32 [B]
+    std::uint32_t max_visible       = 0;       // envelope: largest visible extent of any column
+    bool prefill                    = true;    // prefill: scalar state slots; else [B] selectors
+    std::int32_t source_slot        = 0;
+    std::int32_t destination_slot   = 0;
     const Tensor* source_slots      = nullptr; // I32 [B]
     const Tensor* destination_slots = nullptr; // I32 [B]
     std::int32_t first_position     = 0;       // absolute position of column 0 (taps)
@@ -183,9 +197,9 @@ struct Qwen4Columns {
 };
 
 struct Qwen4State {
-    const PagedKVCache* kv              = nullptr;
-    LinearAttentionStatePool* linear    = nullptr;
-    const Qwen4Runtime* runtime         = nullptr;
+    const PagedKVCache* kv           = nullptr;
+    LinearAttentionStatePool* linear = nullptr;
+    const Qwen4Runtime* runtime      = nullptr;
 };
 
 [[nodiscard]] inline ops::QsaGeometry qwen4_qsa_geometry(const TextConfig& config) {
@@ -234,8 +248,8 @@ template <class Arena>
 class Qwen4Forward {
 public:
     static constexpr bool kExecute = std::is_same_v<Arena, WorkspaceArena>;
-    using Rank        = Qwen4Rank<Arena>;
-    using RankTensors = std::array<Tensor, 2>;
+    using Rank                     = Qwen4Rank<Arena>;
+    using RankTensors              = std::array<Tensor, 2>;
 
     // One device.
     Qwen4Forward(const TextConfig& config, const Parameters& parameters, Arena& work,
@@ -257,8 +271,7 @@ public:
     // `collectives` must be complete when executing (planning ignores it).
     Qwen4Forward(const TextConfig& config, std::array<Rank, 2> ranks, int width,
                  Qwen4Collectives collectives, std::int32_t first, std::int32_t last)
-        : config_(config), r_(ranks), width_(width), tp_(collectives), first_(first),
-          last_(last) {
+        : config_(config), r_(ranks), width_(width), tp_(collectives), first_(first), last_(last) {
         if (first_ <= 0 || last_ < first_) {
             throw std::invalid_argument("Qwen4Exp forward column interval is invalid");
         }
@@ -295,26 +308,40 @@ public:
     }
 
     [[nodiscard]] std::int32_t wide_rows() const { return dimension(config_.residual_width()); }
+
     [[nodiscard]] std::int32_t hidden() const { return dimension(config_.hidden_size); }
+
     [[nodiscard]] std::int32_t streams() const {
         return dimension(config_.hyper_connection->hc_count);
     }
+
+    // The visual columns of a multimodal prefill chunk, per rank: the merged Vision embeddings
+    // BF16 [H, V] and the chunk-relative columns I32 [V] whose token embedding they replace before
+    // the residual is widened (inputs_embeds.masked_scatter, then one copy per stream). The hidden
+    // axis is replicated at tp 2: each rank scatters its own copy of the same embeddings.
+    struct VisualColumns {
+        RankTensors embeddings;
+        RankTensors indices;
+    };
 
     // One device: ids I32 [T]; ple_embedding BF16 [embed_dim, T] (when the model has PLE);
     // wide_out BF16 [S*H, T] receives the committed residual after the last block: the carried
     // hidden of the round (the continuation hidden MTP consumes). head() turns it into the output
     // head's input.
-    void run(const Tensor& ids, const Tensor* ple_embedding, Tensor& wide_out) {
+    void run(const Tensor& ids, const Tensor* ple_embedding, Tensor& wide_out,
+             const VisualColumns* visual = nullptr) {
         const RankTensors rank_ids{ids, Tensor{}};
         RankTensors rank_ple;
         if (ple_embedding != nullptr) { rank_ple = {*ple_embedding, Tensor{}}; }
         RankTensors rank_out{wide_out, Tensor{}};
-        run(rank_ids, ple_embedding != nullptr ? &rank_ple : nullptr, rank_out);
+        run(rank_ids, ple_embedding != nullptr ? &rank_ple : nullptr, rank_out, visual);
     }
 
     // Per rank: ids, the PLE n-gram embedding and the wide output, each resident on its rank.
-    // Both ranks' outputs hold the same (replicated) committed residual.
-    void run(const RankTensors& ids, const RankTensors* ple_embedding, RankTensors& wide_out) {
+    // Both ranks' outputs hold the same (replicated) committed residual. The PLE n-gram rows of
+    // visual columns hash the placeholder token ids, as the reference (ple_input_ids = input_ids).
+    void run(const RankTensors& ids, const RankTensors* ple_embedding, RankTensors& wide_out,
+             const VisualColumns* visual = nullptr) {
         const std::int32_t T = columns();
         auto scope           = scopes();
         RankTensors wide     = wide_buffers(wide_out, T);
@@ -324,6 +351,10 @@ public:
             each([&](int r) {
                 if constexpr (kExecute) {
                     ops::embedding(ids[at(r)], parameters(r).text.token_embedding, e[at(r)], s(r));
+                    if (visual != nullptr) {
+                        ops::scatter(visual->embeddings[at(r)], visual->indices[at(r)], e[at(r)],
+                                     s(r));
+                    }
                     ops::hyper_connection_expand(e[at(r)], streams(), wide[at(r)], s(r));
                 }
             });
@@ -361,10 +392,10 @@ public:
                 if constexpr (kExecute) {
                     const HyperConnectionParameters& hc = block(r, layer).*member;
                     if (pending >= 0) {
-                        ops::hyper_connection_combine_mix(
-                            wide[at(r)], y[at(pending)][at(r)], inject[at(pending)][at(r)],
-                            hc.weights, config_.rms_norm_eps, mixed[at(r)],
-                            &inject[at(next)][at(r)], work(r), s(r));
+                        ops::hyper_connection_combine_mix(wide[at(r)], y[at(pending)][at(r)],
+                                                          inject[at(pending)][at(r)], hc.weights,
+                                                          config_.rms_norm_eps, mixed[at(r)],
+                                                          &inject[at(next)][at(r)], work(r), s(r));
                     } else {
                         ops::hyper_connection_mix(wide[at(r)], hc.weights, config_.rms_norm_eps,
                                                   mixed[at(r)], &inject[at(next)][at(r)], work(r),
@@ -394,13 +425,14 @@ public:
                 }
                 pending = next;
                 next ^= 1;
-                mix(&Qwen4BlockParameters::ffn_hc, layer); // commits the mixer output in the same pass
+                mix(&Qwen4BlockParameters::ffn_hc,
+                    layer); // commits the mixer output in the same pass
                 ahead(layer, wide);
                 moe(layer, mixed, y[at(next)], staging_fp32);
                 pending = next;
                 next ^= 1;
                 if constexpr (kExecute) {
-                    const Qwen4Columns& c = r_[0].columns;
+                    const Qwen4Columns& c       = r_[0].columns;
                     const Qwen4Runtime* runtime = r_[0].state.runtime;
                     if (c.prefill && runtime != nullptr && runtime->taps != nullptr &&
                         runtime->taps->wants(static_cast<std::int32_t>(layer))) {
@@ -507,7 +539,8 @@ public:
                 const Qwen4MtpParameters& p = *m[i];
                 if constexpr (kExecute) {
                     if (embeddings != nullptr) {
-                        CUDA_CHECK(::ninfer::memcpy_device_async(e[i].data, (*embeddings)[i].data, e[i].bytes(), s(r)));
+                        CUDA_CHECK(::ninfer::memcpy_device_async(e[i].data, (*embeddings)[i].data,
+                                                                 e[i].bytes(), s(r)));
                     } else {
                         ops::embedding(ids[i], parameters(r).text.token_embedding, e[i], s(r));
                     }
@@ -526,10 +559,9 @@ public:
                     ops::residual_add(streams_hp[i], wide[i], s(r));
                 } else {
                     const LinearParameters& hp = p.hidden_projection;
-                    reserve(ops::linear_workspace_capacity_bytes(hp.weight.qtype, hp.weight.n,
-                                                                 hp.weight.k, hp.policy,
-                                                                 first_ * streams(),
-                                                                 last_ * streams()),
+                    reserve(ops::linear_workspace_capacity_bytes(
+                                hp.weight.qtype, hp.weight.n, hp.weight.k, hp.policy,
+                                first_ * streams(), last_ * streams()),
                             r);
                 }
             });
@@ -557,10 +589,9 @@ public:
             if (append_only) { return; }
             each([&](int r) {
                 if constexpr (kExecute) {
-                    ops::hyper_connection_combine_mix(wide[at(r)], y[at(r)], inject[at(r)],
-                                                      block(r, layer).ffn_hc.weights,
-                                                      config_.rms_norm_eps, mixed[at(r)],
-                                                      &inject[at(r)], work(r), s(r));
+                    ops::hyper_connection_combine_mix(
+                        wide[at(r)], y[at(r)], inject[at(r)], block(r, layer).ffn_hc.weights,
+                        config_.rms_norm_eps, mixed[at(r)], &inject[at(r)], work(r), s(r));
                 }
             });
             moe(layer, mixed, y, staging_fp32);
@@ -571,8 +602,8 @@ public:
             });
         } catch (const std::exception& error) {
             throw std::runtime_error(std::string("mtp/layers/0 ") + phase() +
-                                     (width_ == 2 ? " tp2" : "") +
-                                     " columns=" + std::to_string(T) + ": " + error.what());
+                                     (width_ == 2 ? " tp2" : "") + " columns=" + std::to_string(T) +
+                                     ": " + error.what());
         }
     }
 
@@ -590,8 +621,11 @@ public:
 
 private:
     [[nodiscard]] static std::size_t at(int r) { return static_cast<std::size_t>(r); }
+
     [[nodiscard]] const Parameters& parameters(int r) const { return *r_[at(r)].parameters; }
+
     [[nodiscard]] const Qwen4Parameters& qwen4(int r) const { return *parameters(r).qwen4; }
+
     // Text block `layer`, or the MTP layer's block at layer == mtp_layer() (run_mtp).
     [[nodiscard]] const Qwen4BlockParameters& block(int r, std::size_t layer) const {
         if (layer == mtp_layer()) {
@@ -601,6 +635,7 @@ private:
         }
         return qwen4(r).layers[layer];
     }
+
     // The MTP layer's index: after the Text layers (the routed-expert backends' layer number).
     [[nodiscard]] std::size_t mtp_layer() const { return config_.layer_types.size(); }
 
@@ -630,10 +665,15 @@ private:
         }
         return out;
     }
+
     [[nodiscard]] Arena& work(int r) const { return *r_[at(r)].work; }
+
     [[nodiscard]] cudaStream_t s(int r) const { return r_[at(r)].stream; }
+
     [[nodiscard]] const Qwen4Columns& c(int r) const { return r_[at(r)].columns; }
+
     [[nodiscard]] const Qwen4State& state(int r) const { return r_[at(r)].state; }
+
     // The per-rank geometry (QSA and GDN heads); identical on both ranks.
     [[nodiscard]] const TextConfig& rc() const { return *r_[0].config; }
 
@@ -714,15 +754,19 @@ private:
         return nullptr;
     }
 
-    // T128c: the mixer exchange carries FP32 partials (default; NINFER_TP_MIX=bf16 = BF16 partials) (FP16 payload in prefill,
-    // FP32 in decode) and rounds to BF16 once, as at one device. Read once.
+    // T128c: the mixer exchange carries FP32 partials (default; NINFER_TP_MIX=bf16 = BF16 partials)
+    // (FP16 payload in prefill, FP32 in decode) and rounds to BF16 once, as at one device. Read
+    // once.
     static bool mix_fp32_partials() {
         static const bool on = [] {
-            // Default since T138 (14/10): on (no measurable decode/prefill cost; E-fc02 step dispersion
-            // 7.9 = GB300 8.1 vs 13.2 with the BF16 mixer exchange). NINFER_TP_MIX=bf16 restores BF16.
-            const char* v = std::getenv("NINFER_TP_MIX");
+            // Default since T138 (14/10): on (no measurable decode/prefill cost; E-fc02 step
+            // dispersion 7.9 = GB300 8.1 vs 13.2 with the BF16 mixer exchange). NINFER_TP_MIX=bf16
+            // restores BF16.
+            const char* v      = std::getenv("NINFER_TP_MIX");
             const bool enabled = v == nullptr || std::string(v) != "bf16";
-            if (enabled) { std::fprintf(stderr, "T128c mixer exchange: FP32 partials, FP16/FP32 transport\n"); }
+            if (enabled) {
+                std::fprintf(stderr, "T128c mixer exchange: FP32 partials, FP16/FP32 transport\n");
+            }
             return enabled;
         }();
         return on;
@@ -734,7 +778,8 @@ private:
             linear(0, x[0], *p[0], y[0]);
             return;
         }
-        if (mix_fp32_partials() && p[0]->weight.qtype == QType::Q8_G32_FP16) {
+        if (mix_fp32_partials() && (p[0]->weight.qtype == QType::Q8_G32_FP16 ||
+                                    p[0]->weight.qtype == QType::MXFP8_E4M3FN_G32_UE8M0)) {
             const std::int32_t T = columns();
             auto scope           = scopes();
             RankTensors part     = alloc(DType::FP32, {hidden(), T});
@@ -742,12 +787,14 @@ private:
             each([&](int r) { linear(r, x[at(r)], *p[at(r)], part[at(r)]); });
             if constexpr (kExecute) {
                 (void)staging;
-                if (Qwen4Taps* taps = exchange_taps()) {   // T128c check: FP32 partials of the mixer
-                    taps->capture_exchange(layer, 0, part[0], part[1], c(0).first_position, s(0), s(1));
+                if (Qwen4Taps* taps = exchange_taps()) { // T128c check: FP32 partials of the mixer
+                    taps->capture_exchange(layer, 0, part[0], part[1], c(0).first_position, s(0),
+                                           s(1));
                 }
                 ops::HostExchange* pipe = c(0).prefill ? tp_.events->host_exchange() : nullptr;
-                if (pipe != nullptr && pipe->begin_sum_f32(part, stage, &y, ops::HostExchange::Payload::FP16,
-                                                           *tp_.execution)) {
+                if (pipe != nullptr &&
+                    pipe->begin_sum_f32(part, stage, &y, ops::HostExchange::Payload::FP16,
+                                        *tp_.execution)) {
                     pipe->columns_ready(0, 0, T);
                     pipe->columns_ready(1, 0, T);
                     pipe->finish_sum_f32();
@@ -783,7 +830,8 @@ private:
         if constexpr (kExecute) {
             const std::size_t element  = dtype_size(source.dtype);
             const std::int64_t columns = source.numel() / source.ne[0];
-            // T139: a kernel, not a memcpy node: cudaGraphExecUpdate sometimes rejected the 2-D memcpy.
+            // T139: a kernel, not a memcpy node: cudaGraphExecUpdate sometimes rejected the 2-D
+            // memcpy.
             ops::copy_rows(destination.data,
                            static_cast<const std::byte*>(source.data) +
                                static_cast<std::size_t>(row0) * element,
@@ -802,11 +850,12 @@ private:
             const std::int64_t columns = source.numel() / source.ne[0];
             if (columns == 1) {
                 Tensor view = destination;
-                view.data   = static_cast<std::byte*>(source.data) +
-                            static_cast<std::size_t>(row0) * element;
+                view.data =
+                    static_cast<std::byte*>(source.data) + static_cast<std::size_t>(row0) * element;
                 return view;
             }
-            // T139: a kernel, not a memcpy node: cudaGraphExecUpdate sometimes rejected the 2-D memcpy.
+            // T139: a kernel, not a memcpy node: cudaGraphExecUpdate sometimes rejected the 2-D
+            // memcpy.
             ops::copy_rows(destination.data,
                            static_cast<const std::byte*>(source.data) +
                                static_cast<std::size_t>(row0) * element,
@@ -829,6 +878,17 @@ private:
         RankTensors slots     = alloc(DType::I32, {2});
         each([&](int r) {
             const PleParameters& p = *block(r, layer).ple;
+            if constexpr (kExecute) {
+                // A decode round's deferred rows: wait for the host's gather, then upload.
+                const Qwen4Runtime* runtime = state(r).runtime;
+                const Tensor& rows          = embedding[at(r)];
+                if (runtime != nullptr && runtime->decode_ple_staged != nullptr &&
+                    rows.data == runtime->decode_ple_rows.data) {
+                    ops::host::consume_host_flag(s(r), runtime->decode_ple_staged);
+                    CUDA_CHECK(cudaMemcpyAsync(rows.data, runtime->decode_ple_host, rows.bytes(),
+                                               cudaMemcpyHostToDevice, s(r)));
+                }
+            }
             linear(r, embedding[at(r)], p.key_value, key_value[at(r)]);
             if constexpr (kExecute) {
                 const Qwen4Columns& col = c(r);
@@ -862,8 +922,7 @@ private:
                         throw std::logic_error("Qwen4Exp PLE speculative record is unavailable");
                     }
                     CUDA_CHECK(::ninfer::memcpy_device_async(record.data, normed[at(r)].data,
-                                               normed[at(r)].bytes(),
-                                               s(r)));
+                                                             normed[at(r)].bytes(), s(r)));
                 } else {
                     ops::ple_conv_advance(normed3, col.prefill ? nullptr : col.valid_columns,
                                           static_cast<std::int32_t>(ple.conv_history()), states,
@@ -878,16 +937,16 @@ private:
     // `y` null: append K/V and the index records only (MTP prompt columns).
     void qsa(std::size_t layer, const RankTensors& x, RankTensors* y, std::uint32_t kv_layer,
              const RankTensors& staging) {
-        const std::int32_t T  = columns();
-        const auto& a         = *rc().attention;
-        const auto head_dim   = dimension(a.head_dim);
-        const auto heads      = dimension(a.num_attention_heads);
-        const auto kv_heads   = dimension(a.num_key_value_heads);
-        const auto qw         = dimension(a.query_width());
-        const auto kw         = dimension(a.key_width());
-        const auto geometry   = qwen4_qsa_geometry(rc());
-        const auto index_rows = geometry.index_heads * geometry.index_dim;
-        auto scope            = scopes();
+        const std::int32_t T    = columns();
+        const auto& a           = *rc().attention;
+        const auto head_dim     = dimension(a.head_dim);
+        const auto heads        = dimension(a.num_attention_heads);
+        const auto kv_heads     = dimension(a.num_key_value_heads);
+        const auto qw           = dimension(a.query_width());
+        const auto kw           = dimension(a.key_width());
+        const auto geometry     = qwen4_qsa_geometry(rc());
+        const auto index_rows   = geometry.index_heads * geometry.index_dim;
+        auto scope              = scopes();
         RankTensors projection  = alloc(DType::BF16, {2 * qw + 2 * kw, T});
         RankTensors q           = alloc(DType::BF16, {qw, T});
         RankTensors k           = alloc(DType::BF16, {kw, T});
@@ -899,11 +958,11 @@ private:
         RankTensors index_query = alloc(DType::BF16, {index_rows, T});
         RankTensors index_key   = alloc(DType::BF16, {geometry.index_dim, T});
         const std::int32_t W = c(0).width, B = c(0).batch;
-        RankTensors selected = alloc(DType::I32, {geometry.max_selected(), kExecute ? W : T,
-                                                  kExecute ? B : 1});
+        RankTensors selected =
+            alloc(DType::I32, {geometry.max_selected(), kExecute ? W : T, kExecute ? B : 1});
         RankTensors counts   = alloc(DType::I32, {kExecute ? W : T, kExecute ? B : 1});
         RankTensors attended = alloc(DType::BF16, {head_dim, heads, T});
-        const auto p = [&](int r) -> const QsaParameters& {
+        const auto p         = [&](int r) -> const QsaParameters& {
             return std::get<QsaParameters>(block(r, layer).mixer);
         };
         each([&](int r) {
@@ -912,7 +971,8 @@ private:
         });
         if constexpr (!kExecute) {
             // Selection scratch for the planned window: W columns of B lanes.
-            reserve(ops::qsa_select_workspace_bytes(geometry, std::max(c(0).max_visible, 1U), W, B));
+            reserve(
+                ops::qsa_select_workspace_bytes(geometry, std::max(c(0).max_visible, 1U), W, B));
             reserve(ops::qsa_attention_workspace_bytes(geometry, last_));
         } else {
             each([&](int r) {
@@ -920,16 +980,16 @@ private:
                 const QsaParameters& qp = p(r);
                 const Qwen4Columns& col = c(r);
                 cudaStream_t stream     = s(r);
-                const Tensor qs = split_rows(r, projection[i], 0, qw, q[i]);
-                const Tensor ks = split_rows(r, projection[i], qw, kw, k[i]);
-                const Tensor gs = split_rows(r, projection[i], qw + kw, qw, gate[i]);
-                const Tensor vs = split_rows(r, projection[i], 2 * qw + kw, kw, v[i]);
-                const Tensor iq = split_rows(r, indexer[i], 0, index_rows, index_query[i]);
+                const Tensor qs         = split_rows(r, projection[i], 0, qw, q[i]);
+                const Tensor ks         = split_rows(r, projection[i], qw, kw, k[i]);
+                const Tensor gs         = split_rows(r, projection[i], qw + kw, qw, gate[i]);
+                const Tensor vs         = split_rows(r, projection[i], 2 * qw + kw, kw, v[i]);
+                const Tensor iq         = split_rows(r, indexer[i], 0, index_rows, index_query[i]);
                 const Tensor ik =
                     split_rows(r, indexer[i], index_rows, geometry.index_dim, index_key[i]);
                 if (y != nullptr) {
-                    ops::rmsnorm(qs.view({head_dim, heads, T}), qp.query_norm,
-                                 config_.rms_norm_eps, true, qn[i], stream);
+                    ops::rmsnorm(qs.view({head_dim, heads, T}), qp.query_norm, config_.rms_norm_eps,
+                                 true, qn[i], stream);
                 }
                 ops::rmsnorm(ks.view({head_dim, kv_heads, T}), qp.key_norm, config_.rms_norm_eps,
                              true, kn[i], stream);
@@ -957,10 +1017,10 @@ private:
                                 *col.table_rows, qp.indexer_query_norm, index, geometry,
                                 col.max_visible, work(r), selected[i], counts[i], stream);
                 Tensor a4 = attended[i].view({head_dim, heads, W, B});
-                ops::qsa_attention(qn[i].view({head_dim, heads, W, B}), selected[i], counts[i],
-                                   *col.table_rows, kv,
-                                   static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim))),
-                                   work(r), a4, stream);
+                ops::qsa_attention(
+                    qn[i].view({head_dim, heads, W, B}), selected[i], counts[i], *col.table_rows,
+                    kv, static_cast<float>(1.0 / std::sqrt(static_cast<double>(head_dim))), work(r),
+                    a4, stream);
                 Tensor flat = attended[i].view({qw, T});
                 ops::sigmoid_mul(gs, flat, stream);
             });
@@ -975,28 +1035,28 @@ private:
     // ---- GDN: each rank's key/value heads, conv channels and state slots ---------------------
     void gdn(std::size_t layer, const RankTensors& x, RankTensors& y, std::int32_t gidx,
              const RankTensors& staging) {
-        const std::int32_t T = columns();
-        const auto& g        = *rc().gdn;
-        const auto heads     = dimension(g.linear_num_value_heads);
-        const auto kheads    = dimension(g.linear_num_key_heads);
-        const auto dk        = dimension(g.linear_key_head_dim);
-        const auto dv        = dimension(g.linear_value_head_dim);
-        const auto kw        = dimension(g.key_width());
-        const auto vw        = dimension(g.value_width());
-        const auto conv      = dimension(g.conv_channels());
-        auto scope              = scopes();
-        RankTensors projection  = alloc(DType::BF16, {conv + vw, T});
-        RankTensors control     = alloc(DType::BF16, {2 * heads, T});
-        RankTensors decay       = alloc(DType::FP32, {heads, T});
-        RankTensors beta        = alloc(DType::FP32, {heads, T});
-        RankTensors qkv         = alloc(DType::BF16, {conv, T});
-        RankTensors z           = alloc(DType::BF16, {vw, T});
-        RankTensors qc          = alloc(DType::BF16, {kw, T});
-        RankTensors kc          = alloc(DType::BF16, {kw, T});
-        RankTensors vc          = alloc(DType::BF16, {vw, T});
-        RankTensors o           = alloc(DType::BF16, {dv, heads, T});
-        RankTensors on          = alloc(DType::BF16, {dv, heads, T});
-        const auto p = [&](int r) -> const Qwen4GdnParameters& {
+        const std::int32_t T   = columns();
+        const auto& g          = *rc().gdn;
+        const auto heads       = dimension(g.linear_num_value_heads);
+        const auto kheads      = dimension(g.linear_num_key_heads);
+        const auto dk          = dimension(g.linear_key_head_dim);
+        const auto dv          = dimension(g.linear_value_head_dim);
+        const auto kw          = dimension(g.key_width());
+        const auto vw          = dimension(g.value_width());
+        const auto conv        = dimension(g.conv_channels());
+        auto scope             = scopes();
+        RankTensors projection = alloc(DType::BF16, {conv + vw, T});
+        RankTensors control    = alloc(DType::BF16, {2 * heads, T});
+        RankTensors decay      = alloc(DType::FP32, {heads, T});
+        RankTensors beta       = alloc(DType::FP32, {heads, T});
+        RankTensors qkv        = alloc(DType::BF16, {conv, T});
+        RankTensors z          = alloc(DType::BF16, {vw, T});
+        RankTensors qc         = alloc(DType::BF16, {kw, T});
+        RankTensors kc         = alloc(DType::BF16, {kw, T});
+        RankTensors vc         = alloc(DType::BF16, {vw, T});
+        RankTensors o          = alloc(DType::BF16, {dv, heads, T});
+        RankTensors on         = alloc(DType::BF16, {dv, heads, T});
+        const auto p           = [&](int r) -> const Qwen4GdnParameters& {
             return std::get<Qwen4GdnParameters>(block(r, layer).mixer);
         };
         each([&](int r) {
@@ -1005,16 +1065,16 @@ private:
         });
         if constexpr (!kExecute) {
             if (c(0).prefill) {
-                reserve(ops::gated_delta_net_workspace_capacity_bytes(kheads, heads, first_,
-                                                                      last_));
+                reserve(
+                    ops::gated_delta_net_workspace_capacity_bytes(kheads, heads, first_, last_));
             }
         } else {
             each([&](int r) {
-                const std::size_t i          = at(r);
-                const Qwen4GdnParameters& gp = p(r);
-                const Qwen4Columns& col      = c(r);
+                const std::size_t i            = at(r);
+                const Qwen4GdnParameters& gp   = p(r);
+                const Qwen4Columns& col        = c(r);
                 LinearAttentionStatePool& pool = *state(r).linear;
-                cudaStream_t stream          = s(r);
+                cudaStream_t stream            = s(r);
                 // a|b read in place from the projection (T49: no row-split copies).
                 const Tensor as = control[i].slice(0, 0, heads);
                 const Tensor bs = control[i].slice(0, heads, heads);
@@ -1024,8 +1084,8 @@ private:
                 const auto gl     = static_cast<std::uint32_t>(gidx);
                 if (col.prefill) {
                     const Tensor qkvs = split_rows(r, projection[i], 0, conv, qkv[i]);
-                    Tensor conv_in  = pool.conv_slot(gl, col.source_slot);
-                    Tensor conv_out = pool.conv_slot(gl, col.destination_slot);
+                    Tensor conv_in    = pool.conv_slot(gl, col.source_slot);
+                    Tensor conv_out   = pool.conv_slot(gl, col.destination_slot);
                     ops::causal_conv1d_silu_split(qkvs, gp.convolution, conv_in, conv_out, qc[i],
                                                   kc[i], vc[i], stream);
                     Tensor in  = pool.recurrent_slot(gl, col.source_slot);
@@ -1036,12 +1096,12 @@ private:
                                          r_[i].execution);
                 } else {
                     const std::int32_t W = col.width, B = col.batch;
-                    Tensor conv_states   = pool.layer_view(gl).conv;
+                    Tensor conv_states = pool.layer_view(gl).conv;
                     const Tensor valid =
                         col.valid_columns != nullptr ? *col.valid_columns : Tensor{};
-                    Tensor q3 = qc[i].view({kw, W, B});
-                    Tensor k3 = kc[i].view({kw, W, B});
-                    Tensor v3 = vc[i].view({vw, W, B});
+                    Tensor q3        = qc[i].view({kw, W, B});
+                    Tensor k3        = kc[i].view({kw, W, B});
+                    Tensor v3        = vc[i].view({vw, W, B});
                     Tensor recurrent = pool.layer_view(gl).recurrent;
                     Tensor o4        = o[i].view({dv, heads, W, B});
                     if (col.replay_records != nullptr) {
@@ -1058,15 +1118,13 @@ private:
                         ops::gated_delta_net_replay_record(
                             qc[i].view({dk, kheads, W, B}), kc[i].view({dk, kheads, W, B}),
                             vc[i].view({dv, heads, W, B}), decay[i].view({heads, W, B}),
-                            beta[i].view({heads, W, B}), scale, recurrent, valid,
-                            *col.source_slots, records.key, records.value, records.gate, o4,
-                            stream);
+                            beta[i].view({heads, W, B}), scale, recurrent, valid, *col.source_slots,
+                            records.key, records.value, records.gate, o4, stream);
                     } else {
                         const Tensor qkvs = split_rows(r, projection[i], 0, conv, qkv[i]);
-                        ops::gdn_projected_conv_snapshot(qkvs.view({conv, W, B}), gp.convolution,
-                                                         conv_states, valid, *col.source_slots,
-                                                         *col.destination_slots, q3, k3, v3,
-                                                         stream);
+                        ops::gdn_projected_conv_snapshot(
+                            qkvs.view({conv, W, B}), gp.convolution, conv_states, valid,
+                            *col.source_slots, *col.destination_slots, q3, k3, v3, stream);
                         ops::gated_delta_net_batch_update(
                             qc[i].view({dk, kheads, W, B}), kc[i].view({dk, kheads, W, B}),
                             vc[i].view({dv, heads, W, B}), decay[i].view({heads, W, B}),
@@ -1106,10 +1164,10 @@ private:
     // FP32, and one FP32 all-reduce rounds the block output to BF16 once on both ranks.
     // `layer` is a Text layer or mtp_layer() (the MTP layer's backend and bank).
     void moe(std::size_t layer, const RankTensors& x, RankTensors& y, const RankTensors& staging) {
-        const std::int32_t T  = columns();
-        const auto& m         = std::get<MoeConfig>(config_.ffn);
-        const auto shared_w   = dimension(m.shared_expert_intermediate_size);
-        auto scope            = scopes();
+        const std::int32_t T   = columns();
+        const auto& m          = std::get<MoeConfig>(config_.ffn);
+        const auto shared_w    = dimension(m.shared_expert_intermediate_size);
+        auto scope             = scopes();
         RankTensors ids        = alloc(DType::I32, {ops::kMoeRouteTopK, T});
         RankTensors weights    = alloc(DType::FP32, {ops::kMoeRouteTopK, T});
         RankTensors gate       = alloc(DType::FP32, {T});
@@ -1217,12 +1275,14 @@ private:
     // pieces; 0 = one group); NINFER_TP_AR_PIPE = 1 takes the pipelined exchange even at fp32
     // with one group (control arm).
     struct T62Exchange {
-        bool enabled               = false;
-        // T127 (13/10): default FP16 (same bytes and speed as BF16, 8x smaller rounding of the partial sums;
-        // T128: error added vs one device 1.44x (BF16) -> 1.01x (FP16) of the unavoidable BF16 rounding). NINFER_TP_AR_PAYLOAD overrides.
+        bool enabled = false;
+        // T127 (13/10): default FP16 (same bytes and speed as BF16, 8x smaller rounding of the
+        // partial sums; T128: error added vs one device 1.44x (BF16) -> 1.01x (FP16) of the
+        // unavoidable BF16 rounding). NINFER_TP_AR_PAYLOAD overrides.
         ops::HostExchange::Payload payload = ops::HostExchange::Payload::FP16;
-        std::int32_t group_columns = ops::kMoeGroupedChunkColumns;
+        std::int32_t group_columns         = ops::kMoeGroupedChunkColumns;
     };
+
     static const T62Exchange& t62_exchange() {
         static const T62Exchange value = [] {
             T62Exchange v;
@@ -1237,7 +1297,7 @@ private:
             if (payload == "bf16") { v.payload = ops::HostExchange::Payload::BF16; }
             const std::string group = get("NINFER_TP_AR_GROUP");
             if (!group.empty()) {
-                const auto g    = static_cast<std::int32_t>(std::strtol(group.c_str(), nullptr, 10));
+                const auto g = static_cast<std::int32_t>(std::strtol(group.c_str(), nullptr, 10));
                 const auto unit = ops::kMoeGroupedChunkColumns;
                 v.group_columns = g > 0 ? std::max(unit, g / unit * unit) : 0;
             }
@@ -1266,6 +1326,7 @@ private:
         }
         return experts;
     }
+
     [[nodiscard]] const Qwen4ExpertBank& expert_bank(int r, std::size_t layer) const {
         if (layer != mtp_layer()) { return block(r, layer).moe.experts; }
         const Qwen4Runtime* runtime = state(r).runtime;

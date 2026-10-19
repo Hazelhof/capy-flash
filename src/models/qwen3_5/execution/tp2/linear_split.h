@@ -53,17 +53,25 @@ inline void project_column_parallel(const std::array<Tensor, 2>& input,
 }
 
 // Input-split projection added to the replicated residual: one all-reduce, after which both ranks
-// hold residual + w x. `staging[r]` matches `residual[r]` and must not overlap it.
+// hold residual + w x. `staging[r]` matches `residual[r]` and must not overlap it. With
+// `exchange_lane` >= 0 the all-reduce is only begun on that lane of the split exchange
+// (ops::linear_add_row_parallel_begin); the caller finishes it (ops::allreduce_sum_finish) before
+// reading `residual`.
 inline void project_add_row_parallel(const std::array<Tensor, 2>& input,
                                      const std::array<const LinearParameters*, 2>& p,
                                      const std::array<Tensor, 2>& residual,
                                      const std::array<Tensor, 2>& staging,
                                      const std::array<WorkspaceArena*, 2>& workspace,
                                      const ExecutionContext& execution,
-                                     const ops::PeerEvents& events) {
+                                     const ops::PeerEvents& events, int exchange_lane = -1) {
     const auto policy = split_policy(p, "row-parallel projection");
     auto scope0       = workspace[0]->scope();
     auto scope1       = workspace[1]->scope();
+    if (exchange_lane >= 0) {
+        ops::linear_add_row_parallel_begin(input, split_weights(p), residual, staging, policy,
+                                           workspace, execution, events, exchange_lane);
+        return;
+    }
     ops::linear_add_row_parallel(input, split_weights(p), residual, staging, policy, workspace,
                                  execution, events);
 }

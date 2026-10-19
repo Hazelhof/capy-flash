@@ -1,8 +1,9 @@
-// Translation-unit fragment of src/ops/wrapper/linear_swiglu.cpp, included once at its end (after its
-// closing namespace), so the two-device code below shares that file's private helpers without
+// Translation-unit fragment of src/ops/wrapper/linear_swiglu.cpp, included once at its end (after
+// its closing namespace), so the two-device code below shares that file's private helpers without
 // copying them. Not a header. Our file; see docs/maintainer/upstream-merge.md.
 //
-// Two-device (tp 2) column-parallel form of linear_swiglu, declared in ninfer/ops/tp2/linear_swiglu.h.
+// Two-device (tp 2) column-parallel form of linear_swiglu, declared in
+// ninfer/ops/tp2/linear_swiglu.h.
 
 #include "ninfer/ops/tp2/linear_swiglu.h"
 #include "ops/common/split_launch.h"

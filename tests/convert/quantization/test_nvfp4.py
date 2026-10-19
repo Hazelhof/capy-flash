@@ -34,9 +34,7 @@ def _decode(words, shape) -> torch.Tensor:
 
 
 def test_round_e2m1_nearest_with_ties_to_even():
-    values = torch.tensor(
-        [0.0, 0.2, 0.25, 0.3, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 5.1, 6.0, 0.74, 2.6]
-    )
+    values = torch.tensor([0.0, 0.2, 0.25, 0.3, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 5.1, 6.0, 0.74, 2.6])
     expected = [0, 0, 0, 1, 2, 2, 4, 4, 6, 6, 7, 7, 1, 5]
     assert round_e2m1(values).tolist() == expected
 
@@ -58,9 +56,7 @@ def test_exactly_representable_matrix_round_trips():
     for row in range(n):
         for col in range(k):
             values[row, col] = (
-                decode_e2m1_word(int(codes[row, col]))
-                * decode_e4m3fn_word(int(scale_words[row, col // 16]))
-                / divisor
+                decode_e2m1_word(int(codes[row, col])) * decode_e4m3fn_word(int(scale_words[row, col // 16])) / divisor
             )
     words = quantize_nvfp4(values.float(), divisor)
     assert torch.equal(words.scales, scale_words.to(torch.uint8))

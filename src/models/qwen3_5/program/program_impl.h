@@ -18,6 +18,7 @@
 #include "models/qwen3_5/program/storage/qwen4_elastic.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix_identity.h"
+#include "models/qwen3_5/program/qwen4_ple_stager.h"
 #include "models/qwen3_5/program/planning/resource_projection.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/qwen4_draft_head.h"
@@ -388,8 +389,8 @@ struct SequenceState {
     std::uint32_t mtp_draft_count = 0;
     // T41 calibration (NINFER_QWEN4_MTP_CALIB): the log-probabilities of the pending proposals.
     std::array<float, qwen3_5::kMtpDecodeMaximumDrafts> mtp_draft_logprobs{};
-    bool tail_hidden_valid        = false;
-    bool endpoint_valid           = false;
+    bool tail_hidden_valid = false;
+    bool endpoint_valid    = false;
     RewriteCheckpoint rewrite_checkpoint;
     std::vector<LongAnchorCheckpoint> long_anchors;
     std::vector<std::uint32_t> shared_prefix_references;
@@ -613,6 +614,11 @@ public:
     [[nodiscard]] std::optional<SharedPrefixSummary>
     demote_retained_shared_kv_for_lease(const SharedPrefixHandle& shared,
                                         DeviceKVPages needed) noexcept;
+    [[nodiscard]] bool idle_device_kv_offload() const noexcept;
+    [[nodiscard]] std::optional<std::size_t>
+    idle_device_kv_host_bytes(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] std::size_t host_kv_free_bytes() const noexcept;
+    DeviceKVCompaction compact_device_kv();
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
@@ -710,8 +716,8 @@ public:
     // Qwen4Exp (T20/M1, tp 2 T31): routed-expert backend, n-gram gather and its pinned staging,
     // the validation dump, and the runtime record every Qwen4Exp TextContext reads.
     std::unique_ptr<execution::Qwen4RoutedExperts> qwen4_experts;
-    std::uint32_t qwen4_expert_slots      = 0;
-    std::size_t qwen4_expert_pool_bytes   = 0;
+    std::uint32_t qwen4_expert_slots    = 0;
+    std::size_t qwen4_expert_pool_bytes = 0;
     // T64: the elastic KV <-> expert slot manager (null unless plan.elastic_kv.enabled).
     std::unique_ptr<Qwen4ElasticVram> qwen4_elastic;
     std::optional<execution::Qwen4ExpertBank> qwen4_mtp_bank;
@@ -736,7 +742,8 @@ public:
     // the verification route; with NINFER_QWEN4_MTP_NO_DRAFTS one token per round). The logits and
     // the state the round computed are untouched: they depend only on the consumed tokens.
     std::vector<std::vector<TokenId>> qwen4_forced_tokens;
-    void force_qwen4_tokens(const SequenceState& sequence, TokenId* tokens, std::int32_t count) const;
+    void force_qwen4_tokens(const SequenceState& sequence, TokenId* tokens,
+                            std::int32_t count) const;
     // NINFER_QWEN4_MTP_NO_DRAFTS=1 (validation): every round verifies its anchor alone (extent 0,
     // the fallback step), i.e. greedy decode through the verification route.
     bool qwen4_mtp_no_drafts = false;
@@ -751,6 +758,22 @@ public:
     // T49: rank 1's commit work (fold) joined into rank 0's stream when the commit does not wait.
     std::optional<CudaCompletionEvent> qwen4_peer_commit_event;
     std::uint16_t* qwen4_decode_ple_host = nullptr;
+    // Deferred decode rows (Qwen4Runtime::decode_ple_staged): the mapped words of rank 0 and rank
+    // 1, and the round's queued gathers (prepared before the launch, run after it).
+    std::optional<PinnedHostBuffer> qwen4_ple_staged_words;
+    std::array<std::uint32_t*, 2> qwen4_ple_staged{};
+
+    struct Qwen4PleStage {
+        std::uint32_t lane       = 0;
+        std::uint32_t frontier   = 0;
+        std::uint32_t count      = 0;
+        std::size_t first_column = 0;
+        std::array<TokenId, qwen3_5::kMtpDecodeMaximumWidth> tokens{};
+    };
+
+    std::vector<Qwen4PleStage> qwen4_ple_queue;
+    // Runs stage_qwen4_ple_round() of a graph round after its launch (created with the words).
+    std::unique_ptr<Qwen4PleStager> qwen4_ple_stager;
     std::unique_ptr<execution::Qwen4TfDump> qwen4_tfdump;
     // T59 fast bench: teacher-forced replay of a recorded decode (NINFER_QWEN4_REPLAY, see
     // qwen4_tfdump.h) and its recorder (NINFER_QWEN4_REPLAY_RECORD=<file>: "req <prompt tokens>"
@@ -759,8 +782,9 @@ public:
     std::FILE* qwen4_replay_record = nullptr;
     // T59 (NINFER_QWEN4_ROUND_LOG=<file>, measurement): one line per decode round,
     // "<o|m> <frontier> <extent> <accepted> <round us> <host gap us> <missing> <cpu experts>
-    // <gpu-share experts> <expert window wall us> <fill wait us>" (gap = previous round's end -> this round's
-    // start, -1 for a request's first round).
+    // <gpu-share experts> <expert window wall us> <fill wait us> <elastic expert columns>" (gap =
+    // previous round's end -> this round's start, -1 for a request's first round; columns -1
+    // without elastic KV).
     std::FILE* qwen4_round_log = nullptr;
     std::chrono::steady_clock::time_point qwen4_round_end{};
     bool qwen4_round_follows = false;
@@ -776,6 +800,7 @@ public:
     [[nodiscard]] const execution::Qwen4Runtime* qwen4_runtime() const noexcept {
         return qwen4_runtime_record ? &*qwen4_runtime_record : nullptr;
     }
+
     void construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backing);
     // Expert window of one execution on every rank's backend (qwen4_experts.h window protocol):
     // begin before anything of it is enqueued, observe once it is enqueued, end after the
@@ -784,6 +809,7 @@ public:
     void qwen4_observe_window();
     void qwen4_end_window();
     void qwen4_abandon_window() noexcept;
+
     // Runs `body` (an execution outside the decode rounds and prefill chunks, e.g. the MTP
     // prefix-reuse bridge) as one prompt window when Qwen4Exp experts are bound: begin, body,
     // observe, device synchronization, end. Without them `body` runs as is.
@@ -807,6 +833,7 @@ public:
             throw;
         }
     }
+
     // Qwen4Exp PLE n-gram rows of a decode window into the pinned round buffer: columns
     // [first_column, first_column + tokens.size()) are the tokens `tokens` at positions
     // frontier.., with `ledger` (the committed tokens before `frontier`) as their history.
@@ -817,6 +844,16 @@ public:
     void prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> lanes, bool mtp);
     void stage_qwen4_ple_rows(std::span<const TokenId> ledger, std::uint32_t frontier,
                               std::span<const TokenId> tokens, std::size_t first_column);
+    // Deferred decode rows. A round: begin_qwen4_ple_round() (no stream waiting: lowers the
+    // words), queue_qwen4_ple_rows() per row while preparing, the launch, then
+    // stage_qwen4_ple_round() gathers the queued rows into the pinned staging and raises the
+    // words (also on failure). raise_qwen4_ple_staged() alone releases an execution whose rows
+    // do not matter (warm-up, graph preparation) or that failed after its launch.
+    void begin_qwen4_ple_round();
+    void queue_qwen4_ple_rows(std::uint32_t lane, std::uint32_t frontier,
+                              std::span<const TokenId> tokens, std::size_t first_column);
+    void stage_qwen4_ple_round();
+    void raise_qwen4_ple_staged() noexcept;
     // Qwen4Exp speculative commit: advances each row's PLE convolution history by its committed
     // prefix of the verified window (the PLE half of the ReplaySSM fold).
     void fold_qwen4_ple(std::span<const ops::GdnReplayFoldRow> rows);

@@ -404,11 +404,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             throw std::logic_error("elastic KV needs the offload expert backend on every rank");
         }
         std::vector<Qwen4ElasticVram::Rank> ranks;
-        ranks.push_back(Qwen4ElasticVram::Rank{elastic_arena.get(), device.stream, &plan.persistent,
-                                               &decoder->text_kv.page_pool(),
-                                               decoder->mtp_cache() != nullptr
-                                                   ? &decoder->mtp_cache()->page_pool()
-                                                   : nullptr});
+        ranks.push_back(Qwen4ElasticVram::Rank{
+            elastic_arena.get(), device.stream, &plan.persistent, &decoder->text_kv.page_pool(),
+            decoder->mtp_cache() != nullptr ? &decoder->mtp_cache()->page_pool() : nullptr});
         if (peer) {
             ranks.push_back(Qwen4ElasticVram::Rank{
                 peer->elastic_arena.get(), peer->device.stream, &*plan.peer_persistent,
@@ -443,8 +441,11 @@ public:
         file_ = std::fopen(path, "ab");
         if (file_ == nullptr) { throw std::runtime_error("cannot open NINFER_QWEN4_MTP_PROBE"); }
     }
+
     ~Qwen4MtpProbeFile() override { std::fclose(file_); }
+
     [[nodiscard]] bool wants(std::int32_t layer) const override { return layer == layer_; }
+
     void capture(std::int32_t, const Tensor& x, const Tensor& ids, const Tensor& weights,
                  cudaStream_t stream) override {
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -482,8 +483,8 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
                            ? static_cast<std::int32_t>(e)
                            : -1;
         }
-        CUDA_CHECK(cudaMemcpyAsync(table.data, slots.data(), table.bytes(),
-                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(table.data, slots.data(), table.bytes(), cudaMemcpyHostToDevice,
+                                   stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
     };
     const int ranks = peer ? execution::kTensorParallelWidth : 1;
@@ -505,14 +506,12 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
             Tensor down    = q.mtp_down_divisors->bind(backing);
             qwen4_mtp_host_divisors.assign(static_cast<std::size_t>(gate_up.numel()),
                                            parameters.qwen4_mtp->uniform_gate_up_divisor);
-            qwen4_mtp_host_divisors.resize(
-                static_cast<std::size_t>(gate_up.numel() + down.numel()),
-                parameters.qwen4_mtp->uniform_down_divisor);
+            qwen4_mtp_host_divisors.resize(static_cast<std::size_t>(gate_up.numel() + down.numel()),
+                                           parameters.qwen4_mtp->uniform_down_divisor);
             CUDA_CHECK(cudaMemcpy(gate_up.data, qwen4_mtp_host_divisors.data(), gate_up.bytes(),
                                   cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaMemcpy(down.data,
-                                  qwen4_mtp_host_divisors.data() + gate_up.numel(), down.bytes(),
-                                  cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(down.data, qwen4_mtp_host_divisors.data() + gate_up.numel(),
+                                  down.bytes(), cudaMemcpyHostToDevice));
             qwen4_mtp_bank->gate_up_divisors = static_cast<const float*>(gate_up.data);
             qwen4_mtp_bank->down_divisors    = static_cast<const float*>(down.data);
             mtp_host_bank->gate_up_divisors  = qwen4_mtp_host_divisors.data();
@@ -533,11 +532,11 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
                 throw std::logic_error("Qwen4Exp tp 2 offloaded experts are not planned on rank 1");
             }
             offload_peer.emplace();
-            offload_peer->device   = peer->device.device;
-            offload_peer->stream   = peer->device.stream;
-            offload_peer->pool     = peer->qwen4_cache_pool;
-            offload_peer->table    = peer->qwen4_cache_table;
-            offload_peer->divisors = peer->qwen4_cache_divisors;
+            offload_peer->device        = peer->device.device;
+            offload_peer->stream        = peer->device.stream;
+            offload_peer->pool          = peer->qwen4_cache_pool;
+            offload_peer->table         = peer->qwen4_cache_table;
+            offload_peer->divisors      = peer->qwen4_cache_divisors;
             offload_peer->stream_tables = peer->qwen4_stream_tables;
             offload_peer->mirror        = peer->qwen4_cache_mirror;
             offload_peer->reads         = peer->qwen4_cache_reads;
@@ -546,8 +545,8 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
             offload_peer->staging       = peer->qwen4_staging;
         }
         if (q.expert_slots <= 0 ||
-            q.cache_layers != static_cast<std::int32_t>(parameters.qwen4->layers.size()) +
-                                  (mtp ? 1 : 0)) {
+            q.cache_layers !=
+                static_cast<std::int32_t>(parameters.qwen4->layers.size()) + (mtp ? 1 : 0)) {
             throw std::logic_error("Qwen4Exp offloaded experts need a resolved slot count");
         }
         // Cache layers: the Text layers, then the MTP layer (layer num_hidden_layers).
@@ -556,7 +555,7 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         for (const auto& layer : parameters.qwen4->layers) { banks.push_back(layer.moe.experts); }
         if (mtp) { banks.push_back(*mtp_host_bank); }
         execution::Qwen4OffloadExperts::DeviceMemory memory;
-        memory.pool = q.bind_pool(elastic_arena ? elastic_arena->span() : backing);
+        memory.pool     = q.bind_pool(elastic_arena ? elastic_arena->span() : backing);
         memory.table    = static_cast<std::int32_t*>(q.cache_table->bind(backing).data);
         memory.divisors = static_cast<float*>(q.cache_divisors->bind(backing).data);
         memory.identity = static_cast<std::int32_t*>(table.data);
@@ -568,9 +567,10 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
             if (!q.prefetch_tags || !q.prefetch_epoch || !q.prefetch_rows) {
                 throw std::logic_error("Qwen4Exp prefetch memory is not planned");
             }
-            memory.prefetch.tags  = static_cast<std::uint32_t*>(q.prefetch_tags->bind(backing).data);
-            memory.prefetch.epoch = static_cast<std::uint32_t*>(q.prefetch_epoch->bind(backing).data);
-            memory.prefetch.rows  = static_cast<std::int32_t*>(q.prefetch_rows->bind(backing).data);
+            memory.prefetch.tags = static_cast<std::uint32_t*>(q.prefetch_tags->bind(backing).data);
+            memory.prefetch.epoch =
+                static_cast<std::uint32_t*>(q.prefetch_epoch->bind(backing).data);
+            memory.prefetch.rows = static_cast<std::int32_t*>(q.prefetch_rows->bind(backing).data);
             memory.prefetch.predict_workspace = q.prefetch_workspace.bind(backing).data;
         }
         memory.stream_tables =
@@ -579,18 +579,19 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
             memory.stage_table = static_cast<std::int32_t*>(q.stage_table->bind(backing).data);
             memory.picks       = static_cast<std::int32_t*>(q.stage_picks->bind(backing).data);
             for (std::size_t plane = 0; plane < memory.staging.size(); ++plane) {
-                memory.staging[plane] = static_cast<std::byte*>(q.stage_pool[plane].bind(backing).data);
+                memory.staging[plane] =
+                    static_cast<std::byte*>(q.stage_pool[plane].bind(backing).data);
             }
         }
         execution::Qwen4OffloadOptions options;
-        options.slots_per_layer  = q.expert_slots;
-        options.elastic_columns  = q.elastic_columns;
-        options.cpu_threads      = static_cast<std::int32_t>(plan.qwen4_experts.cpu_threads);
-        options.insert_cap       = static_cast<std::int32_t>(plan.qwen4_experts.insert_cap);
-        options.admit_threshold  = plan.qwen4_experts.admit_threshold;
-        options.half_life_tokens = plan.qwen4_experts.half_life_tokens;
-        options.evict_tau_windows = plan.qwen4_experts.evict_tau_windows;
-        options.prompt_tokens    = static_cast<std::int32_t>(prefill_chunk);
+        options.slots_per_layer      = q.expert_slots;
+        options.elastic_columns      = q.elastic_columns;
+        options.cpu_threads          = static_cast<std::int32_t>(plan.qwen4_experts.cpu_threads);
+        options.insert_cap           = static_cast<std::int32_t>(plan.qwen4_experts.insert_cap);
+        options.admit_threshold      = plan.qwen4_experts.admit_threshold;
+        options.half_life_tokens     = plan.qwen4_experts.half_life_tokens;
+        options.evict_tau_windows    = plan.qwen4_experts.evict_tau_windows;
+        options.prompt_tokens        = static_cast<std::int32_t>(prefill_chunk);
         const MissSplitOptions split = execution::effective_miss_split(plan.qwen4_experts);
         options.split                = execution::host_miss_split(split);
         options.split_staged         = split.mode != MissSplitMode::Off && split.staged;
@@ -598,7 +599,8 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         options.stream_min_tokens = static_cast<std::int32_t>(plan.qwen4_experts.stream_min_tokens);
         options.stream_ring_slots = static_cast<std::int32_t>(plan.qwen4_experts.stream_ring_slots);
         options.stream_cpu_tail   = plan.qwen4_experts.stream_cpu_tail;
-        options.stream_cpu_max_tokens = static_cast<std::int32_t>(plan.qwen4_experts.stream_cpu_max_tokens);
+        options.stream_cpu_max_tokens =
+            static_cast<std::int32_t>(plan.qwen4_experts.stream_cpu_max_tokens);
         options.stream_cpu_expert_us = plan.qwen4_experts.stream_cpu_expert_us;
         options.stream_cpu_token_us  = plan.qwen4_experts.stream_cpu_token_us;
         options.stream_link_us       = plan.qwen4_experts.stream_link_us;
@@ -609,15 +611,20 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
             options.prompt_workspace_steps.emplace_back(static_cast<std::int32_t>(width),
                                                         static_cast<std::int64_t>(bytes));
         }
-        options.text_layers      = static_cast<std::int32_t>(parameters.qwen4->layers.size());
+        options.text_layers = static_cast<std::int32_t>(parameters.qwen4->layers.size());
         options.prefetch.slots_per_layer = q.staging_slots / 2;
         options.prefetch.min_score       = plan.qwen4_experts.prefetch_min_score;
-        options.prefetch.first_layer     = static_cast<std::int32_t>(plan.qwen4_experts.prefetch_first_layer);
-        options.prefetch.link_gbps       = plan.qwen4_experts.prefetch_link_gbps;
-        options.warm_start               = plan.qwen4_experts.warm_start;
+        options.prefetch.first_layer =
+            static_cast<std::int32_t>(plan.qwen4_experts.prefetch_first_layer);
+        options.prefetch.link_gbps = plan.qwen4_experts.prefetch_link_gbps;
+        options.warm_start         = plan.qwen4_experts.warm_start;
         // Validation / measurement aid (off by default): per-window JSON lines.
-        if (const char* trace = std::getenv("NINFER_QWEN4_EXPERT_TRACE")) { options.trace_path = trace; }
-        if (const char* dump = std::getenv("NINFER_QWEN4_ROUTING_DUMP")) { options.routing_path = dump; }
+        if (const char* trace = std::getenv("NINFER_QWEN4_EXPERT_TRACE")) {
+            options.trace_path = trace;
+        }
+        if (const char* dump = std::getenv("NINFER_QWEN4_ROUTING_DUMP")) {
+            options.routing_path = dump;
+        }
         if (const char* freeze = std::getenv("NINFER_QWEN4_EXPERT_FREEZE")) {
             options.freeze_after_prompt = std::string_view(freeze) == "1";
             // T59 fast bench: nothing is ever inserted (residency = initialization / snapshot).
@@ -626,7 +633,8 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         if (const char* sync = std::getenv("NINFER_QWEN4_EXPERT_SYNC")) {
             options.sync_fills = std::string_view(sync) == "1";
         }
-        if (const char* snap = std::getenv("NINFER_QWEN4_EXPERT_SNAPSHOT"); snap != nullptr && *snap != 0) {
+        if (const char* snap = std::getenv("NINFER_QWEN4_EXPERT_SNAPSHOT");
+            snap != nullptr && *snap != 0) {
             options.snapshot_load = snap;
         }
         if (const char* snap = std::getenv("NINFER_QWEN4_EXPERT_SNAPSHOT_SAVE");
@@ -723,6 +731,24 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
                 peer_runtime.ple_record      = peer->qwen4_ple_record;
             }
         }
+        if (q.decode_ple_rows) {
+            // Deferred decode rows: one mapped word per rank (own cache line), consumed by the
+            // rank's PLE layer; the rounds raise them after gathering the rows post-launch.
+            // Allocated before any capture (the graphs bake in the addresses).
+            constexpr std::size_t kLine = 64;
+            qwen4_ple_staged_words.emplace(2 * kLine, HostMapping::Yes);
+            auto* base = static_cast<std::byte*>(qwen4_ple_staged_words->data());
+            if (qwen4_ple_staged_words->device_data() != qwen4_ple_staged_words->data()) {
+                throw std::logic_error("Qwen4Exp deferred PLE rows need unified addressing");
+            }
+            std::fill_n(base, 2 * kLine, std::byte{0});
+            qwen4_ple_staged[0]       = reinterpret_cast<std::uint32_t*>(base);
+            qwen4_ple_staged[1]       = reinterpret_cast<std::uint32_t*>(base + kLine);
+            runtime.decode_ple_staged = qwen4_ple_staged[0];
+            if (peer) { peer_runtime.decode_ple_staged = qwen4_ple_staged[1]; }
+            qwen4_ple_stager =
+                std::make_unique<Qwen4PleStager>([this] { stage_qwen4_ple_round(); });
+        }
     }
     // Validation token sequences: one whole sequence (prompt + continuation) per line.
     const auto read_sequences = [](const char* path, const char* variable) {
@@ -774,8 +800,9 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         }
     }
     qwen4_replay = execution::Qwen4Replay::from_environment();
-    (void)execution::tp_rank_probe_enabled();   // T123: allocate the probe staging before any capture
-    if (const char* rounds = std::getenv("NINFER_QWEN4_ROUND_LOG"); rounds != nullptr && *rounds != '\0') {
+    (void)execution::tp_rank_probe_enabled(); // T123: allocate the probe staging before any capture
+    if (const char* rounds = std::getenv("NINFER_QWEN4_ROUND_LOG");
+        rounds != nullptr && *rounds != '\0') {
         qwen4_round_log = std::fopen(rounds, "a");
         if (qwen4_round_log == nullptr) {
             throw std::runtime_error(std::string("NINFER_QWEN4_ROUND_LOG: cannot open ") + rounds);
@@ -785,7 +812,8 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         record != nullptr && *record != '\0') {
         qwen4_replay_record = std::fopen(record, "a");
         if (qwen4_replay_record == nullptr) {
-            throw std::runtime_error(std::string("NINFER_QWEN4_REPLAY_RECORD: cannot open ") + record);
+            throw std::runtime_error(std::string("NINFER_QWEN4_REPLAY_RECORD: cannot open ") +
+                                     record);
         }
     }
     if (const char* top2 = std::getenv("NINFER_QWEN4_TOP2"); top2 != nullptr && *top2 != '\0') {
@@ -810,10 +838,10 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         // Split over the ranks: rank 0 scores shortlist rows [0, R) through a view of its half,
         // rank 1 rows [R, 2R), gathered (ascending token IDs) from rank 0's half over UVA and
         // from its own half.
-        const auto& head = parameters.text.output_head;
+        const auto& head          = parameters.text.output_head;
         const std::int32_t prefix = q.draft_prefix;
-        const auto rows = prefix + static_cast<std::int32_t>(plan.draft_extras.size());
-        const std::int32_t half = rows / 2;
+        const auto rows           = prefix + static_cast<std::int32_t>(plan.draft_extras.size());
+        const std::int32_t half   = rows / 2;
         if (!peer || !peer_parameters || !plan.peer_persistent || !plan.peer_persistent->qwen4 ||
             plan.peer_persistent->qwen4->draft_extra != half || half > prefix ||
             peer->qwen4_draft_planes[0] == nullptr) {
@@ -827,30 +855,33 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
                                    cudaMemcpyHostToDevice, device.stream));
         const auto& peer_head    = peer_parameters->text.output_head;
         const std::int32_t rows0 = head.weight.n;
-        const std::span<const std::int32_t> theirs(ids.data() + half, static_cast<std::size_t>(half));
+        const std::span<const std::int32_t> theirs(ids.data() + half,
+                                                   static_cast<std::size_t>(half));
         const auto cut = std::lower_bound(theirs.begin(), theirs.end(), rows0);
         const std::vector<std::int32_t> from0(theirs.begin(), cut);
         std::vector<std::int32_t> from1(cut, theirs.end());
         for (auto& row : from1) { row -= rows0; }
-        execution::gather_q6_rows(head.weight, from0, peer->qwen4_draft_planes, 0, device.stream);
+        execution::gather_draft_rows(head.weight, from0, peer->qwen4_draft_planes, 0,
+                                     device.stream);
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
         {
             const ScopedCurrentDevice rank1(peer->device.device);
-            execution::gather_q6_rows(peer_head.weight, from1, peer->qwen4_draft_planes,
-                                      static_cast<std::int32_t>(from0.size()), peer->device.stream);
+            execution::gather_draft_rows(peer_head.weight, from1, peer->qwen4_draft_planes,
+                                         static_cast<std::int32_t>(from0.size()),
+                                         peer->device.stream);
             CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
         }
         execution::Qwen4DraftHead draft;
         draft.split       = true;
         draft.prefix_rows = half;
-        draft.prefix      = execution::q6_row_view(head, 0, half);
+        draft.prefix      = execution::draft_row_view(head, 0, half);
         draft.peer_rows   = half;
-        draft.peer        = execution::q6_rows_weight(peer_head, peer->qwen4_draft_planes, half);
+        draft.peer        = execution::draft_rows_weight(peer_head, peer->qwen4_draft_planes, half);
         draft.token_ids   = static_cast<const std::int32_t*>(device_ids.data);
         qwen4_draft_head  = draft;
         runtime.draft_head = &*qwen4_draft_head;
     } else if (q.draft_ids) {
-        const auto& head = parameters.text.output_head;
+        const auto& head          = parameters.text.output_head;
         const std::int32_t prefix = q.draft_prefix;
         const std::int32_t extra  = q.draft_extra;
         if (static_cast<std::size_t>(extra) != plan.draft_extras.size() || prefix > head.weight.n) {
@@ -859,7 +890,7 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         execution::Qwen4DraftHead draft;
         draft.prefix_rows = prefix;
         draft.extra_rows  = extra;
-        if (prefix > 0) { draft.prefix = execution::q6_row_view(head, 0, prefix); }
+        if (prefix > 0) { draft.prefix = execution::draft_row_view(head, 0, prefix); }
         Tensor ids = q.draft_ids->bind(backing);
         std::vector<std::int32_t> host(static_cast<std::size_t>(prefix + extra));
         for (std::int32_t i = 0; i < prefix; ++i) { host[static_cast<std::size_t>(i)] = i; }
@@ -872,12 +903,13 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
             for (std::size_t p = 0; p < planes.size(); ++p) {
                 planes[p] = static_cast<std::byte*>(q.draft_planes[p].bind(backing).data);
             }
-            draft.extra = execution::q6_rows_weight(head, planes, extra);
+            draft.extra = execution::draft_rows_weight(head, planes, extra);
             // Rank 0 owns head rows [0, rows0): all of them at one device.
             const std::int32_t rows0 = head.weight.n;
-            const auto split = std::lower_bound(plan.draft_extras.begin(), plan.draft_extras.end(), rows0);
+            const auto split =
+                std::lower_bound(plan.draft_extras.begin(), plan.draft_extras.end(), rows0);
             const std::vector<std::int32_t> own(plan.draft_extras.begin(), split);
-            execution::gather_q6_rows(head.weight, own, planes, 0, device.stream);
+            execution::gather_draft_rows(head.weight, own, planes, 0, device.stream);
             if (split != plan.draft_extras.end()) {
                 if (!peer || !peer_parameters) {
                     throw std::logic_error("Qwen4Exp draft shortlist rows outside the output head");
@@ -886,14 +918,14 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
                 for (auto& row : theirs) { row -= rows0; }
                 CUDA_CHECK(cudaStreamSynchronize(device.stream));
                 const ScopedCurrentDevice rank1(peer->device.device);
-                execution::gather_q6_rows(peer_parameters->text.output_head.weight, theirs, planes,
-                                          static_cast<std::int32_t>(own.size()),
-                                          peer->device.stream);
+                execution::gather_draft_rows(peer_parameters->text.output_head.weight, theirs,
+                                             planes, static_cast<std::int32_t>(own.size()),
+                                             peer->device.stream);
                 CUDA_CHECK(cudaStreamSynchronize(peer->device.stream));
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(device.stream));
-        qwen4_draft_head = draft;
+        qwen4_draft_head   = draft;
         runtime.draft_head = &*qwen4_draft_head;
     }
     qwen4_runtime_record = runtime;
@@ -937,22 +969,26 @@ void ProgramImpl::qwen4_end_window() {
 void ProgramImpl::log_qwen4_round(char kind, std::uint32_t frontier, std::uint32_t extent,
                                   std::int32_t accepted, double round_seconds) {
     if (qwen4_round_log == nullptr) { return; }
-    const auto now   = std::chrono::steady_clock::now();
-    const double gap = qwen4_round_follows
-                           ? std::chrono::duration<double>(now - qwen4_round_end).count() - round_seconds
-                           : -1e-6;
+    const auto now = std::chrono::steady_clock::now();
+    const double gap =
+        qwen4_round_follows
+            ? std::chrono::duration<double>(now - qwen4_round_end).count() - round_seconds
+            : -1e-6;
     long long missing = 0, cpu = 0, gpu = 0;
     double wall = 0, fill_wait = 0;
-    if (const auto* offload = dynamic_cast<const execution::Qwen4OffloadExperts*>(qwen4_experts.get())) {
+    if (const auto* offload =
+            dynamic_cast<const execution::Qwen4OffloadExperts*>(qwen4_experts.get())) {
         const execution::Qwen4OffloadWindowStats& w = offload->last_window();
-        missing = static_cast<long long>(w.missing);
-        cpu     = static_cast<long long>(w.host_experts);
-        gpu     = static_cast<long long>(w.gpu_read_experts);
-        wall    = w.wall_us;
-        fill_wait = w.fill_wait_us;
+        missing                                     = static_cast<long long>(w.missing);
+        cpu                                         = static_cast<long long>(w.host_experts);
+        gpu                                         = static_cast<long long>(w.gpu_read_experts);
+        wall                                        = w.wall_us;
+        fill_wait                                   = w.fill_wait_us;
     }
-    std::fprintf(qwen4_round_log, "%c %u %u %d %.1f %.1f %lld %lld %lld %.1f %.1f\n", kind, frontier, extent,
-                 accepted, 1e6 * round_seconds, 1e6 * gap, missing, cpu, gpu, wall, fill_wait);
+    const int columns = qwen4_elastic ? qwen4_elastic->stats().columns : -1;
+    std::fprintf(qwen4_round_log, "%c %u %u %d %.1f %.1f %lld %lld %lld %.1f %.1f %d\n", kind,
+                 frontier, extent, accepted, 1e6 * round_seconds, 1e6 * gap, missing, cpu, gpu,
+                 wall, fill_wait, columns);
     qwen4_round_end     = std::chrono::steady_clock::now();
     qwen4_round_follows = true;
 }
@@ -972,7 +1008,9 @@ void ProgramImpl::prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> l
         const char* v = std::getenv("NINFER_T53_PLE_PREFETCH");
         return v == nullptr || *v == 0 || std::atoi(v) != 0;
     }();
-    if (!enabled || !qwen4_ple_gather || (mtp ? !mtp_host_egress : !ordinary_host_egress)) { return; }
+    if (!enabled || !qwen4_ple_gather || (mtp ? !mtp_host_egress : !ordinary_host_egress)) {
+        return;
+    }
     const std::size_t context = parameters.model.config().text.ple->ngram_size - 1U;
     if (!mtp) {
         // The next round's column is the sampled token; its context the ledger's last tokens.
@@ -983,7 +1021,9 @@ void ProgramImpl::prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> l
             std::array<std::int32_t, 8> window{};
             if (before + 1U > window.size()) { return; }
             std::size_t n = 0;
-            for (std::size_t i = ledger - before; i < ledger; ++i) { window[n++] = sequence.ledger[i]; }
+            for (std::size_t i = ledger - before; i < ledger; ++i) {
+                window[n++] = sequence.ledger[i];
+            }
             window[n++] = ordinary_host_egress->sampled_tokens[row];
             qwen4_ple_gather->prefetch(std::span<const std::int32_t>(window.data(), n), before, 1);
         }
@@ -999,7 +1039,8 @@ void ProgramImpl::prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> l
         // then the drafts (padding columns repeat the anchor), as stage_qwen4_ple_rows does.
         const TokenId* licensed  = mtp_host_egress->licensed_tokens.data() + row * width;
         const std::size_t ledger = sequence.ledger.size();
-        const std::size_t total  = ledger + static_cast<std::size_t>(count) - 1U; // before the anchor
+        const std::size_t total =
+            ledger + static_cast<std::size_t>(count) - 1U; // before the anchor
         const std::size_t before = std::min(context, total);
         std::array<std::int32_t, 32> window{};
         if (before + width > window.size()) { return; }
@@ -1007,10 +1048,10 @@ void ProgramImpl::prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> l
         for (std::size_t i = total - before; i < total; ++i) {
             window[n++] = i < ledger ? sequence.ledger[i] : licensed[i - ledger];
         }
-        const TokenId anchor = licensed[count - 1];
-        window[n++]          = anchor;
-        const std::int32_t next =
-            std::clamp(mtp_host_egress->next_extents[row], 0, static_cast<std::int32_t>(draft_window));
+        const TokenId anchor    = licensed[count - 1];
+        window[n++]             = anchor;
+        const std::int32_t next = std::clamp(mtp_host_egress->next_extents[row], 0,
+                                             static_cast<std::int32_t>(draft_window));
         for (std::uint32_t j = 0; j < draft_window; ++j) {
             window[n++] = static_cast<std::int32_t>(j) < next
                               ? mtp_host_egress->next_drafts[j * max_concurrency + row]
@@ -1020,9 +1061,54 @@ void ProgramImpl::prefetch_qwen4_ple_next_round(std::span<const std::uint32_t> l
     }
 }
 
+void ProgramImpl::raise_qwen4_ple_staged() noexcept {
+    for (std::uint32_t* word : qwen4_ple_staged) {
+        if (word != nullptr) { ops::host::raise_host_flag(word); }
+    }
+}
+
+void ProgramImpl::queue_qwen4_ple_rows(std::uint32_t lane, std::uint32_t frontier,
+                                       std::span<const TokenId> tokens, std::size_t first_column) {
+    if (tokens.size() > Qwen4PleStage{}.tokens.size()) {
+        throw std::logic_error("Qwen4Exp PLE round window exceeds its staging");
+    }
+    Qwen4PleStage stage;
+    stage.lane         = lane;
+    stage.frontier     = frontier;
+    stage.count        = static_cast<std::uint32_t>(tokens.size());
+    stage.first_column = first_column;
+    std::copy(tokens.begin(), tokens.end(), stage.tokens.begin());
+    qwen4_ple_queue.push_back(stage);
+}
+
+void ProgramImpl::begin_qwen4_ple_round() {
+    qwen4_ple_queue.clear();
+    // No stream waits on the words now (the previous round has synchronized): a raise that no
+    // round consumed (a failed round) must not release this one before its rows are written.
+    for (std::uint32_t* word : qwen4_ple_staged) {
+        if (word != nullptr) { ops::host::lower_host_flag(word); }
+    }
+}
+
+void ProgramImpl::stage_qwen4_ple_round() {
+    // Raised whatever happens: a launched round waits for it at its PLE layer (a failed gather
+    // fails the round; the device must still be able to finish it).
+    struct Raise {
+        ProgramImpl* program;
+
+        ~Raise() { program->raise_qwen4_ple_staged(); }
+    } raise{this};
+
+    for (const Qwen4PleStage& stage : qwen4_ple_queue) {
+        stage_qwen4_ple_rows(active_sequence(stage.lane).ledger, stage.frontier,
+                             std::span<const TokenId>(stage.tokens.data(), stage.count),
+                             stage.first_column);
+    }
+    qwen4_ple_queue.clear();
+}
+
 void ProgramImpl::stage_qwen4_ple_rows(std::span<const TokenId> ledger, std::uint32_t frontier,
-                                       std::span<const TokenId> tokens,
-                                       std::size_t first_column) {
+                                       std::span<const TokenId> tokens, std::size_t first_column) {
     nvtx::ScopedRange range(nvtx::Name::Qwen4PleGather, nvtx::Category::Control,
                             static_cast<std::uint64_t>(tokens.size()));
     if (!qwen4_ple_gather || qwen4_decode_ple_host == nullptr || tokens.empty() ||
@@ -1066,9 +1152,9 @@ void ProgramImpl::fold_qwen4_ple_rank(std::span<const ops::GdnReplayFoldRow> row
     }
     WorkspaceArena& arena = rank == 0 ? work : peer->work;
     cudaStream_t stream   = rank == 0 ? device.stream : peer->device.stream;
-    const auto count = static_cast<std::int32_t>(rows.size());
-    auto scope       = arena.scope();
-    Tensor control   = arena.alloc(DType::I32, {count, 3});
+    const auto count      = static_cast<std::int32_t>(rows.size());
+    auto scope            = arena.scope();
+    Tensor control        = arena.alloc(DType::I32, {count, 3});
     std::array<std::int32_t, 3 * kMaximumConcurrency> host{};
     for (std::int32_t row = 0; row < count; ++row) {
         host[static_cast<std::size_t>(row)]             = rows[row].source_state_slot;
@@ -1078,16 +1164,16 @@ void ProgramImpl::fold_qwen4_ple_rank(std::span<const ops::GdnReplayFoldRow> row
     // The transfer reads the pageable array before returning, so it may go out of scope.
     CUDA_CHECK(cudaMemcpyAsync(control.data, host.data(), control.bytes(), cudaMemcpyHostToDevice,
                                stream));
-    const Tensor& record    = runtime->ple_record;
-    const Tensor inputs     = record.slice(2, 0, count);
-    Tensor states           = runtime->ple_states;
-    const Tensor sources    = control.slice(1, 0, 1).view({count});
-    const Tensor targets    = control.slice(1, 1, 1).view({count});
-    const Tensor committed  = control.slice(1, 2, 1).view({count});
-    ops::ple_conv_advance(inputs, &committed,
-                          static_cast<std::int32_t>(
-                              parameters.model.config().text.ple->conv_history()),
-                          states, sources, targets, stream);
+    const Tensor& record   = runtime->ple_record;
+    const Tensor inputs    = record.slice(2, 0, count);
+    Tensor states          = runtime->ple_states;
+    const Tensor sources   = control.slice(1, 0, 1).view({count});
+    const Tensor targets   = control.slice(1, 1, 1).view({count});
+    const Tensor committed = control.slice(1, 2, 1).view({count});
+    ops::ple_conv_advance(
+        inputs, &committed,
+        static_cast<std::int32_t>(parameters.model.config().text.ple->conv_history()), states,
+        sources, targets, stream);
 }
 
 void ProgramImpl::force_qwen4_tokens(const SequenceState& sequence, TokenId* tokens,
@@ -1199,8 +1285,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
     staged_positions.reserve(kCausalScoreTile);
     std::uint32_t staged_columns = 0;
     if (qwen4_tfdump) {
-        qwen4_tfdump->write_tokens(std::span<const std::int32_t>(prompt.token_ids.data(),
-                                                                 prompt.token_ids.size()));
+        qwen4_tfdump->write_tokens(
+            std::span<const std::int32_t>(prompt.token_ids.data(), prompt.token_ids.size()));
     }
 
     try {
@@ -1234,15 +1320,15 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 Tensor mixed = work.alloc(
                     DType::BF16, {dimension(parameters.model.config().text.hidden_size), columns});
                 ops::hyper_connection_mix(hidden, parameters.qwen4->head.weights,
-                                          parameters.model.config().text.rms_norm_eps, mixed,
-                                          nullptr, work, device.stream);
+                                                       parameters.model.config().text.rms_norm_eps, mixed,
+                                                       nullptr, work, device.stream);
                 hidden = mixed;
             }
             if (peer) {
                 project_score_tile_split(hidden, logits);
             } else {
                 execution::project(hidden, parameters.text.output_head, logits, work,
-                                   device.stream);
+                                                device.stream);
             }
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
                                                     cudaMemcpyHostToDevice, device.stream));
@@ -1254,8 +1340,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             synchronize_devices();
             if (qwen4_tfdump && qwen4_tfdump->logits_enabled()) {
                 std::vector<std::uint16_t> host(static_cast<std::size_t>(logits.numel()));
-                CUDA_CHECK(cudaMemcpy(host.data(), logits.data, logits.bytes(),
-                                      cudaMemcpyDeviceToHost));
+                CUDA_CHECK(
+                    cudaMemcpy(host.data(), logits.data, logits.bytes(), cudaMemcpyDeviceToHost));
                 qwen4_tfdump->write_logits(host, logits.ne[0], staged_positions);
             }
             staged_positions.clear();
@@ -1310,7 +1396,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                                          static_cast<std::int32_t>(count));
                 Tensor destination = score_hidden->slice(
                     1, static_cast<std::int32_t>(staged_columns), static_cast<std::int32_t>(count));
-                CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data, source.bytes(), device.stream));
+                CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data,
+                                                         source.bytes(), device.stream));
                 for (std::uint32_t column = 0; column < count; ++column) {
                     staged_targets.push_back(prompt.token_ids[selected + column + 1U]);
                     staged_positions.push_back(static_cast<std::int32_t>(selected + column));
@@ -1415,10 +1502,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.cuda_graph_observed_bytes    = graph_observed_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
-    out.routed_expert_slots          = qwen4_expert_slots +
-                              (qwen4_elastic ? static_cast<std::uint32_t>(qwen4_elastic->stats().columns) : 0U);
-    out.routed_expert_pool_bytes     = qwen4_expert_pool_bytes;
-    out.prefill_chunk                = prefill_chunk;
+    out.routed_expert_slots =
+        qwen4_expert_slots +
+        (qwen4_elastic ? static_cast<std::uint32_t>(qwen4_elastic->stats().columns) : 0U);
+    out.routed_expert_pool_bytes = qwen4_expert_pool_bytes;
+    out.prefill_chunk            = prefill_chunk;
     out.routed_expert_prompt_workspace_bytes =
         qwen4_prompt_base_chunk > 0 ? workspace_plan.qwen4_prompt : 0;
     if (host_state_images) {

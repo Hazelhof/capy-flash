@@ -92,7 +92,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.tp);
+                     state.execution.tp, state.rope_delta);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden,
@@ -124,7 +124,7 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.text_kv, state.execution.linear_attention, state.execution.io,
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                     state.execution.tp);
+                     state.execution.tp, state.rope_delta);
     configure_text_card(card, state.execution, state.sampling, state.state_source_slot,
                         state.state_destination_slot, state.mtp_proposal_extent);
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden,
@@ -200,7 +200,7 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                          state.text_kv, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk,
                          state.text_kv_base, state.mtp_kv, &state.text_cache, state.mtp_cache,
-                         state.execution.tp);
+                         state.execution.tp, state.rope_delta);
         card.set_qwen4_runtime(state.execution.qwen4);
         card.qwen4_logits_from_hidden(hidden, peer_hidden, logits);
     } else if (state.execution.tp != nullptr) {
@@ -709,10 +709,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             const std::uint32_t ahead = std::min<std::uint32_t>(
                 request_plan.summary.effective_output_tokens + draft_window + 1U,
                 qwen4_elastic->step_tokens());
-            qwen4_elastic->rebalance(std::min(capacity, prompt_tokens + ahead),
-                                     backend_materialized == 0
-                                         ? 0U
-                                         : std::min(capacity, backend_materialized + ahead));
+            qwen4_elastic->rebalance(
+                std::min(capacity, prompt_tokens + ahead),
+                backend_materialized == 0 ? 0U : std::min(capacity, backend_materialized + ahead));
         }
         ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         install_sampling(sequence, request, request_plan.sampling,
@@ -1048,13 +1047,14 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 if (terminal[row]) {
                     sequence.mtp_draft_count = 0;
                 } else {
-                    const std::int32_t next  = mtp_host_egress->next_extents[row];
+                    const std::int32_t next = mtp_host_egress->next_extents[row];
                     if (qwen4_mtp_calib != nullptr) {
                         const auto extent = mtp_host_ingress->current_extents[row];
                         if (extent > 0) {
                             std::fprintf(qwen4_mtp_calib, "%d %u", extent, committed - 1U);
                             for (std::uint32_t k = 0; k < draft_window; ++k) {
-                                std::fprintf(qwen4_mtp_calib, " %.5g", sequence.mtp_draft_logprobs[k]);
+                                std::fprintf(qwen4_mtp_calib, " %.5g",
+                                             sequence.mtp_draft_logprobs[k]);
                             }
                             std::fputc('\n', qwen4_mtp_calib);
                         }
@@ -1067,8 +1067,8 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     if (mtp_min_p > 0.0F) {
                         // T41 adaptive window: the next round verifies the proposals up to the
                         // first whose probability (chain product or its own) is below the floor.
-                        const float floor = std::log(mtp_min_p);
-                        float chain       = 0.0F;
+                        const float floor  = std::log(mtp_min_p);
+                        float chain        = 0.0F;
                         std::uint32_t keep = 0;
                         for (; keep < sequence.mtp_draft_count; ++keep) {
                             const float lp =
@@ -1178,6 +1178,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             0,
             dflash_prefill_host_ingress,
             peer_rewrite_capture_hidden_ptr};
+        schedule_state.rope_delta = sequence.rope_delta;
         // Forced tokens of another lane may have repointed the prefill KV row scalars since this
         // lane's bind; every prefill step publishes its own rows on every rank.
         publish_kv_rows(sequence);
@@ -1198,18 +1199,20 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 .rope_position        = prompt_rope_position(staged.prompt, staged.base - 1),
             };
             if (staged.vision) {
-                execution::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
-                                                 bridge);
+                in_qwen4_window([&] {
+                    execution::mtp_bridge_multimodal(schedule_state, staged.prompt, *staged.vision,
+                                                     bridge);
+                });
             } else {
                 Tensor bridge_token = io.mtp->target_input_ids.slice(0, 0, 1);
                 const TokenId token = staged.prompt.token_ids[staged.base];
                 CUDA_CHECK(cudaMemcpyAsync(bridge_token.data, &token, sizeof(token),
                                            cudaMemcpyHostToDevice, device.stream));
                 in_qwen4_window([&] {
-                    execution::mtp_bridge_and_propose(
-                        schedule_state, bridge_token, previous_hidden,
-                        peer_retains_hidden() ? &peer_previous_hidden : nullptr, bridge.position,
-                        bridge.rope_position, false);
+                    execution::mtp_bridge_and_propose(schedule_state, bridge_token, previous_hidden,
+                                                      peer_retains_hidden() ? &peer_previous_hidden
+                                                                            : nullptr,
+                                                      bridge.position, bridge.rope_position, false);
                 });
             }
             sequence.mtp_kv_valid = staged.base;
@@ -1388,7 +1391,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
         if (qwen4_tfdump) {
             // Validation: teacher-forced first token (NINFER_QWEN4_TFDUMP_FORCE).
-            if (const std::int32_t forced = qwen4_tfdump->forced_token(prompt_tokens); forced >= 0) {
+            if (const std::int32_t forced = qwen4_tfdump->forced_token(prompt_tokens);
+                forced >= 0) {
                 host_tokens[0] = forced;
             }
         }

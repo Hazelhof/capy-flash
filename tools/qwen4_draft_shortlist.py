@@ -21,7 +21,10 @@ the prefix ascending, then the ranking's tokens by count).
   qwen4_draft_shortlist.py --prefix 98304 --count-top 32768 \
       --tokenizer <NVIDIA Qwen3.8-Flash-Next-NVFP4 checkpoint dir> --out shortlist.txt
 """
-import argparse, hashlib, json
+
+import argparse
+import hashlib
+import json
 from pathlib import Path
 import numpy as np
 
@@ -68,16 +71,28 @@ if a.extra_ranking and a.extra_top:
             seen.add(int(i))
             ids.append(int(i))
             added_extra += 1
-    extra_note = (f", extra {added_extra} of {a.extra_ranking.name} "
-                  f"(sha256 {hashlib.sha256(extra_raw).hexdigest()})")
+    extra_note = f", extra {added_extra} of {a.extra_ranking.name} (sha256 {hashlib.sha256(extra_raw).hexdigest()})"
 sha = hashlib.sha256(raw).hexdigest()
 with open(a.out, "w") as f:
     f.write(f"# T43 Qwen4Exp draft shortlist: {len(ids)} token IDs\n")
-    f.write(f"# prefix {a.prefix}, count_top {a.count_top} of {a.ranking.name} row {a.row} "
-            f"(sha256 {sha}){extra_note}, {len(specials)} added tokens, public {public}\n")
+    f.write(
+        f"# prefix {a.prefix}, count_top {a.count_top} of {a.ranking.name} row {a.row} "
+        f"(sha256 {sha}){extra_note}, {len(specials)} added tokens, public {public}\n"
+    )
     f.write(f"# tokenizer {a.tokenizer} (vocab {base} + {len(added)} added)\n")
     for i in ids:
         f.write(f"{i}\n")
-print(json.dumps({"out": str(a.out), "ids": len(ids), "prefix": a.prefix, "count_top": a.count_top,
-                  "outside_prefix": sum(1 for i in ids if i >= a.prefix), "specials": len(specials),
-                  "public": public, "ranking_sha256": sha}))
+print(
+    json.dumps(
+        {
+            "out": str(a.out),
+            "ids": len(ids),
+            "prefix": a.prefix,
+            "count_top": a.count_top,
+            "outside_prefix": sum(1 for i in ids if i >= a.prefix),
+            "specials": len(specials),
+            "public": public,
+            "ranking_sha256": sha,
+        }
+    )
+)

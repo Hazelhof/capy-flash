@@ -12,16 +12,17 @@
 namespace ninfer::ops::detail {
 
 // Past T=1024 upstream's TMA route (and the parent) read 256-token scale tiles. The shard keeps the
-// 128-token tiles up to the device's DeviceTuning bound (core/tp2/device_tuning.h): on an RTX 5070 Ti its 56 row tiles
-// give 224 CTAs at 256 tokens per tile, 3.2 waves on 70 SMs, and 448 at 128, measured at the
-// 1024-token prefill chunk 196.5 -> 183.7 us, while from T=1025 the 256-token tile is faster again
-// (bound 1025, tune 2a596191). Every other T takes upstream's launcher unchanged.
+// 128-token tiles up to the device's DeviceTuning bound (core/tp2/device_tuning.h): on an RTX 5070
+// Ti its 56 row tiles give 224 CTAs at 256 tokens per tile, 3.2 waves on 70 SMs, and 448 at 128,
+// measured at the 1024-token prefill chunk 196.5 -> 183.7 us, while from T=1025 the 256-token tile
+// is faster again (bound 1025, tune 2a596191). Every other T takes upstream's launcher unchanged.
 void nvfp4_attn_input_shard_a4_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                       Tensor& gate, Tensor& k, Tensor& v,
                                       Nvfp4A4Workspace workspace, cudaStream_t stream) {
     const std::int32_t tokens = x.ne[1];
     if (tokens >= 1024 &&
-        tokens < ninfer::tp2::current_device_tuning().nvfp4_attn_input_shard_first_tiled256_tokens) {
+        tokens <
+            ninfer::tp2::current_device_tuning().nvfp4_attn_input_shard_first_tiled256_tokens) {
         constexpr auto layout = Nvfp4ScaleLayout::Tiled128;
         launch_nvfp4_a4_quantize(x, weight, workspace, layout, stream);
         launch_nvfp4_a4_tma_attention_shard(

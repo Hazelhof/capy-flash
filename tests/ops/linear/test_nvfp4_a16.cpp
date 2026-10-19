@@ -39,7 +39,8 @@ int run_nvfp4_a16() {
     failures += run_shape("NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                           {5120, 3072, 713U, Comparison::Sampled, true, invocations});
     // One-device Qwen3.8-Flash-Next shapes of the NVFP4-dense recipe: QSA input, GDN input, shared
-    // expert gate|up, LM head, QSA/GDN output, shared expert down (K = 640: sliced-K route at T <= 16).
+    // expert gate|up, LM head, QSA/GDN output, shared expert down (K = 640: sliced-K route at T <=
+    // 16).
     for (auto [n, k, seed] : {std::tuple{13312, 2560, 721U}, std::tuple{16384, 2560, 723U},
                               std::tuple{1280, 2560, 727U}, std::tuple{248320, 2560, 729U},
                               std::tuple{2560, 6144, 731U}, std::tuple{2560, 640, 733U},

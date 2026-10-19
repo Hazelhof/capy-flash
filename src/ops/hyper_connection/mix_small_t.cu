@@ -1,6 +1,6 @@
 // Implements the small-T route (T <= 8) of hyper_connection_mix / hyper_connection_combine_mix
-// (include/ninfer/ops/hyper_connection.h) over Q8_G32_FP16 row-split Down/Up weights, and over
-// NVFP4 Down/Up weights (option, see the header).
+// (include/ninfer/ops/hyper_connection.h) over Q8_G32_FP16 row-split Down/Up weights, over NVFP4
+// Down/Up weights (option, see the header) and over BF16 Down/Up weights (see the BF16 section).
 //
 // Two launches, no cooperative grid barrier (it needed one co-resident CTA per SM and blocked any
 // overlap with other streams):
@@ -486,6 +486,73 @@ __global__ void __cluster_dims__(kS, 1, 1) __launch_bounds__(kThreads, 2)
                      : "memory");
 }
 
+// One (token, hidden column) item of an Up CTA's gate mix, thread tid < T * 16: the committed
+// residual of each stream (with a pending combine) and the offset norm weights.
+struct MixItem {
+    bool active = false;
+    int token = 0, column = 0, d = 0;
+    float committed[kS] = {}, mix_norm[kS] = {};
+};
+
+template <int Tokens>
+__device__ __forceinline__ MixItem mix_item(const HcFusedMix& p, int tid, int column_begin) {
+    MixItem item;
+    item.active = tid < Tokens * kCols;
+    item.token  = tid / kCols;
+    item.column = tid % kCols;
+    item.d      = column_begin + item.column;
+    if (item.active) {
+        const float y = p.previous_y != nullptr
+                            ? __bfloat162float(
+                                  p.previous_y[item.d + static_cast<std::int64_t>(kH) * item.token])
+                            : 0.0F;
+#pragma unroll
+        for (int s = 0; s < kS; ++s) {
+            const float h = __bfloat162float(
+                p.residual[static_cast<std::int64_t>(kSH) * item.token + kH * s + item.d]);
+            item.committed[s] = p.previous_y != nullptr
+                                    ? committed_value(h, p.previous_inject[s + kS * item.token], y)
+                                    : h;
+            item.mix_norm[s]  = 1.0F + __bfloat162float(p.norm[kH * s + item.d]);
+        }
+    }
+    return item;
+}
+
+// After the dependency wait: the Down launch's low-rank activation (16-bit words, FP16 or BF16)
+// into shared memory and the inverse RMS of each (token, stream).
+template <int Tokens, typename Low>
+__device__ __forceinline__ void stage_low(const HcFusedMix& p, int tid, Low (*low)[kLowStride16],
+                                          float* inverse_rms) {
+    static_assert(sizeof(Low) == 2);
+    for (int i = tid; i < Tokens * (kR / 8); i += kUpThreads) {
+        const int t = i / (kR / 8), part = i % (kR / 8);
+        *reinterpret_cast<uint4*>(&low[t][part * 8]) =
+            *reinterpret_cast<const uint4*>(p.low + t * kR + part * 8);
+    }
+    if (tid < Tokens * kS)
+        inverse_rms[tid] = rsqrtf(p.square_sums[tid] / static_cast<float>(kH) + p.eps);
+}
+
+// The gate mix of one item over the CTA's Up logits [64][8] (row s * 16 + column, token), and the
+// committed residual with a pending combine.
+__device__ __forceinline__ void finish_mix(const HcFusedMix& p, const MixItem& item,
+                                           const float (*logits)[8], const float* inverse_rms) {
+    if (!item.active) return;
+    float mixed = 0.0F;
+#pragma unroll
+    for (int s = 0; s < kS; ++s) {
+        if (p.previous_y != nullptr)
+            p.residual[static_cast<std::int64_t>(kSH) * item.token + kH * s + item.d] =
+                __float2bfloat16_rn(item.committed[s]);
+        const float normalized =
+            item.committed[s] * inverse_rms[item.token * kS + s] * item.mix_norm[s];
+        mixed = fmaf(normalized, sigmoidf_(logits[s * kCols + item.column][item.token]), mixed);
+    }
+    p.mixed[item.d + static_cast<std::int64_t>(kH) * item.token] =
+        __float2bfloat16_rn(mixed * (1.0F / kS));
+}
+
 template <bool Fp4, int Tokens>
 __global__ void __launch_bounds__(kUpThreads)
     hc_up_mix_kernel(const __grid_constant__ HcFusedMaps maps, HcFusedMix p) {
@@ -535,35 +602,10 @@ __global__ void __launch_bounds__(kUpThreads)
         }
     }
     // Mix inputs (outputs of earlier launches, not of the Down launch).
-    const bool has_item = tid < Tokens * kCols;
-    const int token     = tid / kCols;
-    const int column    = tid % kCols;
-    const int d         = column_begin + column;
-    float committed[kS], mix_norm[kS];
-    if (has_item) {
-        const float y =
-            p.previous_y != nullptr
-                ? __bfloat162float(p.previous_y[d + static_cast<std::int64_t>(kH) * token])
-                : 0.0F;
-#pragma unroll
-        for (int s = 0; s < kS; ++s) {
-            const float h =
-                __bfloat162float(p.residual[static_cast<std::int64_t>(kSH) * token + kH * s + d]);
-            committed[s] = p.previous_y != nullptr
-                               ? committed_value(h, p.previous_inject[s + kS * token], y)
-                               : h;
-            mix_norm[s]  = 1.0F + __bfloat162float(p.norm[kH * s + d]);
-        }
-    }
+    const MixItem item = mix_item<Tokens>(p, tid, column_begin);
 
     cudaGridDependencySynchronize(); // the Down launch has completed: low, square sums, inject
-    for (int i = tid; i < Tokens * (kR / 8); i += kUpThreads) {
-        const int t = i / (kR / 8), part = i % (kR / 8);
-        *reinterpret_cast<uint4*>(&sh.low[t][part * 8]) =
-            *reinterpret_cast<const uint4*>(p.low + t * kR + part * 8);
-    }
-    if (tid < Tokens * kS)
-        sh.inverse_rms[tid] = rsqrtf(p.square_sums[tid] / static_cast<float>(kH) + p.eps);
+    stage_low<Tokens>(p, tid, sh.low, sh.inverse_rms);
     __syncthreads(); // also orders the barrier initialization before other threads wait on it
     barrier_wait(barrier);
 
@@ -614,17 +656,285 @@ __global__ void __launch_bounds__(kUpThreads)
     sh.logits[top_row + 8][2 * quad + 1] = acc[3];
     __syncthreads();
 
-    if (!has_item) return;
-    float mixed = 0.0F;
-#pragma unroll
-    for (int s = 0; s < kS; ++s) {
-        if (p.previous_y != nullptr)
-            p.residual[static_cast<std::int64_t>(kSH) * token + kH * s + d] =
-                __float2bfloat16_rn(committed[s]);
-        const float normalized = committed[s] * sh.inverse_rms[token * kS + s] * mix_norm[s];
-        mixed = fmaf(normalized, sigmoidf_(sh.logits[s * kCols + column][token]), mixed);
+    finish_mix(p, item, sh.logits, sh.inverse_rms);
+}
+
+// ---------------------------------------------------------------------------------------------
+// BF16 weights (the mixers of the FP4-Local checkpoint, kept BF16). Same two launches and the same
+// numeric contract as Q8 (FP32 accumulation of exactly represented weights, FP32 p and logits),
+// with BF16 activation operands (the normalized lane and the low rank, as the general route
+// stages them) on BF16 m16n8k16 MMA. A BF16 lane row segment is twice the Q8 bytes, so Down splits
+// each lane in two halves: a cluster of 2 S = 8 CTAs per 16-row tile (40 KiB of codes per CTA, as
+// Q8), and the two halves of a lane exchange their square partials through distributed shared
+// memory before normalizing; its box uses the 128-byte swizzle. Up (64 rows x 640 bytes per CTA)
+// loads its MMA operands straight into registers: staged in shared memory, BF16 Down and Up would
+// each need more than one wave of CTAs.
+
+constexpr int kBf16Parts    = 2;                   // Down CTAs per lane
+constexpr int kBf16Cluster  = kS * kBf16Parts;     // Down cluster
+constexpr int kBf16PartK    = kH / kBf16Parts;     // 1280 K per Down CTA
+constexpr int kBf16WarpK    = kBf16PartK / kWarps; // 160 K per warp
+constexpr int kBf16Chunks   = kBf16WarpK / 32;     // 5 chunks of 32 K
+constexpr int kBf16RowBytes = kBf16PartK * 2;      // 2560 bytes of a Down row per CTA
+static_assert(kBf16PartK % (kWarps * 32) == 0 && kBf16RowBytes % 128 == 0);
+
+// Byte offset of (row, byte) in a 128-byte-swizzled box of RowBytes-byte rows (1 KiB aligned).
+template <int RowBytes>
+__device__ __forceinline__ int swizzled_offset(int row, int byte) {
+    const int line = row * (RowBytes / 128) + byte / 128;
+    return line * 128 + ((((byte >> 4) & 7) ^ (line & 7)) << 4) + (byte & 15);
+}
+
+__device__ __forceinline__ void mma_bf16(float (&c)[4], std::uint32_t a0, std::uint32_t a1,
+                                         std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
+                                         std::uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, "
+                 "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// One 32-wide K chunk, the lane order of mma_chunk: 8 consecutive BF16 weights of rows g and g + 8
+// and the same 8 BF16 activations of token g.
+__device__ __forceinline__ void mma_chunk_bf16(float (&c)[4], const uint4& top, const uint4& bottom,
+                                               const uint4& activation) {
+    mma_bf16(c, top.x, bottom.x, top.y, bottom.y, activation.x, activation.y);
+    mma_bf16(c, top.z, bottom.z, top.w, bottom.w, activation.z, activation.w);
+}
+
+__device__ __forceinline__ std::uint32_t pack_bf16(float low, float high) {
+    const __nv_bfloat162 value = __floats2bfloat162_rn(low, high);
+    return *reinterpret_cast<const std::uint32_t*>(&value);
+}
+
+struct alignas(1024) DownSharedBf16 {
+    std::int8_t codes[kTile * kBf16RowBytes]; // after the contraction: tile sums [16][8] FP32
+
+    union {
+        __nv_bfloat16 norm[kBf16PartK];    // the half lane's norm weights (activation phase)
+        float warp_sums[kWarps][kTile][8]; // after the contraction
+    } stage;
+
+    float squares[kWarps][8]; // read by the other half of the lane
+    unsigned long long weight_barrier;
+};
+
+struct alignas(16) UpSharedBf16 {
+    __nv_bfloat16 low[8][kLowStride16];
+    float logits[kUpRows][8];
+    float inverse_rms[8 * kS];
+};
+
+static_assert(sizeof(DownSharedBf16) <= 48 * 1024);
+
+template <int Tokens>
+__global__ void __cluster_dims__(kBf16Cluster, 1, 1) __launch_bounds__(kThreads, 2)
+    hc_down_bf16_kernel(const __grid_constant__ HcFusedMaps maps, HcFusedMix p) {
+    __shared__ DownSharedBf16 sh;
+    const int tid                 = static_cast<int>(threadIdx.x);
+    const int lane                = tid & 31;
+    const int warp                = tid >> 5;
+    const int group               = lane >> 2;
+    const int quad                = lane & 3;
+    const int rank                = static_cast<int>(blockIdx.x) % kBf16Cluster; // = cluster rank
+    const int stream              = rank / kBf16Parts;
+    const int part                = rank % kBf16Parts;
+    const int tile                = static_cast<int>(blockIdx.x) / kBf16Cluster;
+    const int row0                = tile * kTile;
+    const int k_part              = kH * stream + kBf16PartK * part; // first wide K of the CTA
+    const unsigned weight_barrier = shared_address(&sh.weight_barrier);
+
+    // Constant inputs first, as Q8: the half lane's norm weights and its 16-row code segment.
+    for (int i = tid; i < kBf16PartK * 2 / 16; i += kThreads)
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(
+                         shared_address(sh.stage.norm + 8 * i)),
+                     "l"(p.norm + k_part + 8 * i)
+                     : "memory");
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+    if (tid == 0) {
+        if ((shared_address(sh.codes) & 1023U) != 0) __trap(); // the swizzle needs 1 KiB alignment
+        barrier_init(weight_barrier);
+        barrier_init_fence();
+        barrier_expect(weight_barrier, kTile * kBf16RowBytes); // whole box, zero-filled tail rows
+        tensor_load_3d(sh.codes, &maps.down_codes, 0, (kBf16RowBytes / 128) * rank, row0,
+                       weight_barrier);
     }
-    p.mixed[d + static_cast<std::int64_t>(kH) * token] = __float2bfloat16_rn(mixed * (1.0F / kS));
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion(); // the Up launch reads our outputs only after its
+                                               // wait
+    const bool has_token = group < Tokens;
+    const bool combine   = p.previous_y != nullptr;
+    const int k_warp     = warp * kBf16WarpK; // inside the CTA's half lane
+    std::uint32_t lane_x[kBf16Chunks][4];
+    float square = 0.0F;
+    if (has_token) {
+        const __nv_bfloat16* residual =
+            p.residual + static_cast<std::int64_t>(kSH) * group + k_part + k_warp;
+        std::uint32_t raw[kBf16Chunks][4], yv[kBf16Chunks][4];
+        float inject = 0.0F;
+#pragma unroll
+        for (int i = 0; i < kBf16Chunks; ++i) load_words(raw[i], residual + 8 * quad + 32 * i);
+        if (combine) {
+            inject = p.previous_inject[stream + kS * group];
+            const __nv_bfloat16* y =
+                p.previous_y + static_cast<std::int64_t>(kH) * group + kBf16PartK * part + k_warp;
+#pragma unroll
+            for (int i = 0; i < kBf16Chunks; ++i) load_words(yv[i], y + 8 * quad + 32 * i);
+        }
+#pragma unroll
+        for (int i = 0; i < kBf16Chunks; ++i) {
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                if (combine) {
+                    const __nv_bfloat162 v = __floats2bfloat162_rn(
+                        __fmaf_rn(inject, bf16_low(yv[i][w]), bf16_low(raw[i][w])),
+                        __fmaf_rn(inject, bf16_high(yv[i][w]), bf16_high(raw[i][w])));
+                    lane_x[i][w] = *reinterpret_cast<const std::uint32_t*>(&v);
+                } else {
+                    lane_x[i][w] = raw[i][w];
+                }
+                const float a = bf16_low(lane_x[i][w]), b = bf16_high(lane_x[i][w]);
+                square = fmaf(a, a, square);
+                square = fmaf(b, b, square);
+            }
+        }
+    }
+    square += __shfl_xor_sync(0xffffffffU, square, 1);
+    square += __shfl_xor_sync(0xffffffffU, square, 2);
+    if (quad == 0 && has_token) sh.squares[warp][group] = square;
+    asm volatile("cp.async.wait_group 0;\n" ::: "memory");
+    // Square partials of both halves, norm weights, barrier initialized (release/acquire at
+    // cluster scope also orders the CTA's own threads).
+    cooperative_groups::cluster_group cluster = cooperative_groups::this_cluster();
+    cluster.sync();
+
+    uint4 activation[kBf16Chunks];
+    if (has_token) {
+        // Fixed order (half 0, then half 1): both CTAs of the lane get the same sum.
+        float sum = 0.0F;
+#pragma unroll
+        for (int h = 0; h < kBf16Parts; ++h) {
+            const float* squares =
+                cluster.map_shared_rank(&sh.squares[0][0], kBf16Parts * stream + h);
+#pragma unroll
+            for (int w = 0; w < kWarps; ++w) sum += squares[w * 8 + group];
+        }
+        const float inv = rsqrtf(sum / static_cast<float>(kH) + p.eps);
+        if (tile == 0 && part == 0 && warp == 0 && quad == 0)
+            p.square_sums[stream + kS * group] = sum;
+#pragma unroll
+        for (int i = 0; i < kBf16Chunks; ++i) {
+            const uint4 v =
+                *reinterpret_cast<const uint4*>(&sh.stage.norm[k_warp + 8 * quad + 32 * i]);
+            const std::uint32_t n[4] = {v.x, v.y, v.z, v.w};
+            std::uint32_t a[4];
+#pragma unroll
+            for (int w = 0; w < 4; ++w)
+                a[w] = pack_bf16(bf16_low(lane_x[i][w]) * inv * (1.0F + bf16_low(n[w])),
+                                 bf16_high(lane_x[i][w]) * inv * (1.0F + bf16_high(n[w])));
+            activation[i] = make_uint4(a[0], a[1], a[2], a[3]);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < kBf16Chunks; ++i) activation[i] = make_uint4(0, 0, 0, 0);
+    }
+
+    barrier_wait(weight_barrier);
+    float acc[4] = {};
+#pragma unroll
+    for (int i = 0; i < kBf16Chunks; ++i) {
+        const int byte = 2 * (k_warp + 8 * quad + 32 * i);
+        const uint4 top =
+            *reinterpret_cast<const uint4*>(sh.codes + swizzled_offset<kBf16RowBytes>(group, byte));
+        const uint4 bottom = *reinterpret_cast<const uint4*>(
+            sh.codes + swizzled_offset<kBf16RowBytes>(group + 8, byte));
+        mma_chunk_bf16(acc, top, bottom, activation[i]);
+    }
+    __syncthreads(); // norm and codes are dead: their space holds the sums
+    float (*warp_sums)[kTile][8]             = sh.stage.warp_sums;
+    float (*tile_sums)[8]                    = reinterpret_cast<float (*)[8]>(sh.codes);
+    warp_sums[warp][group][2 * quad]         = acc[0];
+    warp_sums[warp][group][2 * quad + 1]     = acc[1];
+    warp_sums[warp][group + 8][2 * quad]     = acc[2];
+    warp_sums[warp][group + 8][2 * quad + 1] = acc[3];
+    __syncthreads();
+    if (tid < kTile * 8) {
+        float sum = 0.0F;
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) sum += warp_sums[w][tid / 8][tid % 8];
+        tile_sums[tid / 8][tid % 8] = sum;
+    }
+    cluster.sync();
+    if (rank == 0 && tid < kTile * 8) {
+        const int row   = row0 + tid / 8;
+        const int token = tid % 8;
+        if (token < Tokens && row < p.rows) {
+            float part_sum[kBf16Cluster];
+#pragma unroll
+            for (int r = 0; r < kBf16Cluster; ++r)
+                part_sum[r] = *cluster.map_shared_rank(&tile_sums[tid / 8][token], r);
+            float v = 0.0F;
+#pragma unroll
+            for (int r = 0; r < kBf16Cluster; ++r) v += part_sum[r];
+            v *= 1.0F / kS;
+            if (row < kR)
+                reinterpret_cast<__nv_bfloat16*>(p.low)[token * kR + row] =
+                    __float2bfloat16_rn(v * sigmoidf_(v));
+            else
+                p.inject[(row - kR) + kS * token] = 2.0F * sigmoidf_(v);
+        }
+    }
+    // Peers keep their shared memory until rank 0 has read it (the reads have returned: relaxed).
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;\nbarrier.cluster.wait.aligned;\n" ::
+                     : "memory");
+}
+
+template <int Tokens>
+__global__ void __launch_bounds__(kUpThreads)
+    hc_up_mix_bf16_kernel(const __grid_constant__ HcFusedMaps, HcFusedMix p) {
+    __shared__ UpSharedBf16 sh;
+    const int tid          = static_cast<int>(threadIdx.x);
+    const int lane         = tid & 31;
+    const int warp         = tid >> 5;
+    const int group        = lane >> 2;
+    const int quad         = lane & 3;
+    const int column_begin = static_cast<int>(blockIdx.x) * kCols;
+
+    cudaTriggerProgrammaticLaunchCompletion(); // dependents still wait for our completion
+    // Warp w contracts stream w's Up rows of columns [column_begin, +16). The lane's operand words
+    // are loaded straight into registers before the dependency wait (staged in shared memory, the
+    // 160 CTAs of 40 KiB would not all be resident).
+    constexpr int kChunks = kR / 32;
+    const auto* up_row    = reinterpret_cast<const uint4*>(
+        reinterpret_cast<const __nv_bfloat16*>(p.up_codes) +
+        static_cast<std::int64_t>(warp * kH + column_begin + group) * kR + 8 * quad);
+    uint4 top[kChunks], bottom[kChunks];
+#pragma unroll
+    for (int i = 0; i < kChunks; ++i) {
+        top[i]    = __ldg(up_row + 4 * i);      // 32 K = 4 uint4 per chunk
+        bottom[i] = __ldg(up_row + kR + 4 * i); // row + 8 (kR / 8 uint4 per row)
+    }
+    const int top_row  = warp * 16 + group;
+    const MixItem item = mix_item<Tokens>(p, tid, column_begin);
+
+    cudaGridDependencySynchronize(); // the Down launch has completed: low, square sums, inject
+    stage_low<Tokens>(p, tid, sh.low, sh.inverse_rms);
+    __syncthreads();
+
+    float acc[4] = {};
+#pragma unroll
+    for (int i = 0; i < kChunks; ++i) {
+        const int k            = 8 * quad + 32 * i;
+        const uint4 activation = group < Tokens ? *reinterpret_cast<const uint4*>(&sh.low[group][k])
+                                                : make_uint4(0, 0, 0, 0);
+        mma_chunk_bf16(acc, top[i], bottom[i], activation);
+    }
+    sh.logits[top_row][2 * quad]         = acc[0];
+    sh.logits[top_row][2 * quad + 1]     = acc[1];
+    sh.logits[top_row + 8][2 * quad]     = acc[2];
+    sh.logits[top_row + 8][2 * quad + 1] = acc[3];
+    __syncthreads();
+    finish_mix(p, item, sh.logits, sh.inverse_rms);
 }
 
 using SplitKernel = void (*)(HcFusedMaps, HcFusedMix);
@@ -643,6 +953,15 @@ constexpr auto kDownKernels = down_kernels<false>(std::make_integer_sequence<int
 constexpr auto kUpKernels   = up_kernels<false>(std::make_integer_sequence<int, kHcFusedMaxT>{});
 constexpr auto kDownKernelsF4 = down_kernels<true>(std::make_integer_sequence<int, kHcFusedMaxT>{});
 constexpr auto kUpKernelsF4   = up_kernels<true>(std::make_integer_sequence<int, kHcFusedMaxT>{});
+
+template <int... Tokens>
+constexpr auto bf16_kernels(std::integer_sequence<int, Tokens...>) {
+    return std::pair{
+        std::array<SplitKernel, sizeof...(Tokens)>{hc_down_bf16_kernel<Tokens + 1>...},
+        std::array<SplitKernel, sizeof...(Tokens)>{hc_up_mix_bf16_kernel<Tokens + 1>...}};
+}
+
+constexpr auto kBf16Kernels = bf16_kernels(std::make_integer_sequence<int, kHcFusedMaxT>{});
 
 CUtensorMap encode_map(CUtensorMapDataType type, const void* base, int rank,
                        const std::uint64_t* dims, const std::uint64_t* strides,
@@ -664,6 +983,16 @@ CUtensorMap encode_map(CUtensorMapDataType type, const void* base, int rank,
 
 HcFusedMaps make_maps(const HcFusedMix& p) {
     HcFusedMaps maps{};
+    if (p.bf16) {
+        { // Down [rows][160 lines][128 B]; box = one half-lane segment (20 lines) of a 16-row tile.
+            const std::uint64_t dims[3]{128, kSH * 2 / 128, static_cast<std::uint64_t>(p.rows)};
+            const std::uint64_t strides[2]{128, kSH * 2};
+            const std::uint32_t box[3]{128, kBf16RowBytes / 128, kTile};
+            maps.down_codes = encode_map(CU_TENSOR_MAP_DATA_TYPE_UINT8, p.down_codes, 3, dims,
+                                         strides, box, CU_TENSOR_MAP_SWIZZLE_128B);
+        }
+        return maps; // Up is read straight into registers
+    }
     if (p.fp4) {
         { // Down codes [384][40 lines][128 B]; box = one lane segment (10 lines) of a 16-row tile.
             const std::uint64_t dims[3]{128, kSH / 2 / 128,
@@ -731,9 +1060,12 @@ std::size_t hyper_connection_fused_workspace_bytes(std::int32_t tokens) {
 void hyper_connection_fused_mix_launch(const HcFusedMix& params, cudaStream_t stream) {
     const int tiles        = (params.rows + kTile - 1) / kTile;
     const HcFusedMaps maps = make_maps(params);
-    const auto& down       = params.fp4 ? kDownKernelsF4 : kDownKernels;
-    const auto& up         = params.fp4 ? kUpKernelsF4 : kUpKernels;
-    CUDA_CHECK(pdl::launch_dependent(pdl::LaunchConfig{dim3(tiles * kS), dim3(kThreads), 0, stream},
+    const auto& down       = params.bf16  ? kBf16Kernels.first
+                             : params.fp4 ? kDownKernelsF4
+                                          : kDownKernels;
+    const auto& up = params.bf16 ? kBf16Kernels.second : params.fp4 ? kUpKernelsF4 : kUpKernels;
+    const int down_ctas = tiles * (params.bf16 ? kBf16Cluster : kS);
+    CUDA_CHECK(pdl::launch_dependent(pdl::LaunchConfig{dim3(down_ctas), dim3(kThreads), 0, stream},
                                      down[params.tokens - 1], maps, params));
     CUDA_CHECK(
         pdl::launch_dependent(pdl::LaunchConfig{dim3(kH / kCols), dim3(kUpThreads), 0, stream},

@@ -33,10 +33,10 @@ namespace {
 
 using namespace ninfer::expert_cache;
 
-constexpr int kLayersStored = 48;
-constexpr int kTopK         = 10;
-constexpr int kExperts      = 512;
-constexpr int kLayers       = 47;
+constexpr int kLayersStored        = 48;
+constexpr int kTopK                = 10;
+constexpr int kExperts             = 512;
+constexpr int kLayers              = 47;
 constexpr std::size_t kRecordBytes = 2 + 4 + 4 + kLayersStored * kTopK * 2;
 
 struct Record {
@@ -57,9 +57,9 @@ std::vector<Record> load(const std::string& path) {
     if (raw.size() % kRecordBytes != 0) { throw std::runtime_error("truncated routing.bin"); }
     std::vector<Record> records(raw.size() / kRecordBytes);
     for (std::size_t i = 0; i < records.size(); ++i) {
-        const char* r     = raw.data() + i * kRecordBytes;
-        records[i].dom    = static_cast<std::uint8_t>(r[0]);
-        records[i].phase  = static_cast<std::uint8_t>(r[1]);
+        const char* r    = raw.data() + i * kRecordBytes;
+        records[i].dom   = static_cast<std::uint8_t>(r[0]);
+        records[i].phase = static_cast<std::uint8_t>(r[1]);
         std::memcpy(records[i].experts, r + 10, sizeof(records[i].experts)); // little-endian host
     }
     return records;
@@ -118,11 +118,12 @@ std::vector<Window> make_windows(const std::vector<Record>& R, const std::string
 }
 
 [[noreturn]] void usage() {
-    std::cerr << "usage: ninfer_expert_cache_replay ROUTING_BIN --stream S --K N [--W 4]\n"
-                 "  [--partitions P] [--rule engine|f0k_single_pass|f0m_window_start_free]\n"
-                 "  [--admit THRESHOLD HALF_LIFE_TOKENS] [--evict-tau WINDOWS] [--cap N] [--out FILE]\n"
-                 "  [--publish-lag N]  also report device hits when a fill becomes usable N windows\n"
-                 "                     after the window that decided it (0 = the next window)\n";
+    std::cerr
+        << "usage: ninfer_expert_cache_replay ROUTING_BIN --stream S --K N [--W 4]\n"
+           "  [--partitions P] [--rule engine|f0k_single_pass|f0m_window_start_free]\n"
+           "  [--admit THRESHOLD HALF_LIFE_TOKENS] [--evict-tau WINDOWS] [--cap N] [--out FILE]\n"
+           "  [--publish-lag N]  also report device hits when a fill becomes usable N windows\n"
+           "                     after the window that decided it (0 = the next window)\n";
     std::exit(2);
 }
 
@@ -137,7 +138,7 @@ int main(int argc, char** argv) {
     c.experts = kExperts;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
-        auto next = [&]() -> std::string {
+        auto next           = [&]() -> std::string {
             if (i + 1 >= argc) { usage(); }
             return argv[++i];
         };
@@ -178,7 +179,7 @@ int main(int argc, char** argv) {
         }
     }
     try {
-        const std::vector<Record> R      = load(path);
+        const std::vector<Record> R       = load(path);
         const std::vector<Window> windows = make_windows(R, stream, W);
         ExpertCachePolicy policy(c);
         LayerDecision d;
@@ -189,7 +190,7 @@ int main(int argc, char** argv) {
         std::int64_t H = 0, A = 0, M = 0, F = 0, counted = 0, DH = 0;
         // Window index of each (layer, expert) insertion, for --publish-lag.
         std::vector<std::int64_t> inserted_at(static_cast<std::size_t>(kLayers) * kExperts, -1);
-        std::int64_t wi = -1;
+        std::int64_t wi       = -1;
         double decide_seconds = 0.0;
         for (const Window& w : windows) {
             ++wi;
@@ -234,18 +235,20 @@ int main(int argc, char** argv) {
                          static_cast<long long>(f));
         }
         if (out != stdout) { std::fclose(out); }
-        std::fprintf(stderr,
-                     "stream %s K %d P %d windows %lld (all %zu): hit %.4f missing/w %.2f "
-                     "inserts/w %.2f, decide %.1f us/window (47 layers)\n",
-                     stream.c_str(), c.slots_per_layer, c.partitions,
-                     static_cast<long long>(counted), windows.size(),
-                     static_cast<double>(H) / static_cast<double>(std::max<std::int64_t>(A, 1)),
-                     static_cast<double>(M) / static_cast<double>(std::max<std::int64_t>(counted, 1)),
-                     static_cast<double>(F) / static_cast<double>(std::max<std::int64_t>(counted, 1)),
-                     decide_seconds * 1e6 / static_cast<double>(windows.size()));
+        std::fprintf(
+            stderr,
+            "stream %s K %d P %d windows %lld (all %zu): hit %.4f missing/w %.2f "
+            "inserts/w %.2f, decide %.1f us/window (47 layers)\n",
+            stream.c_str(), c.slots_per_layer, c.partitions, static_cast<long long>(counted),
+            windows.size(),
+            static_cast<double>(H) / static_cast<double>(std::max<std::int64_t>(A, 1)),
+            static_cast<double>(M) / static_cast<double>(std::max<std::int64_t>(counted, 1)),
+            static_cast<double>(F) / static_cast<double>(std::max<std::int64_t>(counted, 1)),
+            decide_seconds * 1e6 / static_cast<double>(windows.size()));
         if (lag >= 0) {
             std::fprintf(stderr, "publish lag %d window(s): device hit %.4f\n", lag,
-                         static_cast<double>(DH) / static_cast<double>(std::max<std::int64_t>(A, 1)));
+                         static_cast<double>(DH) /
+                             static_cast<double>(std::max<std::int64_t>(A, 1)));
         }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << '\n';

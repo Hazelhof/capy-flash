@@ -41,8 +41,8 @@ int grid_for(std::int64_t work) {
     return static_cast<int>(std::clamp<std::int64_t>((work + kBlock - 1) / kBlock, 1, 65535LL * 8));
 }
 
-__global__ void hc_split_widen_kernel(const __nv_bfloat16* __restrict__ in,
-                                      float* __restrict__ out, std::int64_t count) {
+__global__ void hc_split_widen_kernel(const __nv_bfloat16* __restrict__ in, float* __restrict__ out,
+                                      std::int64_t count) {
     for (std::int64_t i = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
          i < count; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
         out[i] = __bfloat162float(in[i]);
@@ -118,11 +118,11 @@ std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 std::size_t workspace_bytes(std::int32_t tokens, bool inject) {
     const auto t           = static_cast<std::size_t>(tokens);
     const std::size_t rows = kHcRank + (inject ? kHcStreams : 0);
-    return align256(t * kLocalWide * 2)      // normalized
-           + align256(t * rows * 2)          // projection partial (BF16)
-           + 2 * align256(t * rows * 4)      // p FP32 + staging
-           + align256(t * kHcRank * 2)       // low
-           + align256(t * kLocalWide * 2)    // up logits
+    return align256(t * kLocalWide * 2)       // normalized
+           + align256(t * rows * 2)           // projection partial (BF16)
+           + 2 * align256(t * rows * 4)       // p FP32 + staging
+           + align256(t * kHcRank * 2)        // low
+           + align256(t * kLocalWide * 2)     // up logits
            + 2 * align256(t * kHcHidden * 4); // collapse partial FP32 + staging
 }
 
@@ -130,11 +130,10 @@ struct RankScratch {
     Tensor normalized, projection, p, p_staging, low, up, partial, partial_staging;
 };
 
-
 // The fused route needs its kernels loaded and its grid known on both devices before a capture
 // (a module cannot be loaded inside the capture that first launches it): every eager call prepares
 // them, and a captured call takes the fused route only on devices an eager call prepared.
-constexpr int kMaxDevices = 16;
+constexpr int kMaxDevices    = 16;
 bool g_prepared[kMaxDevices] = {};
 
 bool prepared(int device) { return device >= 0 && device < kMaxDevices && g_prepared[device]; }
@@ -226,7 +225,9 @@ PeerMailbox* fused_mailbox(const Validated& v, const std::array<HyperConnectionW
     }
     const std::size_t widest = static_cast<std::size_t>(v.tokens) * kHcHidden * sizeof(float);
     PeerMailbox* mailbox     = detail::captured_mailbox_for(widest, ec, events);
-    if (mailbox == nullptr || mailbox->kernel() != PeerExchangeKernel::Pipelined) { return nullptr; }
+    if (mailbox == nullptr || mailbox->kernel() != PeerExchangeKernel::Pipelined) {
+        return nullptr;
+    }
     for (int rank = 0; rank < 2; ++rank) {
         ScopedCurrentDevice::select(ec.dev[rank]->device);
         if (detail::hyper_connection_split_fused_grid() == 0) { return nullptr; }

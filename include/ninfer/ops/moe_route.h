@@ -10,9 +10,10 @@
 
 namespace ninfer::ops {
 
-// Router and output combine (or tensor-parallel accumulation) of the Qwen3.8-Flash-Next (Qwen4Exp) sparse MoE block: hidden 2560,
-// 512 routed experts, top-10, and one sigmoid-gated shared expert. The routed experts themselves
-// are computed elsewhere (moe_slots.h, or a host path), as an FP32 partial sum.
+// Router and output combine (or tensor-parallel accumulation) of the Qwen3.8-Flash-Next (Qwen4Exp)
+// sparse MoE block: hidden 2560, 512 routed experts, top-10, and one sigmoid-gated shared expert.
+// The routed experts themselves are computed elsewhere (moe_slots.h, or a host path), as an FP32
+// partial sum.
 
 inline constexpr std::int32_t kMoeRouteHidden  = 2560;
 inline constexpr std::int32_t kMoeRouteExperts = 512;

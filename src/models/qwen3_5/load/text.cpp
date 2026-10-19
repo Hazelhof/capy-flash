@@ -110,8 +110,31 @@ PleWeights bind_ple(Bindings& b, const TextConfig& config, const std::string& pr
     const auto p    = prefix + "ple/";
     const auto wide = config.residual_width();
     PleWeights out;
-    out.table    = b.parameter(p + "table", {ple.table_rows, ple.row_width()}, {},
-                               QType::FP8_E4M3FN_ROW_BF16, artifact::Residency::HostFile);
+    // A row-scaled FP8 table, or the FP4-Local row-scaled NVFP4 table, whose FP32 tensor
+    // multiplier is the separate scalar table_global_scale (absent for FP8).
+    out.table = b.parameter(p + "table", {ple.table_rows, ple.row_width()}, {}, {},
+                            artifact::Residency::HostFile);
+    const auto table_format =
+        b.binder.reader().geometry(b.at(out.table).reference.binding.parts.at(0).object).format;
+    const auto scale_name = p + "table_global_scale";
+    if (table_format == QType::NVFP4_ROW_E4M3_G16) {
+        if (!b.binder.contains(scale_name)) {
+            throw artifact::ArtifactError(p + "table: row-scaled NVFP4 requires " + scale_name);
+        }
+        // One FP32 element, stored as a scalar or a one-element vector.
+        const auto& binding = b.binder.reader().directory().bindings.at(scale_name);
+        auto shape          = binding.whole_object
+                                  ? b.binder.reader().directory().tensor(binding.parts.at(0).object).shape
+                                  : artifact::Shape{binding.elements};
+        if (binding.elements != 1) {
+            throw artifact::ArtifactError(scale_name + ": must be one FP32 value");
+        }
+        out.table_global_scale = b.direct(scale_name, std::move(shape), QType::FP32);
+    } else if (table_format != QType::FP8_E4M3FN_ROW_BF16 || b.binder.contains(scale_name)) {
+        throw artifact::ArtifactError(
+            p + "table: the n-gram table is row-scaled FP8, or row-scaled NVFP4 with " +
+            scale_name);
+    }
     out.key      = b.parameter(p + "key", {wide, ple.embed_dim}, {p + "embedding"});
     out.value    = b.parameter(p + "value", {config.hidden_size, ple.embed_dim}, {p + "embedding"});
     out.key_norm = b.direct(p + "key_norm", {wide});

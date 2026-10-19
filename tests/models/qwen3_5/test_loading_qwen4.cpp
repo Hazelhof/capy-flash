@@ -125,7 +125,7 @@ void check_plan(const qwen::LoadPlan& plan, const Json& expect, const LoadOption
     }
     require_equal(ple_blocks, 1, "PLE blocks");
     for (const auto& [name, format] : expect.at("formats").items()) {
-        const auto& binding = plan.materialization().source->directory().bindings.at(name);
+        const auto& binding  = plan.materialization().source->directory().bindings.at(name);
         const auto& geometry = plan.materialization().source->geometry(binding.parts.at(0).object);
         require(artifact::format_name(geometry.format) == format.get<std::string>(),
                 ("format of " + name).c_str());
@@ -158,7 +158,8 @@ Inventory inventory(const qwen::LoadPlan& plan) {
         add("file-mapped", artifact::object_bytes(reader.directory().object(handle)));
     }
     for (const auto& item : plan.materialization().host_objects) {
-        add("host (resources, values)", artifact::object_bytes(reader.directory().object(item.object)));
+        add("host (resources, values)",
+            artifact::object_bytes(reader.directory().object(item.object)));
     }
     return out;
 }
@@ -306,7 +307,7 @@ int main(int argc, char** argv) {
         Json expect;
         if (!expectations.empty()) {
             std::ifstream in(expectations);
-            expect = Json::parse(in);
+            expect                   = Json::parse(in);
             expect["embedding_host"] = options.embedding_host;
         }
         artifact::Reader reader(path);
@@ -315,8 +316,8 @@ int main(int argc, char** argv) {
             check_plan(plan, expect, options);
             check_residency(plan, expect);
         }
-        std::cout << path.filename().string() << ": plan passed, "
-                  << plan.parameter_count() << " parameters\n";
+        std::cout << path.filename().string() << ": plan passed, " << plan.parameter_count()
+                  << " parameters\n";
         print_inventory(inventory(plan));
         if (plan_only) { return 0; }
         int devices = 0;
@@ -328,8 +329,8 @@ int main(int argc, char** argv) {
         auto model = qwen::materialize_model(std::move(plan), device);
         if (!expect.is_null()) { check_materialized(*model, expect, expectations.parent_path()); }
         std::cout << "materialized: host-mapped " << model->storage_stats().host_mapped_bytes
-                  << " B, file-mapped " << model->storage_stats().mapped_file_bytes
-                  << " B, device " << model->storage_stats().device_capacity_bytes << " B\n";
+                  << " B, file-mapped " << model->storage_stats().mapped_file_bytes << " B, device "
+                  << model->storage_stats().device_capacity_bytes << " B\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

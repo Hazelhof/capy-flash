@@ -49,26 +49,27 @@ void each_rank(const ExecutionContext& ec, Body&& body) {
 
 void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
                                DFlashEnvelopes envelopes) {
-    const TpExecution& tp     = *state.execution.tp;
+    const TpExecution& tp      = *state.execution.tp;
     const ExecutionContext& ec = *tp.execution;
-    const auto& target        = state.execution.parameters.model.config().text;
-    const auto& config        = *state.execution.parameters.model.config().draft;
+    const auto& target         = state.execution.parameters.model.config().text;
+    const auto& config         = *state.execution.parameters.model.config().draft;
     if (config.rms_norm_eps != 1e-6F || config.rope_theta != 1e7F ||
         config.attention.head_dim != 128 || config.attention.num_attention_heads != 32 ||
         config.attention.num_key_value_heads != 8) {
-        throw std::invalid_argument("DFlash2 tp2: the split drafter requires the D128 32/8 profile");
+        throw std::invalid_argument(
+            "DFlash2 tp2: the split drafter requires the D128 32/8 profile");
     }
-    const auto ranks            = draft_ranks(state);
-    const int width             = k + 1;
-    const int columns           = width * batch;
-    const int mask_columns      = k * batch;
-    const std::int32_t hidden   = dimension(target.hidden_size);
-    const std::int32_t q_rows   = kSplitQueryHeads * 128;
-    const std::int32_t kv_rows  = kSplitKvHeads * 128;
+    const auto ranks           = draft_ranks(state);
+    const int width            = k + 1;
+    const int columns          = width * batch;
+    const int mask_columns     = k * batch;
+    const std::int32_t hidden  = dimension(target.hidden_size);
+    const std::int32_t q_rows  = kSplitQueryHeads * 128;
+    const std::int32_t kv_rows = kSplitKvHeads * 128;
     std::array<Tensor, 2> residual, staging, positions, valid, slots;
     each_rank(ec, [&](std::size_t r) {
-        const DraftRank& d = ranks[r];
-        WorkspaceArena& work = d.execution->work;
+        const DraftRank& d        = ranks[r];
+        WorkspaceArena& work      = d.execution->work;
         const cudaStream_t stream = d.execution->device.stream;
         work.reset();
         Tensor anchors   = d.frame->anchors.slice(0, 0, batch);
@@ -77,8 +78,8 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
         slots[r]         = d.frame->state_destination_slots.slice(0, 0, batch);
         Tensor ids       = d.frame->proposal_ids.slice(1, 0, batch);
         positions[r]     = d.frame->proposal_positions.slice(1, 0, batch);
-        ops::prepare_masked_block(anchors, frontiers, valid[r], dimension(config.mask_token_id), ids,
-                                  positions[r], stream);
+        ops::prepare_masked_block(anchors, frontiers, valid[r], dimension(config.mask_token_id),
+                                  ids, positions[r], stream);
         residual[r] = work.alloc(DType::BF16, {hidden, width, batch});
         staging[r]  = work.alloc(DType::BF16, {hidden, width, batch});
         Tensor flat = residual[r].view({hidden, columns});
@@ -104,9 +105,9 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
                 branch[r] = workspace::dflash2_branch(work, target, config, width, batch);
                 prepare_dynamic_branch(core, residual[r], p.input_norm, config.rms_norm_eps,
                                        *p.attention_conv, branch[r]);
-                Tensor query = work.alloc(DType::BF16, {128, kSplitQueryHeads, width, batch});
-                Tensor key   = work.alloc(DType::BF16, {128, kSplitKvHeads, width, batch});
-                Tensor value = work.alloc(DType::BF16, {128, kSplitKvHeads, width, batch});
+                Tensor query      = work.alloc(DType::BF16, {128, kSplitQueryHeads, width, batch});
+                Tensor key        = work.alloc(DType::BF16, {128, kSplitKvHeads, width, batch});
+                Tensor value      = work.alloc(DType::BF16, {128, kSplitKvHeads, width, batch});
                 Tensor query_flat = query.view({q_rows, columns});
                 Tensor key_flat   = key.view({kv_rows, columns});
                 Tensor value_flat = value.view({kv_rows, columns});
@@ -130,10 +131,9 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
             ops::allreduce_sum(partial, staging, ec, *tp.events);
             each_rank(ec, [&](std::size_t r) {
                 Tensor target_residual = residual[r];
-                ops::dynamic_grouped_conv_finish_add(partial[r],
-                                                     layer_of(r, layer).attention_conv->base_kernel,
-                                                     branch[r].finish_delta, target_residual,
-                                                     ranks[r].execution->device.stream);
+                ops::dynamic_grouped_conv_finish_add(
+                    partial[r], layer_of(r, layer).attention_conv->base_kernel,
+                    branch[r].finish_delta, target_residual, ranks[r].execution->device.stream);
             });
         }
         {
@@ -171,10 +171,9 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
             ops::allreduce_sum(partial, staging, ec, *tp.events);
             each_rank(ec, [&](std::size_t r) {
                 Tensor target_residual = residual[r];
-                ops::dynamic_grouped_conv_finish_add(partial[r],
-                                                     layer_of(r, layer).mlp_conv->base_kernel,
-                                                     branch[r].finish_delta, target_residual,
-                                                     ranks[r].execution->device.stream);
+                ops::dynamic_grouped_conv_finish_add(
+                    partial[r], layer_of(r, layer).mlp_conv->base_kernel, branch[r].finish_delta,
+                    target_residual, ranks[r].execution->device.stream);
             });
         }
     }
@@ -189,7 +188,7 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
     // Candidates: both ranks rank their head blocks. The rank that holds the candidate selector
     // (dflash2_selector_rank) selects into its frame; with the selector on rank 1 both ranks merge
     // the candidates, since acceptance on rank 0 reads them.
-    const std::size_t selecting = dflash2_selector_rank(state.execution.parameters);
+    const std::size_t selecting     = dflash2_selector_rank(state.execution.parameters);
     const ProposalParameters& head0 = *state.execution.parameters.proposal;
     if (selecting == 1 && (!head0.split() || ranks[1].frame->candidate_ids.data == nullptr ||
                            ranks[1].frame->proposal_q.data == nullptr)) {
@@ -210,11 +209,10 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
         scores[1] = ranks[1].execution->work.alloc(DType::FP32, {top_k, mask_columns});
     }
     if (head0.split()) {
-        dflash2_candidates_split(final_hidden, {&head0, &*ranks[1].execution->parameters.proposal},
-                                 false, ids[0], scores[0],
-                                 {&state.execution.work, &ranks[1].execution->work}, ec,
-                                 *tp.events, selecting == 1 ? &ids[1] : nullptr,
-                                 selecting == 1 ? &scores[1] : nullptr);
+        dflash2_candidates_split(
+            final_hidden, {&head0, &*ranks[1].execution->parameters.proposal}, false, ids[0],
+            scores[0], {&state.execution.work, &ranks[1].execution->work}, ec, *tp.events,
+            selecting == 1 ? &ids[1] : nullptr, selecting == 1 ? &scores[1] : nullptr);
     } else {
         const ScopedCurrentDevice rank0(ec.dev[0]->device);
         const cudaStream_t stream = state.execution.device.stream;
@@ -230,11 +228,11 @@ void propose_dflash2_batch_tp2(DFlashBatchContext& state, int batch, int k,
     }
     {
         const ScopedCurrentDevice owner(ec.dev[selecting]->device);
-        ExecutionCore& core               = *ranks[selecting].execution;
-        qwen3_5::DFlashDecodeState& frame = *ranks[selecting].frame;
+        ExecutionCore& core                = *ranks[selecting].execution;
+        qwen3_5::DFlashDecodeState& frame  = *ranks[selecting].frame;
         const SelectorParameters& selector = *core.parameters.draft->selector;
-        auto& work                = core.work;
-        const cudaStream_t stream = core.device.stream;
+        auto& work                         = core.work;
+        const cudaStream_t stream          = core.device.stream;
         Tensor projected =
             work.alloc(DType::BF16, {dimension(config.dflash2->selector_rank), mask_columns});
         project(final_hidden[selecting], selector.hidden_projection, projected, work, stream);
@@ -289,8 +287,7 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
     const cudaStream_t stream = ec.dev[target]->stream;
     CUDA_CHECK(cudaStreamWaitEvent(stream, events.inputs_ready(static_cast<int>(source)), 0));
     const auto pull = [&](const Tensor& to, const Tensor& from) {
-        CUDA_CHECK(::ninfer::memcpy_device_async(to.data, from.data, from.bytes(),
-                                   stream));
+        CUDA_CHECK(::ninfer::memcpy_device_async(to.data, from.data, from.bytes(), stream));
     };
     pull(frames[target]->draft_tokens.slice(1, 0, batch_size),
          frames[source]->draft_tokens.slice(1, 0, batch_size));
@@ -301,6 +298,20 @@ void dflash2_share_drafts_tp2(DFlashBatchContext& state, std::int32_t batch_size
         }
         pull(state.frame.proposal_q.slice(2, 0, batch_size),
              peer.proposal_q.slice(2, 0, batch_size));
+    }
+    // The round continues into the target forward's captured mailbox exchanges, and a rank that
+    // reaches its first exchange spins on the peer. Under WSL2 the peer's outstanding pull from
+    // this device stalls behind that spin (issue #1), so the target's inbound copies must be
+    // complete before either rank enters the mailbox phase: the rendezvous the MTP path gets from
+    // its draft phase's staged collectives.
+    // Only once the draft phase runs on the staged copies (the WSL2 step-down, or
+    // NINFER_TP_MAILBOX_DRAFT=copies): where the mailbox holds, the extra cross-stream wait is
+    // not needed and the decode round stays as it was.
+    if (tp->staged_draft_collectives) {
+        CUDA_CHECK(cudaEventRecord(events.pull_done(static_cast<int>(target)), stream));
+        ScopedCurrentDevice::select(ec.dev[source]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(ec.dev[source]->stream,
+                                       events.pull_done(static_cast<int>(target)), 0));
     }
     // Rank 1 derives its verification inputs from its drafts with the same Op as rank 0.
     ScopedCurrentDevice::select(ec.dev[1]->device);
@@ -360,9 +371,9 @@ void dflash_append_context_peer(DFlashPeerDrafter& peer, const qwen3_5::DFlashDe
     CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &host, sizeof(qwen3_5::DFlashDecodeIngress),
                                cudaMemcpyHostToDevice, stream));
     core.work.reset();
-    Tensor features = core.work.alloc(
-        DType::BF16, {dimension(core.parameters.draft->feature_projection.weight.k),
-                      static_cast<std::int32_t>(draft_window + 1U), batch});
+    Tensor features =
+        core.work.alloc(DType::BF16, {dimension(core.parameters.draft->feature_projection.weight.k),
+                                      static_cast<std::int32_t>(draft_window + 1U), batch});
     Tensor positions = frame.append_positions.slice(1, 0, batch);
     Tensor counts    = frame.append_counts.slice(0, 0, batch);
     ops::prepare_ragged_prefix(peer.dflash.pending_features, frame.active_lanes.slice(0, 0, batch),
@@ -393,9 +404,9 @@ DFlashFeatureSink dflash_peer_prefill_sink(DFlashPeerDrafter& peer,
                                            qwen3_5::DFlashPrefillIngress* host_ingress) {
     const auto& config = *peer.execution.parameters.model.config().draft;
     return DFlashFeatureSink{
-        .features        = &peer.dflash.prefill_features,
-        .positions       = &peer.dflash.prefill_positions,
-        .layers          = std::span<const std::uint32_t>(config.target_layer_ids),
+        .features  = &peer.dflash.prefill_features,
+        .positions = &peer.dflash.prefill_positions,
+        .layers    = std::span<const std::uint32_t>(config.target_layer_ids),
         .consume_prefill =
             [&peer, host_ingress](const Tensor& features, const Tensor& positions, bool) {
                 ExecutionCore& core = peer.execution;

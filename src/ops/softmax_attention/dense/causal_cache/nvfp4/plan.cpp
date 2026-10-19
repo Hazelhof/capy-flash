@@ -26,10 +26,10 @@ Nvfp4KvCausalPlan make_nvfp4_kv_causal_plan(int heads, int width, int batch,
                                       ? (width + 1) / 2
                                       : std::min(width, grouped_limit);
     // 12/2 is one device's half of 24/4 at tp 2: two KV heads with 24/4's group of six.
-    const int row_tiles         = (query_tile * (heads == 16 ? 8 : 6) + 15) / 16;
-    constexpr int sms           = kCausalAttentionSmCount;
-    const int wave_ctas         = (sms / independent_tiles) * independent_tiles;
-    const int budget            = row_tiles <= 2 || wave_ctas < sms * 9 / 10 ? 2 * sms : sms;
+    const int row_tiles = (query_tile * (heads == 16 ? 8 : 6) + 15) / 16;
+    constexpr int sms   = kCausalAttentionSmCount;
+    const int wave_ctas = (sms / independent_tiles) * independent_tiles;
+    const int budget    = row_tiles <= 2 || wave_ctas < sms * 9 / 10 ? 2 * sms : sms;
     CausalKvPartition partition{
         1, std::clamp(budget / independent_tiles, 1, CausalKvPartition::kMaxSplits)};
     // Bound partial traffic by keeping enough KV work in each split.

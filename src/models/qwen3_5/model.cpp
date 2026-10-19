@@ -66,8 +66,7 @@ ExpertBankSpans bank_rows(const BoundWeight& weight) {
         region.end % g.shape[1]) {
         throw std::invalid_argument(weight.name + ": a routed expert is not whole bank rows");
     }
-    return {region.parent, region.begin / g.shape[1], (region.end - region.begin) / g.shape[1],
-            {}};
+    return {region.parent, region.begin / g.shape[1], (region.end - region.begin) / g.shape[1], {}};
 }
 
 } // namespace

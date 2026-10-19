@@ -58,9 +58,12 @@ void destroy_event(cudaEvent_t& event) noexcept {
 
 } // namespace
 
-cudaError_t memcpy_device_async(void* dst, const void* src, std::size_t bytes, cudaStream_t stream) {
+cudaError_t memcpy_device_async(void* dst, const void* src, std::size_t bytes,
+                                cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    if (const cudaError_t e = cudaStreamIsCapturing(stream, &status); e != cudaSuccess) { return e; }
+    if (const cudaError_t e = cudaStreamIsCapturing(stream, &status); e != cudaSuccess) {
+        return e;
+    }
     if (bytes > 0 && status == cudaStreamCaptureStatusNone) {
         cudaPointerAttributes d{};
         cudaPointerAttributes s{};
@@ -125,8 +128,8 @@ ExecutionContext::ExecutionContext(const std::vector<int>& device_ids) {
 
 DeviceContext::DeviceContext(int device_id) : device(device_id) {
     const unsigned int sync_flags = sync_schedule_from_environment();
-    int count       = 0;
-    cudaError_t err = cudaGetDeviceCount(&count);
+    int count                     = 0;
+    cudaError_t err               = cudaGetDeviceCount(&count);
     if (err != cudaSuccess) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceCount failed", err));
     }

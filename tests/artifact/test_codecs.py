@@ -33,10 +33,7 @@ def _signed_word(word: int, bits: int) -> int:
         (
             "fp32",
             torch.tensor(
-                [
-                    _signed_word(word, 32)
-                    for word in (0x00000000, 0x80000000, 0x00000001, 0x7FC01234)
-                ],
+                [_signed_word(word, 32) for word in (0x00000000, 0x80000000, 0x00000001, 0x7FC01234)],
                 dtype=torch.int32,
             ).view(torch.float32),
             (0x00000000, 0x80000000, 0x00000001, 0x7FC01234),
@@ -52,9 +49,7 @@ def _signed_word(word: int, bits: int) -> int:
         ),
     ],
 )
-def test_direct_layout_preserves_exact_little_endian_words(
-    format_name, tensor, words, word_format, word_view
-):
+def test_direct_layout_preserves_exact_little_endian_words(format_name, tensor, words, word_format, word_view):
     expected = struct.pack("<" + word_format * len(words), *words)
     payload = encode_direct(tensor, format_name)
     assert payload == expected
@@ -137,13 +132,9 @@ def test_row_split_matches_known_packed_bytes(
     expected = bytearray(scale_offset + groups * 2)
     expected[: len(base_prefix)] = base_prefix
     expected[256 : 256 + len(high_prefix)] = high_prefix
-    expected[scale_offset:] = struct.pack(
-        "<" + "H" * groups, 0x3E00, 0x3400, *([0] * (groups - 2))
-    )
+    expected[scale_offset:] = struct.pack("<" + "H" * groups, 0x3E00, 0x3400, *([0] * (groups - 2)))
     assert encode_row_split(codes, scales, format_name, (1, k)) == expected
-    decoded_scales, decoded_codes = decode_row_split_codes(
-        expected, format_name, (1, k)
-    )
+    decoded_scales, decoded_codes = decode_row_split_codes(expected, format_name, (1, k))
     assert torch.equal(decoded_scales, scales)
     assert torch.equal(decoded_codes, codes)
 
@@ -159,19 +150,9 @@ def test_nvfp4_known_vector_geometry_swizzle_tail_and_round_trip():
         geometry.payload_bytes,
     ) == (4096, 4096, 512, 4608, 4612)
 
-    packed = (
-        torch.arange(geometry.code_plane_bytes, dtype=torch.int64)
-        .remainder(256)
-        .to(torch.uint8)
-        .reshape(128, 32)
-    )
+    packed = torch.arange(geometry.code_plane_bytes, dtype=torch.int64).remainder(256).to(torch.uint8).reshape(128, 32)
     packed[0, 0] = 0x10
-    scales = (
-        torch.arange(128 * 4, dtype=torch.int64)
-        .remainder(0x7F)
-        .to(torch.uint8)
-        .reshape(128, 4)
-    )
+    scales = torch.arange(128 * 4, dtype=torch.int64).remainder(0x7F).to(torch.uint8).reshape(128, 4)
     divisor = struct.pack("<f", 2.5)
     payload = encode_nvfp4(packed, scales, divisor, shape)
 

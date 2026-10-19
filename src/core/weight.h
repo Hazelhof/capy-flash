@@ -7,15 +7,17 @@
 namespace ninfer {
 
 enum class QType : std::uint16_t {
-    Q4_G64_FP16         = 0,
-    Q5_G64_FP16         = 1,
-    Q6_G64_FP16         = 2,
-    Q8_G32_FP16         = 3,
-    BF16                = 4,
-    FP32                = 5,
-    INT32               = 6,
-    NVFP4               = 7,
-    FP8_E4M3FN_ROW_BF16 = 8,
+    Q4_G64_FP16            = 0,
+    Q5_G64_FP16            = 1,
+    Q6_G64_FP16            = 2,
+    Q8_G32_FP16            = 3,
+    BF16                   = 4,
+    FP32                   = 5,
+    INT32                  = 6,
+    NVFP4                  = 7,
+    FP8_E4M3FN_ROW_BF16    = 8,
+    MXFP8_E4M3FN_G32_UE8M0 = 9,
+    NVFP4_ROW_E4M3_G16     = 10,
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -23,6 +25,8 @@ enum class QuantLayout : std::uint16_t {
     Contiguous          = 1,
     BlockScaleK16M128x4 = 2,
     RowScale            = 3,
+    BlockScaleK32       = 4,
+    RowInterleaved      = 5,
 };
 
 struct Weight {

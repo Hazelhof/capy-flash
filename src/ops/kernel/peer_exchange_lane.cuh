@@ -48,14 +48,11 @@ union PeerVecF32 {
 // `peer` is then unspecified. The caller must call it with the whole warp converged and only for
 // warps with warp*32*G < vecs.
 template <int G>
-__device__ __forceinline__ bool peer_exchange_lane(int warp, int lane, const PeerVec (&mine)[G],
-                                                   PeerVec (&peer)[G], PeerVec* mine_payload,
-                                                   std::uint32_t* mine_flags,
-                                                   const PeerVec* peer_payload,
-                                                   std::uint32_t* peer_flags,
-                                                   std::uint32_t* epochs, std::uint32_t* hang,
-                                                   int vecs, std::uint32_t spin_limit,
-                                                   std::uint32_t sleep_ns) {
+__device__ __forceinline__ bool
+peer_exchange_lane(int warp, int lane, const PeerVec (&mine)[G], PeerVec (&peer)[G],
+                   PeerVec* mine_payload, std::uint32_t* mine_flags, const PeerVec* peer_payload,
+                   std::uint32_t* peer_flags, std::uint32_t* epochs, std::uint32_t* hang, int vecs,
+                   std::uint32_t spin_limit, std::uint32_t sleep_ns) {
     using SystemWord = cuda::atomic_ref<std::uint32_t, cuda::thread_scope_system>;
     const int base   = warp * (32 * G) + lane;
 #pragma unroll

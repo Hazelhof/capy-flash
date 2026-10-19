@@ -59,7 +59,7 @@ void check_plan(const artifact::Reader& reader, const qwen::LoadPlan& plan) {
                 return item.axis == ShardAxis::Rows ? 128 : 64;
             }
             return geometry.layout == QuantLayout::RowSplit && item.axis == ShardAxis::Columns ? 128
-                                                                                               : 1;
+                                                                                                    : 1;
         }();
         for (const auto& range : item.ranges) {
             require(range.begin % tile == 0 && range.count % tile == 0,

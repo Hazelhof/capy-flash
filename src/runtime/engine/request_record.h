@@ -177,8 +177,8 @@ struct RequestRecord {
     std::optional<LaneId> lane;
     std::optional<SequenceHandle> sequence;
     std::atomic<bool> cancelled{false};
-    EngineRequestState model_state        = EngineRequestState::Waiting;
-    bool capture_pending                  = false;
+    EngineRequestState model_state = EngineRequestState::Waiting;
+    bool capture_pending           = false;
     // A Device KV lease that stayed short after the retained-cache reclaim was reported once.
     bool lease_shortfall_reported         = false;
     EngineRequestState post_capture_state = EngineRequestState::Prefill;

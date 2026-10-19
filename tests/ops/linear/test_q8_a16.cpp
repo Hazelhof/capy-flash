@@ -15,24 +15,31 @@ struct Geometry {
 };
 
 constexpr std::array kGeometries{
-    Geometry{1024, 2048, 257U},  Geometry{1024, 5120, 223U},  Geometry{2048, 4096, 251U},
-    Geometry{2048, 4608, 271U},  Geometry{2048, 16384, 283U}, Geometry{4608, 4608, 277U},
-    Geometry{5120, 4608, 281U},  Geometry{5120, 6144, 239U},  Geometry{5120, 10240, 211U},
+    Geometry{1024, 2048, 257U}, Geometry{1024, 5120, 223U}, Geometry{2048, 4096, 251U},
+    Geometry{2048, 4608, 271U}, Geometry{2048, 16384, 283U}, Geometry{4608, 4608, 277U},
+    Geometry{5120, 4608, 281U}, Geometry{5120, 6144, 239U}, Geometry{5120, 10240, 211U},
     Geometry{5120, 17408, 241U}, Geometry{5120, 25600, 293U}, Geometry{6144, 5120, 227U},
-    Geometry{9216, 2048, 263U},  Geometry{12288, 2048, 269U}, Geometry{14336, 5120, 229U},
+    Geometry{9216, 2048, 263U}, Geometry{12288, 2048, 269U}, Geometry{14336, 5120, 229U},
     Geometry{34816, 5120, 233U}, Geometry{248320, 5120, 197U},
     // Two-device halves of the MTP projections.
-    Geometry{5120, 3072, 307U},  Geometry{5120, 5120, 311U},  Geometry{5120, 8704, 313U},
-    Geometry{7168, 5120, 317U},  Geometry{17408, 5120, 331U},
+    Geometry{5120, 3072, 307U}, Geometry{5120, 5120, 311U}, Geometry{5120, 8704, 313U},
+    Geometry{7168, 5120, 317U}, Geometry{17408, 5120, 331U},
     // Qwen4Exp hyper-connection Down(+inject)/Up and the PLE key/value parent.
-    Geometry{324, 10240, 337U},  Geometry{320, 10240, 347U},  Geometry{10240, 320, 349U},
+    Geometry{324, 10240, 337U}, Geometry{320, 10240, 347U}, Geometry{10240, 320, 349U},
     Geometry{12800, 2560, 353U},
     // Qwen4Exp dense projections of the Q8 recipe.
-    Geometry{13312, 2560, 359U}, Geometry{640, 2560, 367U},   Geometry{2560, 6144, 373U},
-    Geometry{16384, 2560, 379U}, Geometry{96, 2560, 383U},    Geometry{1280, 2560, 389U},
-    Geometry{2560, 640, 397U},   Geometry{2560, 2560, 401U},
+    Geometry{13312, 2560, 359U}, Geometry{640, 2560, 367U}, Geometry{2560, 6144, 373U},
+    Geometry{16384, 2560, 379U}, Geometry{96, 2560, 383U}, Geometry{1280, 2560, 389U},
+    Geometry{2560, 640, 397U}, Geometry{2560, 2560, 401U},
+    // Qwen4Exp Vision merger output [2560, 4608].
+    Geometry{2560, 4608, 443U},
+    // Qwen3.5 Vision tower stored Q8.
+    Geometry{3456, 1152, 449U}, Geometry{1152, 1152, 457U}, Geometry{4304, 1152, 461U},
+    Geometry{1152, 4304, 463U}, Geometry{1152, 1536, 467U},
     // Qwen4Exp tp 2 shards of the QSA input and output (T49 decode routes).
-    Geometry{6656, 2560, 409U},  Geometry{2560, 3072, 419U},
+    Geometry{6656, 2560, 409U}, Geometry{2560, 3072, 419U},
+    // ... and of the GDN q|k|v|z and a|b projections (warp-row decode routes).
+    Geometry{8192, 2560, 433U}, Geometry{48, 2560, 439U},
     // Two-device vocabulary-row half of a Q8 output head (ninfer-tp2 v0.4.8, issue #6).
     Geometry{124160, 5120, 421U}};
 

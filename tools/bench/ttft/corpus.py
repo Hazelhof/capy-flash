@@ -85,10 +85,7 @@ class Corpus:
             "long-8k-independent-32": (7680, 32, 7744),
             "long-64k-32": (64512, 32, 64576),
             "long-64k-independent-32": (64512, 32, 64576),
-            **{
-                f"rotation-55k-{index}": (55000, 32, 55040)
-                for index in range(6)
-            },
+            **{f"rotation-55k-{index}": (55000, 32, 55040) for index in range(6)},
             "long-256k-32": (260096, 32, 260160),
             "interferer-256": (127, 256, 384),
             "holder-4096": (127, 4096, 4224),
@@ -111,16 +108,11 @@ class Corpus:
         for seed_name, independent_name, owner in independent_shapes:
             seed = shapes[seed_name]
             independent = shapes[independent_name]
-            if (
-                seed["path"] == independent["path"]
-                or seed["sha256"] == independent["sha256"]
-            ):
+            if seed["path"] == independent["path"] or seed["sha256"] == independent["sha256"]:
                 raise CorpusError(f"{owner} long requests are not byte-distinct")
             common = independent.get("seed_common_prefix_tokens")
             if not isinstance(common, int) or common < 0 or common > 3:
-                raise CorpusError(
-                    f"{owner} long requests do not diverge at the first system-content token"
-                )
+                raise CorpusError(f"{owner} long requests do not diverge at the first system-content token")
 
         if not (
             entitlement(7680, 16) + entitlement(127, 256) <= 8192
@@ -128,16 +120,11 @@ class Corpus:
         ):
             raise CorpusError("cache-pressure entitlement relation no longer holds")
         long_64k_entitlement = entitlement(64512, 32)
-        if not (
-            long_64k_entitlement <= 65536
-            and 2 * long_64k_entitlement > 65536
-        ):
+        if not (long_64k_entitlement <= 65536 and 2 * long_64k_entitlement > 65536):
             raise CorpusError("64K Host-swap entitlement relation no longer holds")
 
         rotation = [shapes[f"rotation-55k-{index}"] for index in range(6)]
-        if len({record["path"] for record in rotation}) != 6 or len(
-            {record["sha256"] for record in rotation}
-        ) != 6:
+        if len({record["path"] for record in rotation}) != 6 or len({record["sha256"] for record in rotation}) != 6:
             raise CorpusError("55K rotation shapes are not byte-distinct")
         if any(record.get("max_peer_common_prefix_tokens", 4) > 3 for record in rotation):
             raise CorpusError("55K rotation shapes do not diverge at the first content token")
@@ -157,11 +144,7 @@ class Corpus:
         second_labels: list[str] = []
         for record, original in zip(rotation, original_labels, strict=True):
             label = record.get("second_cohort_label")
-            if (
-                not isinstance(label, str)
-                or not label
-                or record.get("second_cohort_prompt_tokens") != 55000
-            ):
+            if not isinstance(label, str) or not label or record.get("second_cohort_prompt_tokens") != 55000:
                 raise CorpusError("55K second-cohort shape facts are invalid")
             if len(original) != len(label):
                 raise CorpusError("55K second-cohort label changes the frozen text shape")

@@ -1,9 +1,9 @@
 #pragma once
 
-// Staging slots of the routed-expert cache (T25, docs/capy-flash/development-log.md): device slots outside the
-// ExpertCache slot table that receive *predicted* experts during a window, so a layer can use an
-// expert whose copy landed after the window began without changing the table the window started
-// with (ExpertCache's per-window consistency is untouched).
+// Staging slots of the routed-expert cache (T25, docs/capy-flash/development-log.md): device slots
+// outside the ExpertCache slot table that receive *predicted* experts during a window, so a layer
+// can use an expert whose copy landed after the window began without changing the table the window
+// started with (ExpertCache's per-window consistency is untouched).
 //
 // Protocol (one device):
 //   * every window has an epoch (1..kMaxStagingEpoch); begin of window: the compute stream writes

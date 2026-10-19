@@ -118,7 +118,7 @@ std::vector<BoundWeight> resolve_weights(std::span<const PendingWeight> pending,
             out.push_back(bind_file(item, materialized));
             continue;
         }
-        std::size_t held      = 0;
+        std::size_t held = 0;
         for (const auto& part : reference.binding.parts) {
             held += materialized.has_device(part.object, device) ? 1 : 0;
         }

@@ -8,7 +8,7 @@ namespace ninfer::ops::detail {
     void Name(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {                \
         q8_with_output(out, out.ne[0], [&](auto output) {                                          \
             launch_q8_a16_mma<q8_instances::Schedule>(q8_linear_operands(x, w), output,            \
-                                                      LinearIdentityEpilogue{}, stream);          \
+                                                      LinearIdentityEpilogue{}, stream);           \
         });                                                                                        \
     }
 

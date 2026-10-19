@@ -22,8 +22,11 @@
 // are backed. rebalance(), at the start of a request, shrinks each pool's backing to its live
 // extent (the pages still allocated, e.g. a reused prefix) or the new prompt's pages, whichever
 // is larger, rounded up to the grow step, and gives the freed bytes back as columns: their slots
-// are empty and the cache fills them with later insertions. A request that needs more KV than
-// fits (or than kv_budget_bytes) fails in grow() before any page is handed out.
+// are empty and the cache fills them with later insertions. With a Host KV tier (v0.6) the KV of
+// idle conversations leaves the Device while a request decodes and the live pages are packed low,
+// so shrink_to_live() returns their bytes to the experts at once instead of at the next prompt.
+// A request that needs more KV than fits (or than kv_budget_bytes) fails in grow() before any
+// page is handed out.
 //
 // Execution thread only, between windows (the KV materialization points: before a prompt, before
 // a decode round). Not thread-safe.
@@ -52,22 +55,23 @@ namespace ninfer::models::qwen3_5::detail {
 class Qwen4ElasticVram {
 public:
     struct Rank {
-        ElasticArena* arena = nullptr;
-        cudaStream_t stream = nullptr;
+        ElasticArena* arena            = nullptr;
+        cudaStream_t stream            = nullptr;
         const PersistentLayout* layout = nullptr;
         // Rank 0: the pools that hand out pages; rank 1: their mirrors.
         DeviceKVPagePool* text = nullptr;
         DeviceKVPagePool* mtp  = nullptr;
     };
+
     struct Stats {
-        std::uint32_t text_pages   = 0; // backed
-        std::uint32_t mtp_pages    = 0;
-        std::int32_t columns       = 0; // active expert columns
-        std::int32_t base_slots    = 0; // per layer and GPU
-        std::int64_t grows         = 0;
-        std::int64_t shrinks       = 0; // column releases
-        std::int64_t returns       = 0; // column returns
-        std::size_t kv_bytes       = 0; // per GPU, backed KV pages
+        std::uint32_t text_pages = 0; // backed
+        std::uint32_t mtp_pages  = 0;
+        std::int32_t columns     = 0; // active expert columns
+        std::int32_t base_slots  = 0; // per layer and GPU
+        std::int64_t grows       = 0;
+        std::int64_t shrinks     = 0; // column releases
+        std::int64_t returns     = 0; // column returns
+        std::size_t kv_bytes     = 0; // per GPU, backed KV pages
     };
 
     Qwen4ElasticVram(std::vector<Rank> ranks, execution::Qwen4OffloadExperts& experts,
@@ -77,8 +81,16 @@ public:
 
     // Before a request's prompt: `text_tokens` / `mtp_tokens` = the KV it is about to map.
     void rebalance(std::uint32_t text_tokens, std::uint32_t mtp_tokens);
+    // v0.6 (idle KV to the Host), between execution units with the devices idle: once the idle
+    // owners' pages have left the Device and the live pages were packed low
+    // (LogicalKVPageStore::compact_device_replicas), shrinks each pool's backing to its live
+    // extent rounded up to the grow step and gives the freed bytes back as expert columns.
+    // shrinkable() tells whether that would release anything.
+    [[nodiscard]] bool shrinkable() const;
+    void shrink_to_live();
 
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+
     [[nodiscard]] std::uint32_t step_tokens() const noexcept {
         return step_pages_ * static_cast<std::uint32_t>(kPagedKVPageSize);
     }
@@ -88,6 +100,7 @@ private:
         std::size_t range      = 0;
         std::size_t page_bytes = 0;
     };
+
     struct RankState {
         Rank memory;
         std::vector<Plane> text, mtp;
@@ -96,6 +109,14 @@ private:
         std::size_t budget = 0;
     };
 
+    struct Backing {
+        std::uint32_t text   = 0;
+        std::uint32_t mtp    = 0;
+        std::int32_t columns = 0;
+    };
+
+    // The backing rebalance(text_tokens, mtp_tokens) would apply.
+    [[nodiscard]] Backing plan(std::uint32_t text_tokens, std::uint32_t mtp_tokens) const;
     void grow(bool mtp_pool, std::uint32_t pages);
     [[nodiscard]] std::vector<std::size_t> targets(const RankState& r, std::uint32_t text_pages,
                                                    std::uint32_t mtp_pages,
@@ -109,8 +130,8 @@ private:
 
     std::vector<RankState> ranks_;
     execution::Qwen4OffloadExperts& experts_;
-    std::uint32_t step_pages_   = 0;
-    std::size_t kv_budget_      = 0;
+    std::uint32_t step_pages_    = 0;
+    std::size_t kv_budget_       = 0;
     std::uint32_t text_capacity_ = 0;
     std::uint32_t mtp_capacity_  = 0;
     Stats stats_;

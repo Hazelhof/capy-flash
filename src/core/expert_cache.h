@@ -51,8 +51,8 @@ inline constexpr int kMaxPlanes = 8;
 inline constexpr int kMaxGpus   = 2;
 
 // Where the bytes of one expert live. An expert has `planes` planes of `plane_bytes[q]` bytes.
-// Host bank: plane q of (layer l, expert e) begins at bank_base[l * planes + q] + e * bank_stride[q]
-// in pinned host memory. Device pool of GPU p: plane q of slot s begins at
+// Host bank: plane q of (layer l, expert e) begins at bank_base[l * planes + q] + e *
+// bank_stride[q] in pinned host memory. Device pool of GPU p: plane q of slot s begins at
 // pool_base[p][q] + s * pool_stride[q] (one contiguous slot of all planes, as ninfer-ext's
 // kExpertSlotBytes layout, or one array per plane, as qf_moe's).
 struct ExpertLayout {
@@ -128,14 +128,18 @@ public:
     // Slots of GPU p's pool (all layers, base and elastic: ExpertCachePolicy::pool_slot_count)
     // and int32 entries of each table.
     [[nodiscard]] static std::int64_t pool_slots(const PolicyConfig& policy, std::int32_t gpu);
+
     [[nodiscard]] static std::int64_t table_entries(const PolicyConfig& policy) {
         return static_cast<std::int64_t>(policy.layers) * policy.experts;
     }
 
     [[nodiscard]] const ExpertCachePolicy& policy() const noexcept { return policy_; }
+
     // T69: ExpertCachePolicy::set_insert_cap (between windows).
     void set_insert_cap(std::int32_t cap) { policy_.set_insert_cap(cap); }
+
     [[nodiscard]] const CacheCounters& counters() const noexcept { return counters_; }
+
     [[nodiscard]] std::int32_t gpus() const noexcept { return gpus_; }
 
     /**
@@ -152,11 +156,25 @@ public:
 
     [[nodiscard]] LayerView observe(std::int32_t layer, std::span<const Routed> routed,
                                     std::int32_t tokens);
-    // observe() of a prompt window (prefill chunk): ExpertCachePolicy::decide_prompt.
+    // observe() of a prompt window (prefill chunk): ExpertCachePolicy::decide_prompt (with
+    // `target_cap` > 0 at most that many targets per partition, T211b), or with `insert` false
+    // ExpertCachePolicy::count_prompt (T211: the residency stays as it is).
     [[nodiscard]] LayerView observe_prompt(std::int32_t layer, std::span<const Routed> routed,
-                                           std::int32_t tokens);
+                                           std::int32_t tokens, bool insert = true,
+                                           std::int32_t target_cap = 0);
 
     void submit_fills();
+
+    /**
+     * T211b: a prompt's routing applied between windows (after the prompt's last window, before
+     * the next window begins): ExpertCachePolicy::decide_prompt with at most `target_cap` targets
+     * per partition (0 = the slot count; < 0: the frequencies only, ExpertCachePolicy::count_prompt
+     * with frequencies), its fills queued behind the backlog, fenced to the last
+     * launched window (the victims' slots are unpublished at the next begin_window). Nothing for
+     * a lent layer or a frozen cache. The counters count the insertions only.
+     */
+    void apply_prompt(std::int32_t layer, std::span<const Routed> routed, std::int32_t tokens,
+                      std::int32_t target_cap);
 
     /**
      * Mid-window submission: queues the insertions observed so far without waiting for the
@@ -192,8 +210,9 @@ public:
      * not published if in flight); while lent, observe()/observe_prompt() of those layers classify
      * and count but insert nothing. Returns, per GPU, an event recorded on its fill stream after
      * every fill issued before the call: the caller's first write of a lent slot waits for it.
-     * Lent slots are the base slots layer * base_slots(p) + [0, base_slots(p)) of partition p;
-     * the layers' elastic slots stay empty while lent.
+     * Lent slots are the base slots of the layers, the pool slots
+     * [policy().base_offset(p, first), policy().base_offset(p, first + count)) of partition p
+     * (one contiguous run); the layers' elastic slots stay empty while lent.
      *
      * T69 `keep_elastic`: only the base slots are lent (ExpertCachePolicy::block_base): the
      * layers keep the experts of their elastic slots (published, their fills not dropped), and
@@ -223,13 +242,18 @@ public:
      */
     void reclaim_front(std::int32_t count, std::span<const std::vector<std::int32_t>> profile,
                        std::span<const std::int32_t> rank = {});
+
     [[nodiscard]] bool lending() const noexcept { return lent_count_ > 0; }
+
     [[nodiscard]] std::int32_t lent_first() const noexcept { return lent_first_; }
+
     [[nodiscard]] std::int32_t lent_count() const noexcept { return lent_count_; }
+
     // The events lend_layers() returned for the current lending (one per GPU).
     [[nodiscard]] std::span<const cudaEvent_t> lend_events() const noexcept {
         return {lend_events_.data(), static_cast<std::size_t>(gpus_)};
     }
+
     [[nodiscard]] bool lent(std::int32_t layer) const noexcept {
         return layer >= lent_first_ && layer < lent_first_ + lent_count_;
     }
@@ -244,12 +268,14 @@ public:
      * memory may be released.
      */
     void set_active_columns(std::int32_t columns, std::span<const cudaStream_t> streams);
+
     [[nodiscard]] std::int32_t active_columns() const noexcept { return policy_.active_columns(); }
 
     // Host mirror of the table entry the device holds (as of the last begin_window).
     [[nodiscard]] std::int32_t published_slot(std::int32_t layer, std::int32_t expert) const {
         return published_[cell(layer, expert)];
     }
+
     // Insertions observed but not yet copied (staged, queued) and copies in flight.
     [[nodiscard]] std::int64_t fills_pending() const noexcept;
 
@@ -257,7 +283,9 @@ public:
     // missing list) exactly as before but never asks the policy: no insertion, no eviction, the
     // policy state does not move. Residency stays what it was when frozen.
     void set_frozen(bool frozen) noexcept { frozen_ = frozen; }
+
     [[nodiscard]] bool frozen() const noexcept { return frozen_; }
+
     // T59: replace the whole residency by `profile` (one list per layer, as initialize), between
     // windows: every layer is cleared and refilled, the copies are waited for and published at the
     // next begin_window. Policy frequencies are unchanged.
@@ -267,19 +295,21 @@ public:
 
 private:
     struct PendingFill {
-        std::int32_t cell = 0; // layer * experts + expert
-        std::int32_t slot = 0;
+        std::int32_t cell        = 0; // layer * experts + expert
+        std::int32_t slot        = 0;
         std::uint32_t generation = 0;
-        bool fenced = true; // waits for the fence of the last launched window
+        bool fenced              = true; // waits for the fence of the last launched window
     };
+
     struct FillBatch {
         cudaEvent_t done = nullptr;
         std::vector<PendingFill> fills;
     };
+
     struct Gpu {
         GpuBinding binding;
         cudaStream_t fill_stream = nullptr;
-        cudaEvent_t fence        = nullptr; // end of the last launched window
+        cudaEvent_t fence        = nullptr;    // end of the last launched window
         std::vector<std::uint32_t> generation; // [pool slots] bumped at every reassignment
         std::vector<PendingFill> staged;       // insertions of the current window, not submitted
         std::vector<std::int32_t> staged_at;   // [pool slots] index in `staged` or -1
@@ -293,6 +323,7 @@ private:
         return static_cast<std::size_t>(layer) * static_cast<std::size_t>(experts_) +
                static_cast<std::size_t>(expert);
     }
+
     void stage(const Insert& ins, std::int32_t layer);
     void lent_decision(std::span<const Routed> routed);
     void frozen_decision(std::span<const Routed> routed, const LayerView& view);
@@ -311,9 +342,9 @@ private:
     ExpertLayout layout_;
     std::int64_t expert_bytes_        = 0;
     std::int64_t max_in_flight_bytes_ = 0;
-    std::int32_t gpus_    = 0;
-    std::int32_t layers_  = 0;
-    std::int32_t experts_ = 0;
+    std::int32_t gpus_                = 0;
+    std::int32_t layers_              = 0;
+    std::int32_t experts_             = 0;
     std::array<Gpu, kMaxGpus> gpu_{};
 
     std::vector<std::int32_t> published_; // [cells] table value on the owner GPU
@@ -349,7 +380,7 @@ private:
  * replays.
  */
 void expert_cache_map_slots(const std::int32_t* ids, std::int32_t count, std::int32_t layer,
-                            std::int32_t experts, const std::int32_t* table,
-                            std::int32_t* slot_ids, cudaStream_t stream);
+                            std::int32_t experts, const std::int32_t* table, std::int32_t* slot_ids,
+                            cudaStream_t stream);
 
 } // namespace ninfer::expert_cache

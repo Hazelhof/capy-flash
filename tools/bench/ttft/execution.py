@@ -224,11 +224,7 @@ class RequestHandle:
                 occurred_ns=record["completed_ns"],
                 outcome=record["outcome"],
                 http_status=record["http_status"],
-                ttft_ms=(
-                    record["ttft_ns"] / 1e6
-                    if isinstance(record["ttft_ns"], int)
-                    else None
-                ),
+                ttft_ms=(record["ttft_ns"] / 1e6 if isinstance(record["ttft_ns"], int) else None),
                 output_bytes=record["output_bytes"],
                 error_code=record["error_code"],
             )
@@ -298,9 +294,7 @@ class RequestHandle:
                     reason=f"ended:{self.outcome()}",
                     waited_ms=(time.perf_counter_ns() - wait_started_ns) / 1e6,
                 )
-                raise CaseExecutionError(
-                    f"request {self.role} ended before {field}: {self.outcome()}"
-                )
+                raise CaseExecutionError(f"request {self.role} ended before {field}: {self.outcome()}")
         value = getattr(self, field)
         if not isinstance(value, int):
             raise CaseExecutionError(f"request {self.role} signalled {field} without a timestamp")
@@ -401,9 +395,7 @@ class RequestHandle:
             "first_output_ns": first,
             "completed_ns": self.completed_ns,
             "cancel_ns": self.cancel_ns,
-            "cancel_requested": (
-                http.cancel_requested if http is not None else self.cancel_ns is not None
-            ),
+            "cancel_requested": (http.cancel_requested if http is not None else self.cancel_ns is not None),
             "transport_cancelled": http.cancelled if http is not None else False,
             "ttft_ns": ttft_ns,
             "outcome": self.outcome(),
@@ -545,9 +537,7 @@ class CaseContext:
                 try:
                     handle.wait_done(min(self.timeout, 5.0))
                 except CaseExecutionError as error:
-                    self.failures.append(
-                        FailedCondition("cancelled worker terminated", str(error))
-                    )
+                    self.failures.append(FailedCondition("cancelled worker terminated", str(error)))
                     self.progress(
                         "case.cleanup_failed",
                         role=handle.role,

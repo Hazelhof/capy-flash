@@ -11,10 +11,12 @@
 // nothing enters the page cache). The decoded BF16 embedding `[embed_dim, count]` is written to a
 // caller buffer (pinned for one H2D upload per call).
 //
-// Mapped keeps the BF16 row multipliers (the scale plane, 2 bytes per row = 640 MB) in RAM, read
-// once sequentially at construction (T171): otherwise every cold row costs two random page reads,
-// its codes and its multiplier, and the storage's random-read rate bounds the first prefill
-// chunk. NINFER_QWEN4_PLE_RESIDENT_SCALES=0 reads the multipliers through the mapping instead.
+// For the FP8 table, Mapped keeps the BF16 row multipliers (the scale plane, 2 bytes per row =
+// 640 MB) in RAM, read once sequentially at construction (T171): otherwise every cold row costs
+// two random page reads, its codes and its multiplier, and the storage's random-read rate bounds
+// the first prefill chunk. NINFER_QWEN4_PLE_RESIDENT_SCALES=0 reads the multipliers through the
+// mapping instead. An NVFP4 row carries its own scales (one 90-byte read per row), so nothing of
+// that table is resident.
 
 #include <array>
 #include <cstddef>
@@ -36,14 +38,31 @@ struct PleTableSegment {
     std::uint64_t file_offset = 0;
 };
 
-// FP8 E4M3FN codes `[rows, row_width]` (row stride `row_bytes`), then one BF16 multiplier per row
-// at object offset `scale_plane` (the fp8_e4m3fn_row_bf16 row_scale_v1 layout).
+enum class PleRowFormat : std::uint8_t {
+    // fp8_e4m3fn_row_bf16, row_scale_v1: FP8 E4M3FN codes `[rows, row_width]` (row stride
+    // `row_bytes`), then one BF16 multiplier per row at object offset `scale_plane`. A value is
+    // bf16_rn(e4m3 * multiplier).
+    Fp8RowBf16,
+    // nvfp4_row_e4m3_g16, row_interleaved_v1: row r at object offset r * row_bytes holds
+    // row_width / 2 bytes of E2M1 codes (low nibble = even element), then row_width / 16 E4M3FN
+    // scales, one per 16 elements. A value is bf16_rn((e2m1 * e4m3) * global_scale) in FP32.
+    Nvfp4RowE4m3G16,
+};
+
 struct PleTableView {
     std::vector<PleTableSegment> segments; // ascending object_offset, covering the object
+    PleRowFormat format       = PleRowFormat::Fp8RowBf16;
     std::uint64_t rows        = 0;
-    std::uint32_t row_width   = 0;
-    std::uint64_t row_bytes   = 0;
-    std::uint64_t scale_plane = 0;
+    std::uint32_t row_width   = 0;    // values per row
+    std::uint64_t row_bytes   = 0;    // row stride
+    std::uint64_t scale_plane = 0;    // Fp8RowBf16 only
+    float global_scale        = 0.0F; // Nvfp4RowE4m3G16 only
+
+    // Bytes of row r read at object offset r * row_bytes: the codes (FP8) or the whole
+    // codes-then-scales record (NVFP4).
+    [[nodiscard]] std::uint64_t row_record_bytes() const noexcept {
+        return format == PleRowFormat::Fp8RowBf16 ? row_width : row_width / 2 + row_width / 16;
+    }
 };
 
 // N-gram hashing of one PLE layer (docs: Qwen4Exp model reference, "N-gram rows").
@@ -67,8 +86,7 @@ class PleRowReader;
 class PleGather {
 public:
     // `prefetch` (Mapped only) issues MADV_WILLNEED for every row page before decoding.
-    PleGather(PleTableView table, PleHashConfig hash, PleResidency residency,
-              bool prefetch = true);
+    PleGather(PleTableView table, PleHashConfig hash, PleResidency residency, bool prefetch = true);
     ~PleGather();
 
     PleGather(const PleGather&)            = delete;
@@ -98,14 +116,20 @@ public:
                      std::span<std::uint64_t> rows) const;
 
 private:
-    void decode_row(const std::byte* codes, const std::byte* scale, std::uint16_t* out) const;
-    // Calls `piece(segment, within, bytes)` for each segment `[object_offset, +bytes)` touches, in order.
-    // A row can straddle two segments: an artifact's part files end at payload boundaries that need
-    // not fall on a row boundary (T155: "PLE table row crosses a mapped segment").
+    void decode_fp8_row(const std::byte* codes, const std::byte* scale, std::uint16_t* out) const;
+    void decode_nvfp4_row(const std::byte* record, std::uint16_t* out) const;
+
+    // Byte ranges read per row: codes and BF16 multiplier (FP8), or the one record (NVFP4).
+    [[nodiscard]] std::size_t ranges_per_row() const noexcept {
+        return table_.format == PleRowFormat::Fp8RowBf16 ? 2 : 1;
+    }
+    // Calls `piece(segment, within, bytes)` for each segment `[object_offset, +bytes)` touches, in
+    // order. A row can straddle two segments: an artifact's part files end at payload boundaries
+    // that need not fall on a row boundary (T155: "PLE table row crosses a mapped segment").
     template <class Piece>
     void for_each_piece(std::uint64_t object_offset, std::uint64_t bytes, Piece&& piece) const;
-    // Mapped bytes `[object_offset, +bytes)`: a pointer into the mapping, or `bounce` filled from the
-    // segments when the range straddles a segment boundary (`bounce` holds at least `bytes`).
+    // Mapped bytes `[object_offset, +bytes)`: a pointer into the mapping, or `bounce` filled from
+    // the segments when the range straddles a segment boundary (`bounce` holds at least `bytes`).
     [[nodiscard]] const std::byte* locate(std::uint64_t object_offset, std::uint64_t bytes,
                                           std::byte* bounce) const;
     void prefetch_mapped(std::span<const std::uint64_t> rows) const;
@@ -115,9 +139,12 @@ private:
     PleTableView table_;
     PleHashConfig hash_;
     PleResidency residency_;
-    bool prefetch_ = true;
+    bool prefetch_       = true;
     std::uint32_t width_ = 0;
     std::array<float, 256> e4m3_{};
+    // NVFP4: BF16 value of (E4M3 scale code, E2M1 code) at [scale * 16 + code], global scale
+    // applied: bf16_rn((e2m1 * e4m3) * global_scale).
+    std::vector<std::uint16_t> nvfp4_values_;
     std::unique_ptr<PleRowReader> reader_;
     std::vector<std::uint64_t> row_scratch_;
     std::vector<std::byte>

@@ -1,5 +1,5 @@
-// Translation-unit fragment of src/ops/wrapper/attn_input_proj.cpp, included once at its end (after its
-// closing namespace), so the two-device code below shares that file's private helpers without
+// Translation-unit fragment of src/ops/wrapper/attn_input_proj.cpp, included once at its end (after
+// its closing namespace), so the two-device code below shares that file's private helpers without
 // copying them. Not a header. Our file; see docs/maintainer/upstream-merge.md.
 //
 // Two-device (tp 2) forms of attn_input_proj, declared in ninfer/ops/tp2/attn_input_proj.h.
@@ -113,8 +113,8 @@ void attn_input_proj_column_parallel(
                                                     workspace[slot], ec.dev[slot]->stream);
         } else {
             detail::fp8_attn_input_shard_dispatch(x[slot], w[slot], q_out[slot], gate_out[slot],
-                                                  k_out[slot], v_out[slot], policy,
-                                                  workspace[slot], ec.dev[slot]->stream);
+                                                  k_out[slot], v_out[slot], policy, workspace[slot],
+                                                  ec.dev[slot]->stream);
         }
     });
 }

@@ -593,6 +593,67 @@ int exercise_mirror(ninfer::DeviceContext& context) {
     return failures;
 }
 
+// v0.6 (idle KV to the Host): relocate_lower packs leases into the lowest free pages, keeps
+// their bytes and the allocation counts, and leaves leases with no free page below them alone.
+int exercise_relocation(ninfer::DeviceContext& context, ninfer::KVPageGeometry geometry,
+                        const std::string& label) {
+    int failures      = 0;
+    PlannedCache plan = plan_cache(10, 10, 1, geometry);
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    std::vector<ninfer::DeviceKVPageLease> low  = materialize(pool, 4); // 0..3
+    std::vector<ninfer::DeviceKVPageLease> high = materialize(pool, 4); // 4..7
+    std::vector<ninfer::DeviceKVPageLease> top  = materialize(pool, 1); // 8
+    const std::vector<std::vector<unsigned char>> device_bytes =
+        fill_device_pool(pool, context.stream);
+    context.synchronize();
+    ninfer::DeviceKVPageLease kept = std::move(low[1]);
+    low.clear(); // free: 0, 2, 3, 9
+
+    std::vector<ninfer::DeviceKVPageLease*> leases;
+    for (ninfer::DeviceKVPageLease& lease : high) { leases.push_back(&lease); }
+    leases.push_back(&top[0]);
+    const std::uint32_t moved = pool.relocate_lower(leases, context.stream);
+    failures += expect_size(moved, 3, label + " relocated leases");
+    failures += expect_size(pool.allocated_pages(), 6, label + " allocation after relocation");
+    failures += expect_size(pool.allocated_extent(), 9, label + " extent after relocation");
+    const auto index_of = [&](const ninfer::DeviceKVPageLease& lease) {
+        return pool.page_index(lease.handle());
+    };
+    failures += expect(index_of(high[0]) == 0 && index_of(high[1]) == 2 && index_of(high[2]) == 3 &&
+                           index_of(high[3]) == 7 && index_of(top[0]) == 8 && index_of(kept) == 1,
+                       label + " relocation did not take the lowest free pages in order");
+    std::vector<ninfer::DeviceKVPageLease*> rest{&high[3], &top[0]};
+    failures +=
+        expect_size(pool.relocate_lower(rest, context.stream), 2, label + " second relocation");
+    failures += expect_size(pool.allocated_extent(), 6, label + " packed extent");
+    failures += expect(index_of(high[3]) == 4 && index_of(top[0]) == 5,
+                       label + " contiguous relocation changed page order");
+
+    std::vector<ninfer::DeviceKVPageHandle> now;
+    for (const ninfer::DeviceKVPageLease& lease : high) { now.push_back(lease.handle()); }
+    now.push_back(top[0].handle());
+    now.push_back(kept.handle());
+    const std::vector<std::int32_t> original{4, 5, 6, 7, 8, 1};
+    const ninfer::HostKVPageLayout host_layout = ninfer::plan_host_kv_page_layout(pool.geometry());
+    const ninfer::HostKVPageLayout layouts[]   = {host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * now.size(),
+                                   std::span<const ninfer::HostKVPageLayout>(layouts));
+    std::optional<ninfer::HostKVAllocation> host =
+        host_arena.allocate(host_layout, static_cast<std::uint32_t>(now.size()));
+    failures += expect(host.has_value(), label + " relocation Host allocation failed");
+    if (!host) { return failures; }
+    ninfer::HostKVAllocationView view = host_arena.writable_view(*host);
+    std::memset(view.data(), 0, host_layout.page_stride * view.page_count());
+    pool.copy_to_host(now, view, context.stream);
+    context.synchronize();
+    const std::vector<std::byte> expected =
+        expected_host_records(pool, original, host_layout, device_bytes);
+    failures += expect(std::memcmp(view.data(), expected.data(), expected.size()) == 0,
+                       label + " relocation changed page bytes");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -611,6 +672,28 @@ int main() {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
         failures += exercise_mirror(context);
+        failures +=
+            exercise_relocation(context,
+                                ninfer::KVPageGeometry{
+                                    .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                                    .planes =
+                                        {
+                                            {ninfer::DType::I8, 8, 2, 256},
+                                            {ninfer::DType::FP16, 1, 2, 256},
+                                        },
+                                },
+                                "PageMajor relocation");
+        failures +=
+            exercise_relocation(context,
+                                ninfer::KVPageGeometry{
+                                    .device_plane_order = ninfer::PagedKVPlaneOrder::HeadMajor,
+                                    .planes =
+                                        {
+                                            {ninfer::DType::BF16, 8, 3, 256},
+                                            {ninfer::DType::FP16, 2, 3, 256},
+                                        },
+                                },
+                                "HeadMajor relocation");
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{

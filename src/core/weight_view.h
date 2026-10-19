@@ -82,6 +82,7 @@ struct ByteSpan {
 
     friend bool operator==(const ByteSpan&, const ByteSpan&) = default;
 };
+
 [[nodiscard]] std::vector<ByteSpan> weight_row_block_spans(const WeightGeometry& geometry,
                                                            std::uint64_t row_begin,
                                                            std::uint64_t row_count);

@@ -93,7 +93,8 @@ void gdn_gating(const Tensor& a, const Tensor& b, const Tensor& A_log, const Ten
     // a and b may be row slices of one [rows >= H, T] matrix (T49: the GDN a|b projection read in
     // place): contiguous heads, any column stride of at least H elements.
     const auto columns_strided = [](const Tensor& t) {
-        return t.nb[0] == 2 && t.nb[1] >= 2 * static_cast<std::int64_t>(t.ne[0]) && t.nb[1] % 2 == 0;
+        return t.nb[0] == 2 && t.nb[1] >= 2 * static_cast<std::int64_t>(t.ne[0]) &&
+               t.nb[1] % 2 == 0;
     };
     if (!columns_strided(a) || !columns_strided(b) || !A_log.is_contiguous() ||
         !dt_bias.is_contiguous() || !g.is_contiguous() || !beta.is_contiguous()) {

@@ -111,7 +111,7 @@ int extract_case(std::int32_t source_rows, std::int32_t destination_rows,
 
 int continuation_case(int width, int batch) {
     constexpr int rows = 5120, slots = 11;
-    const auto hidden = bit_pattern(static_cast<std::size_t>(rows) * width * batch, 1709U + width);
+    const auto hidden  = bit_pattern(static_cast<std::size_t>(rows) * width * batch, 1709U + width);
     const auto initial = bit_pattern(static_cast<std::size_t>(rows) * slots, 1721U + batch);
     std::vector<std::int32_t> lanes{10, 2, 8, 0, 6, 4, 9, 1};
     lanes.resize(batch);
@@ -133,23 +133,35 @@ int continuation_case(int width, int batch) {
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    if (width == 16 && batch == 8) { definition.capture(context.stream, launch); graph.instantiate(definition); }
+    if (width == 16 && batch == 8) {
+        definition.capture(context.stream, launch);
+        graph.instantiate(definition);
+    }
     int failures = 0;
     for (int phase = 0; phase < width; ++phase) {
         auto expected = initial;
         for (int b = 0; b < batch; ++b) {
             selectors[b] = (phase + 3 * b) % width;
             std::copy_n(hidden.begin() + static_cast<std::size_t>(b * width + selectors[b]) * rows,
-                         rows, expected.begin() + static_cast<std::size_t>(lanes[b]) * rows);
+                        rows, expected.begin() + static_cast<std::size_t>(lanes[b]) * rows);
         }
-        CUDA_CHECK(cudaMemcpyAsync(d_selectors.p, selectors.data(), d_selectors.bytes, cudaMemcpyHostToDevice, context.stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_destination.data(), initial.data(), d_destination.bytes(), cudaMemcpyHostToDevice, context.stream));
-        if (graph.ready()) graph.launch(context.stream); else launch();
+        CUDA_CHECK(cudaMemcpyAsync(d_selectors.p, selectors.data(), d_selectors.bytes,
+                                   cudaMemcpyHostToDevice, context.stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_destination.data(), initial.data(), d_destination.bytes(),
+                                   cudaMemcpyHostToDevice, context.stream));
+        if (graph.ready())
+            graph.launch(context.stream);
+        else
+            launch();
         context.synchronize();
-        failures += verify_exact("continuation slots", from_device<std::uint16_t>(d_destination.data(), expected.size()), expected);
+        failures += verify_exact("continuation slots",
+                                 from_device<std::uint16_t>(d_destination.data(), expected.size()),
+                                 expected);
     }
-    failures += verify_exact("continuation input unchanged", from_device<std::uint16_t>(d_hidden.data(), hidden.size()), hidden);
-    failures += verify_exact("continuation lanes unchanged", from_device<std::int32_t>(d_lanes, batch), lanes);
+    failures += verify_exact("continuation input unchanged",
+                             from_device<std::uint16_t>(d_hidden.data(), hidden.size()), hidden);
+    failures += verify_exact("continuation lanes unchanged",
+                             from_device<std::int32_t>(d_lanes, batch), lanes);
     failures += d_hidden.verify_guards("continuation input");
     failures += d_selected.verify_guards("continuation selected");
     failures += d_destination.verify_guards("continuation destination");

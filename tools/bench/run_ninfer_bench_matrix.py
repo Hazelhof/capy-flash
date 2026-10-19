@@ -82,7 +82,9 @@ def count_corpus_tokens(path: Path) -> int:
 
 
 def add_repetition_args(
-    base_args: list[str], case: BenchCase, repetitions_override: int | None,
+    base_args: list[str],
+    case: BenchCase,
+    repetitions_override: int | None,
     warmup_override: int | None,
 ) -> list[str]:
     repetitions = repetitions_override if repetitions_override is not None else case.repetitions
@@ -295,9 +297,7 @@ def report_rows(report_path: Path, case: BenchCase) -> list[dict[str, Any]]:
             "proposal_head": config.get("proposal_head"),
             "decode_path": config.get("decode_path"),
             "decode_graph_primed": config.get("decode_graph_prime", {}).get("primed"),
-            "decode_graph_prime_output_tokens": config.get("decode_graph_prime", {}).get(
-                "output_tokens"
-            ),
+            "decode_graph_prime_output_tokens": config.get("decode_graph_prime", {}).get("output_tokens"),
             "repetitions": config.get("repetitions"),
             "warmup": config.get("warmup"),
             "load_seconds": load.get("load_seconds"),
@@ -355,9 +355,7 @@ def write_summary(rows: Sequence[dict[str, Any]], out_dir: Path) -> None:
 
 
 def run_command(command: Sequence[str], stdout_path: Path, stderr_path: Path) -> int:
-    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
-        "w", encoding="utf-8"
-    ) as stderr:
+    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
         process = subprocess.run(
             list(command),
             cwd=REPO_ROOT,
@@ -404,9 +402,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--preset", choices=("smoke", "core", "full"), default="core")
     parser.add_argument("--bench", type=Path, default=DEFAULT_BENCH)
-    parser.add_argument(
-        "--weights", type=Path, default=DEFAULT_WEIGHTS, help=".ninfer artifact passed to the bench"
-    )
+    parser.add_argument("--weights", type=Path, default=DEFAULT_WEIGHTS, help=".ninfer artifact passed to the bench")
     parser.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--device", type=int, default=0)
@@ -416,9 +412,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=None, help="override all case warmup repetitions")
     parser.add_argument("--dry-run", action="store_true", help="write commands but do not execute")
     parser.add_argument("--resume", action="store_true", help="skip cases with an existing valid JSON report")
-    parser.add_argument(
-        "--no-build", action="store_true", help="do not build build/bench/ninfer_bench"
-    )
+    parser.add_argument("--no-build", action="store_true", help="do not build build/bench/ninfer_bench")
     return parser.parse_args(argv)
 
 
@@ -445,9 +439,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("selected matrix is empty")
     max_prompt = max_prompt_in_cases(cases)
     if max_prompt > corpus_tokens:
-        raise SystemExit(
-            f"selected matrix needs prompt length {max_prompt}, but corpus has {corpus_tokens} tokens"
-        )
+        raise SystemExit(f"selected matrix needs prompt length {max_prompt}, but corpus has {corpus_tokens} tokens")
 
     out_dir = args.output_dir
     if out_dir is None:
@@ -515,9 +507,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "stderr": str(build_stderr),
                 }
             )
-            (out_dir / "failures.json").write_text(
-                json.dumps(failures, indent=2) + "\n", encoding="utf-8"
-            )
+            (out_dir / "failures.json").write_text(json.dumps(failures, indent=2) + "\n", encoding="utf-8")
             print(f"build failed; see {build_stderr}", file=sys.stderr)
             return 1
 
@@ -584,9 +574,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     write_summary(rows, out_dir)
     if failures:
-        (out_dir / "failures.json").write_text(
-            json.dumps(failures, indent=2) + "\n", encoding="utf-8"
-        )
+        (out_dir / "failures.json").write_text(json.dumps(failures, indent=2) + "\n", encoding="utf-8")
         print(f"completed with {len(failures)} failure(s); see {out_dir / 'failures.json'}")
         return 1
 

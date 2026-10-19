@@ -5,6 +5,7 @@
 #include "core/device_scope.h"
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,9 +29,8 @@ float bf16_to_float(std::uint16_t bits) {
 void write_npy(const std::filesystem::path& path, std::string_view descr, std::size_t count,
                const void* data, std::size_t element_bytes) {
     std::ostringstream header;
-    header << "{'descr': '" << descr << "', 'fortran_order': False, 'shape': (" << count
-           << ",), }";
-    std::string text = header.str();
+    header << "{'descr': '" << descr << "', 'fortran_order': False, 'shape': (" << count << ",), }";
+    std::string text           = header.str();
     const std::size_t unpadded = 10 + text.size() + 1;
     text.append((64 - unpadded % 64) % 64, ' ');
     text.push_back('\n');
@@ -38,13 +38,11 @@ void write_npy(const std::filesystem::path& path, std::string_view descr, std::s
     if (!out) { throw std::runtime_error("tfdump: cannot write " + path.string()); }
     const char magic[] = {'\x93', 'N', 'U', 'M', 'P', 'Y', '\x01', '\x00'};
     out.write(magic, sizeof(magic));
-    const auto length = static_cast<std::uint16_t>(text.size());
-    const char length_bytes[2] = {static_cast<char>(length & 0xFF),
-                                  static_cast<char>(length >> 8)};
+    const auto length          = static_cast<std::uint16_t>(text.size());
+    const char length_bytes[2] = {static_cast<char>(length & 0xFF), static_cast<char>(length >> 8)};
     out.write(length_bytes, 2);
     out.write(text.data(), static_cast<std::streamsize>(text.size()));
-    out.write(static_cast<const char*>(data),
-              static_cast<std::streamsize>(count * element_bytes));
+    out.write(static_cast<const char*>(data), static_cast<std::streamsize>(count * element_bytes));
     if (!out) { throw std::runtime_error("tfdump: short write " + path.string()); }
 }
 
@@ -92,11 +90,13 @@ std::unique_ptr<Qwen4TfDump> Qwen4TfDump::from_environment(std::int32_t layers) 
         }
     }
     const char* logits = std::getenv("NINFER_QWEN4_TFDUMP_LOGITS");
-    auto dump = std::make_unique<Qwen4TfDump>(directory, std::move(selected),
-                                              logits == nullptr || std::string_view(logits) != "0");
+    auto dump          = std::make_unique<Qwen4TfDump>(directory, std::move(selected),
+                                                       logits == nullptr || std::string_view(logits) != "0");
     if (const char* force = std::getenv("NINFER_QWEN4_TFDUMP_FORCE")) {
         std::ifstream in(force);
-        if (!in) { throw std::invalid_argument("NINFER_QWEN4_TFDUMP_FORCE: cannot read the ids file"); }
+        if (!in) {
+            throw std::invalid_argument("NINFER_QWEN4_TFDUMP_FORCE: cannot read the ids file");
+        }
         std::vector<std::int32_t> ids;
         long long value = 0;
         while (in >> value) { ids.push_back(static_cast<std::int32_t>(value)); }
@@ -116,6 +116,12 @@ std::unique_ptr<Qwen4TfDump> Qwen4TfDump::from_environment(std::int32_t layers) 
     }
     if (const char* sequences = std::getenv("NINFER_QWEN4_TFDUMP_SEQUENCES")) {
         dump->sequences_ = std::string_view(sequences) == "1";
+    }
+    if (const char* compact = std::getenv("NINFER_QWEN4_TFDUMP_COMPACT")) {
+        dump->compact_ = std::string_view(compact) == "1";
+    }
+    if (const char* topk = std::getenv("NINFER_QWEN4_TFDUMP_TOPK")) {
+        dump->topk_ = std::max(0, std::atoi(topk));
     }
     return dump;
 }
@@ -139,8 +145,8 @@ void Qwen4TfDump::capture(std::int32_t layer, const Tensor& values, std::int32_t
     const auto rows    = static_cast<std::size_t>(values.ne[0]);
     const auto columns = static_cast<std::size_t>(values.numel()) / rows;
     scratch_.resize(rows * columns);
-    CUDA_CHECK(cudaMemcpyAsync(scratch_.data(), values.data, values.bytes(),
-                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(scratch_.data(), values.data, values.bytes(), cudaMemcpyDeviceToHost,
+                               stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     char name[16];
     if (layer < 0) {
@@ -148,11 +154,25 @@ void Qwen4TfDump::capture(std::int32_t layer, const Tensor& values, std::int32_t
     } else {
         std::snprintf(name, sizeof(name), "L%02d", layer);
     }
+    if (compact_) {
+        std::filesystem::create_directories(out_dir());
+        std::ofstream out(out_dir() / ("hidden_" + std::string(name) + ".bin"),
+                          std::ios::binary | std::ios::app);
+        const std::int32_t head[3] = {first_position, static_cast<std::int32_t>(columns),
+                                      static_cast<std::int32_t>(rows)};
+        out.write(reinterpret_cast<const char*>(head), sizeof(head));
+        out.write(reinterpret_cast<const char*>(scratch_.data()),
+                  static_cast<std::streamsize>(scratch_.size() * sizeof(std::uint16_t)));
+        if (!out) { throw std::runtime_error("tfdump: short write of a compact hidden tap"); }
+        return;
+    }
     const auto directory = out_dir() / "hidden" / name;
     std::filesystem::create_directories(directory);
     std::vector<float> column(rows);
     for (std::size_t c = 0; c < columns; ++c) {
-        for (std::size_t r = 0; r < rows; ++r) { column[r] = bf16_to_float(scratch_[c * rows + r]); }
+        for (std::size_t r = 0; r < rows; ++r) {
+            column[r] = bf16_to_float(scratch_[c * rows + r]);
+        }
         write_npy(directory / position_name(first_position + static_cast<std::int32_t>(c)), "<f4",
                   rows, column.data(), sizeof(float));
     }
@@ -167,8 +187,8 @@ void Qwen4TfDump::compare_ranks(std::int32_t layer, const Tensor& rank0, const T
     std::vector<std::uint16_t> first(count), second(count);
     // Each copy on its rank's stream, with that stream's device current.
     const ScopedCurrentDevice restore;
-    const std::array<std::pair<const Tensor*, cudaStream_t>, 2> ranks{
-        std::pair{&rank0, stream0}, std::pair{&rank1, stream1}};
+    const std::array<std::pair<const Tensor*, cudaStream_t>, 2> ranks{std::pair{&rank0, stream0},
+                                                                      std::pair{&rank1, stream1}};
     std::array<std::uint16_t*, 2> host{first.data(), second.data()};
     for (std::size_t r = 0; r < 2; ++r) {
         int device = 0;
@@ -193,8 +213,8 @@ void Qwen4TfDump::capture_exchange(std::int32_t layer, int site, const Tensor& r
         !rank1.is_contiguous() || (!fp32 && rank0.dtype != DType::BF16)) {
         throw std::invalid_argument("xdump: rank partials must be matching contiguous BF16/FP32");
     }
-    const auto rows    = static_cast<std::size_t>(rank0.ne[0]);
-    const auto columns = static_cast<std::size_t>(rank0.numel()) / rows;
+    const auto rows           = static_cast<std::size_t>(rank0.ne[0]);
+    const auto columns        = static_cast<std::size_t>(rank0.numel()) / rows;
     const std::size_t element = fp32 ? 4U : 2U;
     std::vector<std::int32_t> keep;
     for (std::size_t c = 0; c < columns; ++c) {
@@ -204,8 +224,8 @@ void Qwen4TfDump::capture_exchange(std::int32_t layer, int site, const Tensor& r
     if (keep.empty()) { return; }
     std::vector<std::byte> host(rank0.bytes()), out(keep.size() * rows * element);
     const ScopedCurrentDevice restore;
-    const std::array<std::pair<const Tensor*, cudaStream_t>, 2> ranks{
-        std::pair{&rank0, stream0}, std::pair{&rank1, stream1}};
+    const std::array<std::pair<const Tensor*, cudaStream_t>, 2> ranks{std::pair{&rank0, stream0},
+                                                                      std::pair{&rank1, stream1}};
     char name[64];
     for (std::size_t r = 0; r < 2; ++r) {
         int device = 0;
@@ -224,9 +244,8 @@ void Qwen4TfDump::capture_exchange(std::int32_t layer, int site, const Tensor& r
         write_npy(xdir_ / name, fp32 ? "<f4" : "<u2", keep.size() * rows, out.data(), element);
     }
     std::ofstream index(xdir_ / "index.tsv", std::ios::app);
-    index << layer << '\t' << (site == 0 ? "mix" : "moe") << '\t' << first_position << '\t'
-          << rows << '\t' << keep.size() << '\t' << (fp32 ? "f32" : "bf16") << '\t' << keep.front()
-          << '\n';
+    index << layer << '\t' << (site == 0 ? "mix" : "moe") << '\t' << first_position << '\t' << rows
+          << '\t' << keep.size() << '\t' << (fp32 ? "f32" : "bf16") << '\t' << keep.front() << '\n';
 }
 
 void Qwen4TfDump::capture_mtp_logits(const Tensor& logits, std::int32_t position,
@@ -236,8 +255,8 @@ void Qwen4TfDump::capture_mtp_logits(const Tensor& logits, std::int32_t position
     }
     const auto rows = static_cast<std::size_t>(logits.ne[0]);
     scratch_.resize(rows);
-    CUDA_CHECK(cudaMemcpyAsync(scratch_.data(), logits.data, logits.bytes(),
-                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(scratch_.data(), logits.data, logits.bytes(), cudaMemcpyDeviceToHost,
+                               stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const auto directory = directory_ / "mtp_logits";
     std::filesystem::create_directories(directory);
@@ -263,6 +282,38 @@ void Qwen4TfDump::write_logits(std::span<const std::uint16_t> logits, std::int32
     const auto r = static_cast<std::size_t>(rows);
     if (logits.size() < r * positions.size()) {
         throw std::invalid_argument("tfdump: logits do not cover their positions");
+    }
+    if (topk_ > 0) {
+        std::filesystem::create_directories(out_dir());
+        std::ofstream out(out_dir() / "topk.bin", std::ios::binary | std::ios::app);
+        const auto k = static_cast<std::size_t>(std::min<std::int32_t>(topk_, rows));
+        std::vector<float> column(r);
+        std::vector<std::int32_t> order(r);
+        std::vector<float> lp(k);
+        for (std::size_t c = 0; c < positions.size(); ++c) {
+            float top = -INFINITY;
+            for (std::size_t i = 0; i < r; ++i) {
+                column[i] = bf16_to_float(logits[c * r + i]);
+                top       = std::max(top, column[i]);
+            }
+            double sum = 0;
+            for (std::size_t i = 0; i < r; ++i) {
+                sum += std::exp(static_cast<double>(column[i] - top));
+            }
+            const float lse = top + static_cast<float>(std::log(sum));
+            for (std::size_t i = 0; i < r; ++i) { order[i] = static_cast<std::int32_t>(i); }
+            std::partial_sort(
+                order.begin(), order.begin() + static_cast<std::ptrdiff_t>(k), order.end(),
+                [&](std::int32_t a, std::int32_t b) { return column[a] > column[b]; });
+            for (std::size_t j = 0; j < k; ++j) { lp[j] = column[order[j]] - lse; }
+            out.write(reinterpret_cast<const char*>(&positions[c]), sizeof(std::int32_t));
+            out.write(reinterpret_cast<const char*>(order.data()),
+                      static_cast<std::streamsize>(k * sizeof(std::int32_t)));
+            out.write(reinterpret_cast<const char*>(lp.data()),
+                      static_cast<std::streamsize>(k * sizeof(float)));
+        }
+        if (!out) { throw std::runtime_error("tfdump: short write of the top-k logits"); }
+        return;
     }
     const auto directory = out_dir() / "logits";
     std::filesystem::create_directories(directory);
@@ -304,10 +355,14 @@ Qwen4Replay::Qwen4Replay(const std::string& path) {
         if (tag == "seq") {
             Qwen4ReplaySequence seq;
             for (long long v = 0; row >> v;) { seq.ids.push_back(static_cast<std::int32_t>(v)); }
-            if (seq.ids.size() < 2) { throw std::invalid_argument("NINFER_QWEN4_REPLAY: short seq line"); }
+            if (seq.ids.size() < 2) {
+                throw std::invalid_argument("NINFER_QWEN4_REPLAY: short seq line");
+            }
             sequences_.push_back(std::move(seq));
         } else if (tag == "win") {
-            if (sequences_.empty()) { throw std::invalid_argument("NINFER_QWEN4_REPLAY: win before seq"); }
+            if (sequences_.empty()) {
+                throw std::invalid_argument("NINFER_QWEN4_REPLAY: win before seq");
+            }
             std::uint32_t frontier = 0;
             Qwen4ReplayWindow w;
             if (!(row >> frontier >> w.extent >> w.accepted) || w.accepted > w.extent) {
@@ -315,13 +370,15 @@ Qwen4Replay::Qwen4Replay(const std::string& path) {
             }
             for (long long v = 0; row >> v;) { w.drafts.push_back(static_cast<std::int32_t>(v)); }
             if (w.drafts.size() < w.extent) {
-                throw std::invalid_argument("NINFER_QWEN4_REPLAY: win line with fewer drafts than its extent");
+                throw std::invalid_argument(
+                    "NINFER_QWEN4_REPLAY: win line with fewer drafts than its extent");
             }
             const auto& ids = sequences_.back().ids;
             // The accepted drafts are the reference tokens after the anchor (recorded so).
             for (std::uint32_t j = 0; j < w.accepted; ++j) {
                 if (frontier + 1 + j >= ids.size() || w.drafts[j] != ids[frontier + 1 + j]) {
-                    throw std::invalid_argument("NINFER_QWEN4_REPLAY: accepted draft differs from the reference: " + line);
+                    throw std::invalid_argument(
+                        "NINFER_QWEN4_REPLAY: accepted draft differs from the reference: " + line);
                 }
             }
             sequences_.back().windows[frontier] = std::move(w);
@@ -334,12 +391,13 @@ Qwen4Replay::Qwen4Replay(const std::string& path) {
 }
 
 Qwen4Replay::~Qwen4Replay() {
-    std::fprintf(stderr,
-                 "qwen4 replay: forced tokens %lld, windows replayed %lld, unlisted %lld, rounds of "
-                 "unmatched requests %lld, commit mismatches %lld, ordinary argmax != reference %lld\n",
-                 static_cast<long long>(forced_tokens), static_cast<long long>(windows_replayed),
-                 static_cast<long long>(windows_unlisted), static_cast<long long>(rounds_unmatched),
-                 static_cast<long long>(commit_mismatches), static_cast<long long>(argmax_disagreements));
+    std::fprintf(
+        stderr,
+        "qwen4 replay: forced tokens %lld, windows replayed %lld, unlisted %lld, rounds of "
+        "unmatched requests %lld, commit mismatches %lld, ordinary argmax != reference %lld\n",
+        static_cast<long long>(forced_tokens), static_cast<long long>(windows_replayed),
+        static_cast<long long>(windows_unlisted), static_cast<long long>(rounds_unmatched),
+        static_cast<long long>(commit_mismatches), static_cast<long long>(argmax_disagreements));
 }
 
 const Qwen4ReplaySequence* Qwen4Replay::match(std::span<const std::int32_t> ledger) const {

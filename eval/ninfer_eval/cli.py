@@ -30,15 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    validate = sub.add_parser(
-        "validate", help="validate configuration and installed backend dependencies"
-    )
+    validate = sub.add_parser("validate", help="validate configuration and installed backend dependencies")
     validate.add_argument("--config", required=True)
     validate.add_argument("--suite")
 
-    plan = sub.add_parser(
-        "plan", help="show work, prerequisites, and expected sample counts"
-    )
+    plan = sub.add_parser("plan", help="show work, prerequisites, and expected sample counts")
     plan.add_argument("--config", required=True)
     plan.add_argument("--suite", required=True)
     plan.add_argument(
@@ -126,9 +122,7 @@ def _run(config, suite: str, console: Console, resume_dir: Path | None = None) -
         if cancel.is_set():
             raise KeyboardInterrupt
         cancel.set()
-        _print_stderr(
-            "[yellow]cancellation requested; waiting for the active backend to checkpoint[/yellow]"
-        )
+        _print_stderr("[yellow]cancellation requested; waiting for the active backend to checkpoint[/yellow]")
 
     signal.signal(signal.SIGINT, request_cancel)
     try:

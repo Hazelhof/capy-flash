@@ -44,11 +44,7 @@ def _f32(value, name):
 
 
 def _fixed(config, key, value, label):
-    if key in config and (
-        config[key] != value
-        or isinstance(value, bool)
-        and type(config[key]) is not bool
-    ):
+    if key in config and (config[key] != value or isinstance(value, bool) and type(config[key]) is not bool):
         raise ValueError(f"{label}.{key}: expected {value!r}, got {config[key]!r}")
 
 
@@ -73,11 +69,7 @@ def _rope_source(raw: dict, label: str) -> dict:
 
 def text_config(source: dict, *, mtp: bool) -> dict:
     architectures = source.get("architectures")
-    if (
-        not isinstance(architectures, list)
-        or len(architectures) != 1
-        or architectures[0] not in _TEXT_ARCHITECTURES
-    ):
+    if not isinstance(architectures, list) or len(architectures) != 1 or architectures[0] not in _TEXT_ARCHITECTURES:
         raise ValueError(f"unsupported Qwen text architecture {architectures!r}")
     moe = _TEXT_ARCHITECTURES[architectures[0]]
     raw = source.get("text_config", source)
@@ -102,9 +94,7 @@ def text_config(source: dict, *, mtp: bool) -> dict:
     result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps", 1e-6), "text.rms_norm_eps")
     layers = raw.get("layer_types")
     if layers is None:
-        interval = _positive(
-            raw.get("full_attention_interval", 4), "full_attention_interval"
-        )
+        interval = _positive(raw.get("full_attention_interval", 4), "full_attention_interval")
         layers = [
             "full_attention" if (i + 1) % interval == 0 else "linear_attention"
             for i in range(result["num_hidden_layers"])
@@ -127,25 +117,15 @@ def text_config(source: dict, *, mtp: bool) -> dict:
             rope.get("partial_rotary_factor", raw.get("partial_rotary_factor", 0.25)),
             "partial_rotary_factor",
         )
-        theta = _f32(
-            rope.get("rope_theta", raw.get("rope_theta", 10_000_000)), "rope_theta"
-        )
+        theta = _f32(rope.get("rope_theta", raw.get("rope_theta", 10_000_000)), "rope_theta")
         sections = rope.get("mrope_section")
-        if (
-            not isinstance(sections, list)
-            or len(sections) != 3
-            or any(type(v) is not int or v < 0 for v in sections)
-        ):
+        if not isinstance(sections, list) or len(sections) != 3 or any(type(v) is not int or v < 0 for v in sections):
             raise ValueError("mrope_section must contain three nonnegative integers")
         rotary = int(result["head_dim"] * factor)
         if factor > 1 or rotary <= 0 or rotary % 2 or sum(sections) != rotary // 2:
             raise ValueError("MRoPE sections and rotary width disagree")
         axes = [
-            (
-                1
-                if r % 3 == 1 and r < 3 * sections[1]
-                else 2 if r % 3 == 2 and r < 3 * sections[2] else 0
-            )
+            (1 if r % 3 == 1 and r < 3 * sections[1] else 2 if r % 3 == 2 and r < 3 * sections[2] else 0)
             for r in range(rotary // 2)
         ]
         if [axes.count(i) for i in range(3)] != sections:
@@ -195,11 +175,7 @@ def vision_config(source: dict, text: dict) -> dict:
     _fixed(raw, "hidden_act", "gelu_pytorch_tanh", "vision")
     _fixed(raw, "deepstack_visual_indexes", [], "vision")
     _fixed(raw, "out_hidden_size", text["hidden_size"], "vision")
-    result = {
-        "model_type": (
-            "qwen3_5_moe_vision" if "num_experts" in text else "qwen3_5_vision"
-        )
-    }
+    result = {"model_type": ("qwen3_5_moe_vision" if "num_experts" in text else "qwen3_5_vision")}
     for key in (
         "depth",
         "hidden_size",
@@ -241,14 +217,9 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
         "max_position_embeddings",
     ):
         result[key] = _positive(raw.get(key), backend + "." + key)
-    if (
-        result["num_attention_heads"] % result["num_key_value_heads"]
-        or result["head_dim"] % 2
-    ):
+    if result["num_attention_heads"] % result["num_key_value_heads"] or result["head_dim"] % 2:
         raise ValueError(f"{backend}: invalid attention geometry")
-    result["rms_norm_eps"] = _f32(
-        raw.get("rms_norm_eps", 1e-6), backend + ".rms_norm_eps"
-    )
+    result["rms_norm_eps"] = _f32(raw.get("rms_norm_eps", 1e-6), backend + ".rms_norm_eps")
     rope = _rope_source(raw, backend)
     result["rope_parameters"] = {
         "rope_theta": _f32(
@@ -277,17 +248,13 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
         raise ValueError(f"{backend}: invalid layer_types")
     result["layer_types"] = list(layers)
     if "sliding_attention" in layers:
-        result["sliding_window"] = _positive(
-            raw.get("sliding_window"), backend + ".sliding_window"
-        )
+        result["sliding_window"] = _positive(raw.get("sliding_window"), backend + ".sliding_window")
     draft = raw.get("dflash_config", {})
     taps = draft.get("target_layer_ids")
     if (
         not isinstance(taps, list)
         or not taps
-        or any(
-            type(i) is not int or not 0 <= i < target["num_hidden_layers"] for i in taps
-        )
+        or any(type(i) is not int or not 0 <= i < target["num_hidden_layers"] for i in taps)
         or len(set(taps)) != len(taps)
     ):
         raise ValueError(f"{backend}: invalid target_layer_ids")
@@ -304,9 +271,7 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
         ):
             output[key] = _positive(draft.get(key), backend + "." + key)
         if target["hidden_size"] % output["conv_group_size"]:
-            raise ValueError(
-                "DFlash2 hidden width must be divisible by conv_group_size"
-            )
+            raise ValueError("DFlash2 hidden width must be divisible by conv_group_size")
         for scope in (raw, draft):
             for key, expected in (
                 ("sample_from_anchor", False),
@@ -336,9 +301,7 @@ def _has_model_config(source: SafetensorsSource) -> bool:
 def _check_source_fields(name, actual, expected, fields):
     for field in sorted(fields):
         if actual.get(field) != expected.get(field):
-            raise ValueError(
-                f"{name}: additional source {field} differs; provide an explicit logical source"
-            )
+            raise ValueError(f"{name}: additional source {field} differs; provide an explicit logical source")
 
 
 class _Builder:
@@ -359,9 +322,7 @@ class _Builder:
             if name == "text/output_head":
                 fields.add("tie_word_embeddings")
             if "/attention/" in name:
-                fields.update(
-                    ("num_attention_heads", "num_key_value_heads", "head_dim")
-                )
+                fields.update(("num_attention_heads", "num_key_value_heads", "head_dim"))
             if "/gdn/" in name:
                 fields.update(
                     (
@@ -400,9 +361,7 @@ class _Builder:
             expected = self.model.components[component]["config"]
             fields = set()
             if "/attention/" in name:
-                fields.update(
-                    ("num_attention_heads", "num_key_value_heads", "head_dim")
-                )
+                fields.update(("num_attention_heads", "num_key_value_heads", "head_dim"))
             if "/mlp/" in name:
                 fields.add("intermediate_size")
             draft_fields = set()
@@ -414,9 +373,7 @@ class _Builder:
                     draft_fields.add("conv_group_size")
             if "/candidate_selector/" in name:
                 draft_fields.add("selector_rank")
-            _check_source_fields(
-                name, actual["dflash_config"], expected["dflash_config"], draft_fields
-            )
+            _check_source_fields(name, actual["dflash_config"], expected["dflash_config"], draft_fields)
         if "/layers/" in name:
             index = int(name.split("/layers/", 1)[1].split("/", 1)[0])
             if component == "vision":
@@ -455,15 +412,9 @@ class _Builder:
             selected_name = source_name
             if name.startswith("text/") and _has_model_config(selected):
                 if "text_config" not in selected.config:
-                    selected_name = selected_name.replace(
-                        "model.language_model.", "model.", 1
-                    )
-                elif "text_config" not in store.config and selected_name.startswith(
-                    "model."
-                ):
-                    selected_name = selected_name.replace(
-                        "model.", "model.language_model.", 1
-                    )
+                    selected_name = selected_name.replace("model.language_model.", "model.", 1)
+                elif "text_config" not in store.config and selected_name.startswith("model."):
+                    selected_name = selected_name.replace("model.", "model.language_model.", 1)
             if transpose is not None:
                 if format is not None:
                     raise ValueError(f"{name}: transpose source requires value access")
@@ -474,9 +425,7 @@ class _Builder:
                 return select_rows(ref, rows) if rows is not None else ref
             if format is not None:
                 raise ValueError(f"{name}: provide an explicit encoded source mapping")
-            return tensor_source(
-                selected, selected_name, shape, offset=offset, source_shape=original
-            )
+            return tensor_source(selected, selected_name, shape, offset=offset, source_shape=original)
 
         self.model.add(
             Parameter(
@@ -532,9 +481,7 @@ class _Builder:
             (h, q),
             inputs=(prefix + "attention/gated_output",),
         )
-        roles = [
-            prefix + "attention/" + role for role in ("query", "key", "gate", "value")
-        ]
+        roles = [prefix + "attention/" + role for role in ("query", "key", "gate", "value")]
         self.group(*roles)
         self.group(*roles[:2])
         self.group(*roles[2:])
@@ -698,9 +645,7 @@ class _Builder:
 
     def block(self, prefix, source_prefix, store, config, mixer):
         h = config["hidden_size"]
-        self.add(
-            prefix + "input_norm", store, source_prefix + "input_layernorm.weight", (h,)
-        )
+        self.add(prefix + "input_norm", store, source_prefix + "input_layernorm.weight", (h,))
         if mixer == "full_attention":
             self.attention(prefix, source_prefix, store, config)
         else:
@@ -763,9 +708,7 @@ class _Builder:
                     offset=number * h,
                 )
             self.group(*(p + "attention/" + r for r in ("query", "key", "value")))
-            self.group(
-                *(p + "attention/" + r + "_bias" for r in ("query", "key", "value"))
-            )
+            self.group(*(p + "attention/" + r + "_bias" for r in ("query", "key", "value")))
             for role, field, dims, inputs in (
                 (
                     "attention/output",
@@ -947,29 +890,19 @@ def build_model(
     )
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
-    model = Model(
-        records, resources=resources, token_count=count, special_token_ids=special
-    )
+    model = Model(records, resources=resources, token_count=count, special_token_ids=special)
     builder = _Builder(model)
     h, r = config["hidden_size"], config["vocab_size"]
     text_prefix = "model.language_model." if "text_config" in base.config else "model."
-    builder.add(
-        "text/token_embedding", base, text_prefix + "embed_tokens.weight", (r, h)
-    )
-    head_source = (
-        text_prefix + "embed_tokens.weight"
-        if config["tie_word_embeddings"]
-        else "lm_head.weight"
-    )
+    builder.add("text/token_embedding", base, text_prefix + "embed_tokens.weight", (r, h))
+    head_source = text_prefix + "embed_tokens.weight" if config["tie_word_embeddings"] else "lm_head.weight"
     head_inputs = ("text/final_hidden",) + tuple(
         c + "/final_hidden" for c in ("mtp", "dflash", "dflash2") if c in selected
     )
     builder.add("text/output_head", base, head_source, (r, h), inputs=head_inputs)
     builder.add("text/final_norm", base, text_prefix + "norm.weight", (h,))
     for i, kind in enumerate(config["layer_types"]):
-        builder.block(
-            f"text/layers/{i}/", text_prefix + f"layers.{i}.", base, config, kind
-        )
+        builder.block(f"text/layers/{i}/", text_prefix + f"layers.{i}.", base, config, kind)
     if "mtp" in selected:
         builder.add(
             "mtp/input_projection",
@@ -989,13 +922,7 @@ def build_model(
         builder.vision(base, records["vision"]["config"], h)
     for backend in ("dflash", "dflash2"):
         if backend in selected:
-            if (
-                backend == "dflash2"
-                and records[backend]["config"]["dflash_config"]["selector_top_k"]
-                > count
-            ):
+            if backend == "dflash2" and records[backend]["config"]["dflash_config"]["selector_top_k"] > count:
                 raise ValueError("DFlash2 selector_top_k exceeds public token domain")
-            builder.draft(
-                companions[backend], records[backend]["config"], config, backend
-            )
+            builder.draft(companions[backend], records[backend]["config"], config, backend)
     return model

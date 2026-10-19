@@ -144,8 +144,8 @@ __global__ void embed_gather_q8_kernel(const std::int32_t* ids, const std::uint8
         const std::int32_t t    = static_cast<std::int32_t>(i / d);
         const std::int32_t k    = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * d);
         const std::int32_t row  = ids[t];
-        const std::int32_t g           = k / kEmbedGatherQ8Group;
-        const std::int32_t lane        = k - g * kEmbedGatherQ8Group;
+        const std::int32_t g    = k / kEmbedGatherQ8Group;
+        const std::int32_t lane = k - g * kEmbedGatherQ8Group;
         const std::int64_t group_index = static_cast<std::int64_t>(row) * kg + g;
         const std::uint16_t scale_bits =
             static_cast<std::uint16_t>(scales[group_index * 2]) |

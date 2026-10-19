@@ -9,6 +9,7 @@ checkpoint is not handled: `import_encoded` would fail on it.
 `--recipe quasar_recipe.py:configure_mtp_nvfp4`) is the same plus the MTP layer's MLP gate/up, MLP down
 and attention output as NVFP4 quantized from QUASAR's BF16 MTP weights (`_mtp_nvfp4_layer`); every other
 object is byte-identical to `configure`'s."""
+
 from tools.convert.methods import fp8_row_maxabs, import_encoded
 from tools.convert.official_recipes import FP8, _mtp_nvfp4_layer, _optional
 
@@ -29,14 +30,30 @@ def configure(model, recipe, sources):
             REPORT["as_is"].append(name)
             continue
         if name == "text/output_head":  # QUASAR keeps lm_head in BF16 (quantization ignore list)
-            recipe.assign(name, format=FP8, method=fp8_row_maxabs, source=model.source(name, quantized),
-                          activation_policy="AllowA8")
+            recipe.assign(
+                name,
+                format=FP8,
+                method=fp8_row_maxabs,
+                source=model.source(name, quantized),
+                activation_policy="AllowA8",
+            )
             REPORT["fp8_from_bf16"].append(name)
             continue
-        recipe.assign(name, format="nvfp4", method=import_encoded,
-                      source=model.source(name, quantized, "nvfp4"), activation_policy="AllowA4")
+        recipe.assign(
+            name,
+            format="nvfp4",
+            method=import_encoded,
+            source=model.source(name, quantized, "nvfp4"),
+            activation_policy="AllowA4",
+        )
         REPORT["nvfp4"].append(name)
-    print("QUASAR recipe:", {k: len(v) for k, v in REPORT.items()}, "fp8_from_bf16:", REPORT["fp8_from_bf16"][:8], flush=True)
+    print(
+        "QUASAR recipe:",
+        {k: len(v) for k, v in REPORT.items()},
+        "fp8_from_bf16:",
+        REPORT["fp8_from_bf16"][:8],
+        flush=True,
+    )
 
 
 def configure_mtp_nvfp4(model, recipe, sources):

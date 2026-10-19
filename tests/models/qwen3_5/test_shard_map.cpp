@@ -165,8 +165,8 @@ void logical_policy_27b() {
         // attention by its 32/8 heads, MLP rows and down columns, conv kernels, norms and the
         // feature projection replicated, the candidate selector on rank 1 (rank 0 with Vision on
         // rank 1, NINFER_TP_DRAFT_HEAD=primary or NINFER_TP_SELECTOR=primary).
-        auto drafted  = config;
-        auto& draft   = drafted.draft.emplace();
+        auto drafted            = config;
+        auto& draft             = drafted.draft.emplace();
         draft.attention         = qwen::AttentionConfig{32, 8, 128};
         draft.intermediate_size = 17408;
         draft.num_hidden_layers = 5;
@@ -189,10 +189,10 @@ void logical_policy_27b() {
         }
         expect(drafted, d + "mlp/down", {h, 17408}, ShardAxis::Columns,
                {halves(17408, 0), halves(17408, 1)}, 0, dflash2);
-        for (const auto* leaf : {"input_norm", "post_attention_norm", "attention/query_norm",
-                                 "attention/key_norm", "attention_conv/base_kernel",
-                                 "attention_conv/kernel_projection", "mlp_conv/base_kernel",
-                                 "mlp_conv/kernel_projection"}) {
+        for (const auto* leaf :
+             {"input_norm", "post_attention_norm", "attention/query_norm", "attention/key_norm",
+              "attention_conv/base_kernel", "attention_conv/kernel_projection",
+              "mlp_conv/base_kernel", "mlp_conv/kernel_projection"}) {
             expect(drafted, d + leaf, {h}, ShardAxis::Replicated, {}, 0, dflash2);
         }
         for (const auto* name :
@@ -205,10 +205,10 @@ void logical_policy_27b() {
             expect(drafted, name, {vocab, 256}, ShardAxis::SingleDevice, {}, 1,
                    {.vision = true, .speculative = SpeculativeBackend::DFlash2, .tp = 2});
             expect(drafted, name, {vocab, 256}, ShardAxis::PrimaryOnly, {}, 0,
-                   {.vision        = true,
-                    .speculative   = SpeculativeBackend::DFlash2,
-                    .tp            = 2,
-                    .vision_rank   = 1});
+                   {.vision      = true,
+                    .speculative = SpeculativeBackend::DFlash2,
+                    .tp          = 2,
+                    .vision_rank = 1});
             for (const auto* variable : {"NINFER_TP_SELECTOR", "NINFER_TP_DRAFT_HEAD"}) {
                 ::setenv(variable, "primary", 1);
                 expect(drafted, name, {vocab, 256}, ShardAxis::PrimaryOnly, {}, 0, dflash2);
@@ -267,8 +267,8 @@ void combined_placements_27b() {
     const std::string g    = "text/layers/0/";
     const std::string late = "text/layers/60/";
     const auto spec        = [](std::string id, std::pair<QType, QuantLayout> format,
-                                artifact::Shape shape,
-                                std::vector<std::pair<std::string, std::uint64_t>> rows) {
+                         artifact::Shape shape,
+                         std::vector<std::pair<std::string, std::uint64_t>> rows) {
         return ParentSpec{std::move(id), format.first, format.second, std::move(shape),
                           std::move(rows)};
     };
@@ -643,8 +643,7 @@ void planned_fixture() {
         const auto bytes      = reader.geometry(embedding).bytes;
         require(moved.host_mapped_objects.size() == 1 &&
                     moved.host_mapped_objects[0].object == embedding &&
-                    moved.host_mapped_objects[0].offset == 0 &&
-                    moved.host_mapped_bytes == bytes,
+                    moved.host_mapped_objects[0].offset == 0 && moved.host_mapped_bytes == bytes,
                 "--embedding-host did not plan one host-mapped embedding copy");
         for (const auto& item : moved.device_objects) {
             require(item.object != embedding, "--embedding-host left an embedding device copy");

@@ -79,7 +79,7 @@ bf16_mma_compute_stage(const __nv_bfloat16* As, const __nv_bfloat16* Bs,
     const int a_row_offset = a_inner_row + ((a_matrix & 1) << 3);
     const int a_col_offset = (a_matrix >> 1) << 3;
     const int b_inner_row = lane & 7, b_k_offset = ((lane >> 3) & 1) << 3;
-    auto load_fragments = [&](int k_step, unsigned(&a_frag)[MT][4], unsigned(&b_frag)[NT][2]) {
+    auto load_fragments = [&](int k_step, unsigned (&a_frag)[MT][4], unsigned (&b_frag)[NT][2]) {
 #pragma unroll
         for (int mi = 0; mi < MT; ++mi) {
             const int row = wm * WM + mi * 16 + a_row_offset;
@@ -135,26 +135,30 @@ bf16_mma_compute_stage(const __nv_bfloat16* As, const __nv_bfloat16* Bs,
     }
 }
 
-template <bool FullTokens, class Output, class Epilogue>
+// FullRows = false: the last row tile extends past `rows` (zero-filled operand rows); only the
+// element-wise store path predicates rows, so fragment and tile consumers require full row tiles.
+template <bool FullTokens, bool FullRows = true, class Output, class Epilogue>
 __device__ __forceinline__ void bf16_finish_fragment(const Output& output, const Epilogue& epilogue,
                                                      int row, int token, float4 value, int rows,
                                                      int tokens) {
     if constexpr (requires { epilogue.store_fragment(output, row, token, value, rows, tokens); }) {
+        static_assert(FullRows, "BF16 fragment consumers require complete row tiles");
         // A fragment consumer receives the atom origin and owns its token-tail predicates.
         epilogue.store_fragment(output, row, token, value, rows, tokens);
     } else {
+        const bool low = FullRows || row < rows, high = FullRows || row + 8 < rows;
         if (FullTokens || token < tokens) {
-            output.store(row, token, epilogue.apply(row, token, value.x));
-            output.store(row + 8, token, epilogue.apply(row + 8, token, value.z));
+            if (low) output.store(row, token, epilogue.apply(row, token, value.x));
+            if (high) output.store(row + 8, token, epilogue.apply(row + 8, token, value.z));
         }
         if (FullTokens || token + 1 < tokens) {
-            output.store(row, token + 1, epilogue.apply(row, token + 1, value.y));
-            output.store(row + 8, token + 1, epilogue.apply(row + 8, token + 1, value.w));
+            if (low) output.store(row, token + 1, epilogue.apply(row, token + 1, value.y));
+            if (high) output.store(row + 8, token + 1, epilogue.apply(row + 8, token + 1, value.w));
         }
     }
 }
 
-template <class Schedule, bool FullTokens, class Output, class Epilogue>
+template <class Schedule, bool FullTokens, bool FullRows = true, class Output, class Epilogue>
 __device__ __forceinline__ void
 bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned char* scratch,
                      float (&accum)[Schedule::kMmaRows][Schedule::kMmaTokens][4], int row_begin,
@@ -164,6 +168,7 @@ bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned ch
                       epilogue.template finish_tile<Schedule, FullTokens>(
                           destination, scratch, accum, row_begin, token_begin, rows, tokens);
                   }) {
+        static_assert(FullRows, "BF16 tile consumers require complete row tiles");
         // All staging reads must have finished before a collective consumer reuses scratch.
         __syncthreads();
         epilogue.template finish_tile<Schedule, FullTokens>(destination, scratch, accum, row_begin,
@@ -178,8 +183,9 @@ bf16_finish_mma_tile(const Output& output, const Epilogue& epilogue, unsigned ch
                 const int token =
                     token_begin + wn * Schedule::kWarpTokens + ni * 8 + 2 * (lane & 3);
                 const auto& v = accum[mi][ni];
-                bf16_finish_fragment<FullTokens>(destination, epilogue, row, token,
-                                                 make_float4(v[0], v[1], v[2], v[3]), rows, tokens);
+                bf16_finish_fragment<FullTokens, FullRows>(destination, epilogue, row, token,
+                                                           make_float4(v[0], v[1], v[2], v[3]),
+                                                           rows, tokens);
             }
         }
     }

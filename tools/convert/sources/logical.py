@@ -31,14 +31,10 @@ class LogicalSource:
     def values(self, begin: int = 0, end: int | None = None) -> torch.Tensor:
         end = prod(self.shape) if end is None else end
         if not 0 <= begin <= end <= prod(self.shape):
-            raise ValueError(
-                f"{self.label}: logical range [{begin},{end}) exceeds {self.shape}"
-            )
+            raise ValueError(f"{self.label}: logical range [{begin},{end}) exceeds {self.shape}")
         values = self.read_values(begin, end)
         if values.numel() != end - begin:
-            raise ValueError(
-                f"{self.label}: source returned {values.numel()} values, expected {end-begin}"
-            )
+            raise ValueError(f"{self.label}: source returned {values.numel()} values, expected {end - begin}")
         return values.reshape(-1)
 
     def rows(self, begin: int, end: int) -> torch.Tensor:
@@ -50,30 +46,18 @@ class LogicalSource:
 
 def array_source(values: torch.Tensor, label: str) -> LogicalSource:
     data = values.detach().cpu().contiguous()
-    return LogicalSource(
-        tuple(data.shape), label, lambda begin, end: data.reshape(-1)[begin:end]
-    )
+    return LogicalSource(tuple(data.shape), label, lambda begin, end: data.reshape(-1)[begin:end])
 
 
-def transpose_source(
-    source: LogicalSource, axes: tuple[int, ...], shape: tuple[int, ...]
-) -> LogicalSource:
+def transpose_source(source: LogicalSource, axes: tuple[int, ...], shape: tuple[int, ...]) -> LogicalSource:
     # The architecture uses this for small convolution and norm-related tensors.
     def read(begin: int, end: int) -> torch.Tensor:
-        return (
-            source.values()
-            .reshape(source.shape)
-            .permute(axes)
-            .contiguous()
-            .reshape(-1)[begin:end]
-        )
+        return source.values().reshape(source.shape).permute(axes).contiguous().reshape(-1)[begin:end]
 
     return LogicalSource(shape, f"transpose({source.label},{axes})", read)
 
 
-def select_rows(
-    source: LogicalSource, ranges: tuple[tuple[int, int], ...]
-) -> LogicalSource:
+def select_rows(source: LogicalSource, ranges: tuple[tuple[int, int], ...]) -> LogicalSource:
     if len(source.shape) != 2 or not ranges:
         raise ValueError("row selection requires a matrix and nonempty ranges")
     n, k = source.shape
@@ -100,14 +84,9 @@ def select_rows(
     def encoded(begin: int, end: int) -> EncodedRows:
         if source.read_encoded is None:
             raise ValueError(f"{source.label}: encoded source rows are unavailable")
-        pieces = [
-            source.read_encoded(a // k, b // k) for a, b in spans(begin * k, end * k)
-        ]
+        pieces = [source.read_encoded(a // k, b // k) for a, b in spans(begin * k, end * k)]
         first = pieces[0]
-        if any(
-            (part.format, part.weight_divisor) != (first.format, first.weight_divisor)
-            for part in pieces
-        ):
+        if any((part.format, part.weight_divisor) != (first.format, first.weight_divisor) for part in pieces):
             raise ValueError(f"{source.label}: incompatible encoded row groups")
         return EncodedRows(
             first.format,

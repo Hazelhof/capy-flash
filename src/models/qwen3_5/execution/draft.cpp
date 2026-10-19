@@ -368,13 +368,14 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 ids_flat, scores, work, stream);
         } else {
-            const auto& head = *state.execution.parameters.proposal;
+            const auto& head      = *state.execution.parameters.proposal;
             const TpExecution* tp = state.execution.tp;
             if (tp != nullptr && head.split()) {
                 // Vocabulary-split head (tp 2): both ranks rank their blocks, rank 0 merges.
-                dflash2_candidates_split({hidden, hidden}, {&head, tp->parameters->proposal ? &*tp->parameters->proposal : nullptr},
-                                         true, ids_flat, scores, {&work, tp->work},
-                                         *tp->execution, *tp->events);
+                dflash2_candidates_split(
+                    {hidden, hidden},
+                    {&head, tp->parameters->proposal ? &*tp->parameters->proposal : nullptr}, true,
+                    ids_flat, scores, {&work, tp->work}, *tp->execution, *tp->events);
             } else if (head.token_ids) {
                 ops::linear_topk(hidden, head.head.weight, *head.token_ids, ids_flat, scores, work,
                                  stream);
@@ -661,6 +662,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
         Tensor target_positions   = frame.verify_positions.slice(1, 0, batch_size);
 
+        // The draft phase's own collectives stay on the staged copies while the pinned-host mailbox
+        // carries the target forward below: this phase interleaves cross-device copies with its layer
+        // sums, and under WSL2 such a copy stalls behind the peer's spinning exchange kernel
+        // (issue #1). A full DFlash2 round hung the mailbox; see ProgramImpl::degrade_peer_mailbox().
+        std::optional<ops::PeerEvents::StagedScope> staged_draft;
+        if (tp != nullptr && tp->staged_draft_collectives) { staged_draft.emplace(*tp->events); }
         if (tp != nullptr && tp->dflash != nullptr) {
             // The split drafter (tp 2): both ranks append and propose (execution/tp2/).
             dflash2_draft_round_tp2(state, batch_size, k, envelopes);
@@ -681,6 +688,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         // Tensor-parallel width 2: the drafts reach the other rank, which derives its verification
         // inputs from them (execution/tp2/draft_tp2.inc).
         if (tp != nullptr) { dflash2_share_drafts_tp2(state, batch_size); }
+        staged_draft.reset();
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, stream);
 
@@ -691,15 +699,15 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         DFlashFeatureSink sink =
             batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
         // The split drafter captures rank 1's own features from its copy of the residual.
-        const Tensor peer_lanes = tp != nullptr ? state.peer_frame->active_lanes.slice(0, 0, batch_size)
-                                                : Tensor{};
+        const Tensor peer_lanes =
+            tp != nullptr ? state.peer_frame->active_lanes.slice(0, 0, batch_size) : Tensor{};
         const Tensor peer_valid =
             tp != nullptr ? state.peer_frame->target_valid_columns.slice(0, 0, batch_size)
                           : Tensor{};
         std::optional<DFlashFeatureSink> peer_sink;
         if (tp != nullptr && tp->dflash != nullptr) {
-            peer_sink = dflash_peer_batch_sink(*tp->dflash, peer_lanes, peer_valid, width,
-                                               batch_size);
+            peer_sink =
+                dflash_peer_batch_sink(*tp->dflash, peer_lanes, peer_valid, width, batch_size);
         }
         {
             nvtx::ScopedRange target_range(nvtx::Name::DecodeDFlashTarget, nvtx::Category::DFlash,
@@ -707,12 +715,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             const TargetVerifyFrameView primary =
                 dflash_verify_view(frame, batch_size, state.execution.replay_records, true, &sink);
             if (tp != nullptr) {
-                target_verify_accept(state.execution, state.continuation_hidden_store, card,
-                                     primary,
-                                     dflash_verify_view(*state.peer_frame, batch_size,
-                                                        tp->replay_records, false,
-                                                        peer_sink ? &*peer_sink : nullptr),
-                                     *state.peer_continuation_hidden_store, target_envelope);
+                target_verify_accept(
+                    state.execution, state.continuation_hidden_store, card, primary,
+                    dflash_verify_view(*state.peer_frame, batch_size, tp->replay_records, false,
+                                       peer_sink ? &*peer_sink : nullptr),
+                    *state.peer_continuation_hidden_store, target_envelope);
             } else {
                 target_verify_accept(state.execution, state.continuation_hidden_store, card,
                                      primary, target_envelope);

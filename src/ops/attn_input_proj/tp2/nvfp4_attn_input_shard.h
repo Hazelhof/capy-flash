@@ -33,11 +33,9 @@ namespace ninfer::ops::detail {
 void nvfp4_attn_input_shard_a16_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                        Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 void nvfp4_attn_input_shard_decode_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                          Tensor& gate, Tensor& k, Tensor& v,
-                                          cudaStream_t stream);
+                                          Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 void nvfp4_attn_input_shard_small_t_launch(const Tensor& x, const Weight& weight, Tensor& q,
-                                           Tensor& gate, Tensor& k, Tensor& v,
-                                           cudaStream_t stream);
+                                           Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream);
 void nvfp4_attn_input_shard_a4_launch(const Tensor& x, const Weight& weight, Tensor& q,
                                       Tensor& gate, Tensor& k, Tensor& v,
                                       Nvfp4A4Workspace workspace, cudaStream_t stream);
@@ -51,8 +49,8 @@ void launch_nvfp4_a4_tma_attention_shard(const Nvfp4A4Operands& p, __nv_bfloat16
                                          __nv_bfloat16* value, cudaStream_t stream);
 
 // nvfp4_attn_input_dispatch() at the shard shape.
-void nvfp4_attn_input_shard_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
-                                     Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+void nvfp4_attn_input_shard_dispatch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
+                                     Tensor& k, Tensor& v, LinearPolicy policy,
                                      WorkspaceArena* workspace, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

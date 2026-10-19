@@ -13,6 +13,7 @@
 #include "models/qwen3_5/execution/qwen4_draft_head.h"
 #include "models/qwen3_5/execution/tp.h"
 #include "models/qwen3_5/execution/tp2/workspace_split.h"
+#include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/speculative/mtp_alignment.h"
 
 #include "core/device_scope.h"
@@ -22,6 +23,7 @@
 #include "ninfer/ops/position.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scalar.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 
@@ -57,6 +59,7 @@ bool ple_timing() {
     }();
     return on;
 }
+
 bool ple_next_prefetch_enabled() {
     static const bool on = [] {
         const char* v = std::getenv("NINFER_QWEN4_PLE_NEXT_PREFETCH");
@@ -64,20 +67,23 @@ bool ple_next_prefetch_enabled() {
     }();
     return on;
 }
+
 double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
 class NextChunkPlePrefetch {
 public:
-    NextChunkPlePrefetch() = default;
+    NextChunkPlePrefetch()                                       = default;
     NextChunkPlePrefetch(const NextChunkPlePrefetch&)            = delete;
     NextChunkPlePrefetch& operator=(const NextChunkPlePrefetch&) = delete;
+
     ~NextChunkPlePrefetch() {
         if (thread_.joinable()) { thread_.join(); }
     }
-    void start(PleGather& gather, std::span<const std::int32_t> history,
-               std::size_t first, std::size_t count) {
+
+    void start(PleGather& gather, std::span<const std::int32_t> history, std::size_t first,
+               std::size_t count) {
         if (!ple_next_prefetch_enabled() || count == 0 || first >= history.size()) { return; }
         count   = std::min(count, history.size() - first);
         thread_ = std::thread([&gather, history, first, count] {
@@ -118,7 +124,9 @@ void require_shape(const Tensor& t, DType dtype, std::initializer_list<std::int3
 class ArenaLoan {
 public:
     ArenaLoan() = default;
+
     ~ArenaLoan() { restore(); }
+
     ArenaLoan(const ArenaLoan&)            = delete;
     ArenaLoan& operator=(const ArenaLoan&) = delete;
 
@@ -128,6 +136,7 @@ public:
         target_ = &arena;
         arena   = WorkspaceArena(span);
     }
+
     void restore() noexcept {
         if (target_ == nullptr) { return; }
         *target_ = std::move(*saved_);
@@ -156,8 +165,71 @@ void keep_last_column(const Tensor& xf, const Tensor& prefill_hidden, cudaStream
     if (prefill_hidden.data == nullptr || xf.data == prefill_hidden.data) { return; }
     const Tensor last   = xf.slice(1, xf.ne[1] - 1, 1);
     const Tensor target = prefill_hidden.slice(1, prefill_hidden.ne[1] - 1, 1);
-    CUDA_CHECK(::ninfer::memcpy_device_async(target.data, last.data, last.bytes(),
-                               stream));
+    CUDA_CHECK(::ninfer::memcpy_device_async(target.data, last.data, last.bytes(), stream));
+}
+
+// Columns [first, first + count) of a chunk's RoPE positions: a view of one-axis [T] positions,
+// a contiguous copy (the RoPE Ops read contiguous positions) of axis-major [T,3] ones.
+Tensor rope_columns(const Tensor& rope, std::int32_t first, std::int32_t count,
+                    WorkspaceArena& work, cudaStream_t stream) {
+    if (rope.ne[1] != 3) { return rope.slice(0, first, count); }
+    Tensor out           = work.alloc(DType::I32, {count, 3});
+    const std::int32_t T = rope.ne[0];
+    for (std::int32_t axis = 0; axis < 3; ++axis) {
+        CUDA_CHECK(::ninfer::memcpy_device_async(
+            static_cast<std::int32_t*>(out.data) + static_cast<std::ptrdiff_t>(axis) * count,
+            static_cast<const std::int32_t*>(rope.data) + static_cast<std::ptrdiff_t>(axis) * T +
+                first,
+            static_cast<std::size_t>(count) * sizeof(std::int32_t), stream));
+    }
+    return out;
+}
+
+// A multimodal chunk's host inputs: its three-axis RoPE positions (axis-major [3][len], read
+// from the prompt's positions) and the visual columns of its Vision item (chunk-relative, with
+// the item's first merged token among them).
+struct Qwen4VisualChunk {
+    std::vector<std::int32_t> rope_rows;
+    std::vector<std::int32_t> columns;
+    std::int32_t merged_begin = 0;
+};
+
+Qwen4VisualChunk visual_chunk(std::span<const std::int32_t> positions, std::size_t prompt_tokens,
+                              const VisionChunk& vision, std::uint32_t base, std::int32_t len) {
+    Qwen4VisualChunk out;
+    out.rope_rows.resize(static_cast<std::size_t>(3) * static_cast<std::size_t>(len));
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+        std::copy_n(positions.data() + axis * prompt_tokens + base, len,
+                    out.rope_rows.data() + axis * static_cast<std::size_t>(len));
+    }
+    if (vision.control != nullptr) {
+        const auto scatter = std::span<const std::int32_t>(vision.control->scatter_indices);
+        const auto begin =
+            std::lower_bound(scatter.begin(), scatter.end(), static_cast<std::int32_t>(base));
+        const auto end =
+            std::lower_bound(begin, scatter.end(), static_cast<std::int32_t>(base) + len);
+        out.merged_begin = static_cast<std::int32_t>(begin - scatter.begin());
+        out.columns.reserve(static_cast<std::size_t>(end - begin));
+        for (auto index = begin; index != end; ++index) {
+            out.columns.push_back(*index - static_cast<std::int32_t>(base));
+        }
+    }
+    return out;
+}
+
+// The MTP shifted input of rank `r` for `count` columns starting at `first`: the token
+// embeddings of the shifted ids with the shifted visual overlap scattered over them.
+void compose_mtp_embeddings(const Tensor& ids, const Weight& token_embedding, const Tensor& merged,
+                            std::span<const std::int32_t> columns, std::size_t source_begin,
+                            WorkspaceArena& work, Tensor& out, cudaStream_t stream) {
+    ops::embedding(ids, token_embedding, out, stream);
+    if (columns.empty()) { return; }
+    const auto count = static_cast<std::int32_t>(columns.size());
+    Tensor indices   = work.alloc(DType::I32, {count});
+    CUDA_CHECK(cudaMemcpyAsync(indices.data, columns.data(), columns.size_bytes(),
+                               cudaMemcpyHostToDevice, stream));
+    const Tensor rows = merged.slice(1, static_cast<std::int32_t>(source_begin), count);
+    ops::scatter(rows, indices, out, stream);
 }
 
 } // namespace
@@ -169,21 +241,41 @@ const Qwen4Runtime& TextContext::qwen4_runtime() const {
     return *qwen4_runtime_;
 }
 
+// The whole prompt of a Qwen4Exp chunk (the n-gram embedding hashes the tokens before each column)
+// after checking that exactly one text or multimodal prompt names it from the chunk's base. A
+// multimodal prompt carries its three-axis positions and its Vision session.
+std::span<const int> TextContext::qwen4_prompt(std::span<const int> ids,
+                                               const TextPrefill* text_prefill,
+                                               const MultimodalPrefill* multimodal) const {
+    if ((text_prefill == nullptr) == (multimodal == nullptr)) {
+        throw std::invalid_argument("Qwen4Exp prefill requires its full prompt");
+    }
+    const std::span<const int> prompt =
+        text_prefill != nullptr ? text_prefill->token_ids : multimodal->token_ids;
+    const std::uint32_t begin = text_prefill != nullptr ? text_prefill->begin : multimodal->begin;
+    if (begin != text_kv_base_ || prompt.size() < static_cast<std::size_t>(begin) + ids.size()) {
+        throw std::invalid_argument("Qwen4Exp prefill requires its full prompt");
+    }
+    if (multimodal != nullptr &&
+        (multimodal->vision == nullptr || multimodal->positions.size() != 3 * prompt.size())) {
+        throw std::invalid_argument(
+            "Qwen4Exp multimodal prefill requires a Vision session and [3,T] positions");
+    }
+    return prompt;
+}
+
 PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
                                               const TextPrefill* text_prefill,
+                                              const MultimodalPrefill* multimodal,
                                               bool finalize_at_end) {
     runtime::ExecutionTimingRecorder timing;
     if (ids.empty()) { throw std::invalid_argument("TextContext::prefill requires tokens"); }
-    if (tp2()) { return qwen4_prefill_tp2(ids, text_prefill, finalize_at_end); }
-    const Qwen4Runtime& runtime = qwen4_runtime();
-    cudaStream_t s              = ctx_.stream;
-    const auto T                = static_cast<std::int64_t>(ids.size());
-    const std::uint32_t base    = text_kv_base_;
-    // The n-gram embedding hashes the tokens before each column, so the prompt must be whole.
-    if (text_prefill == nullptr || base != text_prefill->begin ||
-        text_prefill->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
-        throw std::invalid_argument("Qwen4Exp prefill requires its full prompt");
-    }
+    if (tp2()) { return qwen4_prefill_tp2(ids, text_prefill, multimodal, finalize_at_end); }
+    const Qwen4Runtime& runtime       = qwen4_runtime();
+    cudaStream_t s                    = ctx_.stream;
+    const auto T                      = static_cast<std::int64_t>(ids.size());
+    const std::uint32_t base          = text_kv_base_;
+    const std::span<const int> prompt = qwen4_prompt(ids, text_prefill, multimodal);
     if (static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) >
         static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
@@ -194,15 +286,33 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
          mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0]))) {
         throw std::logic_error("Qwen4Exp MTP prefill has no MTP layer or exceeds the draft window");
     }
-    if (text_kv_base_ == 0) { rope_delta_ = 0; }
+    // A multimodal prompt sets its RoPE delta; a text chunk continuing a cached multimodal prefix
+    // keeps the sequence's (T209); a chunk at base 0 resets it.
+    if (multimodal != nullptr) {
+        rope_delta_ = multimodal->rope_delta;
+    } else if (text_kv_base_ == 0) {
+        rope_delta_ = 0;
+    }
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
-    const int base_i              = static_cast<int>(base);
-    const std::int64_t split_abs  = prefill_split_frontier_;
-    const bool has_split          = split_abs > base_i && split_abs <= base_i + T;
-    const int split_rel           = has_split ? static_cast<int>(split_abs - base_i) : -1;
+    const int base_i             = static_cast<int>(base);
+    const std::int64_t split_abs = prefill_split_frontier_;
+    const bool has_split         = split_abs > base_i && split_abs <= base_i + T;
+    const int split_rel          = has_split ? static_cast<int>(split_abs - base_i) : -1;
 
     int len = static_cast<int>(std::min<std::int64_t>(prefill_chunk_, T));
     if (split_rel > 0 && len > split_rel) { len = split_rel; }
+    // The Vision session caps the chunk at the next item and, on an item's first chunk, encodes it
+    // (outside the arena: the encode and the merged embeddings live past its general capacity).
+    VisionChunk vision_chunk;
+    Qwen4VisualChunk visual;
+    if (multimodal != nullptr) {
+        vision_chunk = multimodal->vision->prepare_chunk(base, static_cast<std::uint32_t>(len));
+        if (vision_chunk.length <= 0 || vision_chunk.length > len) {
+            throw std::logic_error("Vision chunk length is outside the prefill chunk");
+        }
+        len    = vision_chunk.length;
+        visual = visual_chunk(multimodal->positions, prompt.size(), vision_chunk, base, len);
+    }
     const bool is_last = finalize_at_end && len == T;
     nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                   static_cast<std::uint64_t>(len));
@@ -213,131 +323,162 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
     // routing once it completed. A chunk wider than the Program's arena runs on lent memory.
     ArenaLoan loan;
     const bool lent_arena = len > runtime.experts->prompt_arena_columns();
-    runtime.experts->prepare_prompt(len);
-    run_expert_window(*runtime.experts, s, Qwen4Window::Prompt, [&] {
-        if (lent_arena) {
-            const cudaStream_t streams[1] = {s};
-            loan.lend(work_, runtime.experts->prompt_workspace(streams)[0]);
-        }
-        Tensor ids_device = work_.alloc(DType::I32, {len});
-        CUDA_CHECK(cudaMemcpyAsync(ids_device.data, ids.data(), ids_device.bytes(),
-                                   cudaMemcpyHostToDevice, s));
-        Tensor positions = work_.alloc(DType::I32, {len});
-        ops::fill_i32_positions(positions, base_i, s);
-        Tensor rope_positions = positions;
-        if (rope_delta_ != 0) {
-            rope_positions = work_.alloc(DType::I32, {len});
-            ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
-        }
-        Tensor ple_embedding;
-        NextChunkPlePrefetch next_ple;
-        if (config_.ple) {
-            if (runtime.ple_gather == nullptr || runtime.ple_host == nullptr) {
-                throw std::logic_error("Qwen4Exp prefill has no PLE gather staging");
+    runtime.experts->prepare_prompt(len, base, static_cast<std::int64_t>(prompt.size()));
+    run_expert_window(
+        *runtime.experts, s, Qwen4Window::Prompt,
+        [&] {
+            if (lent_arena) {
+                const cudaStream_t streams[1] = {s};
+                loan.lend(work_, runtime.experts->prompt_workspace(streams)[0]);
             }
-            const std::uint32_t width = runtime.ple_gather->width();
-            const std::span<const std::int32_t> history(text_prefill->token_ids.data(),
-                                                        text_prefill->token_ids.size());
-            // The staging buffer is reused per chunk; the previous chunk ended in a device
-            // synchronization, so its upload has completed.
-            const auto gather_t0 = std::chrono::steady_clock::now();
-            runtime.ple_gather->gather(
-                history, base, static_cast<std::size_t>(len),
-                std::span<std::uint16_t>(runtime.ple_host, static_cast<std::size_t>(width) * len));
-            if (ple_timing()) {
-                std::fprintf(stderr, "ple_timing gather first=%u count=%d ms=%.1f\n", base, len,
-                             ms_since(gather_t0));
-            }
-            // The prompt continues in `history` beyond this call's `ids` (one chunk per call).
-            next_ple.start(*runtime.ple_gather, history, static_cast<std::size_t>(base) + len,
-                           prefill_chunk_);
-            ple_embedding = work_.alloc(DType::BF16, {static_cast<std::int32_t>(width), len});
-            CUDA_CHECK(cudaMemcpyAsync(ple_embedding.data, runtime.ple_host, ple_embedding.bytes(),
+            Tensor ids_device = work_.alloc(DType::I32, {len});
+            CUDA_CHECK(cudaMemcpyAsync(ids_device.data, ids.data(), ids_device.bytes(),
                                        cudaMemcpyHostToDevice, s));
-        }
-        // The carried hidden of every prompt column: the committed wide residual.
-        Tensor xf = chunk_hidden(prefill_hidden_, work_, wide_rows, len);
-        const Qwen4Columns columns{.width            = len,
-                                   .batch            = 1,
-                                   .cache_positions  = &positions,
-                                   .rope_positions   = &rope_positions,
-                                   .valid_columns    = nullptr,
-                                   .table_rows       = &io_.text_kv_table_row,
-                                   .max_visible      = static_cast<std::uint32_t>(base_i + len),
-                                   .prefill          = true,
-                                   .source_slot      = linear_state_source_slot_,
-                                   .destination_slot = linear_state_destination_slot_,
-                                   .first_position   = base_i};
-        const Qwen4State state{.kv = batch_text_kv_, .linear = &state_, .runtime = &runtime};
-        if (state.kv == nullptr || !state.kv->has_qsa_index()) {
-            throw std::logic_error("Qwen4Exp prefill requires the Main KV cache with QSA planes");
-        }
-        Qwen4Forward<WorkspaceArena> forward(config_, parameters_, work_, s, ctx_.execution_view(),
-                                             columns, state, len, len);
-        forward.run(ids_device, config_.ple ? &ple_embedding : nullptr, xf);
-
-        if (is_last) {
-            auto head_scope = work_.scope();
-            Tensor x        = work_.alloc(DType::BF16, {H, 1});
-            forward.head(parameters_.qwen4->head, xf.slice(1, len - 1, 1), x);
-            Tensor logits = io_.logits.slice(1, 0, 1);
-            ops::linear(x, lm_head_->weight, logits, lm_head_->policy, work_, s);
-            ops::set_i32_scalar(io_.pos, base_i + static_cast<int>(T), s);
-            ops::set_i32_scalar(io_.rope_pos, base_i + static_cast<int>(T) + rope_delta_, s);
-            if (sampling_config_ != nullptr) {
-                ops::sample(logits, io_.token,
-                            dimension(parameters_.model.resources().public_token_count),
-                            sampling_config_, io_.pos, ops::kSamplePurposePrefill, work_, s);
-            } else {
-                ops::argmax(logits, io_.token,
-                            dimension(parameters_.model.resources().public_token_count), s);
+            Tensor positions = work_.alloc(DType::I32, {len});
+            ops::fill_i32_positions(positions, base_i, s);
+            Tensor rope_positions = positions;
+            if (multimodal != nullptr) {
+                rope_positions = work_.alloc(DType::I32, {len, 3});
+                CUDA_CHECK(cudaMemcpyAsync(rope_positions.data, visual.rope_rows.data(),
+                                           rope_positions.bytes(), cudaMemcpyHostToDevice, s));
+            } else if (rope_delta_ != 0) {
+                rope_positions = work_.alloc(DType::I32, {len});
+                ops::offset_i32_positions(positions, io_.rope_delta, rope_positions, s);
             }
-        }
-
-        if (prepare_mtp_prompt && runtime.taps != nullptr && runtime.taps->wants_mtp_logits() &&
-            base == 0) {
-            runtime.taps->capture_tokens(std::span<const std::int32_t>(
-                text_prefill->token_ids.data(), text_prefill->token_ids.size()));
-        }
-        if (prepare_mtp_prompt) {
-            // MTP alignment of this chunk: hidden h_p and position p with token x_(p+1); the last
-            // prompt column takes the generated token (qwen3_5-model.md#prefill-decode-and-mtp).
-            const auto alignment_tokens =
-                static_cast<std::uint32_t>(text_prefill->token_ids.size());
-            const qwen3_5::MtpAlignmentWindow window =
-                qwen3_5::plan_mtp_alignment_window(alignment_tokens, base,
-                                                   static_cast<std::uint32_t>(len));
-            const int prompt_columns =
-                len - static_cast<int>(window.final_column_uses_generated_token);
-            auto mtp_scope           = work_.scope();
-            Tensor mtp_ids           = work_.alloc(DType::I32, {len});
-            if (prompt_columns != 0) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    mtp_ids.data, text_prefill->token_ids.data() + window.shifted_embedding_begin,
-                    static_cast<std::size_t>(prompt_columns) * sizeof(std::int32_t),
-                    cudaMemcpyHostToDevice, s));
+            std::optional<Qwen4Forward<WorkspaceArena>::VisualColumns> visual_columns;
+            if (!visual.columns.empty()) {
+                const auto count = static_cast<std::int32_t>(visual.columns.size());
+                Tensor indices   = work_.alloc(DType::I32, {count});
+                CUDA_CHECK(cudaMemcpyAsync(indices.data, visual.columns.data(), indices.bytes(),
+                                           cudaMemcpyHostToDevice, s));
+                visual_columns.emplace();
+                visual_columns->embeddings = {
+                    vision_chunk.embeddings.slice(1, visual.merged_begin, count), Tensor{}};
+                visual_columns->indices = {indices, Tensor{}};
             }
-            if (window.final_column_uses_generated_token) {
-                CUDA_CHECK(::ninfer::memcpy_device_async(mtp_ids.slice(0, len - 1, 1).data, io_.token.data,
-                                           sizeof(std::int32_t), s));
+            Tensor ple_embedding;
+            NextChunkPlePrefetch next_ple;
+            if (config_.ple) {
+                if (runtime.ple_gather == nullptr || runtime.ple_host == nullptr) {
+                    throw std::logic_error("Qwen4Exp prefill has no PLE gather staging");
+                }
+                const std::uint32_t width = runtime.ple_gather->width();
+                const std::span<const std::int32_t> history(prompt.data(), prompt.size());
+                // The staging buffer is reused per chunk; the previous chunk ended in a device
+                // synchronization, so its upload has completed.
+                const auto gather_t0 = std::chrono::steady_clock::now();
+                runtime.ple_gather->gather(
+                    history, base, static_cast<std::size_t>(len),
+                    std::span<std::uint16_t>(runtime.ple_host,
+                                             static_cast<std::size_t>(width) * len));
+                if (ple_timing()) {
+                    std::fprintf(stderr, "ple_timing gather first=%u count=%d ms=%.1f\n", base, len,
+                                 ms_since(gather_t0));
+                }
+                // The prompt continues in `history` beyond this call's `ids` (one chunk per call).
+                next_ple.start(*runtime.ple_gather, history, static_cast<std::size_t>(base) + len,
+                               prefill_chunk_);
+                ple_embedding = work_.alloc(DType::BF16, {static_cast<std::int32_t>(width), len});
+                CUDA_CHECK(cudaMemcpyAsync(ple_embedding.data, runtime.ple_host,
+                                           ple_embedding.bytes(), cudaMemcpyHostToDevice, s));
             }
-            qwen4_mtp_prefill(mtp_ids, xf, positions, rope_positions,
-                              static_cast<std::uint32_t>(base_i + len),
-                              is_last && mtp_proposal_extent_ != 0);
-        }
+            // The carried hidden of every prompt column: the committed wide residual.
+            Tensor xf = chunk_hidden(prefill_hidden_, work_, wide_rows, len);
+            const Qwen4Columns columns{.width            = len,
+                                       .batch            = 1,
+                                       .cache_positions  = &positions,
+                                       .rope_positions   = &rope_positions,
+                                       .valid_columns    = nullptr,
+                                       .table_rows       = &io_.text_kv_table_row,
+                                       .max_visible      = static_cast<std::uint32_t>(base_i + len),
+                                       .prefill          = true,
+                                       .source_slot      = linear_state_source_slot_,
+                                       .destination_slot = linear_state_destination_slot_,
+                                       .first_position   = base_i};
+            const Qwen4State state{.kv = batch_text_kv_, .linear = &state_, .runtime = &runtime};
+            if (state.kv == nullptr || !state.kv->has_qsa_index()) {
+                throw std::logic_error(
+                    "Qwen4Exp prefill requires the Main KV cache with QSA planes");
+            }
+            Qwen4Forward<WorkspaceArena> forward(config_, parameters_, work_, s,
+                                                 ctx_.execution_view(), columns, state, len, len);
+            forward.run(ids_device, config_.ple ? &ple_embedding : nullptr, xf,
+                        visual_columns ? &*visual_columns : nullptr);
 
-        if (split_rel > 0 && len == split_rel && rewrite_checkpoint_hidden_output_ != nullptr) {
-            const Tensor checkpoint = xf.slice(1, len - 1, 1);
-            CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data, checkpoint.data,
-                                       checkpoint.bytes(), s));
-        }
-        keep_last_column(xf, prefill_hidden_, s);
-        prefill_split_frontier_ = -1;
-        timing.begin_wait();
-    }, [&] {
-        ctx_.synchronize();
-        timing.end_wait();
-    });
+            if (is_last) {
+                auto head_scope = work_.scope();
+                Tensor x        = work_.alloc(DType::BF16, {H, 1});
+                forward.head(parameters_.qwen4->head, xf.slice(1, len - 1, 1), x);
+                Tensor logits = io_.logits.slice(1, 0, 1);
+                ops::linear(x, lm_head_->weight, logits, lm_head_->policy, work_, s);
+                ops::set_i32_scalar(io_.pos, base_i + static_cast<int>(T), s);
+                ops::set_i32_scalar(io_.rope_pos, base_i + static_cast<int>(T) + rope_delta_, s);
+                if (sampling_config_ != nullptr) {
+                    ops::sample(logits, io_.token,
+                                dimension(parameters_.model.resources().public_token_count),
+                                sampling_config_, io_.pos, ops::kSamplePurposePrefill, work_, s);
+                } else {
+                    ops::argmax(logits, io_.token,
+                                dimension(parameters_.model.resources().public_token_count), s);
+                }
+            }
+
+            if (prepare_mtp_prompt && runtime.taps != nullptr && runtime.taps->wants_mtp_logits() &&
+                base == 0) {
+                runtime.taps->capture_tokens(
+                    std::span<const std::int32_t>(prompt.data(), prompt.size()));
+            }
+            if (prepare_mtp_prompt) {
+                // MTP alignment of this chunk: hidden h_p and position p with token x_(p+1); the
+                // last prompt column takes the generated token
+                // (qwen3_5-model.md#prefill-decode-and-mtp).
+                const auto alignment_tokens = static_cast<std::uint32_t>(prompt.size());
+                const qwen3_5::MtpAlignmentWindow window = qwen3_5::plan_mtp_alignment_window(
+                    alignment_tokens, base, static_cast<std::uint32_t>(len));
+                const int prompt_columns =
+                    len - static_cast<int>(window.final_column_uses_generated_token);
+                auto mtp_scope = work_.scope();
+                Tensor mtp_ids = work_.alloc(DType::I32, {len});
+                if (prompt_columns != 0) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        mtp_ids.data, prompt.data() + window.shifted_embedding_begin,
+                        static_cast<std::size_t>(prompt_columns) * sizeof(std::int32_t),
+                        cudaMemcpyHostToDevice, s));
+                }
+                if (window.final_column_uses_generated_token) {
+                    CUDA_CHECK(::ninfer::memcpy_device_async(mtp_ids.slice(0, len - 1, 1).data,
+                                                             io_.token.data, sizeof(std::int32_t),
+                                                             s));
+                }
+                // A shifted token inside the chunk's Vision item enters the MTP layer as its
+                // merged embedding, as in the target's input.
+                qwen3_5::MtpVisualOverlap overlap;
+                if (vision_chunk.control != nullptr) {
+                    overlap = qwen3_5::shifted_visual_overlap(vision_chunk.control->scatter_indices,
+                                                              alignment_tokens, window);
+                }
+                const Qwen4MtpVisual mtp_visual{.merged       = {vision_chunk.embeddings, Tensor{}},
+                                                .columns      = overlap.destination_columns,
+                                                .source_begin = overlap.source_begin};
+                qwen4_mtp_prefill(mtp_ids, xf, positions, rope_positions,
+                                  static_cast<std::uint32_t>(base_i + len),
+                                  is_last && mtp_proposal_extent_ != 0,
+                                  overlap.empty() ? nullptr : &mtp_visual);
+            }
+
+            if (split_rel > 0 && len == split_rel && rewrite_checkpoint_hidden_output_ != nullptr) {
+                const Tensor checkpoint = xf.slice(1, len - 1, 1);
+                CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data,
+                                                         checkpoint.data, checkpoint.bytes(), s));
+            }
+            keep_last_column(xf, prefill_hidden_, s);
+            prefill_split_frontier_ = -1;
+            timing.begin_wait();
+        },
+        [&] {
+            ctx_.synchronize();
+            timing.end_wait();
+        });
     loan.restore();
     work_.reset();
     return PrefillChunkResult{.processed_tokens = static_cast<std::uint32_t>(len),
@@ -348,9 +489,12 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
 // MTP KV of one prompt chunk: every column is appended to the MTP cache; with `propose` the last
 // column (the generated token) runs the whole MTP layer and drafts mtp_proposal_extent_ tokens
 // autoregressively into io_.mtp (draft_tokens, ar_hidden, position).
+// A multimodal chunk passes its three-axis RoPE positions ([T,3]) and, when a shifted token is
+// visual, `visual`: the shifted input is then the composed embedding rather than embed(ids).
 void TextContext::qwen4_mtp_prefill(const Tensor& ids, const Tensor& hidden,
                                     const Tensor& positions, const Tensor& rope_positions,
-                                    std::uint32_t max_visible, bool propose) {
+                                    std::uint32_t max_visible, bool propose,
+                                    const Qwen4MtpVisual* visual) {
     if (batch_mtp_kv_ == nullptr || qwen4_mtp_ == nullptr || !batch_mtp_kv_->has_qsa_index()) {
         throw std::logic_error("Qwen4Exp MTP prefill requires the MTP layer and its QSA cache");
     }
@@ -361,6 +505,19 @@ void TextContext::qwen4_mtp_prefill(const Tensor& ids, const Tensor& hidden,
     const Qwen4State state{.kv = batch_mtp_kv_, .linear = &state_, .runtime = &runtime};
     nvtx::ScopedRange range(nvtx::Name::PrefillMtpChunk, nvtx::Category::Mtp,
                             static_cast<std::uint64_t>(T));
+    auto visual_scope = work_.scope();
+    Tensor embeddings;
+    if (visual != nullptr) {
+        embeddings = work_.alloc(DType::BF16, {dimension(config_.hidden_size), T});
+        compose_mtp_embeddings(ids, parameters_.text.token_embedding, visual->merged[0],
+                               visual->columns, visual->source_begin, work_, embeddings, s);
+    }
+    // The shifted input of `count` columns from `first`: the composed embeddings, or none.
+    const auto inputs = [&](std::int32_t first, std::int32_t count, Tensor& slot) -> Tensor* {
+        if (visual == nullptr) { return nullptr; }
+        slot = embeddings.slice(1, first, count);
+        return &slot;
+    };
     const auto columns_of = [&](std::int32_t first, std::int32_t count, const Tensor& pos,
                                 const Tensor& rope) {
         return Qwen4Columns{.width           = count,
@@ -379,43 +536,46 @@ void TextContext::qwen4_mtp_prefill(const Tensor& ids, const Tensor& hidden,
         for (std::int32_t c = 0; c < append; ++c) {
             auto scope        = work_.scope();
             const Tensor pos  = positions.slice(0, c, 1);
-            const Tensor rope = rope_positions.slice(0, c, 1);
-            Tensor out  = work_.alloc(DType::BF16, {dimension(config_.residual_width()), 1});
-            Tensor draft = work_.alloc(DType::I32, {1});
+            const Tensor rope = rope_columns(rope_positions, c, 1, work_, s);
+            Tensor out        = work_.alloc(DType::BF16, {dimension(config_.residual_width()), 1});
+            Tensor draft      = work_.alloc(DType::I32, {1});
             {
                 Qwen4Forward<WorkspaceArena> forward(config_, parameters_, work_, s,
                                                      ctx_.execution_view(),
                                                      columns_of(c, 1, pos, rope), state, 1, 1);
-                forward.run_mtp(*qwen4_mtp_, ids.slice(0, c, 1), nullptr, hidden.slice(1, c, 1),
-                                out, false);
+                Tensor slot;
+                forward.run_mtp(*qwen4_mtp_, ids.slice(0, c, 1), inputs(c, 1, slot),
+                                hidden.slice(1, c, 1), out, false);
             }
             Tensor logits = io_.logits.slice(1, 0, 1);
             qwen4_mtp_propose(out, logits, draft);
             std::int32_t position = 0;
-            CUDA_CHECK(cudaMemcpyAsync(&position, pos.data, sizeof(position),
-                                       cudaMemcpyDeviceToHost, s));
+            CUDA_CHECK(
+                cudaMemcpyAsync(&position, pos.data, sizeof(position), cudaMemcpyDeviceToHost, s));
             CUDA_CHECK(cudaStreamSynchronize(s));
             runtime.taps->capture_mtp_logits(logits, position, s);
         }
     } else if (append > 0) {
         auto scope        = work_.scope();
         const Tensor pos  = positions.slice(0, 0, append);
-        const Tensor rope = rope_positions.slice(0, 0, append);
+        const Tensor rope = rope_columns(rope_positions, 0, append, work_, s);
         Tensor scratch    = work_.alloc(DType::BF16, {dimension(config_.residual_width()), append});
         Qwen4Forward<WorkspaceArena> forward(config_, parameters_, work_, s, ctx_.execution_view(),
                                              columns_of(0, append, pos, rope), state, append,
                                              append);
-        forward.run_mtp(*qwen4_mtp_, ids.slice(0, 0, append), nullptr,
+        Tensor slot;
+        forward.run_mtp(*qwen4_mtp_, ids.slice(0, 0, append), inputs(0, append, slot),
                         hidden.slice(1, 0, append), scratch, true);
     }
     if (!propose) { return; }
     const Tensor pos  = positions.slice(0, T - 1, 1);
-    const Tensor rope = rope_positions.slice(0, T - 1, 1);
+    const Tensor rope = rope_columns(rope_positions, T - 1, 1, work_, s);
     {
         Qwen4Forward<WorkspaceArena> forward(config_, parameters_, work_, s, ctx_.execution_view(),
                                              columns_of(T - 1, 1, pos, rope), state, 1, 1);
-        forward.run_mtp(*qwen4_mtp_, ids.slice(0, T - 1, 1), nullptr, hidden.slice(1, T - 1, 1),
-                        io_.mtp->ar_hidden, false);
+        Tensor slot;
+        forward.run_mtp(*qwen4_mtp_, ids.slice(0, T - 1, 1), inputs(T - 1, 1, slot),
+                        hidden.slice(1, T - 1, 1), io_.mtp->ar_hidden, false);
     }
     Tensor logits = io_.logits.slice(1, 0, 1);
     Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
@@ -433,15 +593,14 @@ void TextContext::qwen4_mtp_prefill(const Tensor& ids, const Tensor& hidden,
         qwen4_mtp_forward_batch(previous, io_.mtp->ar_hidden, ar_position, {visible, visible},
                                 next_hidden, 0, &logits, &next, nullptr, nullptr);
         CUDA_CHECK(::ninfer::memcpy_device_async(io_.mtp->ar_hidden.data, next_hidden.data,
-                                   io_.mtp->ar_hidden.bytes(), s));
+                                                 io_.mtp->ar_hidden.bytes(), s));
         ops::increment_i32_scalar(ar_position, s);
     }
 }
 
 void TextContext::qwen4_ordinary_decode(const Tensor& ids, const Tensor& cache_positions,
                                         const Tensor& rope_positions, const Tensor& kv_table_rows,
-                                        const Tensor& source_slots,
-                                        const Tensor& destination_slots,
+                                        const Tensor& source_slots, const Tensor& destination_slots,
                                         ops::CausalAttentionExecutionEnvelope envelope,
                                         Tensor& hidden, Tensor& logits) {
     if (mtp_enabled()) { throw std::logic_error("Qwen4Exp MTP decodes through the MTP round"); }
@@ -451,8 +610,8 @@ void TextContext::qwen4_ordinary_decode(const Tensor& ids, const Tensor& cache_p
         return;
     }
     const Qwen4Runtime& runtime = qwen4_runtime();
-    const std::int32_t batch = ids.ne[0];
-    cudaStream_t stream      = ctx_.stream;
+    const std::int32_t batch    = ids.ne[0];
+    cudaStream_t stream         = ctx_.stream;
     Tensor rows;
     if (config_.ple) {
         if (runtime.decode_ple_rows.data == nullptr || runtime.decode_ple_rows.ne[1] < batch) {
@@ -616,9 +775,6 @@ void TextContext::qwen4_mtp_forward_batch(const Tensor& ids, const Tensor& hidde
     if (qwen4_mtp_ == nullptr || batch_mtp_kv_ == nullptr || !batch_mtp_kv_->has_qsa_index()) {
         throw std::logic_error("Qwen4Exp MTP forward requires the MTP layer and its QSA cache");
     }
-    if (input_embeddings != nullptr) {
-        throw std::invalid_argument("Qwen4Exp MTP takes token embeddings only (no image input)");
-    }
     const Qwen4Runtime& runtime  = qwen4_runtime();
     const std::int32_t T         = ids.ne[0];
     const std::int32_t wide_rows = dimension(config_.residual_width());
@@ -629,14 +785,21 @@ void TextContext::qwen4_mtp_forward_batch(const Tensor& ids, const Tensor& hidde
     require_shape(positions, DType::I32, {T}, "MTP positions");
     require_shape(hidden, DType::BF16, {wide_rows, T}, "MTP hidden");
     require_shape(mtp_hidden, DType::BF16, {wide_rows, T}, "MTP output hidden");
+    if (input_embeddings != nullptr) {
+        require_shape(*input_embeddings, DType::BF16, {dimension(config_.hidden_size), T},
+                      "MTP input embeddings");
+    }
     cudaStream_t s = ctx_.stream;
     auto scope     = work_.scope();
     Tensor rope;
     if (explicit_rope_positions != nullptr) {
-        // The bridge passes one three-axis position; the Text RoPE of this architecture is 1-D.
-        rope = explicit_rope_positions->ne[1] == 3
-                   ? explicit_rope_positions->slice(1, 0, 1).view({T})
-                   : explicit_rope_positions->view({T});
+        // The bridge passes its position as [1] when it repeats on the three M-RoPE axes (text)
+        // and as [1,3] when it does not (a visual position, mtp_bridge_and_propose).
+        const Tensor& given = *explicit_rope_positions;
+        if (given.ne[1] == 3 && T != 1) {
+            throw std::invalid_argument("Qwen4Exp MTP batch takes one three-axis position only");
+        }
+        rope = given.ne[1] == 3 ? given.view({1, 3}) : given.view({T});
     } else {
         rope = work_.alloc(DType::I32, {T});
         ops::offset_i32_positions(positions, io_.rope_delta, rope, s);
@@ -653,7 +816,7 @@ void TextContext::qwen4_mtp_forward_batch(const Tensor& ids, const Tensor& hidde
     {
         Qwen4Forward<WorkspaceArena> forward(config_, parameters_, work_, s, ctx_.execution_view(),
                                              columns, state, T, T);
-        forward.run_mtp(*qwen4_mtp_, ids, nullptr, hidden, mtp_hidden, false);
+        forward.run_mtp(*qwen4_mtp_, ids, input_embeddings, hidden, mtp_hidden, false);
     }
     if (logits_column >= 0) {
         if (logits == nullptr || draft_token == nullptr) {
@@ -684,9 +847,9 @@ void TextContext::qwen4_logits_from_hidden(const Tensor& hidden, const Tensor* p
         return;
     }
     const ExecutionContext& execution = *tp_->execution;
-    const auto ws = workspaces();
-    auto scope0   = work_.scope();
-    auto scope1   = tp_->work->scope();
+    const auto ws                     = workspaces();
+    auto scope0                       = work_.scope();
+    auto scope1                       = tp_->work->scope();
     Tensor peer;
     if (peer_hidden != nullptr) {
         require_shape(*peer_hidden, DType::BF16, {wide_rows, 1}, "rank 1 retained hidden");
@@ -696,8 +859,8 @@ void TextContext::qwen4_logits_from_hidden(const Tensor& hidden, const Tensor* p
         CUDA_CHECK(cudaEventRecord(tp_->events->inputs_ready(0), ctx_.stream));
         const ScopedCurrentDevice rank1(execution.dev[1]->device);
         CUDA_CHECK(cudaStreamWaitEvent(rank_stream(1), tp_->events->inputs_ready(0), 0));
-        CUDA_CHECK(::ninfer::memcpy_device_async(peer.data, hidden.data, peer.bytes(),
-                                                 rank_stream(1)));
+        CUDA_CHECK(
+            ::ninfer::memcpy_device_async(peer.data, hidden.data, peer.bytes(), rank_stream(1)));
     }
     std::array<Qwen4Rank<WorkspaceArena>, 2> ranks;
     for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
@@ -739,9 +902,9 @@ void TextContext::qwen4_mtp_propose(const Tensor& hidden, Tensor& logits, Tensor
     }
     nvtx::ScopedRange range(nvtx::Name::MtpProposal, nvtx::Category::Mtp,
                             static_cast<std::uint64_t>(B));
-    cudaStream_t s      = ctx_.stream;
-    auto scope          = work_.scope();
-    Tensor x            = work_.alloc(DType::BF16, {dimension(config_.hidden_size), B});
+    cudaStream_t s = ctx_.stream;
+    auto scope     = work_.scope();
+    Tensor x       = work_.alloc(DType::BF16, {dimension(config_.hidden_size), B});
     const Qwen4Columns columns{.width = B, .batch = 1, .prefill = false};
     const Qwen4State state{.kv = nullptr, .linear = &state_, .runtime = qwen4_runtime_};
     Qwen4Forward<WorkspaceArena> forward(config_, parameters_, work_, s, ctx_.execution_view(),
@@ -814,23 +977,26 @@ const Qwen4Runtime& TextContext::qwen4_peer_runtime() const {
 
 PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
                                                   const TextPrefill* text_prefill,
+                                                  const MultimodalPrefill* multimodal,
                                                   bool finalize_at_end) {
     runtime::ExecutionTimingRecorder timing;
     const std::array<const Qwen4Runtime*, 2> runtime{&qwen4_runtime(), &qwen4_peer_runtime()};
     const ExecutionContext& execution = *tp_->execution;
     const ScopedCurrentDevice device(ctx_.device);
-    cudaStream_t s           = ctx_.stream;
-    const auto T             = static_cast<std::int64_t>(ids.size());
-    const std::uint32_t base = text_kv_base_;
-    if (text_prefill == nullptr || base != text_prefill->begin ||
-        text_prefill->token_ids.size() < static_cast<std::size_t>(base) + ids.size()) {
-        throw std::invalid_argument("Qwen4Exp prefill requires its full prompt");
-    }
+    cudaStream_t s                    = ctx_.stream;
+    const auto T                      = static_cast<std::int64_t>(ids.size());
+    const std::uint32_t base          = text_kv_base_;
+    const std::span<const int> prompt = qwen4_prompt(ids, text_prefill, multimodal);
     if (static_cast<std::uint64_t>(base) + static_cast<std::uint64_t>(T) >
         static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::overflow_error("TextContext::prefill absolute position exceeds int32");
     }
-    if (text_kv_base_ == 0) { rope_delta_ = 0; }
+    // As at one device: a multimodal prompt sets the delta, a text continuation keeps it (T209).
+    if (multimodal != nullptr) {
+        rope_delta_ = multimodal->rope_delta;
+    } else if (text_kv_base_ == 0) {
+        rope_delta_ = 0;
+    }
     // Each rank offsets its own positions by its own copy of the delta.
     ops::set_i32_scalar(io_.rope_delta, rope_delta_, s);
     {
@@ -845,6 +1011,22 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
 
     int len = static_cast<int>(std::min<std::int64_t>(prefill_chunk_, T));
     if (split_rel > 0 && len > split_rel) { len = split_rel; }
+    // The Vision session caps the chunk at the next item and, on an item's first chunk, encodes it
+    // on the tower's rank and copies the merged embeddings to the other rank's handoff (both past
+    // the arenas' general capacity, so a chunk on lent workspace reads them in place).
+    VisionChunk vision_chunk;
+    Qwen4VisualChunk visual;
+    if (multimodal != nullptr) {
+        vision_chunk = multimodal->vision->prepare_chunk(base, static_cast<std::uint32_t>(len));
+        if (vision_chunk.length <= 0 || vision_chunk.length > len) {
+            throw std::logic_error("Vision chunk length is outside the prefill chunk");
+        }
+        if (vision_chunk.control != nullptr && vision_chunk.peer_embeddings.data == nullptr) {
+            throw std::logic_error("tensor-parallel Vision chunk has no rank 1 embeddings");
+        }
+        len    = vision_chunk.length;
+        visual = visual_chunk(multimodal->positions, prompt.size(), vision_chunk, base, len);
+    }
     const bool is_last = finalize_at_end && len == T;
     nvtx::ScopedRange chunk_range(nvtx::Name::PrefillChunk, nvtx::Category::Prefill,
                                   static_cast<std::uint64_t>(len));
@@ -854,7 +1036,7 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
     // A chunk wider than the Program's arenas runs on each GPU's lent memory (T42).
     ArenaLoan loan0, loan1;
     const bool lent_arena = len > runtime[0]->experts->prompt_arena_columns();
-    runtime[0]->experts->prepare_prompt(len);
+    runtime[0]->experts->prepare_prompt(len, base, static_cast<std::int64_t>(prompt.size()));
     // One expert window per chunk (rank 0's backend drives both GPUs' slot tables).
     const auto abandon = [&] {
         for (int rank = kTensorParallelWidth - 1; rank >= 0; --rank) {
@@ -872,7 +1054,7 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
     try {
         if (lent_arena) {
             const cudaStream_t streams[2] = {s, rank_stream(1)};
-            const auto spans = runtime[0]->experts->prompt_workspace(streams);
+            const auto spans              = runtime[0]->experts->prompt_workspace(streams);
             loan0.lend(work_, spans[0]);
             loan1.lend(*tp_->work, spans[1]);
         }
@@ -886,8 +1068,7 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
                 throw std::logic_error("Qwen4Exp prefill has no PLE gather staging");
             }
             ple_width = runtime[0]->ple_gather->width();
-            const std::span<const std::int32_t> history(text_prefill->token_ids.data(),
-                                                        text_prefill->token_ids.size());
+            const std::span<const std::int32_t> history(prompt.data(), prompt.size());
             const auto gather_t0 = std::chrono::steady_clock::now();
             runtime[0]->ple_gather->gather(
                 history, base, static_cast<std::size_t>(len),
@@ -902,6 +1083,9 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
                            prefill_chunk_);
         }
         RankTensors ids_device, positions, rope_positions, ple_embedding, xf;
+        std::optional<Qwen4Forward<WorkspaceArena>::VisualColumns> visual_columns;
+        if (!visual.columns.empty()) { visual_columns.emplace(); }
+        const auto visual_count = static_cast<std::int32_t>(visual.columns.size());
         for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
             const auto r = static_cast<std::size_t>(rank);
             const ScopedCurrentDevice current(rank == 0 ? ctx_.device : execution.dev[1]->device);
@@ -912,10 +1096,26 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
             positions[r] = ws[r]->alloc(DType::I32, {len});
             ops::fill_i32_positions(positions[r], base_i, stream);
             rope_positions[r] = positions[r];
-            if (rope_delta_ != 0) {
+            if (multimodal != nullptr) {
+                rope_positions[r] = ws[r]->alloc(DType::I32, {len, 3});
+                CUDA_CHECK(cudaMemcpyAsync(rope_positions[r].data, visual.rope_rows.data(),
+                                           rope_positions[r].bytes(), cudaMemcpyHostToDevice,
+                                           stream));
+            } else if (rope_delta_ != 0) {
                 rope_positions[r] = ws[r]->alloc(DType::I32, {len});
-                ops::offset_i32_positions(positions[r], rank == 0 ? io_.rope_delta : tp_->rope_delta,
+                ops::offset_i32_positions(positions[r],
+                                          rank == 0 ? io_.rope_delta : tp_->rope_delta,
                                           rope_positions[r], stream);
+            }
+            if (visual_columns) {
+                // The hidden axis is replicated: each rank scatters its own copy.
+                Tensor indices = ws[r]->alloc(DType::I32, {visual_count});
+                CUDA_CHECK(cudaMemcpyAsync(indices.data, visual.columns.data(), indices.bytes(),
+                                           cudaMemcpyHostToDevice, stream));
+                const Tensor& merged =
+                    rank == 0 ? vision_chunk.embeddings : vision_chunk.peer_embeddings;
+                visual_columns->embeddings[r] = merged.slice(1, visual.merged_begin, visual_count);
+                visual_columns->indices[r]    = indices;
             }
             if (config_.ple) {
                 ple_embedding[r] =
@@ -931,7 +1131,7 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
         // prefill_hidden as well (bound only then): the Program's copy_tail retains rank 1's tail
         // hidden from there for the prefix-reuse bridge (T66b).
         const std::int32_t wide_rows = dimension(config_.residual_width());
-        xf[0] = chunk_hidden(prefill_hidden_, work_, wide_rows, len);
+        xf[0]                        = chunk_hidden(prefill_hidden_, work_, wide_rows, len);
         xf[1] = chunk_hidden(tp_->prefill_hidden, *tp_->work, wide_rows, len);
         std::array<Qwen4Rank<WorkspaceArena>, 2> ranks;
         for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
@@ -943,13 +1143,13 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
                     .stream     = rank_stream(rank),
                     .execution  = rank_execution_view(rank),
                     .device     = rank == 0 ? ctx_.device : execution.dev[1]->device,
-                    .columns    = {.width            = len,
-                                   .batch            = 1,
-                                   .cache_positions  = &positions[r],
-                                   .rope_positions   = &rope_positions[r],
-                                   .valid_columns    = nullptr,
-                                   .table_rows       = rank == 0 ? &io_.text_kv_table_row
-                                                                 : &tp_->text_kv_table_row,
+                    .columns    = {.width           = len,
+                                   .batch           = 1,
+                                   .cache_positions = &positions[r],
+                                   .rope_positions  = &rope_positions[r],
+                                   .valid_columns   = nullptr,
+                                   .table_rows =
+                                rank == 0 ? &io_.text_kv_table_row : &tp_->text_kv_table_row,
                                    .max_visible      = static_cast<std::uint32_t>(base_i + len),
                                    .prefill          = true,
                                    .source_slot      = linear_state_source_slot_,
@@ -961,7 +1161,8 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
         }
         Qwen4Forward<WorkspaceArena> forward(config_, ranks, kTensorParallelWidth,
                                              {tp_->execution, tp_->events}, len, len);
-        forward.run(ids_device, config_.ple ? &ple_embedding : nullptr, xf);
+        forward.run(ids_device, config_.ple ? &ple_embedding : nullptr, xf,
+                    visual_columns ? &*visual_columns : nullptr);
 
         if (is_last) {
             RankTensors last{xf[0].slice(1, len - 1, 1), xf[1].slice(1, len - 1, 1)};
@@ -987,8 +1188,7 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
             if (mtp_proposal_extent_ > static_cast<std::uint32_t>(io_.mtp->draft_tokens.ne[0])) {
                 throw std::logic_error("Qwen4Exp MTP prefill exceeds the draft window");
             }
-            const auto alignment_tokens =
-                static_cast<std::uint32_t>(text_prefill->token_ids.size());
+            const auto alignment_tokens              = static_cast<std::uint32_t>(prompt.size());
             const qwen3_5::MtpAlignmentWindow window = qwen3_5::plan_mtp_alignment_window(
                 alignment_tokens, base, static_cast<std::uint32_t>(len));
             const int prompt_columns =
@@ -997,29 +1197,40 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
             auto mtp_scope1 = tp_->work->scope();
             Tensor mtp_ids  = work_.alloc(DType::I32, {len});
             if (prompt_columns != 0) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    mtp_ids.data, text_prefill->token_ids.data() + window.shifted_embedding_begin,
-                    static_cast<std::size_t>(prompt_columns) * sizeof(std::int32_t),
-                    cudaMemcpyHostToDevice, s));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(mtp_ids.data, prompt.data() + window.shifted_embedding_begin,
+                                    static_cast<std::size_t>(prompt_columns) * sizeof(std::int32_t),
+                                    cudaMemcpyHostToDevice, s));
             }
             if (window.final_column_uses_generated_token) {
-                CUDA_CHECK(::ninfer::memcpy_device_async(mtp_ids.slice(0, len - 1, 1).data, io_.token.data,
-                                           sizeof(std::int32_t), s));
+                CUDA_CHECK(::ninfer::memcpy_device_async(mtp_ids.slice(0, len - 1, 1).data,
+                                                         io_.token.data, sizeof(std::int32_t), s));
             }
-            qwen4_mtp_prefill_tp2(mtp_ids, xf, positions, rope_positions,
-                                  static_cast<std::uint32_t>(base_i + len),
-                                  is_last && mtp_proposal_extent_ != 0);
+            // A shifted token inside the chunk's Vision item enters the MTP layer as its merged
+            // embedding on both ranks (the MTP embedding projection is replicated).
+            qwen3_5::MtpVisualOverlap overlap;
+            if (vision_chunk.control != nullptr) {
+                overlap = qwen3_5::shifted_visual_overlap(vision_chunk.control->scatter_indices,
+                                                          alignment_tokens, window);
+            }
+            const Qwen4MtpVisual mtp_visual{
+                .merged       = {vision_chunk.embeddings, vision_chunk.peer_embeddings},
+                .columns      = overlap.destination_columns,
+                .source_begin = overlap.source_begin};
+            qwen4_mtp_prefill_tp2(
+                mtp_ids, xf, positions, rope_positions, static_cast<std::uint32_t>(base_i + len),
+                is_last && mtp_proposal_extent_ != 0, overlap.empty() ? nullptr : &mtp_visual);
         }
         if (split_rel > 0 && len == split_rel && rewrite_checkpoint_hidden_output_ != nullptr) {
             const Tensor checkpoint = xf[0].slice(1, len - 1, 1);
-            CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data, checkpoint.data,
-                                       checkpoint.bytes(), s));
+            CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data,
+                                                     checkpoint.data, checkpoint.bytes(), s));
             if (peer_rewrite_checkpoint_hidden_output_ != nullptr) {
                 // Rank 1 retains the same column of its own replicated residual (T66b): the
                 // MTP bridge resumes rank 1's half of the MTP head from it.
                 const Tensor peer_checkpoint = xf[1].slice(1, len - 1, 1);
-                require_shape(*peer_rewrite_checkpoint_hidden_output_, DType::BF16,
-                              {wide_rows, 1}, "rank 1 rewrite checkpoint hidden output");
+                require_shape(*peer_rewrite_checkpoint_hidden_output_, DType::BF16, {wide_rows, 1},
+                              "rank 1 rewrite checkpoint hidden output");
                 const ScopedCurrentDevice peer(execution.dev[1]->device);
                 CUDA_CHECK(::ninfer::memcpy_device_async(
                     peer_rewrite_checkpoint_hidden_output_->data, peer_checkpoint.data,
@@ -1077,7 +1288,7 @@ void TextContext::qwen4_ordinary_decode_tp2(const Tensor& ids, const Tensor& cac
             source.ne[2] != 1 || source.ne[3] != 1 || !source.is_contiguous() ||
             source.data == nullptr) {
             throw std::invalid_argument(std::string("tensor-parallel rank 1 ordinary ") + label +
-                                        " does not cover the batch");
+                                          " does not cover the batch");
         }
         return source.slice(0, 0, batch);
     };
@@ -1087,8 +1298,8 @@ void TextContext::qwen4_ordinary_decode_tp2(const Tensor& ids, const Tensor& cac
     const RankTensors rope{rope_positions, peer_window(frame.rope_positions, "RoPE positions")};
     const RankTensors rows{kv_table_rows, peer_window(frame.text_kv_table_rows, "KV rows")};
     const RankTensors sources{source_slots, peer_window(frame.state_source_slots, "source slots")};
-    const RankTensors destinations{
-        destination_slots, peer_window(frame.state_destination_slots, "destination slots")};
+    const RankTensors destinations{destination_slots,
+                                   peer_window(frame.state_destination_slots, "destination slots")};
     RankTensors ple_rows;
     if (config_.ple) {
         for (std::size_t r = 0; r < 2; ++r) {
@@ -1145,7 +1356,6 @@ void TextContext::qwen4_ordinary_decode_tp2(const Tensor& ids, const Tensor& cac
     tp_->work->reset();
 }
 
-
 // ---- MTP at tp 2 (T33) -------------------------------------------------------------------------
 
 Tensor TextContext::qwen4_ids_on_rank1(const Tensor& ids) {
@@ -1154,23 +1364,19 @@ Tensor TextContext::qwen4_ids_on_rank1(const Tensor& ids) {
     CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), ctx_.stream));
     const ScopedCurrentDevice rank1(tp_->execution->dev[1]->device);
     CUDA_CHECK(cudaStreamWaitEvent(rank_stream(1), events.inputs_ready(0), 0));
-    CUDA_CHECK(::ninfer::memcpy_device_async(out.data, ids.data, ids.bytes(),
-                               rank_stream(1)));
+    CUDA_CHECK(::ninfer::memcpy_device_async(out.data, ids.data, ids.bytes(), rank_stream(1)));
     return out;
 }
 
-void TextContext::qwen4_target_verify_tp2(const RankTensors& ids, const RankTensors& cache_positions,
-                                          const RankTensors& rope_positions,
-                                          const RankTensors& valid_columns,
-                                          const RankTensors& kv_table_rows,
-                                          const RankTensors& source_slots,
-                                          ops::CausalAttentionExecutionEnvelope envelope,
-                                          const RankTensors& hidden, Tensor& logits,
-                                          Tensor& target_tokens) {
+void TextContext::qwen4_target_verify_tp2(
+    const RankTensors& ids, const RankTensors& cache_positions, const RankTensors& rope_positions,
+    const RankTensors& valid_columns, const RankTensors& kv_table_rows,
+    const RankTensors& source_slots, ops::CausalAttentionExecutionEnvelope envelope,
+    const RankTensors& hidden, Tensor& logits, Tensor& target_tokens) {
     const std::array<const Qwen4Runtime*, 2> runtime{&qwen4_runtime(), &qwen4_peer_runtime()};
-    const std::int32_t W = ids[0].ne[0];
-    const std::int32_t B = ids[0].ne[1];
-    const std::int32_t T = W * B;
+    const std::int32_t W         = ids[0].ne[0];
+    const std::int32_t B         = ids[0].ne[1];
+    const std::int32_t T         = W * B;
     const std::int32_t wide_rows = dimension(config_.residual_width());
     const std::int32_t H         = dimension(config_.hidden_size);
     if (W < 2 || B <= 0 || B > static_cast<std::int32_t>(kMaximumConcurrency)) {
@@ -1188,7 +1394,8 @@ void TextContext::qwen4_target_verify_tp2(const RankTensors& ids, const RankTens
     RankTensors rows;
     if (config_.ple) {
         for (std::size_t r = 0; r < 2; ++r) {
-            if (runtime[r]->decode_ple_rows.data == nullptr || runtime[r]->decode_ple_rows.ne[1] < T) {
+            if (runtime[r]->decode_ple_rows.data == nullptr ||
+                runtime[r]->decode_ple_rows.ne[1] < T) {
                 throw std::logic_error("Qwen4Exp tp 2 verification has no PLE rows");
             }
             rows[r] = runtime[r]->decode_ple_rows.slice(1, 0, T);
@@ -1291,9 +1498,8 @@ void TextContext::qwen4_mtp_forward_decode_tp2(const Tensor& ids, const RankTens
                                .table_rows          = &kv_table_rows[r],
                                .max_visible         = envelope.max_visible_keys,
                                .prefill             = false},
-                .state      = {.kv      = &rank_mtp_cache(rank),
-                               .linear  = &rank_state(rank),
-                               .runtime = runtime[r]}};
+                .state      = {
+                         .kv = &rank_mtp_cache(rank), .linear = &rank_state(rank), .runtime = runtime[r]}};
     }
     Qwen4Forward<WorkspaceArena> forward(config_, ranks, kTensorParallelWidth,
                                          {tp_->execution, tp_->events}, T, T);
@@ -1317,7 +1523,9 @@ void TextContext::qwen4_mtp_propose_tp2(const RankTensors& hidden, Tensor& logit
         require_shape(hidden[r], DType::BF16, {wide_rows, B}, "tp 2 MTP proposal hidden");
     }
     require_shape(draft_tokens, DType::I32, {B}, "MTP proposal tokens");
-    if (proposal_head_ != nullptr) { throw std::logic_error("Qwen4Exp has no trimmed proposal head yet"); }
+    if (proposal_head_ != nullptr) {
+        throw std::logic_error("Qwen4Exp has no trimmed proposal head yet");
+    }
     const ExecutionContext& execution = *tp_->execution;
     const ScopedCurrentDevice device(ctx_.device);
     const auto ws = workspaces();
@@ -1368,12 +1576,10 @@ void TextContext::qwen4_mtp_propose_tp2(const RankTensors& hidden, Tensor& logit
                 workspace::tp_proposal_argmax(*ws[1], draft.peer_rows, 1)};
             const RankTensors column{x[0].slice(1, b, 1), x[1].slice(1, b, 1)};
             Tensor token = draft_tokens.slice(0, b, 1);
-            proposal_argmax_split(column, {&draft.prefix, &draft.peer},
-                                  {roots[0].partial, roots[1].partial},
-                                  {roots[0].local, roots[1].local},
-                                  {roots[0].candidates, roots[1].candidates},
-                                  {roots[0].staging, roots[1].staging}, token, ws,
-                                  *tp_->execution, *tp_->events);
+            proposal_argmax_split(
+                column, {&draft.prefix, &draft.peer}, {roots[0].partial, roots[1].partial},
+                {roots[0].local, roots[1].local}, {roots[0].candidates, roots[1].candidates},
+                {roots[0].staging, roots[1].staging}, token, ws, *tp_->execution, *tp_->events);
         }
         ops::proposal_remap_token_ids(draft_tokens, draft.token_ids, draft.rows(), ctx_.stream);
         return;
@@ -1391,7 +1597,8 @@ void TextContext::qwen4_mtp_propose_tp2(const RankTensors& hidden, Tensor& logit
 void TextContext::qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hidden,
                                         const RankTensors& positions,
                                         const RankTensors& rope_positions,
-                                        std::uint32_t max_visible, bool propose) {
+                                        std::uint32_t max_visible, bool propose,
+                                        const Qwen4MtpVisual* visual) {
     const std::array<const Qwen4Runtime*, 2> runtime{&qwen4_runtime(), &qwen4_peer_runtime()};
     const Qwen4MtpParameters* peer_mtp =
         rank_parameters(1).qwen4_mtp ? &*rank_parameters(1).qwen4_mtp : nullptr;
@@ -1410,7 +1617,8 @@ void TextContext::qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hi
                             static_cast<std::uint64_t>(T));
     const auto run = [&](const RankTensors& column_ids, const RankTensors& in, RankTensors& out,
                          const RankTensors& pos, const RankTensors& rope, std::int32_t count,
-                         bool append_only, std::uint32_t visible_keys) {
+                         bool append_only, std::uint32_t visible_keys,
+                         const RankTensors* embeddings) {
         std::array<Qwen4Rank<WorkspaceArena>, 2> ranks;
         for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
             const auto r = static_cast<std::size_t>(rank);
@@ -1426,53 +1634,88 @@ void TextContext::qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hi
                                    .cache_positions = &pos[r],
                                    .rope_positions  = &rope[r],
                                    .valid_columns   = nullptr,
-                                   .table_rows      = rank == 0 ? &io_.backend_kv_table_row
-                                                                : &tp_->backend_kv_table_row,
-                                   .max_visible     = visible_keys,
-                                   .prefill         = true},
+                                   .table_rows =
+                                rank == 0 ? &io_.backend_kv_table_row : &tp_->backend_kv_table_row,
+                                   .max_visible = visible_keys,
+                                   .prefill     = true},
                     .state      = {.kv      = &rank_mtp_cache(rank),
                                    .linear  = &rank_state(rank),
                                    .runtime = runtime[r]}};
         }
         Qwen4Forward<WorkspaceArena> forward(config_, ranks, kTensorParallelWidth,
                                              {tp_->execution, tp_->events}, count, count);
-        forward.run_mtp({qwen4_mtp_, peer_mtp}, column_ids, nullptr, in, out, append_only);
+        forward.run_mtp({qwen4_mtp_, peer_mtp}, column_ids, embeddings, in, out, append_only);
     };
     const Tensor ids1 = qwen4_ids_on_rank1(ids);
+    // Each rank's composed shifted input (multimodal chunks whose shifted window is visual).
+    auto visual_scope0 = work_.scope();
+    auto visual_scope1 = tp_->work->scope();
+    RankTensors embeddings;
+    if (visual != nullptr) {
+        for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            const ScopedCurrentDevice current(rank == 0 ? ctx_.device : execution.dev[1]->device);
+            embeddings[r] = ws[r]->alloc(DType::BF16, {dimension(config_.hidden_size), T});
+            compose_mtp_embeddings(rank == 0 ? ids : ids1,
+                                   rank_parameters(rank).text.token_embedding, visual->merged[r],
+                                   visual->columns, visual->source_begin, *ws[r], embeddings[r],
+                                   rank_stream(rank));
+        }
+    }
+    const auto inputs = [&](std::int32_t first, std::int32_t count, RankTensors& slot) {
+        if (visual == nullptr) { return static_cast<const RankTensors*>(nullptr); }
+        slot = {embeddings[0].slice(1, first, count), embeddings[1].slice(1, first, count)};
+        return static_cast<const RankTensors*>(&slot);
+    };
+    // Columns of each rank's RoPE positions (contiguous copies of three-axis ones).
+    const auto rope_of = [&](std::int32_t first, std::int32_t count) {
+        RankTensors out;
+        for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            const ScopedCurrentDevice current(rank == 0 ? ctx_.device : execution.dev[1]->device);
+            out[r] = rope_columns(rope_positions[r], first, count, *ws[r], rank_stream(rank));
+        }
+        return out;
+    };
     if (append > 0) {
         auto scope0 = work_.scope();
         auto scope1 = tp_->work->scope();
         RankTensors scratch{ws[0]->alloc(DType::BF16, {wide_rows, append}),
                             ws[1]->alloc(DType::BF16, {wide_rows, append})};
+        RankTensors slot;
         run({ids.slice(0, 0, append), ids1.slice(0, 0, append)},
             {hidden[0].slice(1, 0, append), hidden[1].slice(1, 0, append)}, scratch,
             {positions[0].slice(0, 0, append), positions[1].slice(0, 0, append)},
-            {rope_positions[0].slice(0, 0, append), rope_positions[1].slice(0, 0, append)}, append,
-            true, max_visible);
+            rope_of(0, append), append, true, max_visible, inputs(0, append, slot));
     }
     if (!propose) { return; }
     RankTensors ar_hidden{io_.mtp->ar_hidden, tp_->mtp->ar_hidden};
-    run({ids.slice(0, T - 1, 1), ids1.slice(0, T - 1, 1)},
-        {hidden[0].slice(1, T - 1, 1), hidden[1].slice(1, T - 1, 1)}, ar_hidden,
-        {positions[0].slice(0, T - 1, 1), positions[1].slice(0, T - 1, 1)},
-        {rope_positions[0].slice(0, T - 1, 1), rope_positions[1].slice(0, T - 1, 1)}, 1, false,
-        max_visible);
+    {
+        auto scope0 = work_.scope();
+        auto scope1 = tp_->work->scope();
+        RankTensors slot;
+        run({ids.slice(0, T - 1, 1), ids1.slice(0, T - 1, 1)},
+            {hidden[0].slice(1, T - 1, 1), hidden[1].slice(1, T - 1, 1)}, ar_hidden,
+            {positions[0].slice(0, T - 1, 1), positions[1].slice(0, T - 1, 1)}, rope_of(T - 1, 1),
+            1, false, max_visible, inputs(T - 1, 1, slot));
+    }
     Tensor logits = io_.logits.slice(1, 0, 1);
     Tensor draft0 = io_.mtp->draft_tokens.slice(0, 0, 1);
     qwen4_mtp_propose_tp2(ar_hidden, logits, draft0);
     // Autoregressive drafts: draft i at position (frontier + i) from draft i-1 and the previous
     // MTP hidden, each rank on its own position copy.
-    const RankTensors ar_position{io_.mtp->position.slice(0, 0, 1), tp_->mtp->position.slice(0, 0, 1)};
+    const RankTensors ar_position{io_.mtp->position.slice(0, 0, 1),
+                                  tp_->mtp->position.slice(0, 0, 1)};
     for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
         const ScopedCurrentDevice current(rank == 0 ? ctx_.device : execution.dev[1]->device);
         Tensor p = ar_position[static_cast<std::size_t>(rank)];
         ops::set_i32_scalar(p, static_cast<std::int32_t>(max_visible), rank_stream(rank));
     }
     for (int i = 1; i < static_cast<int>(mtp_proposal_extent_); ++i) {
-        auto scope0 = work_.scope();
-        auto scope1 = tp_->work->scope();
-        const Tensor previous = io_.mtp->draft_tokens.slice(0, i - 1, 1);
-        Tensor next           = io_.mtp->draft_tokens.slice(0, i, 1);
+        auto scope0            = work_.scope();
+        auto scope1            = tp_->work->scope();
+        const Tensor previous  = io_.mtp->draft_tokens.slice(0, i - 1, 1);
+        Tensor next            = io_.mtp->draft_tokens.slice(0, i, 1);
         const Tensor previous1 = qwen4_ids_on_rank1(previous);
         RankTensors rope, next_hidden;
         for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
@@ -1484,12 +1727,14 @@ void TextContext::qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hi
                                       rope[r], rank_stream(rank));
         }
         const auto visible = max_visible + static_cast<std::uint32_t>(i);
-        run({previous, previous1}, ar_hidden, next_hidden, ar_position, rope, 1, false, visible);
+        run({previous, previous1}, ar_hidden, next_hidden, ar_position, rope, 1, false, visible,
+            nullptr);
         qwen4_mtp_propose_tp2(next_hidden, logits, next);
         for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
             const auto r = static_cast<std::size_t>(rank);
             const ScopedCurrentDevice current(rank == 0 ? ctx_.device : execution.dev[1]->device);
-            CUDA_CHECK(::ninfer::memcpy_device_async(ar_hidden[r].data, next_hidden[r].data, ar_hidden[r].bytes(), rank_stream(rank)));
+            CUDA_CHECK(::ninfer::memcpy_device_async(ar_hidden[r].data, next_hidden[r].data,
+                                                     ar_hidden[r].bytes(), rank_stream(rank)));
             Tensor p = ar_position[r];
             ops::increment_i32_scalar(p, rank_stream(rank));
         }
@@ -1500,8 +1745,9 @@ void TextContext::qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hi
 // column and its autoregressive proposal steps), as qwen4_mtp_forward_batch at one device: each
 // rank appends its MTP QSA heads' K/V on its own prefill MTP KV row and runs its expert partition
 // from its own copy of the target hidden; with `logits_column` >= 0 rank 0 proposes from that
-// column through qwen4_mtp_propose_tp2. `rope_positions` are each rank's [T] or [T,3] positions
-// (the Text RoPE of this architecture is 1-D: axis 0).
+// column through qwen4_mtp_propose_tp2. `rope_positions` are each rank's [T] positions or, for one
+// visual bridge column, its [1,3] three-axis position. `input_embeddings` (rank 0's BF16 [H,T])
+// replaces embed(ids) on both ranks: rank 1 runs from its own copy.
 void TextContext::qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTensors& hidden,
                                               const RankTensors& positions,
                                               const RankTensors& rope_positions,
@@ -1516,26 +1762,28 @@ void TextContext::qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTenso
         !batch_mtp_kv_->has_qsa_index() || tp_->mtp == nullptr) {
         throw std::logic_error("Qwen4Exp tp 2 MTP forward requires both ranks' MTP layers");
     }
-    if (input_embeddings != nullptr) {
-        throw std::invalid_argument("Qwen4Exp MTP takes token embeddings only (no image input)");
-    }
     const std::int32_t T         = ids.ne[0];
     const std::int32_t wide_rows = dimension(config_.residual_width());
     if (T <= 0 || static_cast<std::uint32_t>(T) > prefill_chunk_ || logits_column >= T) {
         throw std::invalid_argument("Qwen4Exp MTP batch columns are outside [1,prefill_chunk]");
     }
     require_shape(ids, DType::I32, {T}, "tp 2 MTP ids");
+    if (input_embeddings != nullptr) {
+        require_shape(*input_embeddings, DType::BF16, {dimension(config_.hidden_size), T},
+                      "tp 2 MTP input embeddings");
+    }
     RankTensors rope;
     for (std::size_t r = 0; r < 2; ++r) {
         require_shape(positions[r], DType::I32, {T}, "tp 2 MTP positions");
         require_shape(hidden[r], DType::BF16, {wide_rows, T}, "tp 2 MTP hidden");
         require_shape(mtp_hidden[r], DType::BF16, {wide_rows, T}, "tp 2 MTP output hidden");
         const Tensor& given = rope_positions[r];
-        if (given.dtype != DType::I32 || given.ne[0] != T || (given.ne[1] != 1 && given.ne[1] != 3) ||
-            given.ne[2] != 1 || given.ne[3] != 1 || !given.is_contiguous() || given.data == nullptr) {
-            throw std::invalid_argument("tp 2 MTP RoPE positions must be [T] or [T,3]");
+        if (given.dtype != DType::I32 || given.ne[0] != T ||
+            (given.ne[1] != 1 && !(given.ne[1] == 3 && T == 1)) || given.ne[2] != 1 ||
+            given.ne[3] != 1 || !given.is_contiguous() || given.data == nullptr) {
+            throw std::invalid_argument("tp 2 MTP RoPE positions must be [T] or [1,3]");
         }
-        rope[r] = given.ne[1] == 3 ? given.slice(1, 0, 1).view({T}) : given.view({T});
+        rope[r] = given.ne[1] == 3 ? given.view({1, 3}) : given.view({T});
     }
     if (logits_column >= 0 && (logits == nullptr || draft_token == nullptr)) {
         throw std::invalid_argument("Qwen4Exp MTP logits and draft outputs are required");
@@ -1548,6 +1796,18 @@ void TextContext::qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTenso
     nvtx::ScopedRange range(nvtx::Name::MtpForward, nvtx::Category::Mtp,
                             static_cast<std::uint64_t>(T));
     const Tensor ids1 = qwen4_ids_on_rank1(ids);
+    RankTensors embeddings;
+    if (input_embeddings != nullptr) {
+        // Rank 1's copy, ordered after rank 0's stream as the ids' (staged by the driver).
+        embeddings[0] = *input_embeddings;
+        embeddings[1] = tp_->work->alloc(DType::BF16, {dimension(config_.hidden_size), T});
+        const ops::PeerEvents& events = *tp_->events;
+        CUDA_CHECK(cudaEventRecord(events.inputs_ready(0), ctx_.stream));
+        const ScopedCurrentDevice rank1(execution.dev[1]->device);
+        CUDA_CHECK(cudaStreamWaitEvent(rank_stream(1), events.inputs_ready(0), 0));
+        CUDA_CHECK(::ninfer::memcpy_device_async(embeddings[1].data, embeddings[0].data,
+                                                 embeddings[0].bytes(), rank_stream(1)));
+    }
     {
         std::array<Qwen4Rank<WorkspaceArena>, 2> ranks;
         for (int rank = 0; rank < kTensorParallelWidth; ++rank) {
@@ -1564,10 +1824,10 @@ void TextContext::qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTenso
                                    .cache_positions = &positions[r],
                                    .rope_positions  = &rope[r],
                                    .valid_columns   = nullptr,
-                                   .table_rows      = rank == 0 ? &io_.backend_kv_table_row
-                                                                : &tp_->backend_kv_table_row,
-                                   .max_visible     = envelope.max_visible_keys,
-                                   .prefill         = true},
+                                   .table_rows =
+                                rank == 0 ? &io_.backend_kv_table_row : &tp_->backend_kv_table_row,
+                                   .max_visible = envelope.max_visible_keys,
+                                   .prefill     = true},
                     .state      = {.kv      = &rank_mtp_cache(rank),
                                    .linear  = &rank_state(rank),
                                    .runtime = runtime[r]}};
@@ -1575,7 +1835,8 @@ void TextContext::qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTenso
         Qwen4Forward<WorkspaceArena> forward(config_, ranks, kTensorParallelWidth,
                                              {tp_->execution, tp_->events}, T, T);
         RankTensors out = mtp_hidden;
-        forward.run_mtp({qwen4_mtp_, peer_mtp}, {ids, ids1}, nullptr, hidden, out, false);
+        forward.run_mtp({qwen4_mtp_, peer_mtp}, {ids, ids1},
+                        input_embeddings != nullptr ? &embeddings : nullptr, hidden, out, false);
     }
     if (logits_column >= 0) {
         const RankTensors column{mtp_hidden[0].slice(1, logits_column, 1),

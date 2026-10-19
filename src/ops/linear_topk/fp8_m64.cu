@@ -164,8 +164,8 @@ __launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void fp8_m64_l
                 cp_commit();
             }
 
-            const auto load_fragments = [&](int k_step, unsigned(&a)[4],
-                                            unsigned(&b)[kTokenMmas][2]) {
+            const auto load_fragments = [&](int k_step, unsigned (&a)[4],
+                                            unsigned (&b)[kTokenMmas][2]) {
                 const int weight_row = warp_row * 16 + a_rowoff;
                 const int weight_col = k_step * 16 + a_coloff;
                 ldmatrix_x4(

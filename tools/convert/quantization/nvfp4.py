@@ -38,9 +38,7 @@ def weight_divisor(amax: float, targets: Sequence[float]) -> float:
         raise ValueError("NVFP4 targets must lie in (0, 6]")
     if not amax > 0.0 or amax != amax or amax == float("inf"):
         return 1.0
-    divisor = struct.unpack(
-        "<f", struct.pack("<f", E4M3FN_MAX * min(targets) / float(amax))
-    )[0]
+    divisor = struct.unpack("<f", struct.pack("<f", E4M3FN_MAX * min(targets) / float(amax)))[0]
     if not 0.0 < divisor < float("inf"):
         raise ValueError("NVFP4 weight divisor is not a finite positive binary32 value")
     return divisor
@@ -61,9 +59,7 @@ def _decode_e4m3fn(words: torch.Tensor) -> torch.Tensor:
     return words.view(torch.float8_e4m3fn).to(torch.float32)
 
 
-def quantize_nvfp4(
-    values: torch.Tensor, divisor: float, targets: Sequence[float] = (E2M1_MAX,)
-) -> Nvfp4Words:
+def quantize_nvfp4(values: torch.Tensor, divisor: float, targets: Sequence[float] = (E2M1_MAX,)) -> Nvfp4Words:
     """Quantize floating ``[rows, K]`` values with a fixed matrix divisor."""
 
     if values.dim() != 2 or values.shape[1] % GROUP or values.shape[0] <= 0:
@@ -91,11 +87,7 @@ def quantize_nvfp4(
         step = torch.where(live, scale / d, torch.ones_like(scale))
         normalized = torch.clamp(magnitude / step[..., None], max=E2M1_MAX)
         code = torch.where(live[..., None], round_e2m1(normalized), 0)
-        error = (
-            (magnitudes[code.long()] * step[..., None] * live[..., None] - magnitude)
-            .square()
-            .sum(dim=-1)
-        )
+        error = (magnitudes[code.long()] * step[..., None] * live[..., None] - magnitude).square().sum(dim=-1)
         if best_error is None:
             best_error, best_codes, best_scales = error, code, scale_words
         else:

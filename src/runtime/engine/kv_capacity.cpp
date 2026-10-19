@@ -97,16 +97,16 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
         }
         capacity_budget -= policy.automatic_headroom_bytes;
         if (capacity_budget < curve.minimum_device_reservation_bytes) {
-            const std::size_t required_total = checked_add(
-                curve.minimum_device_reservation_bytes, policy.automatic_headroom_bytes,
-                "automatic KV capacity requirement overflows size_t");
+            const std::size_t required_total =
+                checked_add(curve.minimum_device_reservation_bytes, policy.automatic_headroom_bytes,
+                            "automatic KV capacity requirement overflows size_t");
             throw std::invalid_argument(
                 "automatic KV capacity requires " + std::to_string(required_total) +
                 " bytes total (" + std::to_string(curve.minimum_device_reservation_bytes) +
                 " bytes minimum Engine runtime reservation + " +
                 std::to_string(policy.automatic_headroom_bytes) +
-                " bytes automatic headroom), but only " +
-                std::to_string(available_runtime_bytes) + " bytes are available after weights");
+                " bytes automatic headroom), but only " + std::to_string(available_runtime_bytes) +
+                " bytes are available after weights");
         }
         if (curve.minimum_main_page_groups < curve.maximum_main_page_groups) {
             const std::size_t additional =

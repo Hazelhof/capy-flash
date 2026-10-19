@@ -98,9 +98,9 @@ context_query_stage_v_tile(__half* dst, const __half* context, const __nv_bfloat
     constexpr int VecsPerRow = kContextQueryHeadDim / 8;
     if (query_tile) {
         for (int chunk = tid; chunk < KeyBlock * VecsPerRow; chunk += Threads) {
-            const int row                = chunk / VecsPerRow;
-            const int d                  = (chunk - row * VecsPerRow) * 8;
-            const bool live              = row < valid_keys;
+            const int row   = chunk / VecsPerRow;
+            const int d     = (chunk - row * VecsPerRow) * 8;
+            const bool live = row < valid_keys;
             const std::int64_t src_index =
                 context_query_query_kv_index<KVHeads>(kv_head, d, live ? row : 0);
             const int4 values = live ? bf16x8_bits_to_f16x8_bits(load_vec<int4>(query + src_index))
@@ -174,8 +174,8 @@ __device__ __forceinline__ void context_query_split_partial_body(
         partial_l += StatElements * split_capacity * batch;
     }
     const int valid = valid_columns[batch];
-    if (kv_head >= KVHeads || split >= split_capacity || length < 0 ||
-        length > max_context || valid < 0 || valid > Tokens) {
+    if (kv_head >= KVHeads || split >= split_capacity || length < 0 || length > max_context ||
+        valid < 0 || valid > Tokens) {
         return;
     }
     if (valid == 0) {

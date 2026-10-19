@@ -828,7 +828,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`: `8`) |
-| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192`; at `--tp 2` `0` unless set (`--profile 27b`: `8192`) |
+| `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192`; at `--tp 2` `0` unless set (`--profile 27b`: `8192`, `--profile flash-next`: `4096`) |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
@@ -907,8 +907,22 @@ rank 0's half followed by rank 1's, and each GPU copies its own half on its own 
 the RAM cost per token is the same as on one GPU. They are off unless asked for: an omitted
 `--host-state-slots` or `--host-kv-mib` becomes `0` (on Qwen3.8-Flash-Next the routed experts
 already pin most of the RAM and the PLE table is read through the page cache); `--profile 27b`
-sets `--host-state-slots 8 --host-kv-mib 8192`. With them, a checkpoint that no longer fits on the
-GPUs moves to RAM and comes back when its conversation resumes, as on one GPU. Without them, every
+sets `--host-state-slots 8 --host-kv-mib 8192`, `--profile flash-next` sets `--host-kv-mib 4096`.
+With them, a checkpoint that no longer fits on the GPUs moves to RAM and comes back when its
+conversation resumes, as on one GPU.
+
+With `--elastic` (Qwen3.8-Flash-Next) and a Host KV tier, the GPUs keep only the KV of the
+requests being answered: once a request decodes, the KV of every idle retained conversation moves
+to RAM, the remaining KV pages are packed at the start of the pool, and the VRAM they leave goes
+back to routed-expert slots at once (the log line `idle KV to Host` reports each move). A
+conversation that resumes is copied back to the GPUs before its prompt, taking the slots it needs
+then. When the Host KV tier has no room for a conversation, idle conversations already in RAM are
+dropped, least valuable first; one that still does not fit stays on the GPUs. The flash-next default
+of 4 GiB holds about two idle conversations of 80k tokens (22.5 KB of KV per token over both
+GPUs, Main and MTP); each GiB is pinned and comes out of the page cache the CPU experts' PLE rows
+are read from (measured on the T71 agentic replay: 4 GiB cost +0.8 GB of disk reads and +0.6 s of
+PLE gathers over 53 turns, against about 5 s of decode saved; 8 GiB added the same again with no
+further gain). Without them, every
 checkpoint lives in a Device StateImage, and the defaults raise the Device checkpoint pool
 and the private catalog to `max(2 * max-concurrency, 8)`. Without a Host tier, a private checkpoint
 captured during prefill (the turn-closure point a follow-up turn resumes from, a long-prompt anchor)

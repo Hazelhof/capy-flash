@@ -193,7 +193,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
     }
 
     __syncthreads();
-    auto* partial = shared.partial;
+    auto* partial         = shared.partial;
     const auto partial_at = [&](int split, int tile, int token_mma) {
         return partial + (((split * kRowTiles + tile) * kTokenMmas + token_mma) * 32 + lane) * 4;
     };
@@ -203,9 +203,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                 const auto& accumulator = accumulators[tile][token_mma];
-                store_vec(partial_at(warp, tile, token_mma),
-                          make_float4(accumulator[0], accumulator[1], accumulator[2],
-                                      accumulator[3]));
+                store_vec(
+                    partial_at(warp, tile, token_mma),
+                    make_float4(accumulator[0], accumulator[1], accumulator[2], accumulator[3]));
             }
         }
     }

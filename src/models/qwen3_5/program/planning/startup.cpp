@@ -129,7 +129,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
     // The split DFlash2 drafter at tp 2 keeps its state on both ranks, each ring holding the
     // rank's KV heads (execution/tp2/draft_split.h); otherwise the drafter is rank 0's alone.
     const bool split_drafter = plan.tp != 1 && dflash2_drafter_split_tp2(plan);
-    const bool drafter = plan.features.masked_draft() && (rank_index == 0 || split_drafter);
+    const bool drafter       = plan.features.masked_draft() && (rank_index == 0 || split_drafter);
 
     if (!plan.context_cache.device_state_slots) {
         throw std::logic_error("Qwen3.5 context cache options are not normalized");
@@ -161,19 +161,20 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
     const std::int32_t carried_hidden =
         config.qwen4() ? dimension(config.residual_width()) : dimension(config.hidden_size);
     out.decoder = qwen3_5::plan_decoder_state(
-        builder, qwen3_5::DecoderStateSpec{
-                     .full_attention_layers     = config.full_attention_layers,
-                     .mtp_layers                = 1,
-                     .capacity                  = plan.capacity,
-                     .kv_heads                  = dimension(rank.attention->num_key_value_heads),
-                     .attention_head_dim        = dimension(config.attention->head_dim),
-                     .kv_storage                = plan.kv_storage,
-                     .enable_mtp                = plan.features.mtp(),
-                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
-                     .text_physical_page_groups = physical_pages,
-                     .mtp_physical_page_groups  = mtp_physical_pages,
-                     .qsa_index                 = config.qwen4(),
-                 },
+        builder,
+        qwen3_5::DecoderStateSpec{
+            .full_attention_layers     = config.full_attention_layers,
+            .mtp_layers                = 1,
+            .capacity                  = plan.capacity,
+            .kv_heads                  = dimension(rank.attention->num_key_value_heads),
+            .attention_head_dim        = dimension(config.attention->head_dim),
+            .kv_storage                = plan.kv_storage,
+            .enable_mtp                = plan.features.mtp(),
+            .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+            .text_physical_page_groups = physical_pages,
+            .mtp_physical_page_groups  = mtp_physical_pages,
+            .qsa_index                 = config.qwen4(),
+        },
         elastic ? &elastic_builder : nullptr);
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
@@ -193,9 +194,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
         // One PLE layer: (kernel-1)*dilation previous normalized gated columns of the wide width.
         state_image_spec.ple = qwen3_5::PleStateSpec{
             .layers = 1U,
-            .rows   = checked_i32(std::uint64_t(config.ple->conv_history()) *
-                                      config.residual_width(),
-                                  "Qwen4Exp PLE state rows exceed int32")};
+            .rows = checked_i32(std::uint64_t(config.ple->conv_history()) * config.residual_width(),
+                                "Qwen4Exp PLE state rows exceed int32")};
     }
     {
         const auto* draft =
@@ -204,8 +204,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
             state_image_spec.dflash_local = qwen3_5::DFlashLocalStateSpec{
                 .layers   = draft->local_layer_count(),
                 .capacity = draft->sliding_window.value_or(0),
-                .kv_heads = dimension(draft->attention.num_key_value_heads) /
-                            (split_drafter ? plan.tp : 1),
+                .kv_heads =
+                    dimension(draft->attention.num_key_value_heads) / (split_drafter ? plan.tp : 1),
                 .head_dim = dimension(draft->attention.head_dim),
             };
         }
@@ -295,14 +295,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
         plan.qwen4_base_chunk > 0
             ? static_cast<std::int32_t>(std::min(plan.qwen4_base_chunk, plan.capacity))
             : effective_prefill_chunk;
-    out.prefill_hidden =
-        add_tensor(builder, DType::BF16, {carried_hidden, prefill_hidden_columns},
-                   "step prefill hidden");
+    out.prefill_hidden = add_tensor(builder, DType::BF16, {carried_hidden, prefill_hidden_columns},
+                                    "step prefill hidden");
     if (plan.causal_scoring) {
-        out.score_hidden =
-            add_tensor(builder, DType::BF16,
-                       {carried_hidden, static_cast<std::int32_t>(kCausalScoreTile)},
-                       "causal score hidden staging");
+        out.score_hidden = add_tensor(builder, DType::BF16,
+                                      {carried_hidden, static_cast<std::int32_t>(kCausalScoreTile)},
+                                      "causal score hidden staging");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
@@ -318,9 +316,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
     }
     if (config.qwen4()) {
         Qwen4PersistentLayout& q = out.qwen4.emplace();
-        const auto experts = dimension(std::get<MoeConfig>(config.ffn).num_experts);
-        const auto layers  = dimension(config.num_hidden_layers);
-        q.expert_table     = add_tensor(builder, DType::I32, {experts}, "Qwen4Exp expert table");
+        const auto experts       = dimension(std::get<MoeConfig>(config.ffn).num_experts);
+        const auto layers        = dimension(config.num_hidden_layers);
+        q.expert_table = add_tensor(builder, DType::I32, {experts}, "Qwen4Exp expert table");
         const bool speculative = plan.speculative_backend != SpeculativeBackend::None;
         const auto window = static_cast<std::int32_t>(speculative ? plan.draft_window + 1U : 1U);
         if (config.ple && !plan.causal_scoring) {
@@ -337,7 +335,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                                        static_cast<std::int32_t>(plan.max_concurrency)},
                                       "Qwen4Exp PLE speculative record");
         }
-        const bool mtp = plan.speculative_backend == SpeculativeBackend::Mtp && parameters.qwen4_mtp;
+        const bool mtp =
+            plan.speculative_backend == SpeculativeBackend::Mtp && parameters.qwen4_mtp;
         if (mtp && parameters.qwen4_mtp->uniform_gate_up_divisor > 0.0F) {
             q.mtp_gate_up_divisors =
                 add_tensor(builder, DType::FP32, {2 * experts}, "Qwen4Exp MTP gate/up divisors");
@@ -345,51 +344,55 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                 add_tensor(builder, DType::FP32, {experts}, "Qwen4Exp MTP down divisors");
         }
         if (plan.qwen4_experts.backend == RoutedExpertBackend::Offload) {
-            q.expert_slots = static_cast<std::int32_t>(plan.qwen4_experts.slots_per_layer);
-            q.elastic_columns =
-                q.expert_slots > 0 ? static_cast<std::int32_t>(plan.qwen4_experts.elastic_columns) : 0;
+            q.expert_slots    = static_cast<std::int32_t>(plan.qwen4_experts.slots_per_layer);
+            q.elastic_columns = q.expert_slots > 0
+                                    ? static_cast<std::int32_t>(plan.qwen4_experts.elastic_columns)
+                                    : 0;
             // The offload backend serves the MTP layer as one more cache layer.
             q.cache_layers = layers + (mtp ? 1 : 0);
         }
         if (q.expert_slots > 0) {
             const auto cache_layers = q.cache_layers;
-            q.cache_table = add_tensor(
-                builder, DType::I32,
-                {checked_i32(std::uint64_t(cache_layers) * std::uint64_t(experts),
-                             "Qwen4Exp expert table exceeds int32")},
-                "Qwen4Exp expert slot table");
+            q.cache_table =
+                add_tensor(builder, DType::I32,
+                           {checked_i32(std::uint64_t(cache_layers) * std::uint64_t(experts),
+                                        "Qwen4Exp expert table exceeds int32")},
+                           "Qwen4Exp expert slot table");
             q.cache_divisors = add_tensor(
                 builder, DType::FP32,
                 {checked_i32(std::uint64_t(cache_layers) *
                                  std::uint64_t(execution::Qwen4OffloadExperts::kDivisorsPerLayer),
                              "Qwen4Exp expert divisors exceed int32")},
                 "Qwen4Exp expert divisors");
-            q.cache_reads = add_tensor(builder, DType::I32,
-                                       {ops::kMoeSlotsTopK * ops::kMoeSlotsMaxTokens},
-                                       "Qwen4Exp expert device reads");
+            q.cache_reads =
+                add_tensor(builder, DType::I32, {ops::kMoeSlotsTopK * ops::kMoeSlotsMaxTokens},
+                           "Qwen4Exp expert device reads");
             // Rank 0's residency mirror (the CPU path's publish) and rank 1's (its miss-split
             // share, T42): ~100 KB each.
             if (plan.tp == 2) {
-                q.cache_mirror = add_tensor(
-                    builder, DType::I32,
-                    {checked_i32(std::uint64_t(cache_layers) * std::uint64_t(experts),
-                                 "Qwen4Exp expert mirror exceeds int32")},
-                    "Qwen4Exp expert residency mirror");
+                q.cache_mirror =
+                    add_tensor(builder, DType::I32,
+                               {checked_i32(std::uint64_t(cache_layers) * std::uint64_t(experts),
+                                            "Qwen4Exp expert mirror exceeds int32")},
+                               "Qwen4Exp expert residency mirror");
             }
-            q.cache_stream_tables = add_tensor(
-                builder, DType::I32,
-                {checked_i32(std::uint64_t(layers) * std::uint64_t(experts),
-                             "Qwen4Exp expert stream tables exceed int32")},
-                "Qwen4Exp expert stream tables");
+            q.cache_stream_tables =
+                add_tensor(builder, DType::I32,
+                           {checked_i32(std::uint64_t(layers) * std::uint64_t(experts),
+                                        "Qwen4Exp expert stream tables exceed int32")},
+                           "Qwen4Exp expert stream tables");
             if (execution::staged_miss_split(plan.qwen4_experts)) {
                 // Staged GPU share of the misses (T18): scratch slots, their table, the pick list.
-                q.stage_table = add_tensor(builder, DType::I32, {experts}, "Qwen4Exp miss split table");
+                q.stage_table =
+                    add_tensor(builder, DType::I32, {experts}, "Qwen4Exp miss split table");
                 q.stage_picks = add_tensor(builder, DType::I32, {execution::kMissSplitSlots + 1},
                                            "Qwen4Exp miss split picks");
-                const auto planes = execution::Qwen4OffloadExperts::pool_plane_bytes(1, execution::kMissSplitSlots);
+                const auto planes =
+                    execution::Qwen4OffloadExperts::pool_plane_bytes(1, execution::kMissSplitSlots);
                 for (std::size_t plane = 0; plane < planes.size(); ++plane) {
-                    q.stage_pool[plane] = builder.add(static_cast<std::size_t>(planes[plane]), kArenaAlign,
-                                                      "Qwen4Exp miss split scratch slots");
+                    q.stage_pool[plane] =
+                        builder.add(static_cast<std::size_t>(planes[plane]), kArenaAlign,
+                                    "Qwen4Exp miss split scratch slots");
                 }
             }
             // T25 prefetch: staging slots after the cache's slots, and their bookkeeping.
@@ -398,11 +401,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                 q.prefetch_tags  = add_tensor(builder, DType::I32, {q.staging_slots},
                                               "Qwen4Exp prefetch staging tags");
                 q.prefetch_epoch = add_tensor(builder, DType::I32, {1}, "Qwen4Exp prefetch epoch");
-                q.prefetch_rows  = add_tensor(
-                    builder, DType::I32,
-                    {checked_i32(std::uint64_t(layers) * std::uint64_t(experts),
-                                 "Qwen4Exp prefetch rows exceed int32")},
-                    "Qwen4Exp prefetch effective slot rows");
+                q.prefetch_rows =
+                    add_tensor(builder, DType::I32,
+                               {checked_i32(std::uint64_t(layers) * std::uint64_t(experts),
+                                            "Qwen4Exp prefetch rows exceed int32")},
+                               "Qwen4Exp prefetch effective slot rows");
                 q.prefetch_workspace = builder.add(ops::moe_predict_workspace_bytes(), kArenaAlign,
                                                    "Qwen4Exp prefetch predictor workspace");
             }
@@ -411,8 +414,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                 cache_layers, q.expert_slots + q.elastic_columns, q.staging_slots);
             for (std::size_t plane = 0; plane < planes.size(); ++plane) {
                 q.cache_pool[plane] = (elastic ? elastic_builder : builder)
-                                          .add(static_cast<std::size_t>(planes[plane]),
-                                               kArenaAlign, "Qwen4Exp expert slot pool");
+                                          .add(static_cast<std::size_t>(planes[plane]), kArenaAlign,
+                                               "Qwen4Exp expert slot pool");
                 q.cache_pool_bytes += static_cast<std::size_t>(planes[plane]);
             }
         }
@@ -428,8 +431,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
         }
         if (mtp && shortlist && plan.draft_split && rank_index == 1) {
             q.draft_extra    = shortlist_rows / 2;
-            const auto bytes = execution::q6_row_plane_bytes(parameters.text.output_head.weight);
+            const auto bytes = execution::draft_row_plane_bytes(parameters.text.output_head.weight);
             for (std::size_t p = 0; p < bytes.size(); ++p) {
+                if (bytes[p] == 0) { continue; } // a BF16 head has one plane
                 q.draft_planes[p] = builder.add(bytes[p] * static_cast<std::size_t>(q.draft_extra),
                                                 kArenaAlign, "Qwen4Exp draft shortlist head rows");
             }
@@ -440,8 +444,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
             q.draft_ids    = add_tensor(builder, DType::I32, {q.draft_prefix + q.draft_extra},
                                         "Qwen4Exp draft shortlist token IDs");
             if (q.draft_extra > 0) {
-                const auto bytes = execution::q6_row_plane_bytes(parameters.text.output_head.weight);
+                const auto bytes =
+                    execution::draft_row_plane_bytes(parameters.text.output_head.weight);
                 for (std::size_t p = 0; p < bytes.size(); ++p) {
+                    if (bytes[p] == 0) { continue; } // a BF16 head has one plane
                     q.draft_planes[p] =
                         builder.add(bytes[p] * static_cast<std::size_t>(q.draft_extra), kArenaAlign,
                                     "Qwen4Exp draft shortlist head rows");
@@ -449,7 +455,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
             }
         }
     }
-    out.bytes = builder.finish(kArenaAlign, "persistent layout");
+    out.bytes         = builder.finish(kArenaAlign, "persistent layout");
     out.elastic_bytes = elastic ? elastic_builder.finish(kArenaAlign, "elastic layout") : 0;
     out.kv_payload_bytes =
         out.decoder.kv_payload_bytes() + (out.dflash ? out.dflash->kv_payload_bytes() : 0);
@@ -570,9 +576,9 @@ std::size_t dflash_proposal_workspace(const SequencePlanImpl& plan, std::int32_t
         reserve_matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
         reserve_matrix(layout, DType::FP32, dimension(draft.dflash2->selector_top_k), mask_columns);
         reserve_scratch(layout, plan.tp != 1 ? dflash2_candidates_workspace_tp2(plan, mask_columns)
-                                              : ops::linear_topk_workspace_capacity_bytes(
-                                                    head.weight.qtype, head.weight.n, head.weight.k,
-                                                    mask_columns, mask_columns));
+                                             : ops::linear_topk_workspace_capacity_bytes(
+                                                   head.weight.qtype, head.weight.n, head.weight.k,
+                                                   mask_columns, mask_columns));
         reserve_matrix(layout, DType::BF16, dimension(draft.dflash2->selector_rank), mask_columns);
         reserve_linear(layout, parameters.draft->selector->hidden_projection, mask_columns,
                        mask_columns);
@@ -670,11 +676,11 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
         chunk_u32 > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("sequence workspace dimensions are invalid");
     }
-    using Layouts      = std::array<WorkspaceLayoutBuilder, 2>;
-    const auto chunk   = static_cast<std::int32_t>(chunk_u32);
-    const auto H       = dimension(config.hidden_size);
-    const auto wide    = dimension(config.residual_width());
-    const auto vocab   = dimension(config.vocab_size);
+    using Layouts              = std::array<WorkspaceLayoutBuilder, 2>;
+    const auto chunk           = static_cast<std::int32_t>(chunk_u32);
+    const auto H               = dimension(config.hidden_size);
+    const auto wide            = dimension(config.residual_width());
+    const auto vocab           = dimension(config.vocab_size);
     const auto rank_parameters = [&](int rank) -> const execution::Parameters& {
         return rank == 0 ? parameters : *plan.peer_parameters;
     };
@@ -693,9 +699,8 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto linear_scratch = [&](WorkspaceLayoutBuilder& layout,
                                     const execution::LinearParameters& p, int first, int last) {
-        reserve_scratch(layout, ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n,
-                                                                     p.weight.k, p.policy, first,
-                                                                     last));
+        reserve_scratch(layout, ops::linear_workspace_capacity_bytes(
+                                    p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last));
     };
     // One forward phase over W columns of B lanes (prefill: W = chunk, B = 1) on every rank.
     const auto make = [&](Layouts& layout, bool prefill, std::int32_t width, std::int32_t batch,
@@ -707,17 +712,18 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
         columns.prefill     = prefill;
         std::array<execution::Qwen4Rank<WorkspaceLayoutBuilder>, 2> rank_operands;
         for (int r = 0; r < ranks; ++r) {
-            rank_operands[static_cast<std::size_t>(r)] = execution::Qwen4Rank<WorkspaceLayoutBuilder>{
-                .config     = &shard,
-                .parameters = &rank_parameters(r),
-                .work       = &layout[static_cast<std::size_t>(r)],
-                .columns    = columns};
+            rank_operands[static_cast<std::size_t>(r)] =
+                execution::Qwen4Rank<WorkspaceLayoutBuilder>{
+                    .config     = &shard,
+                    .parameters = &rank_parameters(r),
+                    .work       = &layout[static_cast<std::size_t>(r)],
+                    .columns    = columns};
         }
         return execution::Qwen4Forward<WorkspaceLayoutBuilder>(config, rank_operands, ranks, {},
                                                                first, last);
     };
-    const auto forward = [&](Layouts& layout, bool prefill, std::int32_t width,
-                             std::int32_t batch, std::int32_t first, std::int32_t last) {
+    const auto forward = [&](Layouts& layout, bool prefill, std::int32_t width, std::int32_t batch,
+                             std::int32_t first, std::int32_t last) {
         auto f = make(layout, prefill, width, batch, first, last);
         std::array<Tensor, 2> none{};
         std::array<Tensor, 2> out{};
@@ -752,12 +758,11 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto mtp = [&](Layouts& layout, bool prefill, std::int32_t width, std::int32_t batch,
                          bool append_only, std::int32_t first = 0) {
-        auto f = make(layout, prefill, width, batch, first > 0 ? first : width * batch,
-                      width * batch);
+        auto f =
+            make(layout, prefill, width, batch, first > 0 ? first : width * batch, width * batch);
         std::array<Tensor, 2> none{}, out{};
-        f.run_mtp({&*parameters.qwen4_mtp,
-                   tp2 ? &*plan.peer_parameters->qwen4_mtp : nullptr},
-                  none, nullptr, none, out, append_only);
+        f.run_mtp({&*parameters.qwen4_mtp, tp2 ? &*plan.peer_parameters->qwen4_mtp : nullptr}, none,
+                  nullptr, none, out, append_only);
     };
     const auto public_tokens = dimension(parameters.model.resources().public_token_count);
     const bool mtp_enabled   = plan.speculative_backend == SpeculativeBackend::Mtp;
@@ -767,13 +772,19 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
         throw std::logic_error("Qwen4Exp MTP workspace plan has no MTP Parameters");
     }
 
+    // With Vision a prompt chunk carries three-axis RoPE positions and its visual scatter indices
+    // on every rank, and its MTP alignment the composed shifted input (qwen4_text.cpp).
+    const bool vision = plan.features.vision;
     WorkspacePlan out;
     {
         Layouts text_prefill;
-        matrix(text_prefill, DType::I32, 1, chunk); // ids
-        matrix(text_prefill, DType::I32, 1, chunk); // positions
-        matrix(text_prefill, DType::I32, 1, chunk); // RoPE positions (rope delta)
-        if (config.ple) { matrix(text_prefill, DType::BF16, dimension(config.ple->embed_dim), chunk); }
+        matrix(text_prefill, DType::I32, 1, chunk);                 // ids
+        matrix(text_prefill, DType::I32, 1, chunk);                 // positions
+        matrix(text_prefill, DType::I32, vision ? 3 : 1, chunk);    // RoPE positions
+        if (vision) { matrix(text_prefill, DType::I32, 1, chunk); } // visual columns
+        if (config.ple) {
+            matrix(text_prefill, DType::BF16, dimension(config.ple->embed_dim), chunk);
+        }
         if (tp2) { matrix(text_prefill, DType::BF16, wide, chunk); } // the chunk's hidden
         forward(text_prefill, true, chunk, 1, 1, chunk);
         if (!plan.causal_scoring) {
@@ -791,12 +802,17 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
                 // MTP prompt KV: append-only columns, then the last column's layer, its proposal
                 // and the autoregressive drafts (TextContext::qwen4_mtp_prefill).
                 matrix(text_prefill, DType::I32, 1, chunk); // shifted ids
+                if (vision) {
+                    matrix(text_prefill, DType::BF16, H, chunk); // composed shifted input
+                    matrix(text_prefill, DType::I32, 1, chunk);  // its visual columns
+                }
                 {
                     std::array<std::optional<WorkspaceLayoutBuilder::Scope>, 2> scope;
                     for (int r = 0; r < ranks; ++r) {
                         scope[static_cast<std::size_t>(r)].emplace(
                             text_prefill[static_cast<std::size_t>(r)].scope());
                     }
+                    if (vision) { matrix(text_prefill, DType::I32, 3, chunk); } // RoPE columns
                     matrix(text_prefill, DType::BF16, wide, chunk);
                     mtp(text_prefill, true, chunk, 1, true, 1);
                 }
@@ -806,6 +822,7 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
                         scope[static_cast<std::size_t>(r)].emplace(
                             text_prefill[static_cast<std::size_t>(r)].scope());
                     }
+                    if (vision) { matrix(text_prefill, DType::I32, 3, 1); } // RoPE column
                     mtp(text_prefill, true, 1, 1, false);
                     head(text_prefill, 1);
                     matrix(text_prefill, DType::BF16, wide, 1);
@@ -874,9 +891,11 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
             out.mtp_round = std::max({out.mtp_round, finish(target), finish(alignment), finish(ar),
                                       finish(proposal), accept});
         }
-        // The prefix-reuse bridge: one MTP column and its proposal drafts on the prefill row.
+        // The prefix-reuse bridge: one MTP column and its proposal drafts on the prefill row (with
+        // Vision, rank 1's copy of a visual column's merged embedding).
         Layouts bridge;
         matrix(bridge, DType::I32, 1, 3);
+        if (vision) { matrix(bridge, DType::BF16, H, 1); }
         mtp(bridge, true, 1, 1, false);
         head(bridge, 1);
         out.ordinary_round = finish(bridge);
@@ -884,6 +903,19 @@ WorkspacePlan build_qwen4_workspace_plan(const SequencePlanImpl& plan) {
     out.general_capacity = std::max(
         {out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round, out.causal_score});
     out.capacity = out.general_capacity;
+    if (vision) {
+        // The tower's rank encodes each item past its general prefix and keeps the merged
+        // embeddings there for the item's chunks; at tp 2 the other rank only receives them.
+        out.vision = execution::VisionContext::plan_workspace(
+            *parameters.model.config().vision, *plan.vision_parameters->vision,
+            vision_item_tokens(plan), out.general_capacity);
+        out.capacity = std::max(out.capacity, out.vision->capacity_bytes);
+        if (tp2) {
+            out.vision_receiver = execution::VisionContext::plan_receiver(*out.vision);
+            out.receiver_capacity =
+                std::max(out.general_capacity, out.vision_receiver->capacity_bytes);
+        }
+    }
     return out;
 }
 
@@ -1308,9 +1340,6 @@ void validate_target_options(const execution::Parameters& parameters,
                     "Qwen4ExpForCausalLM: MTP proposes over the full vocabulary only");
             }
         }
-        if (models::load_options(options).vision) {
-            throw std::invalid_argument("Qwen4ExpForCausalLM: image input is not implemented");
-        }
         if (!parameters.qwen4) {
             throw std::logic_error("Qwen4ExpForCausalLM Parameters have no Qwen4Exp blocks");
         }
@@ -1328,66 +1357,77 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->vision_parameters      = inputs.vision_parameters;
     impl->peer_parameters        = inputs.peer_parameters;
     impl->max_vision_item_tokens = inputs.max_vision_item_tokens;
-    impl->capacity            = inputs.capacity;
-    impl->main_page_groups    = main_page_groups;
-    impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
+    impl->capacity               = inputs.capacity;
+    impl->main_page_groups       = main_page_groups;
+    impl->kv_capacity            = static_cast<std::uint32_t>(checked_i32(
         static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
         "resolved Paged KV capacity exceeds int32"));
-    impl->max_concurrency     = inputs.max_concurrency;
-    impl->prefill_chunk       = inputs.prefill_chunk;
+    impl->max_concurrency        = inputs.max_concurrency;
+    impl->prefill_chunk          = inputs.prefill_chunk;
     impl->kv_lease_window_tokens = inputs.kv_lease_window_tokens;
-    impl->draft_window        = inputs.draft_window;
-    impl->mtp_min_p           = inputs.mtp_min_p;
-    impl->mtp_window_rule     = inputs.mtp_window_rule;
-    impl->speculative_backend = inputs.speculative_backend;
-    impl->proposal_head       = inputs.proposal_head;
-    impl->features            = inputs.features;
-    impl->use_cuda_graph      = inputs.use_cuda_graph;
-    impl->causal_scoring      = inputs.causal_scoring;
-    impl->device              = inputs.device;
-    impl->tp                  = inputs.tp;
-    impl->tp_mailbox          = inputs.tp_mailbox;
-    impl->context_cache       = inputs.context_cache;
-    impl->kv_storage          = inputs.kv_storage;
-    impl->qwen4_experts       = inputs.qwen4_experts;
-    impl->elastic_kv          = inputs.elastic_kv;
-    impl->draft_prefix        = inputs.draft_prefix;
-    impl->draft_extras        = inputs.draft_extras;
-    impl->draft_split         = inputs.draft_split;
+    impl->draft_window           = inputs.draft_window;
+    impl->mtp_min_p              = inputs.mtp_min_p;
+    impl->mtp_window_rule        = inputs.mtp_window_rule;
+    impl->speculative_backend    = inputs.speculative_backend;
+    impl->proposal_head          = inputs.proposal_head;
+    impl->features               = inputs.features;
+    impl->use_cuda_graph         = inputs.use_cuda_graph;
+    impl->causal_scoring         = inputs.causal_scoring;
+    impl->device                 = inputs.device;
+    impl->tp                     = inputs.tp;
+    impl->tp_mailbox             = inputs.tp_mailbox;
+    impl->context_cache          = inputs.context_cache;
+    impl->kv_storage             = inputs.kv_storage;
+    impl->qwen4_experts          = inputs.qwen4_experts;
+    impl->elastic_kv             = inputs.elastic_kv;
+    impl->draft_prefix           = inputs.draft_prefix;
+    impl->draft_extras           = inputs.draft_extras;
+    impl->draft_split            = inputs.draft_split;
     // T42: Qwen4Exp prompts stream in chunks wider than prefill_chunk on workspace the offload
     // backend lends from the slot pool (the layers below the streaming ring), so the Program's
     // arena and the decode slot cache stay sized for prefill_chunk. The prompt chunk is the
-    // largest prompt_chunk / 2^i (> prefill_chunk) whose workspace and ring fit in half the Text
-    // layers' slots. The sizing probe (no slots yet) plans prefill_chunk only.
+    // largest prompt_chunk / 2^i (> prefill_chunk) whose workspace and ring fit in the Text layers
+    // a prompt may lend (Qwen4OffloadExperts::may_lend, over the backend's per-layer base slots,
+    // layer_slot_profile). The sizing probe (no slots yet) plans prefill_chunk only. The ring
+    // counts as the runtime lends it (Qwen4OffloadExperts::ring_layers: half a layer of experts per
+    // GPU at tp 2): planning the 1-GPU ring at tp 2 cost FP4-Local (59 slots) its 16384-column
+    // chunk for 8192, so twice the chunks and expert streaming per prompt (o-prefill).
     std::size_t prompt_workspace = 0;
     std::vector<std::pair<std::uint32_t, std::size_t>> prompt_steps;
     {
         // NINFER_TP_HOST_EXCHANGE=0 brings the driver-staged peer pull back (program_impl_tp2.inc).
         const char* exchange_env = std::getenv("NINFER_TP_HOST_EXCHANGE");
-        const bool peer_pull = exchange_env != nullptr && std::string_view(exchange_env) == "0";
-        const auto& experts = impl->qwen4_experts;
-        const auto& text    = impl->parameters->model.config().text;
+        const bool peer_pull     = exchange_env != nullptr && std::string_view(exchange_env) == "0";
+        const auto& experts      = impl->qwen4_experts;
+        const auto& text         = impl->parameters->model.config().text;
         const std::uint32_t base = impl->prefill_chunk;
         if (text.qwen4() && experts.backend == RoutedExpertBackend::Offload &&
             experts.slots_per_layer > 0 && experts.stream_min_tokens > 0 &&
-            experts.prompt_chunk > base && !impl->causal_scoring && !impl->features.vision &&
-            impl->capacity > base &&
+            experts.prompt_chunk > base && !impl->causal_scoring && impl->capacity > base &&
             // T64: at tp 2 the elastic expert pool is VMM memory, which a cross-device pull
             // (ops::allreduce pull_peer) cannot read without P2P; the lent workspace lives there.
             // The eager prefill all-reduce goes through the host-staged exchange (T56 C1), so the
             // lending stays on unless the peer pull is forced back (T68).
             !(impl->elastic_kv.enabled && impl->tp == 2 && peer_pull)) {
-            const auto K           = static_cast<std::int64_t>(experts.slots_per_layer);
-            const auto text_layers = static_cast<std::int64_t>(text.num_hidden_layers);
-            const std::int64_t ring_layers =
-                (static_cast<std::int64_t>(std::max<std::uint32_t>(experts.stream_ring_slots, 512)) +
-                 K - 1) / K;
+            const auto text_layers = static_cast<std::int32_t>(text.num_hidden_layers);
+            // The cache's layers and their base slots as the backend lays them out (the MTP
+            // layer is one more cache layer, Qwen4ExpCache::cache_layers).
+            const bool mtp_layer =
+                impl->speculative_backend == SpeculativeBackend::Mtp && impl->parameters->qwen4_mtp;
+            const std::vector<std::int32_t> layer_base =
+                execution::Qwen4OffloadExperts::layer_slot_profile(
+                    text_layers + (mtp_layer ? 1 : 0), text_layers,
+                    static_cast<std::int32_t>(experts.slots_per_layer),
+                    static_cast<std::int32_t>(experts.elastic_columns), impl->tp);
+            const std::int32_t ring_layers = execution::Qwen4OffloadExperts::ring_layers(
+                static_cast<std::int32_t>(std::max<std::uint32_t>(experts.stream_ring_slots, 512)),
+                layer_base, text_layers, impl->tp);
             // The workspace is the lent layers' slots of the gate/up code plane (one contiguous
-            // region of the planar pool).
-            const std::int64_t layer_bytes = K * execution::Qwen4OffloadExperts::kLendPlaneBytes;
-            const auto need_for = [&](std::uint32_t width) {
-                SequencePlanImpl wide = *impl;
-                wide.prefill_chunk    = width;
+            // region of the planar pool), the layers just below the ring.
+            constexpr auto lend_bytes = execution::Qwen4OffloadExperts::kLendPlaneBytes;
+            const auto need_for       = [&](std::uint32_t width) {
+                SequencePlanImpl wide    = *impl;
+                wide.prefill_chunk       = width;
                 const WorkspacePlan plan = build_workspace_plan(wide);
                 // The phase plans assume the chunk's carried hidden lives in prefill_hidden; on
                 // lent workspace it is an arena matrix [S*H, width] BF16 too (qwen4_text.cpp
@@ -1400,10 +1440,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             for (std::uint32_t chunk = experts.prompt_chunk; chunk > base; chunk /= 2) {
                 const std::uint32_t width = std::min(chunk, impl->capacity);
                 if (width <= base || width % kPrefillChunkAlignment != 0) { continue; }
-                const std::size_t need = need_for(width);
-                const auto layers = static_cast<std::int64_t>((need + layer_bytes - 1) / layer_bytes);
-                if (ring_layers + layers <= execution::Qwen4OffloadExperts::max_lent_layers(
-                                                static_cast<std::int32_t>(text_layers))) {
+                const std::size_t need    = need_for(width);
+                const std::int32_t layers = execution::Qwen4OffloadExperts::layers_below(
+                    layer_base, text_layers - ring_layers,
+                    static_cast<std::int64_t>((need + lend_bytes - 1) / lend_bytes));
+                if (execution::Qwen4OffloadExperts::may_lend(layer_base, text_layers,
+                                                             ring_layers + layers)) {
                     impl->qwen4_base_chunk = base;
                     impl->prefill_chunk    = width;
                     prompt_workspace       = need;
@@ -1419,13 +1461,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             }
         }
     }
-    impl->persistent          = persistent_layout(*impl, 0);
+    impl->persistent = persistent_layout(*impl, 0);
     if (impl->tp != 1) { impl->peer_persistent = persistent_layout(*impl, 1); }
     if (impl->qwen4_base_chunk > 0) {
-        SequencePlanImpl narrow = *impl;
-        narrow.prefill_chunk    = impl->qwen4_base_chunk;
-        impl->workspace         = build_workspace_plan(narrow);
-        impl->workspace.qwen4_prompt = prompt_workspace;
+        SequencePlanImpl narrow            = *impl;
+        narrow.prefill_chunk               = impl->qwen4_base_chunk;
+        impl->workspace                    = build_workspace_plan(narrow);
+        impl->workspace.qwen4_prompt       = prompt_workspace;
         impl->workspace.qwen4_prompt_steps = std::move(prompt_steps);
     } else {
         impl->workspace = build_workspace_plan(*impl);
@@ -1437,9 +1479,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         if (impl->speculative_backend == SpeculativeBackend::None) {
             // Per device; tp 2 uses its measured allowance (core/tp2/device_tuning.h).
             const std::size_t per_batch =
-                impl->tp == 1
-                    ? 12ULL * kMiB
-                    : tp2::device_tuning(impl->device).tp2_ordinary_graph_allowance_bytes;
+                impl->tp == 1 ? 12ULL * kMiB
+                              : tp2::device_tuning(impl->device).tp2_ordinary_graph_allowance_bytes;
             impl->graph_allowance_bytes =
                 checked_mul(per_batch, impl->max_concurrency, "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
@@ -1485,10 +1526,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     // Rank 0's layout bounds rank 1's, which only omits the drafter's state; both ranks are
     // budgeted for it. With Vision the budget carries the encoding rank's workspace; the other
     // rank's budget is credited with the part it does not allocate.
-    impl->device_reservation_bytes = checked_add(
-        checked_add(impl->persistent.bytes + impl->persistent.elastic_bytes,
-                    impl->workspace.capacity, "sequence memory plan"),
-        impl->graph_allowance_bytes, "sequence graph allowance");
+    impl->device_reservation_bytes =
+        checked_add(checked_add(impl->persistent.bytes + impl->persistent.elastic_bytes,
+                                impl->workspace.capacity, "sequence memory plan"),
+                    impl->graph_allowance_bytes, "sequence graph allowance");
     return impl;
 }
 
@@ -1541,7 +1582,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         std::error_code ec;
         if (!options.artifact_path.empty() && std::filesystem::is_regular_file(sidecar, ec)) {
             shortlist_path = sidecar.string();
-            std::fprintf(stderr, "qwen4: draft shortlist (artifact sidecar) %s\n", shortlist_path.c_str());
+            std::fprintf(stderr, "qwen4: draft shortlist (artifact sidecar) %s\n",
+                         shortlist_path.c_str());
         }
     }
     if (shortlist_path == "none") { shortlist_path.clear(); }
@@ -1552,7 +1594,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
             throw std::invalid_argument("a draft shortlist needs Qwen4Exp with MTP");
         }
         if (!execution::draft_head_supported(head)) {
-            throw std::invalid_argument("a draft shortlist needs a Q6 RowSplit output head");
+            throw std::invalid_argument(
+                "a draft shortlist needs a Q6 RowSplit or BF16 output head");
         }
         const auto ids = execution::read_draft_shortlist(shortlist_path.c_str(),
                                                          options.speculative.draft_shortlist_rows);
@@ -1560,20 +1603,20 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         // split over the ranks when rank 0's half (rows [0, R)) lies in the prefix view
         // (NINFER_QWEN4_DRAFT_SPLIT=0: rank 0 alone, for comparison).
         const bool tp2 = options.tp == 2;
-        auto split = execution::split_draft_shortlist(
+        auto split     = execution::split_draft_shortlist(
             ids, dimension(parameters.model.resources().public_token_count), head.n, tp2 ? 16 : 8);
         const auto rows = split.prefix + static_cast<std::int32_t>(split.extras.size());
         const char* env = std::getenv("NINFER_QWEN4_DRAFT_SPLIT");
-        inputs.draft_split  = tp2 && rows / 2 <= split.prefix &&
-                              !(env != nullptr && std::string(env) == "0");
+        inputs.draft_split =
+            tp2 && rows / 2 <= split.prefix && !(env != nullptr && std::string(env) == "0");
         inputs.draft_prefix = split.prefix;
         inputs.draft_extras = std::move(split.extras);
     }
     if (parameters.model.config().text.qwen4()) {
         const RoutedExpertOptions& experts = options.routed_experts;
-        const MissSplitOptions& split = experts.miss_split;
-        const MissSplitCosts& cost    = split.costs;
-        const auto nonneg             = [](float v) { return std::isfinite(v) && v >= 0.0F; };
+        const MissSplitOptions& split      = experts.miss_split;
+        const MissSplitCosts& cost         = split.costs;
+        const auto nonneg                  = [](float v) { return std::isfinite(v) && v >= 0.0F; };
         if (experts.slots_per_layer > 512 || experts.cpu_threads == 0 ||
             experts.admit_threshold < 0.0F || !(experts.half_life_tokens > 0.0F) ||
             !(experts.evict_tau_windows >= 0.0F) || !std::isfinite(experts.evict_tau_windows) ||
@@ -1585,13 +1628,14 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
             !nonneg(cost.gpu_column_us) || experts.prefetch_slots > 64 ||
             !(experts.prefetch_min_score >= 0.0F) || experts.prefetch_first_layer == 0 ||
             !(experts.prefetch_link_gbps > 0.0F)) {
-            throw std::invalid_argument("Engine routed_experts: slots_per_layer must be in [0,512], "
-                                        "cpu_threads > 0, admit_threshold >= 0, half_life > 0, "
-                                        "evict_tau_windows >= 0, "
-                                        "device_reads, miss_split count/max_reads <= 16, "
-                                        "miss_split fraction in [0,1], costs >= 0, slowdown >= 1, "
-                                        "prefetch_slots <= 64, prefetch_min_score >= 0, "
-                                        "prefetch_first_layer >= 1, prefetch_link_gbps > 0");
+            throw std::invalid_argument(
+                "Engine routed_experts: slots_per_layer must be in [0,512], "
+                "cpu_threads > 0, admit_threshold >= 0, half_life > 0, "
+                "evict_tau_windows >= 0, "
+                "device_reads, miss_split count/max_reads <= 16, "
+                "miss_split fraction in [0,1], costs >= 0, slowdown >= 1, "
+                "prefetch_slots <= 64, prefetch_min_score >= 0, "
+                "prefetch_first_layer >= 1, prefetch_link_gbps > 0");
         }
         // Warm start is on by default (T25/T42) and only means something to the offload backend:
         // other backends ignore it. Prefetch must be asked for, and runs at one device only.

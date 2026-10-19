@@ -46,8 +46,9 @@ struct TensorSlice {
 
 // Axis 1 of a matrix, with the ranges concatenated within every row. Only Contiguous accepts
 // more than one range; the other layouts group, tile or swizzle columns. RowSplit ranges are
-// multiples of 128 columns, BlockScaleK16M128x4 ranges multiples of 64, and RowScale keeps its
-// per-row scale plane whole because the rows are unchanged.
+// multiples of 128 columns, BlockScaleK16M128x4 ranges multiples of 64, BlockScaleK32 ranges
+// multiples of 32 and RowInterleaved ranges multiples of 16 (whole scale groups); RowScale keeps
+// its per-row scale plane whole because the rows are unchanged.
 [[nodiscard]] TensorSlice tensor_column_slice(const WeightGeometry& parent,
                                               std::span<const SliceRange> columns);
 

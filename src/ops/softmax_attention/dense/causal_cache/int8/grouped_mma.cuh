@@ -82,12 +82,12 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
     const int partial_begin = column_begin;
     // Splits are the slowest grid axis: a row's live splits precede the idle capacity of every
     // row, so live CTAs stay contiguous in launch order and spread over the SMs.
-    const int split         = static_cast<int>(blockIdx.z);
-    const int batch         = MultiBatch ? static_cast<int>(blockIdx.y) : 0;
-    const int split_count   = static_cast<int>(gridDim.z);
-    const int tid           = static_cast<int>(threadIdx.x);
-    const int warp          = tid >> 5;
-    const int lane          = tid & 31;
+    const int split       = static_cast<int>(blockIdx.z);
+    const int batch       = MultiBatch ? static_cast<int>(blockIdx.y) : 0;
+    const int split_count = static_cast<int>(gridDim.z);
+    const int tid         = static_cast<int>(threadIdx.x);
+    const int warp        = tid >> 5;
+    const int lane        = tid & 31;
 
     int valid_tokens = tile_tokens;
     if constexpr (Masked) {
@@ -129,8 +129,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) __global__
                 int q_head = 0;
                 int token  = 0;
                 causal_row_to_qt<Geometry>(row, kv_head, q_head, token);
-                const auto index = causal_stat_index<Geometry>(q_head, partial_begin + token,
-                                                               split, partial_width);
+                const auto index = causal_stat_index<Geometry>(q_head, partial_begin + token, split,
+                                                               partial_width);
                 partial_m[index] = -CUDART_INF_F;
                 partial_l[index] = 0.0f;
             }

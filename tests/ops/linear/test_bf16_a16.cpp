@@ -70,6 +70,15 @@ std::vector<std::int32_t> sampled_rows(std::int32_t rows) {
     if (rows == 14336) {
         result.insert(result.end(), {1023, 6143, 6144, 7167, 7168, 13311, 13312});
     }
+    // Row tiles of 16/32/48/64 rows and their tails (324 = 6 x 48 + 36, 6656 = 138 x 48 + 32).
+    for (const std::int32_t row :
+         {15, 16, 47, 48, 63, 64, rows - 49, rows - 48, rows - 33, rows - 32, rows - 17, rows - 16,
+          rows - 9, rows - 8, rows - 5, rows - 4}) {
+        if (row >= 0 && row < rows) result.push_back(row);
+    }
+    if (rows <= 1024) {
+        for (std::int32_t row = 0; row < rows; ++row) result.push_back(row);
+    }
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
@@ -281,6 +290,34 @@ int run_bf16_linear() {
     return failures;
 }
 
+// Qwen3.8-Flash-Next BF16 projections (FP4-Local): hyper-connection Down(+inject) and Up, whole
+// and stream-split, the MTP dense layer and the PLE key|value parent. Token counts straddle every
+// selector cutoff (8, 16, 64, 128, 256, 512, 1024) and leave partial token tiles.
+int run_qwen4_linear() {
+    struct Shape {
+        std::int32_t n, k;
+        std::uint32_t seed;
+    };
+
+    constexpr Shape kShapes[]{{324, 10240, 421U},  {320, 10240, 423U}, {324, 5120, 425U},
+                              {320, 5120, 427U},   {10240, 320, 429U}, {5120, 320, 431U},
+                              {13312, 2560, 433U}, {6656, 2560, 435U}, {640, 2560, 437U},
+                              {2560, 6144, 439U},  {2560, 3072, 441U}, {1280, 2560, 443U},
+                              {2560, 640, 445U},   {2560, 2560, 447U}, {12800, 2560, 449U}};
+    int failures = 0;
+    for (const Shape& shape : kShapes) {
+        DeviceWeight weight(make_patterned(shape.n, shape.k, shape.seed));
+        for (int tokens : {1,   8,   9,   16,  17,  33,  63,  64,   65,   127,  128,
+                           129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 2049}) {
+            failures += run_bf16_linear_case(weight, tokens);
+        }
+        for (int tokens : {9, 17, 65, 129, 513, 1025}) {
+            failures += run_bf16_linear_case(weight, tokens, true);
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -290,7 +327,7 @@ int main() {
     }
 
     try {
-        const int failures = run_bf16_linear();
+        const int failures = run_bf16_linear() + run_qwen4_linear();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " BF16_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

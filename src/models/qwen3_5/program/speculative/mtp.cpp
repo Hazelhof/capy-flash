@@ -59,40 +59,42 @@ struct MtpRoundView {
 
 MtpRoundView slice_mtp_frame(qwen3_5::MtpDecodeState& frame, std::int32_t batch_size) {
     MtpRoundView out;
-    out.anchors            = frame.anchors.slice(0, 0, batch_size);
-    out.frontiers          = frame.base_frontiers.slice(0, 0, batch_size);
-    out.budgets            = frame.remaining_budgets.slice(0, 0, batch_size);
-    out.current_extents    = frame.current_extents.slice(0, 0, batch_size);
-    out.target_valid       = frame.target_valid_columns.slice(0, 0, batch_size);
-    out.current_drafts     = frame.current_drafts.slice(1, 0, batch_size);
-    out.target_rope        = frame.target_rope_positions.slice(1, 0, batch_size);
-    out.text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
-    out.mtp_rows           = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
-    out.state_sources      = frame.state_source_slots.slice(0, 0, batch_size);
-    out.state_destinations = frame.state_destination_slots.slice(0, 0, batch_size);
-    out.rope_deltas        = frame.rope_deltas.slice(0, 0, batch_size);
-    out.verify_ids         = frame.verify_ids.slice(1, 0, batch_size);
-    out.target_positions   = frame.target_positions.slice(1, 0, batch_size);
-    out.target_tokens      = frame.target_argmax.slice(1, 0, batch_size);
-    out.target_logits      = frame.target_logits.slice(2, 0, batch_size);
-    out.target_hidden      = frame.target_hidden.slice(2, 0, batch_size);
-    out.selected_hidden    = frame.target_continuation_hidden.slice(1, 0, batch_size);
-    out.licensed_tokens    = frame.licensed_tokens.slice(1, 0, batch_size);
-    out.licensed_counts    = frame.licensed_counts.slice(0, 0, batch_size);
-    out.accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
-    out.next_extents       = frame.next_extents.slice(0, 0, batch_size);
-    out.alignment_ids      = frame.alignment_ids.slice(1, 0, batch_size);
-    out.alignment_hidden   = frame.alignment_hidden.slice(2, 0, batch_size);
-    out.ar_hidden          = frame.ar_hidden.slice(1, 0, batch_size);
-    out.next_hidden        = frame.next_hidden.slice(1, 0, batch_size);
-    out.ar_positions       = frame.ar_positions.slice(0, 0, batch_size);
-    out.ar_rope_positions  = frame.ar_rope_positions.slice(0, 0, batch_size);
-    out.ar_valid_columns   = frame.ar_valid_columns.slice(0, 0, batch_size);
-    out.next_drafts        = frame.next_drafts.slice(0, 0, batch_size);
+    out.anchors             = frame.anchors.slice(0, 0, batch_size);
+    out.frontiers           = frame.base_frontiers.slice(0, 0, batch_size);
+    out.budgets             = frame.remaining_budgets.slice(0, 0, batch_size);
+    out.current_extents     = frame.current_extents.slice(0, 0, batch_size);
+    out.target_valid        = frame.target_valid_columns.slice(0, 0, batch_size);
+    out.current_drafts      = frame.current_drafts.slice(1, 0, batch_size);
+    out.target_rope         = frame.target_rope_positions.slice(1, 0, batch_size);
+    out.text_rows           = frame.text_kv_table_rows.slice(0, 0, batch_size);
+    out.mtp_rows            = frame.mtp_kv_table_rows.slice(0, 0, batch_size);
+    out.state_sources       = frame.state_source_slots.slice(0, 0, batch_size);
+    out.state_destinations  = frame.state_destination_slots.slice(0, 0, batch_size);
+    out.rope_deltas         = frame.rope_deltas.slice(0, 0, batch_size);
+    out.verify_ids          = frame.verify_ids.slice(1, 0, batch_size);
+    out.target_positions    = frame.target_positions.slice(1, 0, batch_size);
+    out.target_tokens       = frame.target_argmax.slice(1, 0, batch_size);
+    out.target_logits       = frame.target_logits.slice(2, 0, batch_size);
+    out.target_hidden       = frame.target_hidden.slice(2, 0, batch_size);
+    out.selected_hidden     = frame.target_continuation_hidden.slice(1, 0, batch_size);
+    out.licensed_tokens     = frame.licensed_tokens.slice(1, 0, batch_size);
+    out.licensed_counts     = frame.licensed_counts.slice(0, 0, batch_size);
+    out.accepted            = frame.accepted_drafts.slice(0, 0, batch_size);
+    out.next_extents        = frame.next_extents.slice(0, 0, batch_size);
+    out.alignment_ids       = frame.alignment_ids.slice(1, 0, batch_size);
+    out.alignment_hidden    = frame.alignment_hidden.slice(2, 0, batch_size);
+    out.ar_hidden           = frame.ar_hidden.slice(1, 0, batch_size);
+    out.next_hidden         = frame.next_hidden.slice(1, 0, batch_size);
+    out.ar_positions        = frame.ar_positions.slice(0, 0, batch_size);
+    out.ar_rope_positions   = frame.ar_rope_positions.slice(0, 0, batch_size);
+    out.ar_valid_columns    = frame.ar_valid_columns.slice(0, 0, batch_size);
+    out.next_drafts         = frame.next_drafts.slice(0, 0, batch_size);
     out.next_draft_logprobs = frame.next_draft_logprobs.slice(0, 0, batch_size);
-    out.proposal_logits    = frame.proposal_logits.slice(1, 0, batch_size);
-    if (qwen4_replay_enabled()) { out.forced_targets = frame.forced_targets.slice(1, 0, batch_size); }
-    out.sampling           = frame.sampling;
+    out.proposal_logits     = frame.proposal_logits.slice(1, 0, batch_size);
+    if (qwen4_replay_enabled()) {
+        out.forced_targets = frame.forced_targets.slice(1, 0, batch_size);
+    }
+    out.sampling = frame.sampling;
     return out;
 }
 
@@ -170,12 +172,16 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
 
     Tensor position_view = state.execution.io.mtp->target_positions.slice(0, 0, 1);
     ops::set_i32_scalar(position_view, position, state.execution.device.stream);
-    Tensor mtp_hidden         = state.execution.io.mtp->ar_hidden;
-    Tensor logits             = state.execution.io.logits.slice(1, 0, 1);
-    Tensor draft0             = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
-    Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, 3});
+    Tensor mtp_hidden = state.execution.io.mtp->ar_hidden;
+    Tensor logits     = state.execution.io.logits.slice(1, 0, 1);
+    Tensor draft0     = state.execution.io.mtp->draft_tokens.slice(0, 0, 1);
+    // Qwen4Exp runs a text position (the same on the three M-RoPE axes) one-axis, as its decode.
+    const bool one_axis = state.execution.qwen4 != nullptr &&
+                          rope_position[1] == rope_position[0] &&
+                          rope_position[2] == rope_position[0];
+    Tensor rope_position_view = state.execution.work.alloc(DType::I32, {1, one_axis ? 1 : 3});
     CUDA_CHECK(cudaMemcpyAsync(rope_position_view.data, rope_position.data(),
-                               rope_position.size_bytes(), cudaMemcpyHostToDevice,
+                               rope_position_view.bytes(), cudaMemcpyHostToDevice,
                                state.execution.device.stream));
     const auto bridge_visible = static_cast<std::uint32_t>(position + 1);
     const ops::CausalAttentionExecutionEnvelope bridge_envelope{bridge_visible, bridge_visible};
@@ -200,8 +206,9 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
         const ops::CausalAttentionExecutionEnvelope envelope{visible, visible};
         card.mtp_forward_ar_step(previous_token, state.execution.io.mtp->ar_hidden, ar_position,
                                  envelope, next_hidden, logits, next_draft);
-        CUDA_CHECK(::ninfer::memcpy_device_async(state.execution.io.mtp->ar_hidden.data, next_hidden.data,
-                                   state.execution.io.mtp->ar_hidden.bytes(), state.execution.device.stream));
+        CUDA_CHECK(::ninfer::memcpy_device_async(
+            state.execution.io.mtp->ar_hidden.data, next_hidden.data,
+            state.execution.io.mtp->ar_hidden.bytes(), state.execution.device.stream));
         ops::increment_i32_scalar(ar_position, state.execution.device.stream);
     }
 }
@@ -218,15 +225,17 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
         const std::int32_t width       = static_cast<std::int32_t>(k) + 1;
         // Rows of the carried hidden (Qwen4Exp: the wide residual).
         const std::int32_t hidden_size = frame.ar_hidden.ne[0];
-        const auto max_context = static_cast<std::int32_t>(state.text_cache.max_context());
-        cudaStream_t stream    = state.execution.device.stream;
+        const auto max_context         = static_cast<std::int32_t>(state.text_cache.max_context());
+        cudaStream_t stream            = state.execution.device.stream;
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    stream));
         if (const Qwen4Runtime* qwen4 = state.execution.qwen4;
-            qwen4 != nullptr && qwen4->decode_ple_rows.data != nullptr) {
+            qwen4 != nullptr && qwen4->decode_ple_rows.data != nullptr &&
+            qwen4->decode_ple_staged == nullptr) {
             // Qwen4Exp: the n-gram rows of the verified window, gathered on the host before the
-            // launch (one upload node).
+            // launch (one upload node). Deferred rows (decode_ple_staged) are uploaded by the PLE
+            // layer itself once the host has gathered them after the launch.
             const Tensor rows = qwen4->decode_ple_rows.slice(1, 0, width * batch_size);
             CUDA_CHECK(cudaMemcpyAsync(rows.data, qwen4->decode_ple_host, rows.bytes(),
                                        cudaMemcpyHostToDevice, stream));
@@ -320,7 +329,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                      {std::pair{peer->anchors, round.anchors},
                       std::pair{peer->frontiers, round.frontiers},
                       std::pair{peer->licensed_counts, round.licensed_counts}}) {
-                    CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data, source.bytes(), rank1->stream));
+                    CUDA_CHECK(::ninfer::memcpy_device_async(destination.data, source.data,
+                                                             source.bytes(), rank1->stream));
                 }
                 prepare_next_round(*peer, max_context, rank1->stream);
             }
@@ -408,9 +418,9 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                     card.mtp_propose_batch(proposal_hidden, proposal_logits, next,
                                            draft_logprob(s + 1));
                     const ScopedCurrentDevice scope(rank1->device);
-                    CUDA_CHECK(::ninfer::memcpy_device_async(peer->ar_hidden.data, peer->next_hidden.data,
-                                               peer->ar_hidden.bytes(),
-                                               rank1->stream));
+                    CUDA_CHECK(
+                        ::ninfer::memcpy_device_async(peer->ar_hidden.data, peer->next_hidden.data,
+                                                      peer->ar_hidden.bytes(), rank1->stream));
                 } else {
                     card.mtp_forward_decode_batch(previous, hidden_batch, position, rope, valid,
                                                   round.mtp_rows, envelopes.ar[step],
@@ -419,9 +429,8 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size, std:
                     card.mtp_propose_batch(round.next_hidden, proposal_logits, next,
                                            draft_logprob(s + 1));
                 }
-                CUDA_CHECK(::ninfer::memcpy_device_async(round.ar_hidden.data, round.next_hidden.data,
-                                           round.ar_hidden.bytes(),
-                                           stream));
+                CUDA_CHECK(::ninfer::memcpy_device_async(
+                    round.ar_hidden.data, round.next_hidden.data, round.ar_hidden.bytes(), stream));
             }
         }
 

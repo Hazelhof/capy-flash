@@ -165,7 +165,9 @@ public:
         explicit StagedScope(const PeerEvents& events) noexcept : events_(&events) {
             ++events_->staged_scopes_;
         }
+
         ~StagedScope() { --events_->staged_scopes_; }
+
         StagedScope(const StagedScope&)            = delete;
         StagedScope& operator=(const StagedScope&) = delete;
 
@@ -180,14 +182,15 @@ public:
     // operand through its pinned host buffers instead of the driver-staged cross-device copy.
     // Captured calls ignore it. It must serve the ExecutionContext these events were created for.
     void attach_host_exchange(HostExchange* exchange) noexcept { host_exchange_ = exchange; }
+
     [[nodiscard]] HostExchange* host_exchange() const noexcept { return host_exchange_; }
 
 private:
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
-    PeerMailbox* mailbox_           = nullptr;
-    HostExchange* host_exchange_    = nullptr;
-    mutable int staged_scopes_      = 0;
+    PeerMailbox* mailbox_        = nullptr;
+    HostExchange* host_exchange_ = nullptr;
+    mutable int staged_scopes_   = 0;
 };
 
 /**
@@ -231,6 +234,7 @@ public:
     // inputs_ready(from) must come after the peer's stream has passed this copy.
     void copy(int from, const void* source, void* destination, std::size_t bytes,
               const ExecutionContext& ec, const PeerEvents& events);
+
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
     // ---- T62: the TP2 prefill MoE exchange, by column groups, with an optional narrow payload --
@@ -275,9 +279,43 @@ public:
                                      const ExecutionContext& ec);
     void columns_ready(int rank, std::int64_t first, std::int64_t count);
     void finish_sum_f32();
+
     // Columns of rank r reported in the open call (0 when none is open).
     [[nodiscard]] std::int64_t columns_done(int rank) const noexcept {
         return pending_.active ? pending_.done[static_cast<std::size_t>(rank)] : 0;
+    }
+
+    // ---- Split-phase BF16 summing all-reduce on independent lanes (27B prefill overlap) ------
+    //
+    // allreduce_sum() of `buffer` through `staging` (same contract, same bits: the local combine
+    // is the same residual_add body), cut in two so that other work enqueued on the ranks'
+    // streams between the halves runs while the bytes move:
+    //
+    //   sum_begin(lane, ...)   both operands buffer[r] are complete on ec.dev[r]->stream: rank r's
+    //                          operand goes device-to-host into the lane's own pinned buffer on a
+    //                          send stream of rank r, in chunks, and each chunk host-to-device into
+    //                          staging[1-r] on a receive stream of the peer. Nothing is enqueued
+    //                          on the ranks' own streams except one event record each.
+    //   sum_finish(lane, ec)   rank r's stream waits for both receive streams' copies of the lane
+    //                          (its inbound data; the peer's read of rank r's host buffer, which
+    //                          follows rank r's read of buffer[r]) and combines buffer[r] +=
+    //                          staging[r].
+    //
+    // Up to kSumLanes calls may be open at once, one per lane, on disjoint buffer and staging
+    // ranges; work enqueued between a lane's begin and finish must neither read nor write that
+    // lane's buffer or staging. Calls on a lane alternate begin/finish. Each lane's completion is
+    // its own event recorded at begin, so finishing one lane never waits for a later lane. After
+    // sum_finish, rank r's stream is ordered after every copy of the lane (the post-condition of
+    // allreduce_sum()), so staged and lane calls interleave freely. Eager only (the caller checks
+    // that neither stream is capturing); the lanes' pinned buffers are their own, grown on demand
+    // (growing synchronizes both devices).
+    static constexpr int kSumLanes = 2;
+    void sum_begin(int lane, const std::array<Tensor, 2>& buffer,
+                   const std::array<Tensor, 2>& staging, const ExecutionContext& ec);
+    void sum_finish(int lane, const ExecutionContext& ec);
+
+    [[nodiscard]] bool sum_open(int lane) const noexcept {
+        return lane >= 0 && lane < kSumLanes && lanes_[static_cast<std::size_t>(lane)].active;
     }
 
 private:
@@ -293,15 +331,16 @@ private:
 
     // T62 state.
     struct Pending {
-        bool active = false;
+        bool active                = false;
         const ExecutionContext* ec = nullptr;
         std::array<Tensor, 2> partial, staging, out;
-        bool has_out    = false;
-        Payload payload = Payload::FP32;
+        bool has_out      = false;
+        Payload payload   = Payload::FP32;
         std::int64_t rows = 0, columns = 0;
         std::array<std::int64_t, 2> done{0, 0};
         std::array<std::size_t, 2> groups{0, 0}, chunks{0, 0};
     };
+
     Pending pending_;
     std::int64_t calls_ = 0;
     std::array<cudaStream_t, 2> receive_{nullptr, nullptr};
@@ -309,6 +348,24 @@ private:
     std::array<cudaEvent_t, 2> received_{nullptr, nullptr};
     std::array<std::vector<cudaEvent_t>, 2> group_ready_, pipe_chunk_;
     std::array<void*, 2> stats_{nullptr, nullptr};
+
+    // Split-phase lanes. The send/receive streams are shared by the lanes (their calls are
+    // issued in time order); everything else is per lane.
+    struct Lane {
+        bool active          = false;
+        std::size_t capacity = 0;
+        std::array<Tensor, 2> buffer, staging;
+        std::array<std::byte*, 2> host{nullptr, nullptr};
+        std::array<cudaEvent_t, 2> begun{nullptr, nullptr};
+        std::array<cudaEvent_t, 2> received{nullptr, nullptr};
+        std::array<std::vector<cudaEvent_t>, 2> chunk_done;
+    };
+
+    void reserve_lane(Lane& lane, std::size_t bytes, std::size_t chunks,
+                      const ExecutionContext& ec);
+    std::array<Lane, kSumLanes> lanes_;
+    std::array<cudaStream_t, 2> lane_send_{nullptr, nullptr};
+    std::array<cudaStream_t, 2> lane_receive_{nullptr, nullptr};
 };
 
 // T68: the HostExchange attached to `events` when it serves `ec` and neither rank's stream is
@@ -337,6 +394,21 @@ HostExchange* eager_exchange(const ExecutionContext& ec, const PeerEvents& event
  */
 void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
                    const ExecutionContext& ec, const PeerEvents& events);
+
+/**
+ * Split-phase allreduce_sum() on `lane` of the eager HostExchange attached to `events`
+ * (HostExchange::sum_begin / sum_finish): identical arguments, result and bits, but the transfer
+ * runs on the exchange's own streams between the two calls, so work the caller enqueues in
+ * between overlaps it. allreduce_sum_split_available() tells whether the split form can run (an
+ * eager HostExchange serving `ec` is attached and neither stream is capturing); begin throws
+ * otherwise. The caller completes every begun lane with allreduce_sum_finish() before reading
+ * `buffer` or reusing `staging`, and does not touch either in between.
+ */
+[[nodiscard]] bool allreduce_sum_split_available(const ExecutionContext& ec,
+                                                 const PeerEvents& events);
+void allreduce_sum_begin(const std::array<Tensor, 2>& buffer, const std::array<Tensor, 2>& staging,
+                         const ExecutionContext& ec, const PeerEvents& events, int lane);
+void allreduce_sum_finish(const ExecutionContext& ec, const PeerEvents& events, int lane);
 
 /**
  * Two-device summing all-reduce of FP32 partials, rounded once:

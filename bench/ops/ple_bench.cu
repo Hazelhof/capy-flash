@@ -52,12 +52,18 @@ Options parse(int argc, char** argv) {
         }
         if (++i >= argc) throw std::invalid_argument("missing option value");
         const std::string value = argv[i];
-        if (arg == "--part") o.part = value;
-        else if (arg == "--tokens") o.tokens = list(value);
-        else if (arg == "--cache") o.cache = value;
-        else if (arg == "--warmup") o.warmup = std::stoi(value);
-        else if (arg == "--repeat") o.repeat = std::stoi(value);
-        else throw std::invalid_argument("unknown option: " + arg);
+        if (arg == "--part")
+            o.part = value;
+        else if (arg == "--tokens")
+            o.tokens = list(value);
+        else if (arg == "--cache")
+            o.cache = value;
+        else if (arg == "--warmup")
+            o.warmup = std::stoi(value);
+        else if (arg == "--repeat")
+            o.repeat = std::stoi(value);
+        else
+            throw std::invalid_argument("unknown option: " + arg);
     }
     if ((o.part != "block" && o.part != "ops") || (o.cache != "cold" && o.cache != "warm"))
         throw std::invalid_argument("invalid part or cache");
@@ -78,12 +84,12 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
         std::printf("GPU=%s CUDART=%d part=%s cache=%s\n", prop.name, CUDART_VERSION,
                     o.part.c_str(), o.cache.c_str());
-        auto kv = bench::make_row_split_weight(QType::Q8_G32_FP16, kWide + kHidden, kEmbed,
-                                               kEmbed, 0x81U, 0.05F);
-        DeviceBuffer qn = bench::make_bf16(kWide, 0x82U, -0.1F, 0.1F);
-        DeviceBuffer kn = bench::make_bf16(kWide, 0x83U, -0.1F, 0.1F);
-        DeviceBuffer cn = bench::make_bf16(kWide, 0x84U, -0.1F, 0.1F);
-        DeviceBuffer conv = bench::make_bf16(std::size_t(kWide) * kTaps, 0x85U, -0.3F, 0.3F);
+        auto kv = bench::make_row_split_weight(QType::Q8_G32_FP16, kWide + kHidden, kEmbed, kEmbed,
+                                               0x81U, 0.05F);
+        DeviceBuffer qn    = bench::make_bf16(kWide, 0x82U, -0.1F, 0.1F);
+        DeviceBuffer kn    = bench::make_bf16(kWide, 0x83U, -0.1F, 0.1F);
+        DeviceBuffer cn    = bench::make_bf16(kWide, 0x84U, -0.1F, 0.1F);
+        DeviceBuffer conv  = bench::make_bf16(std::size_t(kWide) * kTaps, 0x85U, -0.3F, 0.3F);
         DeviceBuffer state = bench::make_bf16(std::size_t(kWide) * kHistory, 0x86U, -1.0F, 1.0F);
         DeviceBuffer slot(4);
         CUDA_CHECK(cudaMemset(slot.p, 0, 4));
@@ -91,8 +97,9 @@ int main(int argc, char** argv) {
             t_cn(cn.p, DType::BF16, {kWide}), t_conv(conv.p, DType::BF16, {kWide, kTaps}),
             t_state(state.p, DType::BF16, {kHistory * kWide, 1}), t_slot(slot.p, DType::I32, {1});
         for (const int t : o.tokens) {
-            DeviceBuffer embedding = bench::make_bf16(std::size_t(kEmbed) * t, 0x87U, -0.02F, 0.02F);
-            DeviceBuffer residual  = bench::make_bf16(std::size_t(kWide) * t, 0x88U, -0.75F, 0.75F);
+            DeviceBuffer embedding =
+                bench::make_bf16(std::size_t(kEmbed) * t, 0x87U, -0.02F, 0.02F);
+            DeviceBuffer residual = bench::make_bf16(std::size_t(kWide) * t, 0x88U, -0.75F, 0.75F);
             DeviceBuffer key_value(std::size_t(kWide + kHidden) * t * 2);
             DeviceBuffer gated(std::size_t(kWide) * t * 2), normed(std::size_t(kWide) * t * 2);
             Tensor t_e(embedding.p, DType::BF16, {kEmbed, t});

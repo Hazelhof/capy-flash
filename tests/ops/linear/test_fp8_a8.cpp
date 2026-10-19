@@ -111,9 +111,9 @@ int run_fp8_a8() {
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
-    failures += run_shape(
-        "FP8_A16", ActivationCompute::A16, make_fp8_weight,
-        {5120, 6144, 855U, Comparison::Sampled, true, residual6144_decode_invocations});
+    failures +=
+        run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                  {5120, 6144, 855U, Comparison::Sampled, true, residual6144_decode_invocations});
     constexpr std::array residual6144_invocations{
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
@@ -139,9 +139,9 @@ int run_fp8_a8() {
         Invocation{8, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{16, CallForm::Policy, ops::LinearPolicy::AllowA8},
     };
-    failures += run_shape(
-        "FP8_A16", ActivationCompute::A16, make_fp8_weight,
-        {5120, 17408, 867U, Comparison::Sampled, true, residual17408_decode_invocations});
+    failures +=
+        run_shape("FP8_A16", ActivationCompute::A16, make_fp8_weight,
+                  {5120, 17408, 867U, Comparison::Sampled, true, residual17408_decode_invocations});
     constexpr std::array residual17408_invocations{
         Invocation{17, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{48, CallForm::Policy, ops::LinearPolicy::AllowA4},
@@ -160,9 +160,9 @@ int run_fp8_a8() {
         Invocation{1024, CallForm::Policy, ops::LinearPolicy::AllowA8},
         Invocation{1025, CallForm::Policy, ops::LinearPolicy::AllowA8, true},
     };
-    failures += run_shape(
-        "FP8_A8", ActivationCompute::A8, make_fp8_weight,
-        {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
+    failures +=
+        run_shape("FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                  {5120, 17408, 859U, Comparison::Sampled, true, residual17408_invocations});
 
     // Two-device halves. Each runs the routes of the problem it halves at its seams; the
     // input-column halves [5120,3072] and [5120,8704] take the A8 floor of the fused residual

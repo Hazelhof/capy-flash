@@ -19,18 +19,18 @@ struct Fp8ActivationGeometry {
     static constexpr std::int32_t kInputRows = InputRows;
 };
 
-using Fp8N14336K5120             = Fp8Geometry<14336, 5120>;
-using Fp8N16384K5120             = Fp8Geometry<16384, 5120>;
-using Fp8N34816K5120             = Fp8Geometry<34816, 5120>;
-using Fp8N248320K5120            = Fp8Geometry<248320, 5120>;
-using Fp8N5120K6144              = Fp8Geometry<5120, 6144>;
-using Fp8N5120K17408             = Fp8Geometry<5120, 17408>;
-using Fp8N7168K5120              = Fp8Geometry<7168, 5120>;
-using Fp8N8192K5120              = Fp8Geometry<8192, 5120>;
-using Fp8N17408K5120             = Fp8Geometry<17408, 5120>;
-using Fp8N124160K5120            = Fp8Geometry<124160, 5120>;
-using Fp8N5120K3072              = Fp8Geometry<5120, 3072>;
-using Fp8N5120K8704              = Fp8Geometry<5120, 8704>;
+using Fp8N14336K5120  = Fp8Geometry<14336, 5120>;
+using Fp8N16384K5120  = Fp8Geometry<16384, 5120>;
+using Fp8N34816K5120  = Fp8Geometry<34816, 5120>;
+using Fp8N248320K5120 = Fp8Geometry<248320, 5120>;
+using Fp8N5120K6144   = Fp8Geometry<5120, 6144>;
+using Fp8N5120K17408  = Fp8Geometry<5120, 17408>;
+using Fp8N7168K5120   = Fp8Geometry<7168, 5120>;
+using Fp8N8192K5120   = Fp8Geometry<8192, 5120>;
+using Fp8N17408K5120  = Fp8Geometry<17408, 5120>;
+using Fp8N124160K5120 = Fp8Geometry<124160, 5120>;
+using Fp8N5120K3072   = Fp8Geometry<5120, 3072>;
+using Fp8N5120K8704   = Fp8Geometry<5120, 8704>;
 
 // First token count at which fp8 linear_add over the attention output ([5120,6144] and its
 // two-device half [5120,3072]) and over the MLP down projection ([5120,17408] and [5120,8704])
@@ -38,11 +38,11 @@ using Fp8N5120K8704              = Fp8Geometry<5120, 8704>;
 // and rank 1's linear() in one row-parallel pair always take the same route.
 inline constexpr std::int32_t kFp8OutputFamilyFirstA8Tokens = 17;
 inline constexpr std::int32_t kFp8DownFamilyFirstA8Tokens   = 20;
-using Fp8Activation3072Geometry  = Fp8ActivationGeometry<3072>;
-using Fp8Activation5120Geometry  = Fp8ActivationGeometry<5120>;
-using Fp8Activation6144Geometry  = Fp8ActivationGeometry<6144>;
-using Fp8Activation8704Geometry  = Fp8ActivationGeometry<8704>;
-using Fp8Activation17408Geometry = Fp8ActivationGeometry<17408>;
+using Fp8Activation3072Geometry                             = Fp8ActivationGeometry<3072>;
+using Fp8Activation5120Geometry                             = Fp8ActivationGeometry<5120>;
+using Fp8Activation6144Geometry                             = Fp8ActivationGeometry<6144>;
+using Fp8Activation8704Geometry                             = Fp8ActivationGeometry<8704>;
+using Fp8Activation17408Geometry                            = Fp8ActivationGeometry<17408>;
 
 enum class Fp8GeometryId : std::uint8_t {
     N14336K5120,

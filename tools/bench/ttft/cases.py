@@ -123,9 +123,7 @@ def _anonymous_hot(context: CaseContext, corpus: Corpus) -> None:
     )
     context.require_success(source)
     continuation_messages = [*source_messages, _assistant(source)]
-    continuation_messages.append(
-        {"role": "user", "content": "Now answer with the saved code only."}
-    )
+    continuation_messages.append({"role": "user", "content": "Now answer with the saved code only."})
     continuation = context.start(
         "continuation",
         chat_request(context.model, continuation_messages, 32),
@@ -134,9 +132,7 @@ def _anonymous_hot(context: CaseContext, corpus: Corpus) -> None:
 
 
 def _state_probe(context: CaseContext, corpus: Corpus, label: str, turn: int) -> None:
-    request = context.start(
-        f"{label}{turn}", chat_request(context.model, corpus.state_messages(label, turn), 32)
-    )
+    request = context.start(f"{label}{turn}", chat_request(context.model, corpus.state_messages(label, turn), 32))
     context.require_success(request)
 
 
@@ -173,9 +169,7 @@ def _shared_state_hot_prefix(context: CaseContext, corpus: Corpus) -> None:
 
 
 def _session_hot(context: CaseContext, corpus: Corpus) -> None:
-    source = _responses_shape(
-        context, corpus, "long-8k-16", "source", store=True
-    )
+    source = _responses_shape(context, corpus, "long-8k-16", "source", store=True)
     context.require_success(source)
     continuation = context.start(
         "continuation",
@@ -194,13 +188,9 @@ def _session_alternating(context: CaseContext, corpus: Corpus) -> None:
     messages_a = corpus.shape_messages("long-8k-16")
     messages_b = copy.deepcopy(messages_a)
     messages_b[-1]["content"] += "\nThis is independent session B."
-    a1 = context.start(
-        "a1", responses_request(context.model, messages_a, 16, store=True)
-    )
+    a1 = context.start("a1", responses_request(context.model, messages_a, 16, store=True))
     context.require_success(a1)
-    b1 = context.start(
-        "b1", responses_request(context.model, messages_b, 16, store=True)
-    )
+    b1 = context.start("b1", responses_request(context.model, messages_b, 16, store=True))
     context.require_success(b1)
     a2 = context.start(
         "a2",
@@ -227,13 +217,9 @@ def _session_alternating(context: CaseContext, corpus: Corpus) -> None:
 
 
 def _session_alternating_64k_host_swap(context: CaseContext, corpus: Corpus) -> None:
-    a1 = _responses_shape(
-        context, corpus, "long-64k-32", "a1", store=True
-    )
+    a1 = _responses_shape(context, corpus, "long-64k-32", "a1", store=True)
     context.require_success(a1)
-    b1 = _responses_shape(
-        context, corpus, "long-64k-independent-32", "b1", store=True
-    )
+    b1 = _responses_shape(context, corpus, "long-64k-independent-32", "b1", store=True)
     context.require_success(b1)
     a2 = context.start(
         "a2",
@@ -327,10 +313,7 @@ class _BackgroundResponseLoops:
     @classmethod
     def start(cls, context: CaseContext) -> _BackgroundResponseLoops:
         handles = context.barrier(
-            (
-                (f"background-{index}-generation-0", cls._request(context, index))
-                for index in range(2)
-            )
+            ((f"background-{index}-generation-0", cls._request(context, index)) for index in range(2))
         )
         for handle in handles:
             handle.wait_first_output(context.timeout)
@@ -350,9 +333,7 @@ class _BackgroundResponseLoops:
                 if self._stop.is_set():
                     return
                 if handle.outcome() != "success":
-                    raise CaseExecutionError(
-                        f"{handle.role} ended before its replacement: {handle.outcome()}"
-                    )
+                    raise CaseExecutionError(f"{handle.role} ended before its replacement: {handle.outcome()}")
                 with self._lock:
                     if self._stop.is_set():
                         return
@@ -378,12 +359,8 @@ class _BackgroundResponseLoops:
             if all(handle.first_output_ns is not None and not handle.is_done for handle in current):
                 return
             if self._stop.is_set() or time.monotonic() >= deadline:
-                detail = ", ".join(
-                    f"{handle.role}:{handle.outcome()}" for handle in current
-                )
-                raise CaseExecutionError(
-                    f"background streams were not simultaneously active: {detail}"
-                )
+                detail = ", ".join(f"{handle.role}:{handle.outcome()}" for handle in current)
+                raise CaseExecutionError(f"background streams were not simultaneously active: {detail}")
             time.sleep(0.01)
 
     def stop(self) -> None:
@@ -401,9 +378,7 @@ class _BackgroundResponseLoops:
             generations = list(self._generations)
         self._context.notes["background_stream_generations"] = generations
         if live_threads:
-            raise CaseExecutionError(
-                f"background stream loops did not terminate: {', '.join(live_threads)}"
-            )
+            raise CaseExecutionError(f"background stream loops did not terminate: {', '.join(live_threads)}")
         if errors:
             raise CaseExecutionError(errors[0])
 
@@ -476,24 +451,18 @@ def _unmarked_common(context: CaseContext, corpus: Corpus) -> None:
 
 
 def _pressure_graph(context: CaseContext, corpus: Corpus) -> None:
-    source = _responses_shape(
-        context, corpus, "long-8k-16", "source", store=True
-    )
+    source = _responses_shape(context, corpus, "long-8k-16", "source", store=True)
     context.require_success(source)
     interferer_messages = corpus.shape_messages("interferer-256")
     interferers = context.barrier(
         (
             (
                 "interferer-b",
-                responses_request(
-                    context.model, interferer_messages, 256, store=False
-                ),
+                responses_request(context.model, interferer_messages, 256, store=False),
             ),
             (
                 "interferer-c",
-                responses_request(
-                    context.model, interferer_messages, 256, store=False
-                ),
+                responses_request(context.model, interferer_messages, 256, store=False),
             ),
         )
     )
@@ -586,9 +555,7 @@ def _openai_explicit_shared(context: CaseContext, corpus: Corpus) -> None:
 def _openai_implicit_shared(context: CaseContext, corpus: Corpus) -> None:
     messages = corpus.shape_messages("unmarked-common-a")
     facts = corpus.shape("unmarked-common-a")
-    first = context.start(
-        "first", chat_request(context.model, messages, facts["max_output_tokens"])
-    )
+    first = context.start("first", chat_request(context.model, messages, facts["max_output_tokens"]))
     context.require_success(first)
     filler = context.start(
         "private-filler",
@@ -599,9 +566,7 @@ def _openai_implicit_shared(context: CaseContext, corpus: Corpus) -> None:
         ),
     )
     context.require_success(filler)
-    reuse = context.start(
-        "reuse", chat_request(context.model, messages, facts["max_output_tokens"])
-    )
+    reuse = context.start("reuse", chat_request(context.model, messages, facts["max_output_tokens"]))
     context.require_success(reuse)
 
 
@@ -837,12 +802,7 @@ def _protected_no_backfill(context: CaseContext, corpus: Corpus) -> None:
 
 def _active_lanes_full(context: CaseContext, corpus: Corpus) -> None:
     messages = corpus.shape_messages("holder-4096")
-    holders = context.barrier(
-        (
-            (f"holder-{index}", chat_request(context.model, messages, 4096))
-            for index in range(8)
-        )
-    )
+    holders = context.barrier(((f"holder-{index}", chat_request(context.model, messages, 4096)) for index in range(8)))
     for holder in holders:
         holder.wait_first_output(context.timeout)
     probe = _chat_shape(context, corpus, "short-32", "probe")
@@ -931,9 +891,7 @@ def _require_transport_cancellation(
     result = handle.result
     completed_ns = handle.completed_ns
     terminal_events = (
-        [event for event in result.events if event.kind in {"terminal", "error"}]
-        if result is not None
-        else []
+        [event for event in result.events if event.kind in {"terminal", "error"}] if result is not None else []
     )
     context.require(
         handle.outcome() == "cancelled"
@@ -953,8 +911,7 @@ def _require_transport_cancellation(
         f"terminal_events={[event.event_type for event in terminal_events]}",
     )
     context.require(
-        isinstance(completed_ns, int)
-        and cancel_ns <= completed_ns <= cancel_ns + _CANCEL_TERMINATION_LIMIT_NS,
+        isinstance(completed_ns, int) and cancel_ns <= completed_ns <= cancel_ns + _CANCEL_TERMINATION_LIMIT_NS,
         f"0 <= {handle.role}.completed-{handle.role}.cancel <= 5s",
         f"cancel={cancel_ns}, completed={completed_ns}",
     )
@@ -1016,12 +973,7 @@ def _expect_rejection(
 
 def _pending_overflow(context: CaseContext, corpus: Corpus) -> None:
     messages = corpus.shape_messages("holder-4096")
-    holders = context.barrier(
-        (
-            (f"holder-{index}", chat_request(context.model, messages, 4096))
-            for index in range(8)
-        )
-    )
+    holders = context.barrier(((f"holder-{index}", chat_request(context.model, messages, 4096)) for index in range(8)))
     for holder in holders:
         holder.wait_first_output(context.timeout)
     pending = _chat_shape(context, corpus, "short-32", "pending")
@@ -1094,10 +1046,7 @@ def _mixed_four_requests(
 
 
 def _mixed_four_ordered(context: CaseContext, corpus: Corpus) -> None:
-    handles = [
-        context.prepare(role, request)
-        for role, request in _mixed_four_requests(context, corpus)
-    ]
+    handles = [context.prepare(role, request) for role, request in _mixed_four_requests(context, corpus)]
     for handle in handles:
         handle.start()
         handle.wait_accepted(context.timeout)
@@ -1144,9 +1093,7 @@ def _media_prefix_continuation(context: CaseContext, corpus: Corpus) -> None:
     context.require_success(source)
     history = [*source_messages, _assistant(source)]
     history.append({"role": "user", "content": "Recall the same image in one phrase."})
-    continuation = context.start(
-        "continuation", chat_request(context.model, history, 32)
-    )
+    continuation = context.start("continuation", chat_request(context.model, history, 32))
     context.require_success(continuation)
 
 
@@ -1156,9 +1103,7 @@ def _media_prefix_append(context: CaseContext, corpus: Corpus) -> None:
     context.require_success(source)
     history = [*source_messages, _assistant(source)]
     history.extend(corpus.load_image_messages(1, prompt="Compare this new image with the prior one."))
-    continuation = context.start(
-        "continuation", chat_request(context.model, history, 32)
-    )
+    continuation = context.start("continuation", chat_request(context.model, history, 32))
     context.require_success(continuation)
 
 
@@ -1171,9 +1116,7 @@ def _media_prefix_changed(context: CaseContext, corpus: Corpus) -> None:
     _replace_first_image(changed, replacement)
     changed.append(_assistant(source))
     changed.append({"role": "user", "content": "Answer after the earlier image changed."})
-    continuation = context.start(
-        "changed-continuation", chat_request(context.model, changed, 32)
-    )
+    continuation = context.start("changed-continuation", chat_request(context.model, changed, 32))
     context.require_success(continuation)
 
 
@@ -1211,9 +1154,7 @@ def _text_during_media_prepare(context: CaseContext, corpus: Corpus) -> None:
     )
     media = context.prepare(
         "media",
-        chat_request(
-            context.model, corpus.media_messages("many-image-28-a"), 32
-        ),
+        chat_request(context.model, corpus.media_messages("many-image-28-a"), 32),
     )
     media.start()
     media.wait_body_sent(context.timeout)
@@ -1259,15 +1200,11 @@ def _two_heavy_media(context: CaseContext, corpus: Corpus) -> None:
         (
             (
                 "media-a",
-                chat_request(
-                    context.model, corpus.media_messages("many-image-28-a"), 32
-                ),
+                chat_request(context.model, corpus.media_messages("many-image-28-a"), 32),
             ),
             (
                 "media-b",
-                chat_request(
-                    context.model, corpus.media_messages("many-image-28-b"), 32
-                ),
+                chat_request(context.model, corpus.media_messages("many-image-28-b"), 32),
             ),
         )
     )
@@ -1315,34 +1252,131 @@ def _definition(
 
 _DEFINITIONS = (
     _definition(
-        "shared-state-working-set-shift", "openai_chat", "cache-state-working-set", "resource",
+        "shared-state-working-set-shift",
+        "openai_chat",
+        "cache-state-working-set",
+        "resource",
         tuple(f"state-2k-{label}" for label in "abcdef"),
         "Two three-conversation working sets in one process under State pressure, followed by repeated probes.",
         _shared_state_working_set,
     ),
     _definition(
-        "private-state-working-set-shift", "openai_chat", "cache-private-working-set", "resource",
+        "private-state-working-set-shift",
+        "openai_chat",
+        "cache-private-working-set",
+        "resource",
         tuple(f"state-2k-{label}" for label in "abcd"),
         "Two pairs of full-history conversations compete for private checkpoint State capacity.",
         _private_state_working_set,
     ),
     _definition(
-        "shared-state-hot-prefix", "openai_chat", "cache-state-working-set", "resource",
+        "shared-state-hot-prefix",
+        "openai_chat",
+        "cache-state-working-set",
+        "resource",
         tuple(f"state-2k-{label}" for label in "abcdef"),
         "A frequently revisited prefix is interleaved with five one-use conversations.",
         _shared_state_hot_prefix,
     ),
-    _definition("cold-short", "openai_chat", "text-cold-8k", "workload", ("short-32",), "Short cold TTFT baseline.", _cold_shape("short-32")),
-    _definition("cold-long-8k", "openai_chat", "text-cold-8k", "workload", ("long-8k-32",), "8K cold prefill baseline.", _cold_shape("long-8k-32")),
-    _definition("cold-long-64k", "openai_chat", "text-cold-64k", "workload", ("long-64k-32",), "64K legal long-context input.", _cold_shape("long-64k-32")),
-    _definition("cold-long-256k", "openai_chat", "text-cold-256k", "workload", ("long-256k-32",), "Hardware-resident extreme context under the standard FP8 KV profile.", _cold_shape("long-256k-32")),
-    _definition("mixed-four-ordered", "openai_chat", "mixed-four", "workload", ("long-8k-16", "long-8k-independent-32", "short-32", "image-chart"), "Four legal heterogeneous arrivals submitted in observed Serve-acceptance order.", _mixed_four_ordered),
-    _definition("mixed-four-concurrent", "openai_chat", "mixed-four", "workload", ("long-8k-16", "long-8k-independent-32", "short-32", "image-chart"), "The same heterogeneous requests released concurrently without an artificial order.", _mixed_four_concurrent),
-    _definition("anonymous-hot-continuation", "openai_chat", "cache-hot", "private", ("long-8k-16",), "Anonymous full-history continuation.", _anonymous_hot),
-    _definition("session-hot-continuation", "openai_responses", "cache-hot", "session", ("long-8k-16",), "Named Responses session continuation.", _session_hot),
-    _definition("session-alternating", "openai_responses", "cache-pressure-device", "session", ("long-8k-16",), "Alternating named sessions.", _session_alternating),
-    _definition("session-alternating-64k-host-swap", "openai_responses", "cache-swap-64k-host", "resource", ("long-64k-32", "long-64k-independent-32"), "Two near-capacity sessions alternate through Host KV.", _session_alternating_64k_host_swap),
-    _definition("session-rotation-55k-host", "openai_responses", "cache-rotation-55k-host", "resource", tuple(f"rotation-55k-{index}" for index in range(6)), "Six early-divergent 55K Responses roots, one warm branch, then three sequential round-robin branch rounds under Device/Host KV pressure.", _session_rotation_55k_host),
+    _definition(
+        "cold-short",
+        "openai_chat",
+        "text-cold-8k",
+        "workload",
+        ("short-32",),
+        "Short cold TTFT baseline.",
+        _cold_shape("short-32"),
+    ),
+    _definition(
+        "cold-long-8k",
+        "openai_chat",
+        "text-cold-8k",
+        "workload",
+        ("long-8k-32",),
+        "8K cold prefill baseline.",
+        _cold_shape("long-8k-32"),
+    ),
+    _definition(
+        "cold-long-64k",
+        "openai_chat",
+        "text-cold-64k",
+        "workload",
+        ("long-64k-32",),
+        "64K legal long-context input.",
+        _cold_shape("long-64k-32"),
+    ),
+    _definition(
+        "cold-long-256k",
+        "openai_chat",
+        "text-cold-256k",
+        "workload",
+        ("long-256k-32",),
+        "Hardware-resident extreme context under the standard FP8 KV profile.",
+        _cold_shape("long-256k-32"),
+    ),
+    _definition(
+        "mixed-four-ordered",
+        "openai_chat",
+        "mixed-four",
+        "workload",
+        ("long-8k-16", "long-8k-independent-32", "short-32", "image-chart"),
+        "Four legal heterogeneous arrivals submitted in observed Serve-acceptance order.",
+        _mixed_four_ordered,
+    ),
+    _definition(
+        "mixed-four-concurrent",
+        "openai_chat",
+        "mixed-four",
+        "workload",
+        ("long-8k-16", "long-8k-independent-32", "short-32", "image-chart"),
+        "The same heterogeneous requests released concurrently without an artificial order.",
+        _mixed_four_concurrent,
+    ),
+    _definition(
+        "anonymous-hot-continuation",
+        "openai_chat",
+        "cache-hot",
+        "private",
+        ("long-8k-16",),
+        "Anonymous full-history continuation.",
+        _anonymous_hot,
+    ),
+    _definition(
+        "session-hot-continuation",
+        "openai_responses",
+        "cache-hot",
+        "session",
+        ("long-8k-16",),
+        "Named Responses session continuation.",
+        _session_hot,
+    ),
+    _definition(
+        "session-alternating",
+        "openai_responses",
+        "cache-pressure-device",
+        "session",
+        ("long-8k-16",),
+        "Alternating named sessions.",
+        _session_alternating,
+    ),
+    _definition(
+        "session-alternating-64k-host-swap",
+        "openai_responses",
+        "cache-swap-64k-host",
+        "resource",
+        ("long-64k-32", "long-64k-independent-32"),
+        "Two near-capacity sessions alternate through Host KV.",
+        _session_alternating_64k_host_swap,
+    ),
+    _definition(
+        "session-rotation-55k-host",
+        "openai_responses",
+        "cache-rotation-55k-host",
+        "resource",
+        tuple(f"rotation-55k-{index}" for index in range(6)),
+        "Six early-divergent 55K Responses roots, one warm branch, then three sequential round-robin branch rounds under Device/Host KV pressure.",
+        _session_rotation_55k_host,
+    ),
     _definition(
         "session-rotation-55k-two-cohort-stream",
         "openai_responses",
@@ -1356,59 +1390,425 @@ _DEFINITIONS = (
         symmetric_role_groups=tuple(
             SymmetricRoleGroup(
                 f"cohort-b-round-{round_index}",
-                tuple(
-                    f"cohort-b-round-{round_index}-context-{source_index}"
-                    for source_index in range(6)
-                ),
+                tuple(f"cohort-b-round-{round_index}-context-{source_index}" for source_index in range(6)),
             )
             for round_index in range(1, 4)
         ),
     ),
-    _definition("unmarked-common-prefix-miss", "openai_chat", "cache-hot", "private", ("unmarked-common-a", "unmarked-common-b"), "Raw token commonality without a checkpoint.", _unmarked_common),
-    _definition("resume-after-interference-device", "openai_responses", "cache-pressure-device", "resource", ("long-8k-16", "interferer-256"), "Pressure graph with Device-resident source.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),
-    _definition("resume-after-interference-state-host", "openai_responses", "cache-pressure-state-host", "resource", ("long-8k-16", "interferer-256"), "Pressure graph with Host State restore.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),
-    _definition("resume-after-interference-kv-host", "openai_responses", "cache-pressure-kv-host", "resource", ("long-8k-16", "interferer-256"), "Pressure graph with Host KV restore.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),
-    _definition("resume-after-interference-both-host", "openai_responses", "cache-pressure-both-host", "resource", ("long-8k-16", "interferer-256"), "Pressure graph with State and KV restore.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),
-    _definition("resume-after-interference-evicted", "openai_responses", "cache-pressure-evict", "resource", ("long-8k-16", "interferer-256"), "Pressure graph with no legal retained replica.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),
-    _definition("resume-after-interference-catalog", "openai_responses", "cache-pressure-catalog", "resource", ("long-8k-16", "interferer-256"), "Descriptor pressure with spare physical capacity.", _pressure_graph, symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),)),
-    _definition("continuation-cache-off", "openai_responses", "cache-off", "control", ("long-8k-16",), "Full-history Responses control with Engine reuse disabled.", _cache_off),
-    _definition("shared-sequential", "anthropic_messages", "shared-prefix", "shared", ("system-a",), "Marked Anthropic shared prefix sequential reuse.", _shared_sequential),
-    _definition("shared-openai-explicit", "openai_chat", "shared-prefix", "shared", ("system-a",), "OpenAI explicit system boundary shared by different suffixes.", _openai_explicit_shared),
-    _definition("shared-openai-implicit", "openai_chat", "shared-value", "shared", ("unmarked-common-a",), "OpenAI default implicit full-prompt owner survives private displacement.", _openai_implicit_shared),
-    _definition("shared-observed-promotion", "anthropic_messages", "shared-value", "shared", ("unmarked-common-a",), "Two independent unmarked observations promote a private base before private displacement.", _observed_shared_promotion),
-    _definition("shared-fanout", "anthropic_messages", "shared-prefix", "shared", ("system-a",), "Concurrent branches from a non-aligned shared prefix.", _shared_fanout, symmetric_role_groups=(SymmetricRoleGroup("branches", ("branch-b", "branch-c")),)),
-    _definition("shared-slot-retention", "anthropic_messages", "shared-value", "shared", ("system-a", "system-b"), "Equal-value S=1 challenger must justify replacing the established owner.", _shared_slot_retention),
-    _definition("shared-value-replacement", "anthropic_messages", "shared-value", "shared", ("system-a", "client-tools-32"), "A higher-value tool frontier competes for one shared slot.", _shared_value_replacement),
-    _definition("shared-tools-sequential", "anthropic_messages", "shared-prefix", "shared", ("client-tools-32",), "Stable 32-tool prefix reuse.", _shared_tools_sequential),
-    _definition("shared-tools-changed", "anthropic_messages", "shared-prefix", "shared", ("client-tools-32",), "Early tool identity change invalidates the marked prefix.", _shared_tools_changed),
-    _definition("short-during-prefill-128", "openai_chat", "scheduler-prefill-128", "scheduling", ("long-8k-32", "short-32"), "Arrival during prefill with 128-token chunks.", _short_during_prefill),
-    _definition("short-during-prefill-1024", "openai_chat", "scheduler-overlap", "scheduling", ("long-8k-32", "short-32"), "Arrival during prefill with 1024-token chunks.", _short_during_prefill),
-    _definition("short-during-prefill-4096", "openai_chat", "scheduler-prefill-4096", "scheduling", ("long-8k-32", "short-32"), "Arrival during prefill with 4096-token chunks.", _short_during_prefill),
-    _definition("short-during-decode", "openai_chat", "scheduler-overlap", "scheduling", ("holder-4096", "short-32"), "New prefill during active decode.", _short_during_decode),
-    _definition("protected-head-backfill", "openai_chat", "scheduler-backfill", "scheduling", ("holder-4096", "long-8k-32", "short-32"), "Persistent-safe borrower may pass a protected head.", _protected_backfill),
-    _definition("protected-head-no-backfill", "openai_chat", "scheduler-backfill", "scheduling", ("holder-4096", "long-8k-32", "medium-3000"), "Unsafe borrower stays behind a protected head.", _protected_no_backfill),
-    _definition("active-lanes-full-8", "openai_chat", "lane-limit-8", "boundary", ("holder-4096", "short-32"), "Startup-fixed eight-lane product boundary.", _active_lanes_full, symmetric_role_groups=(SymmetricRoleGroup("holders", tuple(f"holder-{index}" for index in range(8))),)),
-    _definition("session-publication-order", "openai_responses", "session-order", "boundary", ("holder-4096",), "Older late completion cannot overwrite newer session binding.", _session_publication_order),
-    _definition("cancel-before-first", "openai_chat", "scheduler-overlap", "boundary", ("long-8k-32", "short-32"), "Cancellation after admission but before first output.", _cancel_before_first),
-    _definition("cancel-after-first", "openai_chat", "scheduler-overlap", "boundary", ("holder-4096", "short-32"), "Active cancellation after first output.", _cancel_after_first),
-    _definition("pending-overflow", "openai_chat", "lane-limit-8", "rejection", ("holder-4096", "short-32"), "Bounded FIFO overflow returns 429 without TTFT.", _pending_overflow),
-    _definition("pending-timeout", "openai_chat", "pending-timeout", "rejection", ("holder-4096", "short-32"), "Non-streaming pending request returns 503.", _pending_timeout),
-    _definition("context-exact", "openai_chat", "context-boundary", "boundary", ("context-exact",), "p+(o-1) exactly equals max_context.", _context_exact),
-    _definition("context-over", "openai_chat", "context-boundary", "rejection", ("context-over",), "Prompt beyond max_context returns 400 without TTFT.", _context_over),
-    _definition("media-cold-image", "openai_chat", "vision-cache", "media", ("image-chart",), "Single-image external TTFT.", _media_cold("image-chart")),
-    _definition("media-cold-image-video", "openai_chat", "vision-cache", "media", ("image-video",), "Interleaved image and video input.", _media_cold("image-video")),
-    _definition("media-prefix-continuation", "openai_chat", "vision-cache", "media", ("image-chart",), "Exact multimodal prefix continuation.", _media_prefix_continuation),
-    _definition("media-prefix-append", "openai_chat", "vision-cache", "media", ("image-chart", "load-image-01"), "Reused media prefix with new suffix image.", _media_prefix_append),
-    _definition("media-prefix-changed", "openai_chat", "vision-cache", "media", ("image-chart", "load-image-02"), "Earlier media identity change invalidates reuse.", _media_prefix_changed),
-    _definition("media-preprocess-warm", "openai_chat", "media-cache-tight", "media", ("load-image-00",), "Media preprocess cache warm control with context reuse off.", _media_preprocess_warm),
-    _definition("media-cache-thrash", "openai_chat", "media-cache-tight", "media", ("load-image-00", "load-image-01", "load-image-02"), "A-B-C-A media LRU pressure.", _media_cache_thrash),
-    _definition("many-image-28", "openai_chat", "vision-cache", "media", ("many-image-28-a",), "Legal high Vision and many-item request.", _many_image),
-    _definition("many-image-28-thread-1", "openai_chat", "vision-thread-1", "media", ("many-image-28-a",), "Single preprocessing worker control.", _many_image),
-    _definition("text-during-media-prepare", "openai_chat", "vision-concurrent", "media", ("many-image-28-a", "short-32"), "Text arrival while a complete media body is preparing.", _text_during_media_prepare),
-    _definition("media-during-text-decode", "openai_chat", "vision-concurrent", "media", ("holder-4096", "many-image-28-a"), "Heavy media arrival during text decode.", _media_during_text_decode),
-    _definition("two-heavy-media-arrivals", "openai_chat", "vision-concurrent", "media", ("many-image-28-a", "many-image-28-b"), "Two byte-distinct legal high-media arrivals.", _two_heavy_media, symmetric_role_groups=(SymmetricRoleGroup("media", ("media-a", "media-b")),)),
-    _definition("vision-disabled", "openai_chat", "text-cold-8k", "rejection", ("image-chart",), "Media on a text-only Serve is rejected.", _vision_disabled),
-    _definition("vision-envelope-over", "openai_chat", "vision-boundary", "rejection", ("many-image-33",), "Aggregate Vision envelope rejection.", _vision_envelope_over),
+    _definition(
+        "unmarked-common-prefix-miss",
+        "openai_chat",
+        "cache-hot",
+        "private",
+        ("unmarked-common-a", "unmarked-common-b"),
+        "Raw token commonality without a checkpoint.",
+        _unmarked_common,
+    ),
+    _definition(
+        "resume-after-interference-device",
+        "openai_responses",
+        "cache-pressure-device",
+        "resource",
+        ("long-8k-16", "interferer-256"),
+        "Pressure graph with Device-resident source.",
+        _pressure_graph,
+        symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),),
+    ),
+    _definition(
+        "resume-after-interference-state-host",
+        "openai_responses",
+        "cache-pressure-state-host",
+        "resource",
+        ("long-8k-16", "interferer-256"),
+        "Pressure graph with Host State restore.",
+        _pressure_graph,
+        symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),),
+    ),
+    _definition(
+        "resume-after-interference-kv-host",
+        "openai_responses",
+        "cache-pressure-kv-host",
+        "resource",
+        ("long-8k-16", "interferer-256"),
+        "Pressure graph with Host KV restore.",
+        _pressure_graph,
+        symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),),
+    ),
+    _definition(
+        "resume-after-interference-both-host",
+        "openai_responses",
+        "cache-pressure-both-host",
+        "resource",
+        ("long-8k-16", "interferer-256"),
+        "Pressure graph with State and KV restore.",
+        _pressure_graph,
+        symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),),
+    ),
+    _definition(
+        "resume-after-interference-evicted",
+        "openai_responses",
+        "cache-pressure-evict",
+        "resource",
+        ("long-8k-16", "interferer-256"),
+        "Pressure graph with no legal retained replica.",
+        _pressure_graph,
+        symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),),
+    ),
+    _definition(
+        "resume-after-interference-catalog",
+        "openai_responses",
+        "cache-pressure-catalog",
+        "resource",
+        ("long-8k-16", "interferer-256"),
+        "Descriptor pressure with spare physical capacity.",
+        _pressure_graph,
+        symmetric_role_groups=(SymmetricRoleGroup("interferers", ("interferer-b", "interferer-c")),),
+    ),
+    _definition(
+        "continuation-cache-off",
+        "openai_responses",
+        "cache-off",
+        "control",
+        ("long-8k-16",),
+        "Full-history Responses control with Engine reuse disabled.",
+        _cache_off,
+    ),
+    _definition(
+        "shared-sequential",
+        "anthropic_messages",
+        "shared-prefix",
+        "shared",
+        ("system-a",),
+        "Marked Anthropic shared prefix sequential reuse.",
+        _shared_sequential,
+    ),
+    _definition(
+        "shared-openai-explicit",
+        "openai_chat",
+        "shared-prefix",
+        "shared",
+        ("system-a",),
+        "OpenAI explicit system boundary shared by different suffixes.",
+        _openai_explicit_shared,
+    ),
+    _definition(
+        "shared-openai-implicit",
+        "openai_chat",
+        "shared-value",
+        "shared",
+        ("unmarked-common-a",),
+        "OpenAI default implicit full-prompt owner survives private displacement.",
+        _openai_implicit_shared,
+    ),
+    _definition(
+        "shared-observed-promotion",
+        "anthropic_messages",
+        "shared-value",
+        "shared",
+        ("unmarked-common-a",),
+        "Two independent unmarked observations promote a private base before private displacement.",
+        _observed_shared_promotion,
+    ),
+    _definition(
+        "shared-fanout",
+        "anthropic_messages",
+        "shared-prefix",
+        "shared",
+        ("system-a",),
+        "Concurrent branches from a non-aligned shared prefix.",
+        _shared_fanout,
+        symmetric_role_groups=(SymmetricRoleGroup("branches", ("branch-b", "branch-c")),),
+    ),
+    _definition(
+        "shared-slot-retention",
+        "anthropic_messages",
+        "shared-value",
+        "shared",
+        ("system-a", "system-b"),
+        "Equal-value S=1 challenger must justify replacing the established owner.",
+        _shared_slot_retention,
+    ),
+    _definition(
+        "shared-value-replacement",
+        "anthropic_messages",
+        "shared-value",
+        "shared",
+        ("system-a", "client-tools-32"),
+        "A higher-value tool frontier competes for one shared slot.",
+        _shared_value_replacement,
+    ),
+    _definition(
+        "shared-tools-sequential",
+        "anthropic_messages",
+        "shared-prefix",
+        "shared",
+        ("client-tools-32",),
+        "Stable 32-tool prefix reuse.",
+        _shared_tools_sequential,
+    ),
+    _definition(
+        "shared-tools-changed",
+        "anthropic_messages",
+        "shared-prefix",
+        "shared",
+        ("client-tools-32",),
+        "Early tool identity change invalidates the marked prefix.",
+        _shared_tools_changed,
+    ),
+    _definition(
+        "short-during-prefill-128",
+        "openai_chat",
+        "scheduler-prefill-128",
+        "scheduling",
+        ("long-8k-32", "short-32"),
+        "Arrival during prefill with 128-token chunks.",
+        _short_during_prefill,
+    ),
+    _definition(
+        "short-during-prefill-1024",
+        "openai_chat",
+        "scheduler-overlap",
+        "scheduling",
+        ("long-8k-32", "short-32"),
+        "Arrival during prefill with 1024-token chunks.",
+        _short_during_prefill,
+    ),
+    _definition(
+        "short-during-prefill-4096",
+        "openai_chat",
+        "scheduler-prefill-4096",
+        "scheduling",
+        ("long-8k-32", "short-32"),
+        "Arrival during prefill with 4096-token chunks.",
+        _short_during_prefill,
+    ),
+    _definition(
+        "short-during-decode",
+        "openai_chat",
+        "scheduler-overlap",
+        "scheduling",
+        ("holder-4096", "short-32"),
+        "New prefill during active decode.",
+        _short_during_decode,
+    ),
+    _definition(
+        "protected-head-backfill",
+        "openai_chat",
+        "scheduler-backfill",
+        "scheduling",
+        ("holder-4096", "long-8k-32", "short-32"),
+        "Persistent-safe borrower may pass a protected head.",
+        _protected_backfill,
+    ),
+    _definition(
+        "protected-head-no-backfill",
+        "openai_chat",
+        "scheduler-backfill",
+        "scheduling",
+        ("holder-4096", "long-8k-32", "medium-3000"),
+        "Unsafe borrower stays behind a protected head.",
+        _protected_no_backfill,
+    ),
+    _definition(
+        "active-lanes-full-8",
+        "openai_chat",
+        "lane-limit-8",
+        "boundary",
+        ("holder-4096", "short-32"),
+        "Startup-fixed eight-lane product boundary.",
+        _active_lanes_full,
+        symmetric_role_groups=(SymmetricRoleGroup("holders", tuple(f"holder-{index}" for index in range(8))),),
+    ),
+    _definition(
+        "session-publication-order",
+        "openai_responses",
+        "session-order",
+        "boundary",
+        ("holder-4096",),
+        "Older late completion cannot overwrite newer session binding.",
+        _session_publication_order,
+    ),
+    _definition(
+        "cancel-before-first",
+        "openai_chat",
+        "scheduler-overlap",
+        "boundary",
+        ("long-8k-32", "short-32"),
+        "Cancellation after admission but before first output.",
+        _cancel_before_first,
+    ),
+    _definition(
+        "cancel-after-first",
+        "openai_chat",
+        "scheduler-overlap",
+        "boundary",
+        ("holder-4096", "short-32"),
+        "Active cancellation after first output.",
+        _cancel_after_first,
+    ),
+    _definition(
+        "pending-overflow",
+        "openai_chat",
+        "lane-limit-8",
+        "rejection",
+        ("holder-4096", "short-32"),
+        "Bounded FIFO overflow returns 429 without TTFT.",
+        _pending_overflow,
+    ),
+    _definition(
+        "pending-timeout",
+        "openai_chat",
+        "pending-timeout",
+        "rejection",
+        ("holder-4096", "short-32"),
+        "Non-streaming pending request returns 503.",
+        _pending_timeout,
+    ),
+    _definition(
+        "context-exact",
+        "openai_chat",
+        "context-boundary",
+        "boundary",
+        ("context-exact",),
+        "p+(o-1) exactly equals max_context.",
+        _context_exact,
+    ),
+    _definition(
+        "context-over",
+        "openai_chat",
+        "context-boundary",
+        "rejection",
+        ("context-over",),
+        "Prompt beyond max_context returns 400 without TTFT.",
+        _context_over,
+    ),
+    _definition(
+        "media-cold-image",
+        "openai_chat",
+        "vision-cache",
+        "media",
+        ("image-chart",),
+        "Single-image external TTFT.",
+        _media_cold("image-chart"),
+    ),
+    _definition(
+        "media-cold-image-video",
+        "openai_chat",
+        "vision-cache",
+        "media",
+        ("image-video",),
+        "Interleaved image and video input.",
+        _media_cold("image-video"),
+    ),
+    _definition(
+        "media-prefix-continuation",
+        "openai_chat",
+        "vision-cache",
+        "media",
+        ("image-chart",),
+        "Exact multimodal prefix continuation.",
+        _media_prefix_continuation,
+    ),
+    _definition(
+        "media-prefix-append",
+        "openai_chat",
+        "vision-cache",
+        "media",
+        ("image-chart", "load-image-01"),
+        "Reused media prefix with new suffix image.",
+        _media_prefix_append,
+    ),
+    _definition(
+        "media-prefix-changed",
+        "openai_chat",
+        "vision-cache",
+        "media",
+        ("image-chart", "load-image-02"),
+        "Earlier media identity change invalidates reuse.",
+        _media_prefix_changed,
+    ),
+    _definition(
+        "media-preprocess-warm",
+        "openai_chat",
+        "media-cache-tight",
+        "media",
+        ("load-image-00",),
+        "Media preprocess cache warm control with context reuse off.",
+        _media_preprocess_warm,
+    ),
+    _definition(
+        "media-cache-thrash",
+        "openai_chat",
+        "media-cache-tight",
+        "media",
+        ("load-image-00", "load-image-01", "load-image-02"),
+        "A-B-C-A media LRU pressure.",
+        _media_cache_thrash,
+    ),
+    _definition(
+        "many-image-28",
+        "openai_chat",
+        "vision-cache",
+        "media",
+        ("many-image-28-a",),
+        "Legal high Vision and many-item request.",
+        _many_image,
+    ),
+    _definition(
+        "many-image-28-thread-1",
+        "openai_chat",
+        "vision-thread-1",
+        "media",
+        ("many-image-28-a",),
+        "Single preprocessing worker control.",
+        _many_image,
+    ),
+    _definition(
+        "text-during-media-prepare",
+        "openai_chat",
+        "vision-concurrent",
+        "media",
+        ("many-image-28-a", "short-32"),
+        "Text arrival while a complete media body is preparing.",
+        _text_during_media_prepare,
+    ),
+    _definition(
+        "media-during-text-decode",
+        "openai_chat",
+        "vision-concurrent",
+        "media",
+        ("holder-4096", "many-image-28-a"),
+        "Heavy media arrival during text decode.",
+        _media_during_text_decode,
+    ),
+    _definition(
+        "two-heavy-media-arrivals",
+        "openai_chat",
+        "vision-concurrent",
+        "media",
+        ("many-image-28-a", "many-image-28-b"),
+        "Two byte-distinct legal high-media arrivals.",
+        _two_heavy_media,
+        symmetric_role_groups=(SymmetricRoleGroup("media", ("media-a", "media-b")),),
+    ),
+    _definition(
+        "vision-disabled",
+        "openai_chat",
+        "text-cold-8k",
+        "rejection",
+        ("image-chart",),
+        "Media on a text-only Serve is rejected.",
+        _vision_disabled,
+    ),
+    _definition(
+        "vision-envelope-over",
+        "openai_chat",
+        "vision-boundary",
+        "rejection",
+        ("many-image-33",),
+        "Aggregate Vision envelope rejection.",
+        _vision_envelope_over,
+    ),
 )
 
 
@@ -1442,8 +1842,7 @@ def run_case(
             "expected_profile_label": definition.profile,
             "corpus_ids": list(definition.corpus_ids),
             "symmetric_role_groups": [
-                {"name": group.name, "roles": list(group.roles)}
-                for group in definition.symmetric_role_groups
+                {"name": group.name, "roles": list(group.roles)} for group in definition.symmetric_role_groups
             ],
             "status": "invalid_profile_provenance",
             "constructed": False,
@@ -1470,9 +1869,7 @@ def run_case(
             "case.execution_failed",
             error=f"{type(error).__name__}: {error}",
         )
-        context.failures.append(
-            FailedCondition("case execution completed", f"{type(error).__name__}: {error}")
-        )
+        context.failures.append(FailedCondition("case execution completed", f"{type(error).__name__}: {error}"))
     finally:
         context.cancel_live()
 
@@ -1518,8 +1915,7 @@ def run_case(
         "completion_order": completion_order,
         "notes": context.notes,
         "symmetric_role_groups": [
-            {"name": group.name, "roles": list(group.roles)}
-            for group in definition.symmetric_role_groups
+            {"name": group.name, "roles": list(group.roles)} for group in definition.symmetric_role_groups
         ],
         "requests": records,
     }

@@ -10,7 +10,7 @@ namespace ninfer::models::qwen3_5::detail {
 namespace {
 
 std::size_t dflash2_candidates_workspace_tp2(const SequencePlanImpl& plan, std::int32_t columns) {
-    const auto& parameters = *plan.parameters;
+    const auto& parameters                    = *plan.parameters;
     const execution::ProposalParameters& head = *parameters.proposal;
     if (!head.split()) {
         return ops::linear_topk_workspace_capacity_bytes(head.head.weight.qtype, head.head.weight.n,
@@ -26,20 +26,20 @@ bool dflash2_drafter_split_tp2(const SequencePlanImpl& plan) {
     return plan.parameters != nullptr && execution::dflash2_drafter_split(*plan.parameters);
 }
 
-// One rank's proposal of the split drafter over `batch` rows of `width` masked-block columns, in the
-// allocation order of execution/tp2/draft_tp2.inc (propose_dflash2_batch_tp2). Both ranks run the
-// same layers at their shard shapes and rank with their head blocks; the selecting rank (rank 1 by
-// default, load/sharding.cpp) also projects and selects, so the plan includes that step and bounds
-// both ranks.
+// One rank's proposal of the split drafter over `batch` rows of `width` masked-block columns, in
+// the allocation order of execution/tp2/draft_tp2.inc (propose_dflash2_batch_tp2). Both ranks run
+// the same layers at their shard shapes and rank with their head blocks; the selecting rank (rank 1
+// by default, load/sharding.cpp) also projects and selects, so the plan includes that step and
+// bounds both ranks.
 std::size_t dflash_proposal_workspace_split(const SequencePlanImpl& plan, std::int32_t width,
                                             std::int32_t batch) {
-    const auto& parameters      = *plan.parameters;
-    const auto& config          = parameters.model.config().text;
-    const auto& draft           = *parameters.model.config().draft;
-    const auto drafts           = static_cast<std::int32_t>(plan.draft_window);
-    const std::int32_t hidden   = dimension(config.hidden_size);
-    const std::int32_t columns  = width * batch;
-    const std::int32_t mask     = drafts * batch;
+    const auto& parameters     = *plan.parameters;
+    const auto& config         = parameters.model.config().text;
+    const auto& draft          = *parameters.model.config().draft;
+    const auto drafts          = static_cast<std::int32_t>(plan.draft_window);
+    const std::int32_t hidden  = dimension(config.hidden_size);
+    const std::int32_t columns = width * batch;
+    const std::int32_t mask    = drafts * batch;
     const ops::AttentionHeadGeometry heads{128, 16, 4};
     WorkspaceLayoutBuilder layout;
     reserve_matrix(layout, DType::BF16, hidden, columns); // residual
@@ -57,9 +57,10 @@ std::size_t dflash_proposal_workspace_split(const SequencePlanImpl& plan, std::i
             reserve_matrix(layout, DType::BF16, 128 * heads.kv_heads, columns);
             reserve_matrix(layout, DType::BF16, 128 * heads.kv_heads, columns);
             reserve_matrix(layout, DType::BF16, 128 * heads.query_heads, columns);
-            reserve_scratch(layout, ops::sliding_window_attention_head_block_workspace_capacity_bytes(
-                                        heads, dimension(draft.sliding_window.value_or(0)),
-                                        {0, plan.capacity}, width, width, batch));
+            reserve_scratch(layout,
+                            ops::sliding_window_attention_head_block_workspace_capacity_bytes(
+                                heads, dimension(draft.sliding_window.value_or(0)),
+                                {0, plan.capacity}, width, width, batch));
             reserve_matrix(layout, DType::BF16, hidden, columns);
             reserve_linear(layout, block.output, columns, columns);
         }
@@ -84,12 +85,12 @@ std::size_t dflash_proposal_workspace_split(const SequencePlanImpl& plan, std::i
     reserve_matrix(layout, DType::BF16, hidden, mask);
     reserve_matrix(layout, DType::FP32, dimension(draft.dflash2->selector_top_k), mask);
     const execution::ProposalParameters& head = *parameters.proposal;
-    reserve_scratch(layout, head.split()
-                                ? execution::dflash2_candidates_split_workspace_bytes(
-                                      head, hidden, mask, false)
-                                : ops::linear_topk_workspace_capacity_bytes(
-                                      head.head.weight.qtype, head.head.weight.n,
-                                      head.head.weight.k, mask, mask));
+    reserve_scratch(
+        layout,
+        head.split()
+            ? execution::dflash2_candidates_split_workspace_bytes(head, hidden, mask, false)
+            : ops::linear_topk_workspace_capacity_bytes(head.head.weight.qtype, head.head.weight.n,
+                                                        head.head.weight.k, mask, mask));
     // The selecting rank's projection (rank 1's with the candidate selector there).
     const execution::Parameters& selecting =
         parameters.draft->selector || plan.peer_parameters == nullptr ? parameters
@@ -99,9 +100,8 @@ std::size_t dflash_proposal_workspace_split(const SequencePlanImpl& plan, std::i
     }
     reserve_matrix(layout, DType::BF16, dimension(draft.dflash2->selector_rank), mask);
     reserve_linear(layout, selecting.draft->selector->hidden_projection, mask, mask);
-    reserve_scratch(layout,
-                    ops::candidate_selector_path_workspace_capacity_bytes(drafts, drafts, batch,
-                                                                          batch));
+    reserve_scratch(layout, ops::candidate_selector_path_workspace_capacity_bytes(drafts, drafts,
+                                                                                  batch, batch));
     return layout.peak_bytes(1);
 }
 
@@ -315,7 +315,7 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
         (void)workspace::tp_call_roots(target, config, aggregate);
         target_body(target, aggregate, aggregate, TextPhase::Verify, true, batch, verify, verify);
         {
-            auto logits = target.scope();
+            auto logits             = target.scope();
             const std::int32_t rows = parameters.text.output_head.weight.n;
             (void)workspace::tp_logits(target, rows, dimension(config.vocab_size) - rows, aggregate,
                                        true);
@@ -329,8 +329,8 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
         // the targets, the logprobs, its head half and the staging of rank 1's; rank 1 its head
         // half. Its hidden copy lives in its persistent score_hidden.
         const execution::LinearParameters& head = parameters.text.output_head;
-        const std::int32_t rows1 = dimension(config.vocab_size) - head.weight.n;
-        const auto tile          = static_cast<std::int32_t>(kCausalScoreTile);
+        const std::int32_t rows1                = dimension(config.vocab_size) - head.weight.n;
+        const auto tile                         = static_cast<std::int32_t>(kCausalScoreTile);
         const std::size_t head_scratch =
             execution::output_head_split_workspace_bytes(head, 1, tile);
         WorkspaceLayoutBuilder rank0;
@@ -403,16 +403,17 @@ WorkspacePlan build_tensor_parallel_workspace_plan(const SequencePlanImpl& plan)
         out.dflash_context = dflash_context_workspace(plan, chunk, 1, false);
         for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
              ++batch) {
-            out.dflash_round = std::max(
-                {out.dflash_round, verification(batch), dflash_accept_workspace(plan, batch),
-                 dflash_context_workspace(plan, verify, batch, true),
-                 dflash2_drafter_split_tp2(plan) ? dflash_proposal_workspace_split(plan, verify, batch)
-                                                 : dflash_proposal_workspace(plan, verify, batch)});
+            out.dflash_round = std::max({out.dflash_round, verification(batch),
+                                         dflash_accept_workspace(plan, batch),
+                                         dflash_context_workspace(plan, verify, batch, true),
+                                         dflash2_drafter_split_tp2(plan)
+                                             ? dflash_proposal_workspace_split(plan, verify, batch)
+                                             : dflash_proposal_workspace(plan, verify, batch)});
         }
     }
-    out.general_capacity = std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill,
-                                     out.mtp_round, out.dflash_context, out.dflash_round,
-                                     out.causal_score});
+    out.general_capacity =
+        std::max({out.text_prefill, out.ordinary_round, out.mtp_prefill, out.mtp_round,
+                  out.dflash_context, out.dflash_round, out.causal_score});
     out.capacity = out.general_capacity;
     if (plan.features.vision) {
         // The rank that holds the tower encodes each item after its general prefix, as on one

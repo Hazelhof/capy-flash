@@ -9,7 +9,7 @@ from math import prod
 from typing import Sequence
 
 from tools.artifact.layouts import encoded_size
-from tools.artifact.formats import DirectFormat, Fp8RowFormat, Nvfp4Format, get_format
+from tools.artifact.formats import DirectFormat, Fp8RowFormat, Mxfp8Format, Nvfp4Format, Nvfp4RowFormat, get_format
 from tools.artifact.schema import ACTIVATION_POLICIES, TensorSpec
 from .methods import (
     AuxiliaryValue,
@@ -66,6 +66,10 @@ def default_layout(format: str) -> str:
         return "row_scale_v1"
     if isinstance(kind, Nvfp4Format):
         return "block_scale_k16_m128x4_v1"
+    if isinstance(kind, Mxfp8Format):
+        return "block_scale_k32_v1"
+    if isinstance(kind, Nvfp4RowFormat):
+        return "row_interleaved_v1"
     return "row_split_k128_v1"
 
 
@@ -78,9 +82,7 @@ def _slice_source(source: LogicalSource, begin: int, end: int) -> LogicalSource:
     if len(source.shape) == 2:
         return select_rows(source, ((begin // width, end // width),))
     shape = ((end - begin) // width, *source.shape[1:])
-    return LogicalSource(
-        shape, source.label, lambda a, b: source.values(begin + a, begin + b)
-    )
+    return LogicalSource(shape, source.label, lambda a, b: source.values(begin + a, begin + b))
 
 
 class Recipe:
@@ -129,9 +131,7 @@ class Recipe:
                 else [name for name in self.selections if fnmatchcase(name, selector)]
             )
             if not matched:
-                raise ValueError(
-                    f"recipe selector matched no logical parameter: {selector!r}"
-                )
+                raise ValueError(f"recipe selector matched no logical parameter: {selector!r}")
             for name in matched:
                 if name not in seen:
                     seen.add(name)
@@ -160,29 +160,18 @@ class Recipe:
         for name in self.match(selectors):
             parameter = self.model.parameters[name]
             if source is not None and tuple(source.shape) != parameter.shape:
-                raise ValueError(
-                    f"{name}: override source shape differs from logical parameter"
-                )
+                raise ValueError(f"{name}: override source shape differs from logical parameter")
             size = prod(parameter.shape)
             begin, end = 0, size
             if rows is not None:
                 if len(rows) != 2 or not parameter.shape:
-                    raise ValueError(
-                        f"{name}: rows requires two bounds and a nonscalar parameter"
-                    )
+                    raise ValueError(f"{name}: rows requires two bounds and a nonscalar parameter")
                 first, last = rows
-                if (
-                    type(first) is not int
-                    or type(last) is not int
-                    or not 0 <= first < last <= parameter.shape[0]
-                ):
+                if type(first) is not int or type(last) is not int or not 0 <= first < last <= parameter.shape[0]:
                     raise ValueError(f"{name}: row range {rows} is invalid")
                 width = prod(parameter.shape[1:])
                 begin, end = first * width, last * width
-            physical = any(
-                value is not None
-                for value in (format, layout, method, source, parameters)
-            )
+            physical = any(value is not None for value in (format, layout, method, source, parameters))
             if physical:
                 self.aliases.pop(name, None)
                 updated = []
@@ -205,7 +194,9 @@ class Recipe:
                             changes[key] = (
                                 None
                                 if key == "layout" and value == "auto"
-                                else deepcopy(value) if key == "parameters" else value
+                                else deepcopy(value)
+                                if key == "parameters"
+                                else value
                             )
                     updated.append(replace(previous, **changes))
                     if high < previous.end:
@@ -248,10 +239,7 @@ class Recipe:
     def share(self, parameter: str, target: str) -> None:
         if parameter not in self.selections or target not in self.selections:
             raise ValueError("shared parameters must exist")
-        if (
-            self.model.parameters[parameter].shape
-            != self.model.parameters[target].shape
-        ):
+        if self.model.parameters[parameter].shape != self.model.parameters[target].shape:
             raise ValueError("shared parameters must have equal logical shapes")
         current = target
         visited = {parameter}
@@ -280,10 +268,7 @@ class Recipe:
             )
 
         def parent_shape(items, chosen):
-            sources = [
-                _slice_source(value.source, value.begin, value.end)
-                for _, value in items
-            ]
+            sources = [_slice_source(value.source, value.begin, value.end) for _, value in items]
             size = sum(prod(source.shape) for source in sources)
             if chosen is not None:
                 if prod(chosen) != size:
@@ -297,14 +282,9 @@ class Recipe:
                 return (prod(first[:-1]), first[-1]) if first else (1, 1), sources
             if all(len(source.shape) == 1 for source in sources):
                 return (size,) if direct else (1, size), sources
-            if all(
-                len(source.shape) == 2 and source.shape[1] == first[1]
-                for source in sources
-            ):
+            if all(len(source.shape) == 2 and source.shape[1] == first[1] for source in sources):
                 return (sum(source.shape[0] for source in sources), first[1]), sources
-            raise ValueError(
-                "grouped inputs need compatible rows or an explicit parent shape"
-            )
+            raise ValueError("grouped inputs need compatible rows or an explicit parent shape")
 
         def parent_divisors(sources, selection) -> int:
             """How many NVFP4 divisors this parent stores: one per source, or one for all.
@@ -321,54 +301,38 @@ class Recipe:
                 if any(len(source.shape) != 2 for source in sources) or (
                     len({source.shape[0] for source in sources}) != 1
                 ):
-                    raise ValueError(
-                        "stacked NVFP4 sources must be complete matrices with equal row counts"
-                    )
+                    raise ValueError("stacked NVFP4 sources must be complete matrices with equal row counts")
                 return len(sources)
             if selection.method is not import_encoded:
                 # A quantizing method writes the one divisor it chooses for the parent.
                 return 1
-            words = [
-                source.weight_divisor() if source.weight_divisor else None
-                for source in sources
-            ]
+            words = [source.weight_divisor() if source.weight_divisor else None for source in sources]
             # A stack is only chosen when the sources are known to disagree. A divisor no source
             # states at plan time is unknown, not different.
             if None in words or len(set(words)) == 1:
                 return 1
-            if any(len(source.shape) != 2 for source in sources) or (
-                len({source.shape[0] for source in sources}) != 1
-            ):
+            if any(len(source.shape) != 2 for source in sources) or (len({source.shape[0] for source in sources}) != 1):
                 raise ValueError(
-                    "NVFP4 sources quantised against different divisors must be complete "
-                    "matrices with equal row counts"
+                    "NVFP4 sources quantised against different divisors must be complete matrices with equal row counts"
                 )
             return len(sources)
 
         def emit(items, chosen=None):
             if len({self.model.parameters[name].residency for name, _ in items}) > 1:
-                raise ValueError(
-                    "grouping crosses independently selected private weights"
-                )
+                raise ValueError("grouping crosses independently selected private weights")
             if not compatible(items):
-                raise ValueError(
-                    "explicit grouping has incompatible formats, layouts or methods"
-                )
+                raise ValueError("explicit grouping has incompatible formats, layouts or methods")
             dims, sources = parent_shape(items, chosen)
             selection = items[0][1]
             layout = selection.layout or default_layout(selection.format)
             divisors = parent_divisors(sources, selection)
             encoded_size(layout, selection.format, dims, divisors)
-            spec = TensorSpec(
-                f"weight/{len(weights):06d}", dims, selection.format, layout, divisors
-            )
+            spec = TensorSpec(f"weight/{len(weights):06d}", dims, selection.format, layout, divisors)
             inputs = tuple(
                 MethodInput(
                     name,
                     source,
-                    tuple(
-                        (name, value) for value in self.model.parameters[name].inputs
-                    ),
+                    tuple((name, value) for value in self.model.parameters[name].inputs),
                 )
                 for (name, _), source in zip(items, sources)
             )
@@ -384,16 +348,12 @@ class Recipe:
             try:
                 prepared = selection.method(request)
             except Exception as error:
-                raise ValueError(
-                    f"{','.join(name for name, _ in items)}: {error}"
-                ) from error
+                raise ValueError(f"{','.join(name for name, _ in items)}: {error}") from error
             if not isinstance(prepared, PreparedMethod):
                 raise TypeError("conversion method must return request.job(...)")
             for key, value in prepared.auxiliaries.items():
                 if key in auxiliary_values and auxiliary_values[key] != value:
-                    raise ValueError(
-                        f"{key}: conflicting auxiliary values across physical parts"
-                    )
+                    raise ValueError(f"{key}: conflicting auxiliary values across physical parts")
                 auxiliary_values[key] = value
             weights.append(
                 WeightJob(
@@ -401,9 +361,7 @@ class Recipe:
                     prepared,
                     tuple(name for name, _ in items),
                     tuple(source.label for source in sources),
-                    getattr(
-                        selection.method, "__name__", type(selection.method).__name__
-                    ),
+                    getattr(selection.method, "__name__", type(selection.method).__name__),
                     dict(selection.parameters),
                 )
             )
@@ -417,9 +375,7 @@ class Recipe:
             if any(name in used or name in self.aliases for name in names):
                 raise ValueError("explicit groups overlap or include a shared alias")
             if any(len(self.selections[name]) != 1 for name in names):
-                raise ValueError(
-                    "explicit grouping requires unsplit logical selections"
-                )
+                raise ValueError("explicit grouping requires unsplit logical selections")
             emit([(name, self.selections[name][0]) for name in names], chosen)
             used.update(names)
         standard = (
@@ -431,10 +387,7 @@ class Recipe:
             nvfp4_mse,
         )
         for names in self.model.packing_groups:
-            if any(
-                name in used or name in self.aliases or name in self.separate_parameters
-                for name in names
-            ):
+            if any(name in used or name in self.aliases or name in self.separate_parameters for name in names):
                 continue
             if any(len(self.selections[name]) != 1 for name in names):
                 continue
@@ -443,11 +396,7 @@ class Recipe:
                 continue
             if items[0][1].format == "nvfp4" and items[0][1].method is import_encoded:
                 divisors = [
-                    (
-                        value.source.weight_divisor()
-                        if value.source.weight_divisor is not None
-                        else None
-                    )
+                    (value.source.weight_divisor() if value.source.weight_divisor is not None else None)
                     for _, value in items
                 ]
                 if None in divisors or len(set(divisors)) != 1:
@@ -482,10 +431,7 @@ class Recipe:
                 bindings[name] = {"object": parent}
             else:
                 bindings[name] = {
-                    "parts": [
-                        {"object": parent, "range": [first, last]}
-                        for _, parent, first, last in parts
-                    ]
+                    "parts": [{"object": parent, "range": [first, last]} for _, parent, first, last in parts]
                 }
         for name in self.aliases:
             target = self.aliases[name]
@@ -518,9 +464,7 @@ class Recipe:
             for role, value in auxiliaries_by_use.get((name, input_name), ()):
                 if role == "activation_input_divisor":
                     if value.format != "fp32" or value.shape != ():
-                        raise ValueError(
-                            f"{name}: activation divisor must be an FP32 scalar"
-                        )
+                        raise ValueError(f"{name}: activation divisor must be an FP32 scalar")
                     AuxiliaryValue.activation_divisor(value.data)
                 layout = default_layout(value.format)
                 if len(value.data) != encoded_size(layout, value.format, value.shape):
@@ -539,6 +483,4 @@ class Recipe:
         known_uses = set(self.policies)
         if any((key[0], key[1]) not in known_uses for key in auxiliary_values):
             raise ValueError("method returned an auxiliary for an unknown Use")
-        return PreparedRecipe(
-            tuple(weights), bindings, tuple(uses), tuple(auxiliary_outputs)
-        )
+        return PreparedRecipe(tuple(weights), bindings, tuple(uses), tuple(auxiliary_outputs))

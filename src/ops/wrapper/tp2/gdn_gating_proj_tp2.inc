@@ -1,5 +1,5 @@
-// Translation-unit fragment of src/ops/wrapper/gdn_gating_proj.cpp, included once at its end (after its
-// closing namespace), so the two-device code below shares that file's private helpers without
+// Translation-unit fragment of src/ops/wrapper/gdn_gating_proj.cpp, included once at its end (after
+// its closing namespace), so the two-device code below shares that file's private helpers without
 // copying them. Not a header. Our file; see docs/maintainer/upstream-merge.md.
 //
 // Two-device (tp 2) forms of gdn_gating_proj, declared in ninfer/ops/tp2/gdn_gating_proj.h.

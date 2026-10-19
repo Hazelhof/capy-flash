@@ -75,13 +75,13 @@ std::optional<PrefillMissReport> PrefillMissDump::observe(std::span<const TokenI
                 best    = length;
             }
         }
-        const bool matches = static_cast<double>(best) >=
-                             options_.min_match * static_cast<double>(prompt.size());
+        const bool matches =
+            static_cast<double>(best) >= options_.min_match * static_cast<double>(prompt.size());
         const std::size_t server_recomputed = best > reused ? best - reused : 0;
         const std::size_t client_rewritten =
             closest->tokens.size() > best ? closest->tokens.size() - best : 0;
-        const bool suspicious = server_recomputed >= options_.min_tokens ||
-                                client_rewritten >= options_.min_tokens;
+        const bool suspicious =
+            server_recomputed >= options_.min_tokens || client_rewritten >= options_.min_tokens;
         if (matches && suspicious && sequence_ < kMaximumDumps) {
             report = PrefillMissReport{
                 .prompt_tokens      = static_cast<std::uint32_t>(prompt.size()),
@@ -90,8 +90,8 @@ std::optional<PrefillMissReport> PrefillMissDump::observe(std::span<const TokenI
                 .old_context_tokens = static_cast<std::uint32_t>(closest->tokens.size()),
             };
             try {
-                report->directory = write_dump(prompt, static_cast<std::uint32_t>(reused), label,
-                                               *closest, best);
+                report->directory =
+                    write_dump(prompt, static_cast<std::uint32_t>(reused), label, *closest, best);
             } catch (const std::exception&) { report->directory.clear(); }
         }
     }
@@ -148,7 +148,7 @@ std::string PrefillMissDump::write_dump(std::span<const TokenId> prompt,
     };
     // Both readings can hold at once: checkpoints are discrete, so a client-side change can also
     // leave identical tokens to recompute before it.
-    nlohmann::json reading = nlohmann::json::array();
+    nlohmann::json reading      = nlohmann::json::array();
     const std::size_t old_after = old.tokens.size() - common_prefix;
     if (old_after >= options_.min_tokens) {
         reading.push_back("client: the request changed or dropped " + std::to_string(old_after) +

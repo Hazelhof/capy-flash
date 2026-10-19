@@ -51,9 +51,7 @@ def test_streamed_fp8_conversion_matches_known_words(tmp_path) -> None:
     )
     shard = "model.safetensors"
     save_file({name: source}, tmp_path / shard)
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {name: shard}}), encoding="utf-8"
-    )
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {name: shard}}), encoding="utf-8")
     (tmp_path / "config.json").write_text("{}")
     model = Model({"text": {"config": {}}})
     with SafetensorsSource(tmp_path) as reader:
@@ -65,9 +63,7 @@ def test_streamed_fp8_conversion_matches_known_words(tmp_path) -> None:
             )
         )
         recipe = Recipe(model)
-        recipe.assign(
-            "embedding", format="fp8_e4m3fn_row_bf16", method="fp8_row_maxabs"
-        )
+        recipe.assign("embedding", format="fp8_e4m3fn_row_bf16", method="fp8_row_maxabs")
         path = tmp_path / "embedding.ninfer"
         convert(model, recipe, path, device="cpu", rows_per_chunk=2)
     with Artifact(path) as artifact:

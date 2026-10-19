@@ -53,20 +53,20 @@ void DeviceKVPagePool::zero_run(std::int32_t first, std::int32_t count, cudaStre
 }
 
 void DeviceKVPagePool::copy_run(std::int32_t source_index, std::int32_t destination_index,
-                                cudaStream_t stream) const {
+                                cudaStream_t stream, std::int32_t count) const {
     for (const Tensor& plane : planes_) {
         auto* base = static_cast<unsigned char*>(plane.data);
         if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
-            CUDA_CHECK(
-                cudaMemcpyAsync(base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
-                                base + static_cast<std::int64_t>(source_index) * plane.nb[3],
-                                plane.nb[3], cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                base + static_cast<std::int64_t>(destination_index) * plane.nb[3],
+                base + static_cast<std::int64_t>(source_index) * plane.nb[3],
+                static_cast<std::size_t>(count) * plane.nb[3], cudaMemcpyDeviceToDevice, stream));
         } else {
             CUDA_CHECK(cudaMemcpy2DAsync(
                 base + static_cast<std::int64_t>(destination_index) * plane.nb[2], plane.nb[3],
                 base + static_cast<std::int64_t>(source_index) * plane.nb[2], plane.nb[3],
-                plane.nb[2], static_cast<std::size_t>(plane.ne[3]), cudaMemcpyDeviceToDevice,
-                stream));
+                static_cast<std::size_t>(count) * plane.nb[2],
+                static_cast<std::size_t>(plane.ne[3]), cudaMemcpyDeviceToDevice, stream));
         }
     }
 }

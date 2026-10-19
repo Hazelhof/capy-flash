@@ -512,6 +512,17 @@ Program::demote_retained_shared_kv_for_lease(const SharedPrefixHandle& shared,
     return impl_->demote_retained_shared_kv_for_lease(shared, needed);
 }
 
+bool Program::idle_device_kv_offload() const noexcept { return impl_->idle_device_kv_offload(); }
+
+std::optional<std::size_t>
+Program::idle_device_kv_host_bytes(const ContinuationHandle& continuation) const noexcept {
+    return impl_->idle_device_kv_host_bytes(continuation);
+}
+
+std::size_t Program::host_kv_free_bytes() const noexcept { return impl_->host_kv_free_bytes(); }
+
+DeviceKVCompaction Program::compact_device_kv() { return impl_->compact_device_kv(); }
+
 ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) noexcept {
     return impl_->release_continuation(std::move(continuation));
 }
@@ -542,7 +553,9 @@ MemorySummary Program::memory_summary() const noexcept { return impl_->memory_su
 
 void Program::reset_memory_peaks() noexcept { impl_->reset_memory_peaks(); }
 
-const TpTransportStatus& Program::tp_transport() const noexcept { return impl_->tp_transport_status; }
+const TpTransportStatus& Program::tp_transport() const noexcept {
+    return impl_->tp_transport_status;
+}
 
 std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
                                          const EngineOptions& options) {

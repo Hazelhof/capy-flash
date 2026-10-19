@@ -83,9 +83,7 @@ def _ensure_port_free() -> None:
     connection.settimeout(0.2)
     try:
         if connection.connect_ex((HOST, PORT)) == 0:
-            raise CampaignError(
-                f"{HOST}:{PORT} is already in use; stop the existing service before the campaign"
-            )
+            raise CampaignError(f"{HOST}:{PORT} is already in use; stop the existing service before the campaign")
     finally:
         connection.close()
 
@@ -99,9 +97,7 @@ def _stage_weights() -> tuple[Path, dict[str, Any]]:
     if status.st_size <= 0:
         raise CampaignError("the standard artifact is empty")
 
-    fingerprint = (
-        f"{status.st_dev:x}-{status.st_ino:x}-{status.st_size:x}-{status.st_mtime_ns:x}"
-    )
+    fingerprint = f"{status.st_dev:x}-{status.st_ino:x}-{status.st_size:x}-{status.st_mtime_ns:x}"
     cached = RAM_WEIGHTS_ROOT / f"qwen3_8_27b_nvfp4-{fingerprint}.ninfer"
     record: dict[str, Any] = {
         "kind": "tmpfs",
@@ -120,9 +116,8 @@ def _stage_weights() -> tuple[Path, dict[str, Any]]:
     # Every file under this private directory is a derived copy owned by this controller. Remove
     # interrupted staging files, obsolete source identities, and incomplete copies.
     for candidate in RAM_WEIGHTS_ROOT.iterdir():
-        manager_owned = (
-            candidate.name.startswith("qwen3_8_27b_nvfp4-")
-            or candidate.name.startswith(".qwen3_8_27b_nvfp4-")
+        manager_owned = candidate.name.startswith("qwen3_8_27b_nvfp4-") or candidate.name.startswith(
+            ".qwen3_8_27b_nvfp4-"
         )
         if manager_owned and (candidate != cached or not cache_valid):
             candidate.unlink(missing_ok=True)
@@ -149,8 +144,7 @@ def _stage_weights() -> tuple[Path, dict[str, Any]]:
 
     started = time.monotonic()
     print(
-        f"artifact cache stage: {source} -> {cached} "
-        f"({status.st_size / 1024**3:.2f} GiB, one SSD read)",
+        f"artifact cache stage: {source} -> {cached} ({status.st_size / 1024**3:.2f} GiB, one SSD read)",
         flush=True,
     )
     command = [
@@ -168,9 +162,7 @@ def _stage_weights() -> tuple[Path, dict[str, Any]]:
             raise CampaignError(f"artifact tmpfs staging failed with status {completed.returncode}")
         staged_size = staging.stat().st_size
         if staged_size != status.st_size:
-            raise CampaignError(
-                f"artifact tmpfs staging produced {staged_size} bytes, expected {status.st_size}"
-            )
+            raise CampaignError(f"artifact tmpfs staging produced {staged_size} bytes, expected {status.st_size}")
         staging.chmod(0o600)
         os.replace(staging, cached)
     except BaseException:
@@ -224,8 +216,7 @@ class RunningServe:
             if returncode is not None:
                 detail = _tail(self.log_path)
                 raise CampaignError(
-                    f"ninfer-serve exited during startup with status {returncode}"
-                    + (f"\n{detail}" if detail else "")
+                    f"ninfer-serve exited during startup with status {returncode}" + (f"\n{detail}" if detail else "")
                 )
 
             connection = http.client.HTTPConnection(HOST, PORT, timeout=1.0)
@@ -251,9 +242,7 @@ class RunningServe:
 
             now = time.monotonic()
             if now >= deadline:
-                raise CampaignError(
-                    f"timed out waiting for ninfer-serve after {self.startup_timeout:.1f}s"
-                )
+                raise CampaignError(f"timed out waiting for ninfer-serve after {self.startup_timeout:.1f}s")
             if now >= next_notice:
                 print(f"  loading serve: {now - started:.0f}s", flush=True)
                 next_notice = now + 5.0
@@ -386,11 +375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"required campaign input is missing: {required}")
 
     campaign_name = args.campaign or ("focused" if args.selected_cases else "resource")
-    case_names = (
-        tuple(args.selected_cases)
-        if args.selected_cases
-        else CAMPAIGNS[args.campaign or "resource"]
-    )
+    case_names = tuple(args.selected_cases) if args.selected_cases else CAMPAIGNS[args.campaign or "resource"]
     definitions = [CASES[name] for name in case_names]
     missing_profiles = sorted({case.profile for case in definitions} - PROFILE_ARGS.keys())
     if missing_profiles:
@@ -417,19 +402,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         for sample in range(1, args.samples + 1):
             suffix = f"sample-{sample:03d}"
             raw_path = output_dir / "raw" / definition.profile / definition.name / f"{suffix}.json"
-            progress_path = (
-                output_dir / "progress" / definition.profile / definition.name / f"{suffix}.log"
-            )
-            serve_log = (
-                output_dir / "serve" / definition.profile / definition.name / f"{suffix}.log"
-            )
-            request_log_jsonl = (
-                output_dir
-                / "request-log"
-                / definition.profile
-                / definition.name
-                / f"{suffix}.jsonl"
-            )
+            progress_path = output_dir / "progress" / definition.profile / definition.name / f"{suffix}.log"
+            serve_log = output_dir / "serve" / definition.profile / definition.name / f"{suffix}.log"
+            request_log_jsonl = output_dir / "request-log" / definition.profile / definition.name / f"{suffix}.jsonl"
             plans.append(
                 {
                     "case": definition.name,
@@ -439,12 +414,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "progress": str(progress_path),
                     "serve_log": str(serve_log),
                     "request_log_jsonl": str(request_log_jsonl),
-                    "server_command": _server_command(
-                        definition.profile, runtime_weights, request_log_jsonl
-                    ),
-                    "runner_command": _runner_command(
-                        definition, raw_path, args.request_timeout_seconds
-                    ),
+                    "server_command": _server_command(definition.profile, runtime_weights, request_log_jsonl),
+                    "runner_command": _runner_command(definition, raw_path, args.request_timeout_seconds),
                 }
             )
 
@@ -487,8 +458,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             request_log_jsonl.parent.mkdir(parents=True, exist_ok=True)
             phase = "serve_start"
             print(
-                f"[{index}/{total}] {definition.name} "
-                f"profile={definition.profile} sample={plan['sample']:03d}",
+                f"[{index}/{total}] {definition.name} profile={definition.profile} sample={plan['sample']:03d}",
                 flush=True,
             )
             try:
@@ -506,9 +476,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     valid_runs.append(raw_path)
                 phase = "construction"
                 if returncode != 0 or run.get("constructed") is not True:
-                    raise CampaignError(
-                        f"runner returned {returncode}, status={run.get('status')!r}"
-                    )
+                    raise CampaignError(f"runner returned {returncode}, status={run.get('status')!r}")
                 resume = next(
                     (request for request in run["requests"] if request["role"] == "resume"),
                     None,
@@ -571,8 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"summary: {paths['markdown']}", flush=True)
     if failures:
         print(
-            f"campaign finished with {len(failures)} failure(s): "
-            f"{output_dir / 'failures.json'}",
+            f"campaign finished with {len(failures)} failure(s): {output_dir / 'failures.json'}",
             file=sys.stderr,
         )
         return 1

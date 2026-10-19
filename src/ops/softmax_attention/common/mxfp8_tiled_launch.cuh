@@ -18,7 +18,7 @@ void launch_mxfp8_kv_tiled_mma(const CausalAttentionOperands& p, View cache,
         !partial.maximum || !partial.sum)
         throw std::invalid_argument("MXFP8 tiled attention: invalid batch or partial storage");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel    = mxfp8_kv_tiled_mma_kernel<G, S, Values, Metadata>;
+        constexpr auto kernel = mxfp8_kv_tiled_mma_kernel<G, S, Values, Metadata>;
         static FuncAttrPerDevice attribute;
         attribute.ensure(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads, partition.capacity);

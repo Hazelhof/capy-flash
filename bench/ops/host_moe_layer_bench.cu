@@ -43,13 +43,14 @@ using namespace ninfer::ops::host;
 
 namespace {
 
-#define CK(x)                                                                                    \
-    do {                                                                                         \
-        cudaError_t e_ = (x);                                                                    \
-        if (e_ != cudaSuccess) {                                                                 \
-            std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
-            std::exit(1);                                                                        \
-        }                                                                                        \
+#define CK(x)                                                                                      \
+    do {                                                                                           \
+        cudaError_t e_ = (x);                                                                      \
+        if (e_ != cudaSuccess) {                                                                   \
+            std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__,     \
+                         __LINE__);                                                                \
+            std::exit(1);                                                                          \
+        }                                                                                          \
     } while (0)
 
 constexpr int H = 2560, I = 640, TOPK = 10;
@@ -57,13 +58,16 @@ constexpr double kExpertBytes = 2764800.0;
 
 struct Args {
     std::string mode = "graph";
-    int threads = 6, layers = 48, tokens = 4, replays = 30, warmup = 3, min_mt = 1, fill_gpus = 0, slices = 4;
+    int threads = 6, layers = 48, tokens = 4, replays = 30, warmup = 3, min_mt = 1, fill_gpus = 0,
+        slices      = 4;
     double bank_gib = 3.0, resident_us = 47.0, dense_us = 150.0, p2 = 0.47;
     int umin = 3, umax = 5, calls = 400;
     std::string tag;
     // T35 (cpu mode): executor options, pool placement, engine-like conditions.
-    std::string schedule = "static", placement = "spread", fill_mode = "cont", grid_u = "1,2,4,5,8", grid_m = "1,2,3,4";
-    int member_quant = 1, prefetch_rows = 0, timeline = 0, cold_x = 0, huge = 1, decode_case = 1, steal = 1, blocks = 1;
+    std::string schedule = "static", placement = "spread", fill_mode = "cont", grid_u = "1,2,4,5,8",
+                grid_m = "1,2,3,4";
+    int member_quant = 1, prefetch_rows = 0, timeline = 0, cold_x = 0, huge = 1, decode_case = 1,
+        steal = 1, blocks = 1;
     std::string variants;
     double gap_us = 0.0, fill_experts = 1.34;
 };
@@ -86,77 +90,122 @@ Args parse(int argc, char** argv) {
     Args a;
     for (int i = 1; i < argc; ++i) {
         const std::string k = argv[i];
-        auto next = [&]() -> std::string {
-            if (i + 1 >= argc) { std::fprintf(stderr, "missing value for %s\n", k.c_str()); std::exit(2); }
+        auto next           = [&]() -> std::string {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "missing value for %s\n", k.c_str());
+                std::exit(2);
+            }
             return argv[++i];
         };
-        if (k == "--mode") a.mode = next();
-        else if (k == "--threads") a.threads = std::stoi(next());
-        else if (k == "--layers") a.layers = std::stoi(next());
-        else if (k == "--tokens") a.tokens = std::stoi(next());
-        else if (k == "--replays") a.replays = std::stoi(next());
-        else if (k == "--warmup") a.warmup = std::stoi(next());
-        else if (k == "--min-mt") a.min_mt = std::stoi(next());
-        else if (k == "--fill-gpus") a.fill_gpus = std::stoi(next());
-        else if (k == "--slices") a.slices = std::stoi(next());
-        else if (k == "--bank-gib") a.bank_gib = std::stod(next());
-        else if (k == "--resident-us") a.resident_us = std::stod(next());
-        else if (k == "--dense-us") a.dense_us = std::stod(next());
-        else if (k == "--p2") a.p2 = std::stod(next());
-        else if (k == "--experts-min") a.umin = std::stoi(next());
-        else if (k == "--experts-max") a.umax = std::stoi(next());
-        else if (k == "--calls") a.calls = std::stoi(next());
-        else if (k == "--tag") a.tag = next();
-        else if (k == "--schedule") a.schedule = next();
-        else if (k == "--member-quant") a.member_quant = std::stoi(next());
-        else if (k == "--steal") a.steal = std::stoi(next());
-        else if (k == "--variants") a.variants = next();
-        else if (k == "--blocks") a.blocks = std::stoi(next());
-        else if (k == "--prefetch-rows") a.prefetch_rows = std::stoi(next());
-        else if (k == "--placement") a.placement = next();
-        else if (k == "--timeline") a.timeline = std::stoi(next());
-        else if (k == "--gap-us") a.gap_us = std::stod(next());
-        else if (k == "--cold-x") a.cold_x = std::stoi(next());
-        else if (k == "--huge") a.huge = std::stoi(next());
-        else if (k == "--fill-mode") a.fill_mode = next();
-        else if (k == "--fill-experts") a.fill_experts = std::stod(next());
-        else if (k == "--grid-u") a.grid_u = next();
-        else if (k == "--grid-m") a.grid_m = next();
-        else if (k == "--decode-case") a.decode_case = std::stoi(next());
-        else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
+        if (k == "--mode")
+            a.mode = next();
+        else if (k == "--threads")
+            a.threads = std::stoi(next());
+        else if (k == "--layers")
+            a.layers = std::stoi(next());
+        else if (k == "--tokens")
+            a.tokens = std::stoi(next());
+        else if (k == "--replays")
+            a.replays = std::stoi(next());
+        else if (k == "--warmup")
+            a.warmup = std::stoi(next());
+        else if (k == "--min-mt")
+            a.min_mt = std::stoi(next());
+        else if (k == "--fill-gpus")
+            a.fill_gpus = std::stoi(next());
+        else if (k == "--slices")
+            a.slices = std::stoi(next());
+        else if (k == "--bank-gib")
+            a.bank_gib = std::stod(next());
+        else if (k == "--resident-us")
+            a.resident_us = std::stod(next());
+        else if (k == "--dense-us")
+            a.dense_us = std::stod(next());
+        else if (k == "--p2")
+            a.p2 = std::stod(next());
+        else if (k == "--experts-min")
+            a.umin = std::stoi(next());
+        else if (k == "--experts-max")
+            a.umax = std::stoi(next());
+        else if (k == "--calls")
+            a.calls = std::stoi(next());
+        else if (k == "--tag")
+            a.tag = next();
+        else if (k == "--schedule")
+            a.schedule = next();
+        else if (k == "--member-quant")
+            a.member_quant = std::stoi(next());
+        else if (k == "--steal")
+            a.steal = std::stoi(next());
+        else if (k == "--variants")
+            a.variants = next();
+        else if (k == "--blocks")
+            a.blocks = std::stoi(next());
+        else if (k == "--prefetch-rows")
+            a.prefetch_rows = std::stoi(next());
+        else if (k == "--placement")
+            a.placement = next();
+        else if (k == "--timeline")
+            a.timeline = std::stoi(next());
+        else if (k == "--gap-us")
+            a.gap_us = std::stod(next());
+        else if (k == "--cold-x")
+            a.cold_x = std::stoi(next());
+        else if (k == "--huge")
+            a.huge = std::stoi(next());
+        else if (k == "--fill-mode")
+            a.fill_mode = next();
+        else if (k == "--fill-experts")
+            a.fill_experts = std::stod(next());
+        else if (k == "--grid-u")
+            a.grid_u = next();
+        else if (k == "--grid-m")
+            a.grid_m = next();
+        else if (k == "--decode-case")
+            a.decode_case = std::stoi(next());
+        else {
+            std::fprintf(stderr, "unknown option %s\n", k.c_str());
+            std::exit(2);
+        }
     }
     return a;
 }
 
 // ------------------------------------------------------------------ synthetic bank (pinned)
 struct Bank {
-    std::byte* base = nullptr;
-    std::size_t bytes = 0;
+    std::byte* base      = nullptr;
+    std::size_t bytes    = 0;
     std::int32_t experts = 0;
     HostExpertLayer layer;
 };
 
 Bank make_bank(double gib, int threads, bool huge = true) {
     Bank b;
-    b.experts = static_cast<std::int32_t>(gib * (1ULL << 30) / kExpertBytes);
-    b.experts = std::max(b.experts / 4 * 4, 8);
-    const std::int64_t gu_rows = std::int64_t{b.experts} * 2 * I, dn_rows = std::int64_t{b.experts} * H;
-    const std::size_t gu = Nvfp4Plane::payload_bytes(gu_rows, H, 2 * b.experts);
-    const std::size_t dn = Nvfp4Plane::payload_bytes(dn_rows, I, b.experts);
-    const std::size_t gu_al = (gu + (2u << 20) - 1) / (2u << 20) * (2u << 20);
-    b.bytes = gu_al + (dn + (2u << 20) - 1) / (2u << 20) * (2u << 20);
-    void* p = mmap(nullptr, b.bytes + (2u << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (p == MAP_FAILED) { std::perror("mmap"); std::exit(1); }
+    b.experts                  = static_cast<std::int32_t>(gib * (1ULL << 30) / kExpertBytes);
+    b.experts                  = std::max(b.experts / 4 * 4, 8);
+    const std::int64_t gu_rows = std::int64_t{b.experts} * 2 * I,
+                       dn_rows = std::int64_t{b.experts} * H;
+    const std::size_t gu       = Nvfp4Plane::payload_bytes(gu_rows, H, 2 * b.experts);
+    const std::size_t dn       = Nvfp4Plane::payload_bytes(dn_rows, I, b.experts);
+    const std::size_t gu_al    = (gu + (2u << 20) - 1) / (2u << 20) * (2u << 20);
+    b.bytes                    = gu_al + (dn + (2u << 20) - 1) / (2u << 20) * (2u << 20);
+    void* p                    = mmap(nullptr, b.bytes + (2u << 20), PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        std::perror("mmap");
+        std::exit(1);
+    }
     auto aligned = (reinterpret_cast<std::uintptr_t>(p) + (2u << 20) - 1) / (2u << 20) * (2u << 20);
-    b.base = reinterpret_cast<std::byte*>(aligned);
+    b.base       = reinterpret_cast<std::byte*>(aligned);
     madvise(b.base, b.bytes, huge ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
     // Fill in parallel: random codes, E4M3 scales 0x30..0x3f (0.5..0.94), divisors 1000.
     std::vector<std::thread> th;
     for (int t = 0; t < threads; ++t) {
         th.emplace_back([&, t] {
-            std::uint64_t s = 0x9E3779B97F4A7C15ULL * (t + 1);
-            const std::size_t words = b.bytes / 8, lo = words * t / threads, hi = words * (t + 1) / threads;
-            auto* w = reinterpret_cast<std::uint64_t*>(b.base);
+            std::uint64_t s         = 0x9E3779B97F4A7C15ULL * (t + 1);
+            const std::size_t words = b.bytes / 8, lo = words * t / threads,
+                              hi = words * (t + 1) / threads;
+            auto* w              = reinterpret_cast<std::uint64_t*>(b.base);
             for (std::size_t i = lo; i < hi; ++i) {
                 s ^= s << 13, s ^= s >> 7, s ^= s << 17;
                 w[i] = s;
@@ -166,9 +215,10 @@ Bank make_bank(double gib, int threads, bool huge = true) {
     for (auto& t : th) t.join();
     auto fix_scales = [&](std::byte* plane, std::int64_t rows, int k, std::int64_t divisors) {
         const std::size_t codes = static_cast<std::size_t>(rows) * k / 2;
-        auto* sc = reinterpret_cast<std::uint8_t*>(plane + (codes + 255) / 256 * 256);
+        auto* sc            = reinterpret_cast<std::uint8_t*>(plane + (codes + 255) / 256 * 256);
         const std::size_t n = static_cast<std::size_t>(rows) * k / 16;
-        for (std::size_t i = 0; i < n; ++i) sc[i] = static_cast<std::uint8_t>(0x30 | (sc[i] & 0x0F));
+        for (std::size_t i = 0; i < n; ++i)
+            sc[i] = static_cast<std::uint8_t>(0x30 | (sc[i] & 0x0F));
         auto* d = reinterpret_cast<float*>(sc + n);
         for (std::int64_t i = 0; i < divisors; ++i) d[i] = 1000.0F;
     };
@@ -185,12 +235,12 @@ double thp_fraction(const void* p, std::size_t bytes) {
     if (!f) return -1;
     const auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + bytes;
     char line[512];
-    bool in = false;
+    bool in        = false;
     double huge_kb = 0;
     while (std::fgets(line, sizeof line, f)) {
         unsigned long a = 0, b = 0;
-        if (std::sscanf(line, "%lx-%lx ", &a, &b) == 2 && std::strchr(line, ' ') && line[0] != ' ' &&
-            std::strncmp(line, "AnonHugePages", 13) != 0) {
+        if (std::sscanf(line, "%lx-%lx ", &a, &b) == 2 && std::strchr(line, ' ') &&
+            line[0] != ' ' && std::strncmp(line, "AnonHugePages", 13) != 0) {
             in = a < hi && b > lo;
             continue;
         }
@@ -230,7 +280,7 @@ Window make_window(const Args& a, int experts, std::mt19937_64& rng) {
         std::vector<std::vector<int>> host(T); // host experts of each token
         int pairs = 0;
         for (int i = 0; i < u; ++i) {
-            const int m = (two(rng) && T > 1) ? 2 : 1;
+            const int m  = (two(rng) && T > 1) ? 2 : 1;
             const int t0 = tok(rng);
             for (int j = 0; j < m; ++j) {
                 const int t = (t0 + j) % T;
@@ -259,6 +309,7 @@ struct Stat {
     double med = 0, p10 = 0, p90 = 0, mean = 0;
     std::size_t n = 0;
 };
+
 Stat stat(std::vector<double> v) {
     Stat s;
     if (v.empty()) return s;
@@ -269,10 +320,11 @@ Stat stat(std::vector<double> v) {
     s.mean /= v.size();
     return s;
 }
+
 std::string js(const Stat& s) {
     char b[200];
-    std::snprintf(b, sizeof b, "{\"med\":%.3f,\"p10\":%.3f,\"p90\":%.3f,\"mean\":%.3f,\"n\":%zu}", s.med, s.p10, s.p90,
-                  s.mean, s.n);
+    std::snprintf(b, sizeof b, "{\"med\":%.3f,\"p10\":%.3f,\"p90\":%.3f,\"mean\":%.3f,\"n\":%zu}",
+                  s.med, s.p10, s.p90, s.mean, s.n);
     return b;
 }
 
@@ -281,6 +333,7 @@ struct Fill {
     std::atomic<bool> stop{false};
     std::vector<std::thread> th;
     std::vector<double> gbps;
+
     void start(const Bank& bank, int gpus) {
         gbps.assign(gpus, 0.0);
         for (int g = 0; g < gpus; ++g) {
@@ -289,20 +342,21 @@ struct Fill {
                 cudaStream_t s;
                 CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
                 const std::size_t chunk = 64u << 20;
-                void* dst = nullptr;
+                void* dst               = nullptr;
                 CK(cudaMalloc(&dst, 4 * chunk));
                 std::size_t off = static_cast<std::size_t>(g) * (bank.bytes / 2), bytes = 0;
                 const auto t0 = std::chrono::steady_clock::now();
                 while (!stop.load(std::memory_order_relaxed)) {
                     for (int k = 0; k < 4; ++k) {
                         if (off + chunk > bank.bytes) off = 0;
-                        CK(cudaMemcpyAsync(static_cast<char*>(dst) + k * chunk, bank.base + off, chunk,
-                                           cudaMemcpyHostToDevice, s));
+                        CK(cudaMemcpyAsync(static_cast<char*>(dst) + k * chunk, bank.base + off,
+                                           chunk, cudaMemcpyHostToDevice, s));
                         off += chunk, bytes += chunk;
                     }
                     CK(cudaStreamSynchronize(s));
                 }
-                const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                const double sec =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
                 gbps[g] = bytes / sec / 1e9;
                 CK(cudaFree(dst));
                 CK(cudaStreamDestroy(s));
@@ -310,6 +364,7 @@ struct Fill {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200)); // reach steady state
     }
+
     void finish() {
         stop = true;
         for (auto& t : th) t.join();
@@ -340,10 +395,11 @@ __global__ void standin_kernel(long long ns, long long* stamp) {
 __global__ void stamp_kernel(long long* stamp) { *stamp = gtime(); }
 
 // Calibration only (never in an engine graph): ping a host word, spin until the CPU answers.
-__global__ void calib_kernel(volatile unsigned* ping, volatile unsigned* pong, long long* out, int n) {
+__global__ void calib_kernel(volatile unsigned* ping, volatile unsigned* pong, long long* out,
+                             int n) {
     for (int i = 0; i < n; ++i) {
         const long long g0 = gtime();
-        *ping = i + 1;
+        *ping              = i + 1;
         __threadfence_system();
         while (*pong != static_cast<unsigned>(i + 1)) {}
         out[2 * i] = g0, out[2 * i + 1] = gtime();
@@ -351,8 +407,8 @@ __global__ void calib_kernel(volatile unsigned* ping, volatile unsigned* pong, l
 }
 
 struct Calib {
-    double offset_ns = 0; // cpu_ns = gpu_ns + offset
-    double rtt_ns = 0;    // minimum round trip of the calibration
+    double offset_ns   = 0; // cpu_ns = gpu_ns + offset
+    double rtt_ns      = 0; // minimum round trip of the calibration
     double gpu_tick_ns = 0;
 };
 
@@ -362,7 +418,7 @@ Calib calibrate(int n = 2000) {
     std::memset(words, 0, 256);
     volatile unsigned* ping = words;
     volatile unsigned* pong = words + 16;
-    long long* dout = nullptr;
+    long long* dout         = nullptr;
     CK(cudaMalloc(&dout, sizeof(long long) * 2 * n));
     std::vector<std::int64_t> c(n);
     std::thread cpu([&] {
@@ -378,7 +434,7 @@ Calib calibrate(int n = 2000) {
     std::vector<long long> g(2 * n);
     CK(cudaMemcpy(g.data(), dout, sizeof(long long) * 2 * n, cudaMemcpyDeviceToHost));
     Calib r;
-    r.rtt_ns = 1e30;
+    r.rtt_ns    = 1e30;
     double tick = 1e30;
     for (int i = 10; i < n; ++i) {
         const double rtt = g[2 * i + 1] - g[2 * i];
@@ -391,8 +447,8 @@ Calib calibrate(int n = 2000) {
     return r;
 }
 
-
-// ------------------------------------------------------------------ probe mode: cost of each handshake piece
+// ------------------------------------------------------------------ probe mode: cost of each
+// handshake piece
 __global__ void write_host_kernel(uint4* dst, int vectors) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < vectors) dst[i] = make_uint4(i, i, i, i);
@@ -401,15 +457,16 @@ __global__ void write_host_kernel(uint4* dst, int vectors) {
 __global__ void read_host_kernel(const float* src, float* dst, int vectors) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= vectors) return;
-    const float4 v = __ldcv(reinterpret_cast<const float4*>(src) + i);
+    const float4 v                    = __ldcv(reinterpret_cast<const float4*>(src) + i);
     reinterpret_cast<float4*>(dst)[i] = v;
 }
 
 __global__ void empty_kernel() {}
 
-// Data + doorbell from the kernel: the last block resets done and raises ready (after a system fence).
-__global__ void write_host_doorbell_kernel(uint4* dst, int vectors, unsigned* counter, volatile unsigned* done,
-                                           volatile unsigned* ready) {
+// Data + doorbell from the kernel: the last block resets done and raises ready (after a system
+// fence).
+__global__ void write_host_doorbell_kernel(uint4* dst, int vectors, unsigned* counter,
+                                           volatile unsigned* done, volatile unsigned* ready) {
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i < vectors) dst[i] = make_uint4(i, i, i, i);
     __threadfence_system();
@@ -425,7 +482,10 @@ __global__ void write_host_doorbell_kernel(uint4* dst, int vectors, unsigned* co
 }
 
 void cu(CUresult r, const char* what) {
-    if (r != CUDA_SUCCESS) { std::fprintf(stderr, "driver error %d at %s\n", static_cast<int>(r), what); std::exit(1); }
+    if (r != CUDA_SUCCESS) {
+        std::fprintf(stderr, "driver error %d at %s\n", static_cast<int>(r), what);
+        std::exit(1);
+    }
 }
 
 void run_probe(const Args& a, const Bank& bank) {
@@ -434,15 +494,18 @@ void run_probe(const Args& a, const Bank& bank) {
     // Bench-local mapped words and buffers: [L] ready/done lines, x [T*H] bf16, partial [T*H] f32.
     const std::size_t line = 64, words = 2 * line * L;
     std::byte* host = nullptr;
-    CK(cudaHostAlloc(reinterpret_cast<void**>(&host), words + 4096 + 8 * H * T * 2, cudaHostAllocMapped | cudaHostAllocPortable));
+    CK(cudaHostAlloc(reinterpret_cast<void**>(&host), words + 4096 + 8 * H * T * 2,
+                     cudaHostAllocMapped | cudaHostAllocPortable));
     std::memset(host, 0, words + 4096 + 8 * H * T * 2);
     auto ready = [&](int l) { return reinterpret_cast<volatile unsigned*>(host + line * 2 * l); };
-    auto done  = [&](int l) { return reinterpret_cast<volatile unsigned*>(host + line * (2 * l + 1)); };
-    auto* one  = reinterpret_cast<unsigned*>(host + words); // constant 1
-    *one = 1;
-    auto* xbuf = reinterpret_cast<uint4*>(host + words + 4096);
-    auto* pbuf = reinterpret_cast<float*>(host + words + 4096 + 2 * H * T * 2);
-    float* dtmp = nullptr;
+    auto done  = [&](int l) {
+        return reinterpret_cast<volatile unsigned*>(host + line * (2 * l + 1));
+    };
+    auto* one         = reinterpret_cast<unsigned*>(host + words); // constant 1
+    *one              = 1;
+    auto* xbuf        = reinterpret_cast<uint4*>(host + words + 4096);
+    auto* pbuf        = reinterpret_cast<float*>(host + words + 4096 + 2 * H * T * 2);
+    float* dtmp       = nullptr;
     long long* dstamp = nullptr;
     CK(cudaMalloc(&dtmp, 4 * H * T));
     CK(cudaMalloc(&dstamp, sizeof(long long) * 2 * L));
@@ -451,7 +514,9 @@ void run_probe(const Args& a, const Bank& bank) {
     cudaStream_t s;
     CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     const auto S = reinterpret_cast<CUstream>(s);
-    auto dev = [](const volatile void* p) { return reinterpret_cast<CUdeviceptr>(const_cast<void*>(p)); };
+    auto dev     = [](const volatile void* p) {
+        return reinterpret_cast<CUdeviceptr>(const_cast<void*>(p));
+    };
 
     std::atomic<bool> stop{false};
     std::thread echo([&] { // CPU side of the ping-pong: done[l] = 1 as soon as ready[l] is seen
@@ -466,32 +531,39 @@ void run_probe(const Args& a, const Bank& bank) {
                 *ready(l) = 0;
                 std::atomic_thread_fence(std::memory_order_release);
                 *done(l) = 1;
-                l = (l + 1) % L;
+                l        = (l + 1) % L;
             } else {
                 _mm_pause();
             }
         }
     });
 
-    const char* names[] = {"stamps only", "empty kernel", "publish kernel (x T*H bf16 to host)", "writeValue x2",
-                           "waitValue on a word already 1", "combine-like kernel (T*H f32 from host)",
-                           "writeValue x2 + waitValue (CPU echo)", "full: publish + signal + echo + wait + combine",
-                           "stand-in kernel (resident_us)", "publish + signal + stand-in + wait (echo) + combine",
-                           "mailbox publish + stand-in + accumulate (no host expert)",
-                           "mailbox publish + accumulate (no host expert, no stand-in)",
-                           "mailbox publish + waitValue(constant 1) + accumulate (no host expert)",
-                           "kernel doorbell (data + flags from the kernel) + echo + wait + combine"};
+    const char* names[] = {
+        "stamps only",
+        "empty kernel",
+        "publish kernel (x T*H bf16 to host)",
+        "writeValue x2",
+        "waitValue on a word already 1",
+        "combine-like kernel (T*H f32 from host)",
+        "writeValue x2 + waitValue (CPU echo)",
+        "full: publish + signal + echo + wait + combine",
+        "stand-in kernel (resident_us)",
+        "publish + signal + stand-in + wait (echo) + combine",
+        "mailbox publish + stand-in + accumulate (no host expert)",
+        "mailbox publish + accumulate (no host expert, no stand-in)",
+        "mailbox publish + waitValue(constant 1) + accumulate (no host expert)",
+        "kernel doorbell (data + flags from the kernel) + echo + wait + combine"};
     unsigned* dcounter = nullptr;
     CK(cudaMalloc(&dcounter, 4));
     CK(cudaMemset(dcounter, 0, 4));
     cudaDeviceProp prop{};
     CK(cudaGetDeviceProperties(&prop, 0));
-    const int sms = prop.multiProcessorCount;
+    const int sms          = prop.multiProcessorCount;
     const long long res_ns = static_cast<long long>(a.resident_us * 1e3);
     std::vector<std::int32_t> ids(static_cast<std::size_t>(L) * T * TOPK, -1);
     std::vector<float> alpha(ids.size(), 0.1F);
     std::int32_t* dids = nullptr;
-    float* dalpha = nullptr;
+    float* dalpha      = nullptr;
     __nv_bfloat16 *dx = nullptr, *dy = nullptr;
     CK(cudaMalloc(&dids, ids.size() * 4));
     CK(cudaMalloc(&dalpha, ids.size() * 4));
@@ -502,11 +574,13 @@ void run_probe(const Args& a, const Bank& bank) {
     CK(cudaMemset(dx, 0, static_cast<std::size_t>(L) * T * H * 2));
     CK(cudaMemset(dy, 0, static_cast<std::size_t>(L) * T * H * 2));
     HostMoeMailboxConfig cfg;
-    cfg.device = 0, cfg.layers = L, cfg.max_tokens = kHostMaxTokens, cfg.top_k = TOPK, cfg.hidden = H, cfg.intermediate = I;
+    cfg.device = 0, cfg.layers = L, cfg.max_tokens = kHostMaxTokens, cfg.top_k = TOPK,
+    cfg.hidden = H, cfg.intermediate = I;
     const auto all = spread_cpus(a.threads + 1);
     cfg.cpus.assign(all.begin() + 1, all.end()); // the echo thread keeps all[0]
     cfg.trace_capacity = static_cast<std::int64_t>(L) * (a.warmup + a.replays);
-    HostMoeMailbox mailbox(cfg, std::vector<HostExpertLayer>(static_cast<std::size_t>(L), bank.layer));
+    HostMoeMailbox mailbox(cfg,
+                           std::vector<HostExpertLayer>(static_cast<std::size_t>(L), bank.layer));
     const int xv = T * H / 8, pv = T * H / 4;
     for (int v = 0; v < 14; ++v) {
         cudaGraph_t g;
@@ -515,27 +589,32 @@ void run_probe(const Args& a, const Bank& bank) {
         for (int l = 0; l < L; ++l) {
             stamp_kernel<<<1, 1, 0, s>>>(dstamp + 2 * l);
             if (v == 1) empty_kernel<<<1, 32, 0, s>>>();
-            const std::size_t ox = static_cast<std::size_t>(l) * T * H, orr = static_cast<std::size_t>(l) * T * TOPK;
-            if (v == 10 || v == 11 || v == 12) mailbox.publish(s, l, T, dx + ox, dids + orr, dalpha + orr, nullptr);
+            const std::size_t ox  = static_cast<std::size_t>(l) * T * H,
+                              orr = static_cast<std::size_t>(l) * T * TOPK;
+            if (v == 10 || v == 11 || v == 12)
+                mailbox.publish(s, l, T, dx + ox, dids + orr, dalpha + orr, nullptr);
             if (v == 12) cu(cuStreamWaitValue32(S, dev(one), 1, CU_STREAM_WAIT_VALUE_GEQ), "flush");
             if (v == 11 || v == 12) stamp_kernel<<<1, 1, 0, s>>>(dmid + l);
             if (v == 13) {
-                write_host_doorbell_kernel<<<(xv + 255) / 256, 256, 0, s>>>(xbuf, xv, dcounter,
-                                                                            const_cast<unsigned*>(done(l)),
-                                                                            const_cast<unsigned*>(ready(l)));
+                write_host_doorbell_kernel<<<(xv + 255) / 256, 256, 0, s>>>(
+                    xbuf, xv, dcounter, const_cast<unsigned*>(done(l)),
+                    const_cast<unsigned*>(ready(l)));
                 stamp_kernel<<<1, 1, 0, s>>>(dmid + l);
                 cu(cuStreamWaitValue32(S, dev(done(l)), 1, CU_STREAM_WAIT_VALUE_GEQ), "waitd13");
                 read_host_kernel<<<(pv + 255) / 256, 256, 0, s>>>(pbuf, dtmp, pv);
             }
-            if (v == 2 || v == 7 || v == 9) write_host_kernel<<<(xv + 255) / 256, 256, 0, s>>>(xbuf, xv);
+            if (v == 2 || v == 7 || v == 9)
+                write_host_kernel<<<(xv + 255) / 256, 256, 0, s>>>(xbuf, xv);
             if (v == 3 || v == 6 || v == 7 || v == 9) {
                 cu(cuStreamWriteValue32(S, dev(done(l)), 0, 0), "w0");
                 cu(cuStreamWriteValue32(S, dev(ready(l)), v == 3 ? 0 : 1, 0), "w1");
             }
             if (v == 4) cu(cuStreamWaitValue32(S, dev(one), 1, CU_STREAM_WAIT_VALUE_GEQ), "wait1");
             if (v == 8 || v == 9 || v == 10) standin_kernel<<<sms, 32, 0, s>>>(res_ns, nullptr);
-            if (v == 6 || v == 7 || v == 9) cu(cuStreamWaitValue32(S, dev(done(l)), 1, CU_STREAM_WAIT_VALUE_GEQ), "waitd");
-            if (v == 5 || v == 7 || v == 9) read_host_kernel<<<(pv + 255) / 256, 256, 0, s>>>(pbuf, dtmp, pv);
+            if (v == 6 || v == 7 || v == 9)
+                cu(cuStreamWaitValue32(S, dev(done(l)), 1, CU_STREAM_WAIT_VALUE_GEQ), "waitd");
+            if (v == 5 || v == 7 || v == 9)
+                read_host_kernel<<<(pv + 255) / 256, 256, 0, s>>>(pbuf, dtmp, pv);
             if (v == 10 || v == 11 || v == 12) mailbox.accumulate(s, l, T, dy + ox);
             stamp_kernel<<<1, 1, 0, s>>>(dstamp + 2 * l + 1);
         }
@@ -564,7 +643,8 @@ void run_probe(const Args& a, const Bank& bank) {
             CK(cudaMemcpy(st.data(), dstamp, sizeof(long long) * 2 * L, cudaMemcpyDeviceToHost));
             for (int l = 0; l < L; ++l) seg.push_back((st[2 * l + 1] - st[2 * l]) / 1e3);
             std::vector<long long> mid(L);
-            if (v >= 11) CK(cudaMemcpy(mid.data(), dmid, sizeof(long long) * L, cudaMemcpyDeviceToHost));
+            if (v >= 11)
+                CK(cudaMemcpy(mid.data(), dmid, sizeof(long long) * L, cudaMemcpyDeviceToHost));
             if (mb) {
                 const auto tr = mailbox.trace();
                 for (int l = 0; l < L; ++l) {
@@ -577,13 +657,17 @@ void run_probe(const Args& a, const Bank& bank) {
             }
         }
         if (mb) {
-            std::printf("{\"mode\":\"probe_split\",\"variant\":%d,\"calib_rtt_ns\":%.0f,\"gpu_to_cpu_us\":%s,\"cpu_to_gpu_us\":%s,\"rtt_us\":%s,\"after_doorbell_stamp_to_cpu_us\":%s}\n",
-                        v, cal.rtt_ns, js(stat(g2c)).c_str(), js(stat(c2g)).c_str(), js(stat(rtt)).c_str(),
-                        js(stat(mid2c)).c_str());
+            std::printf(
+                "{\"mode\":\"probe_split\",\"variant\":%d,\"calib_rtt_ns\":%.0f,\"gpu_to_cpu_us\":%"
+                "s,\"cpu_to_gpu_us\":%s,\"rtt_us\":%s,\"after_doorbell_stamp_to_cpu_us\":%s}\n",
+                v, cal.rtt_ns, js(stat(g2c)).c_str(), js(stat(c2g)).c_str(), js(stat(rtt)).c_str(),
+                js(stat(mid2c)).c_str());
         }
-        std::printf("{\"mode\":\"probe\",\"tag\":\"%s\",\"variant\":%d,\"what\":\"%s\",\"T\":%d,\"fill_gpus\":%d,"
+        std::printf("{\"mode\":\"probe\",\"tag\":\"%s\",\"variant\":%d,\"what\":\"%s\",\"T\":%d,"
+                    "\"fill_gpus\":%d,"
                     "\"segment_us\":%s,\"window_per_layer_us\":%s}\n",
-                    a.tag.c_str(), v, names[v], T, a.fill_gpus, js(stat(seg)).c_str(), js(stat(win)).c_str());
+                    a.tag.c_str(), v, names[v], T, a.fill_gpus, js(stat(seg)).c_str(),
+                    js(stat(win)).c_str());
         std::fflush(stdout);
         CK(cudaGraphExecDestroy(e));
         CK(cudaGraphDestroy(g));
@@ -609,6 +693,7 @@ struct CallFill {
     std::atomic<bool> stop{false};
     std::atomic<long> issued{0};
     std::thread th;
+
     void start(const Bank& bank, int cpu) {
         th = std::thread([this, &bank, cpu] {
             cpu_set_t set;
@@ -619,17 +704,20 @@ struct CallFill {
             cudaStream_t st;
             CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
             const std::size_t E = static_cast<std::size_t>(kExpertBytes);
-            void* dst = nullptr;
+            void* dst           = nullptr;
             CK(cudaMalloc(&dst, 8 * E));
             std::mt19937_64 rng(7);
             std::uniform_int_distribution<std::size_t> off(0, bank.bytes / E - 1);
             long n = 0;
             while (!stop.load(std::memory_order_relaxed)) {
                 const int k = pending.exchange(0, std::memory_order_acq_rel);
-                if (k == 0) { _mm_pause(); continue; }
+                if (k == 0) {
+                    _mm_pause();
+                    continue;
+                }
                 for (int i = 0; i < k; ++i, ++n) {
-                    CK(cudaMemcpyAsync(static_cast<char*>(dst) + (n % 8) * E, bank.base + off(rng) * E, E,
-                                       cudaMemcpyHostToDevice, st));
+                    CK(cudaMemcpyAsync(static_cast<char*>(dst) + (n % 8) * E,
+                                       bank.base + off(rng) * E, E, cudaMemcpyHostToDevice, st));
                 }
                 issued.fetch_add(k, std::memory_order_relaxed);
             }
@@ -638,6 +726,7 @@ struct CallFill {
             CK(cudaStreamDestroy(st));
         });
     }
+
     void finish() {
         stop = true;
         if (th.joinable()) th.join();
@@ -668,8 +757,9 @@ struct Variant {
 };
 
 std::vector<Variant> parse_variants(const Args& a) {
-    Variant base{a.tag, a.schedule, a.placement, a.fill_gpus > 0 ? a.fill_mode : "none", a.member_quant, a.steal,
-                 a.prefetch_rows, a.threads};
+    Variant base{
+        a.tag,          a.schedule, a.placement,     a.fill_gpus > 0 ? a.fill_mode : "none",
+        a.member_quant, a.steal,    a.prefetch_rows, a.threads};
     if (a.variants.empty()) return {base};
     std::vector<Variant> out;
     std::size_t i = 0;
@@ -677,29 +767,42 @@ std::vector<Variant> parse_variants(const Args& a) {
         std::size_t j = a.variants.find(';', i);
         if (j == std::string::npos) j = a.variants.size();
         const std::string spec = a.variants.substr(i, j - i);
-        i = j + 1;
+        i                      = j + 1;
         if (spec.empty()) continue;
-        Variant v = base;
+        Variant v           = base;
         const std::size_t c = spec.find(':');
-        v.name = spec.substr(0, c);
-        std::string kv = c == std::string::npos ? "" : spec.substr(c + 1);
-        std::size_t k = 0;
+        v.name              = spec.substr(0, c);
+        std::string kv      = c == std::string::npos ? "" : spec.substr(c + 1);
+        std::size_t k       = 0;
         while (k < kv.size()) {
             std::size_t e = kv.find(',', k);
             if (e == std::string::npos) e = kv.size();
             const std::string item = kv.substr(k, e - k);
-            k = e + 1;
-            const std::size_t eq = item.find('=');
-            if (eq == std::string::npos) { std::fprintf(stderr, "bad variant item %s\n", item.c_str()); std::exit(2); }
+            k                      = e + 1;
+            const std::size_t eq   = item.find('=');
+            if (eq == std::string::npos) {
+                std::fprintf(stderr, "bad variant item %s\n", item.c_str());
+                std::exit(2);
+            }
             const std::string key = item.substr(0, eq), val = item.substr(eq + 1);
-            if (key == "schedule") v.schedule = val;
-            else if (key == "mq") v.mq = std::stoi(val);
-            else if (key == "steal") v.steal = std::stoi(val);
-            else if (key == "pf") v.pf = std::stoi(val);
-            else if (key == "placement") v.placement = val;
-            else if (key == "threads") v.threads = std::stoi(val);
-            else if (key == "fill") v.fill = val;
-            else { std::fprintf(stderr, "bad variant key %s\n", key.c_str()); std::exit(2); }
+            if (key == "schedule")
+                v.schedule = val;
+            else if (key == "mq")
+                v.mq = std::stoi(val);
+            else if (key == "steal")
+                v.steal = std::stoi(val);
+            else if (key == "pf")
+                v.pf = std::stoi(val);
+            else if (key == "placement")
+                v.placement = val;
+            else if (key == "threads")
+                v.threads = std::stoi(val);
+            else if (key == "fill")
+                v.fill = val;
+            else {
+                std::fprintf(stderr, "bad variant key %s\n", key.c_str());
+                std::exit(2);
+            }
         }
         out.push_back(v);
     }
@@ -708,10 +811,11 @@ std::vector<Variant> parse_variants(const Args& a) {
 
 struct CallStats {
     std::vector<double> us, per_expert, ph0, ph1, ph2;
-    std::vector<double> t_setup, t_wake, t_b1, t_g_min, t_g_mean, t_g_max, t_b2, t_d_min, t_d_mean, t_d_max, t_tail;
+    std::vector<double> t_setup, t_wake, t_b1, t_g_min, t_g_mean, t_g_max, t_b2, t_d_min, t_d_mean,
+        t_d_max, t_tail;
     double experts = 0, pairs = 0;
     long fills = 0;
-    int calls = 0;
+    int calls  = 0;
 };
 
 void run_cpu(const Args& a, const Bank& bank) {
@@ -720,7 +824,7 @@ void run_cpu(const Args& a, const Bank& bank) {
     // x: 64-byte aligned; --cold-x flushes it from the caches before every call (the engine's x is
     // written by the GPU into mapped memory just before the doorbell).
     const std::size_t x_elems = static_cast<std::size_t>(kHostMaxTokens) * H;
-    auto* x = static_cast<std::uint16_t*>(std::aligned_alloc(64, x_elems * 2));
+    auto* x                   = static_cast<std::uint16_t*>(std::aligned_alloc(64, x_elems * 2));
     std::normal_distribution<float> nd(0.0F, 1.0F);
     for (std::size_t i = 0; i < x_elems; ++i) {
         const float f = nd(rng);
@@ -735,7 +839,7 @@ void run_cpu(const Args& a, const Bank& bank) {
     std::vector<int> used;
     for (const Variant& v : variants) {
         any_call_fill |= v.fill == "overlap" || v.fill == "gap";
-        Args va = a;
+        Args va    = a;
         va.threads = v.threads, va.placement = v.placement;
         for (const int c : pool_cpus(va)) used.push_back(c);
     }
@@ -744,7 +848,10 @@ void run_cpu(const Args& a, const Bank& bank) {
         for (const int c : spread_cpus(12)) {
             if (std::find(used.begin(), used.end(), c) == used.end()) helper = c;
         }
-        if (helper < 0) { std::fprintf(stderr, "no free core for the fill helper\n"); std::exit(2); }
+        if (helper < 0) {
+            std::fprintf(stderr, "no free core for the fill helper\n");
+            std::exit(2);
+        }
         fill.start(bank, helper);
     }
     std::bernoulli_distribution fill_extra(a.fill_experts - std::floor(a.fill_experts));
@@ -757,21 +864,21 @@ void run_cpu(const Args& a, const Bank& bank) {
             for (std::size_t vi = 0; vi < variants.size(); ++vi) {
                 const Variant& v = variants[vi];
                 CallStats& cs    = stats[vi];
-                Args va = a;
+                Args va          = a;
                 va.threads = v.threads, va.placement = v.placement;
                 HostCpuPool pool(pool_cpus(va));
                 HostMoeExecutor::Options opt;
                 opt.min_multi_token = a.min_mt;
                 opt.slices_per_item = a.slices;
-                opt.schedule        = v.schedule == "dynamic" ? Schedule::Dynamic : Schedule::Static;
+                opt.schedule = v.schedule == "dynamic" ? Schedule::Dynamic : Schedule::Static;
                 opt.member_quantize = v.mq != 0;
                 opt.steal           = v.steal != 0;
                 opt.prefetch_rows   = v.pf;
                 opt.record_members  = a.timeline != 0;
                 HostMoeExecutor ex(pool, H, I, kHostMaxTokens, TOPK, opt);
-                const bool vfill = a.fill_gpus > 0 && (v.fill == "overlap" || v.fill == "gap");
+                const bool vfill   = a.fill_gpus > 0 && (v.fill == "overlap" || v.fill == "gap");
                 const long issued0 = fill.issued.load();
-                const int warm = blk == 0 ? 20 : 5;
+                const int warm     = blk == 0 ? 20 : 5;
                 for (int c = 0; c < per_block + warm; ++c) {
                     make_ids(ids);
                     if (a.cold_x) {
@@ -780,11 +887,13 @@ void run_cpu(const Args& a, const Bank& bank) {
                         _mm_sfence();
                     }
                     int nfill = 0;
-                    if (vfill) nfill = static_cast<int>(std::floor(a.fill_experts)) + (fill_extra(rng) ? 1 : 0);
+                    if (vfill)
+                        nfill = static_cast<int>(std::floor(a.fill_experts)) +
+                                (fill_extra(rng) ? 1 : 0);
                     if (vfill && v.fill == "overlap") fill.pending.fetch_add(nfill);
                     const HostMoeJob job{T, TOPK, x, ids.data(), alpha.data(), out.data()};
-                    const auto t0 = HostMoeMailbox::now_ns();
-                    const auto st = ex.run(bank.layer, job);
+                    const auto t0   = HostMoeMailbox::now_ns();
+                    const auto st   = ex.run(bank.layer, job);
                     const double dt = (HostMoeMailbox::now_ns() - t0) / 1e3;
                     if (vfill && v.fill == "gap") fill.pending.fetch_add(nfill);
                     if (a.gap_us > 0) spin_us(a.gap_us);
@@ -798,12 +907,12 @@ void run_cpu(const Args& a, const Bank& bank) {
                     cs.experts += st.experts, cs.pairs += st.pairs;
                     if (st.members != nullptr && st.experts > 0) {
                         const int n = st.member_count;
-                        double wake = 0, a1 = 0, l1 = 0, gmin = 1e18, gsum = 0, gmax = 0, e3 = 0, l3 = 0, dmin = 1e18,
-                               dsum = 0, dmax = 0, e5 = 0;
+                        double wake = 0, a1 = 0, l1 = 0, gmin = 1e18, gsum = 0, gmax = 0, e3 = 0,
+                               l3 = 0, dmin = 1e18, dsum = 0, dmax = 0, e5 = 0;
                         for (int m = 0; m < n; ++m) {
                             const auto& ns = st.members[m].ns;
-                            wake = std::max(wake, double(ns[0] - st.dispatch_ns));
-                            a1   = std::max(a1, double(ns[1]));
+                            wake           = std::max(wake, double(ns[0] - st.dispatch_ns));
+                            a1             = std::max(a1, double(ns[1]));
                             l1 += double(ns[2]) / n;
                             const double g = double(ns[3] - ns[2]), d = double(ns[5] - ns[4]);
                             gmin = std::min(gmin, g), gmax = std::max(gmax, g), gsum += g / n;
@@ -815,9 +924,11 @@ void run_cpu(const Args& a, const Bank& bank) {
                         cs.t_setup.push_back(st.dispatch_ns / 1e3);
                         cs.t_wake.push_back(wake / 1e3);
                         cs.t_b1.push_back(std::max(0.0, l1 - a1) / 1e3);
-                        cs.t_g_min.push_back(gmin / 1e3), cs.t_g_mean.push_back(gsum / 1e3), cs.t_g_max.push_back(gmax / 1e3);
+                        cs.t_g_min.push_back(gmin / 1e3), cs.t_g_mean.push_back(gsum / 1e3),
+                            cs.t_g_max.push_back(gmax / 1e3);
                         cs.t_b2.push_back(std::max(0.0, l3 - e3) / 1e3);
-                        cs.t_d_min.push_back(dmin / 1e3), cs.t_d_mean.push_back(dsum / 1e3), cs.t_d_max.push_back(dmax / 1e3);
+                        cs.t_d_min.push_back(dmin / 1e3), cs.t_d_mean.push_back(dsum / 1e3),
+                            cs.t_d_max.push_back(dmax / 1e3);
                         cs.t_tail.push_back((st.end_ns - e5) / 1e3);
                     }
                 }
@@ -825,31 +936,42 @@ void run_cpu(const Args& a, const Bank& bank) {
             }
         }
         for (std::size_t vi = 0; vi < variants.size(); ++vi) {
-            const Variant& v = variants[vi];
+            const Variant& v    = variants[vi];
             const CallStats& cs = stats[vi];
             const Stat s = stat(cs.us), pe = stat(cs.per_expert);
             const double mean_u = cs.experts / cs.calls;
             std::string tl;
             if (!cs.t_setup.empty()) {
-                tl = ",\"timeline\":{\"setup\":" + js(stat(cs.t_setup)) + ",\"wake\":" + js(stat(cs.t_wake)) + ",\"b1\":" +
-                     js(stat(cs.t_b1)) + ",\"gate_min\":" + js(stat(cs.t_g_min)) + ",\"gate_mean\":" + js(stat(cs.t_g_mean)) +
-                     ",\"gate_max\":" + js(stat(cs.t_g_max)) + ",\"b2\":" + js(stat(cs.t_b2)) + ",\"down_min\":" +
-                     js(stat(cs.t_d_min)) + ",\"down_mean\":" + js(stat(cs.t_d_mean)) + ",\"down_max\":" + js(stat(cs.t_d_max)) +
-                     ",\"tail\":" + js(stat(cs.t_tail)) + "}";
+                tl = ",\"timeline\":{\"setup\":" + js(stat(cs.t_setup)) +
+                     ",\"wake\":" + js(stat(cs.t_wake)) + ",\"b1\":" + js(stat(cs.t_b1)) +
+                     ",\"gate_min\":" + js(stat(cs.t_g_min)) +
+                     ",\"gate_mean\":" + js(stat(cs.t_g_mean)) +
+                     ",\"gate_max\":" + js(stat(cs.t_g_max)) + ",\"b2\":" + js(stat(cs.t_b2)) +
+                     ",\"down_min\":" + js(stat(cs.t_d_min)) +
+                     ",\"down_mean\":" + js(stat(cs.t_d_mean)) +
+                     ",\"down_max\":" + js(stat(cs.t_d_max)) + ",\"tail\":" + js(stat(cs.t_tail)) +
+                     "}";
             }
             char cfg[640];
             std::snprintf(cfg, sizeof cfg,
-                          "\"variant\":\"%s\",\"schedule\":\"%s\",\"member_quant\":%d,\"steal\":%d,\"prefetch_rows\":%d,"
-                          "\"placement\":\"%s\",\"gap_us\":%.0f,\"cold_x\":%d,\"huge\":%d,\"thp\":%.3f,\"fill_mode\":\"%s\","
+                          "\"variant\":\"%s\",\"schedule\":\"%s\",\"member_quant\":%d,\"steal\":%d,"
+                          "\"prefetch_rows\":%d,"
+                          "\"placement\":\"%s\",\"gap_us\":%.0f,\"cold_x\":%d,\"huge\":%d,\"thp\":%"
+                          ".3f,\"fill_mode\":\"%s\","
                           "\"fill_experts\":%.2f,\"fills\":%ld,\"blocks\":%d",
-                          v.name.c_str(), v.schedule.c_str(), v.mq, v.steal, v.pf, v.placement.c_str(), a.gap_us, a.cold_x,
-                          a.huge, g_thp, a.fill_gpus > 0 ? v.fill.c_str() : "none", a.fill_experts, cs.fills, blocks);
-            std::printf("{\"mode\":\"cpu\",\"tag\":\"%s\",\"case\":\"%s\",\"threads\":%d,\"slices\":%d,\"min_mt\":%d,\"fill_gpus\":%d,%s,"
-                        "\"T\":%d,\"experts_mean\":%.3f,\"tokens_per_expert\":%.3f,\"call_us\":%s,\"us_per_expert\":%s,"
+                          v.name.c_str(), v.schedule.c_str(), v.mq, v.steal, v.pf,
+                          v.placement.c_str(), a.gap_us, a.cold_x, a.huge, g_thp,
+                          a.fill_gpus > 0 ? v.fill.c_str() : "none", a.fill_experts, cs.fills,
+                          blocks);
+            std::printf("{\"mode\":\"cpu\",\"tag\":\"%s\",\"case\":\"%s\",\"threads\":%d,"
+                        "\"slices\":%d,\"min_mt\":%d,\"fill_gpus\":%d,%s,"
+                        "\"T\":%d,\"experts_mean\":%.3f,\"tokens_per_expert\":%.3f,\"call_us\":%s,"
+                        "\"us_per_expert\":%s,"
                         "\"gbps_med\":%.2f,\"prep_us\":%s,\"gate_up_us\":%s,\"down_us\":%s%s}\n",
-                        a.tag.c_str(), label.c_str(), v.threads, a.slices, a.min_mt, a.fill_gpus, cfg, T, mean_u,
-                        cs.pairs / cs.experts, js(s).c_str(), js(pe).c_str(), mean_u * kExpertBytes / (s.med * 1e3),
-                        js(stat(cs.ph0)).c_str(), js(stat(cs.ph1)).c_str(), js(stat(cs.ph2)).c_str(), tl.c_str());
+                        a.tag.c_str(), label.c_str(), v.threads, a.slices, a.min_mt, a.fill_gpus,
+                        cfg, T, mean_u, cs.pairs / cs.experts, js(s).c_str(), js(pe).c_str(),
+                        mean_u * kExpertBytes / (s.med * 1e3), js(stat(cs.ph0)).c_str(),
+                        js(stat(cs.ph1)).c_str(), js(stat(cs.ph2)).c_str(), tl.c_str());
         }
         std::fflush(stdout);
     };
@@ -857,26 +979,31 @@ void run_cpu(const Args& a, const Bank& bank) {
     for (const int m : int_list(a.grid_m)) {
         for (const int U : int_list(a.grid_u)) {
             const int T = std::max(m, a.tokens);
-            bench("grid U" + std::to_string(U) + " m" + std::to_string(m), T, [&](std::vector<std::int32_t>& ids) {
-                std::fill(ids.begin(), ids.end(), -1);
-                std::vector<int> chosen;
-                while (static_cast<int>(chosen.size()) < U) {
-                    const int e = ex_d(rng);
-                    if (std::find(chosen.begin(), chosen.end(), e) == chosen.end()) chosen.push_back(e);
-                }
-                for (int t = 0; t < m; ++t)
-                    for (int u = 0; u < U; ++u) ids[static_cast<std::size_t>(t) * TOPK + u] = chosen[u];
-            });
+            bench("grid U" + std::to_string(U) + " m" + std::to_string(m), T,
+                  [&](std::vector<std::int32_t>& ids) {
+                      std::fill(ids.begin(), ids.end(), -1);
+                      std::vector<int> chosen;
+                      while (static_cast<int>(chosen.size()) < U) {
+                          const int e = ex_d(rng);
+                          if (std::find(chosen.begin(), chosen.end(), e) == chosen.end())
+                              chosen.push_back(e);
+                      }
+                      for (int t = 0; t < m; ++t)
+                          for (int u = 0; u < U; ++u)
+                              ids[static_cast<std::size_t>(t) * TOPK + u] = chosen[u];
+                  });
         }
     }
     if (a.decode_case) {
         // Decode pattern (same generator as the graph mode, one layer per call).
-        Args one = a;
+        Args one   = a;
         one.layers = 1;
-        bench("decode U" + std::to_string(a.umin) + "-" + std::to_string(a.umax) + " p2 " + std::to_string(a.p2), a.tokens,
-              [&](std::vector<std::int32_t>& ids) {
+        bench("decode U" + std::to_string(a.umin) + "-" + std::to_string(a.umax) + " p2 " +
+                  std::to_string(a.p2),
+              a.tokens, [&](std::vector<std::int32_t>& ids) {
                   const Window w = make_window(one, bank.experts, rng);
-                  for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = w.slot[i] < 0 ? w.ids[i] : -1;
+                  for (std::size_t i = 0; i < ids.size(); ++i)
+                      ids[i] = w.slot[i] < 0 ? w.ids[i] : -1;
               });
     }
     fill.finish();
@@ -897,23 +1024,27 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
     const int sms = prop.multiProcessorCount;
     const int L = a.layers, T = a.tokens;
     const Calib c0 = calibrate();
-    std::printf("{\"mode\":\"calib\",\"tag\":\"%s\",\"offset_ns\":%.0f,\"rtt_min_ns\":%.0f,\"gpu_tick_ns\":%.0f}\n",
+    std::printf("{\"mode\":\"calib\",\"tag\":\"%s\",\"offset_ns\":%.0f,\"rtt_min_ns\":%.0f,\"gpu_"
+                "tick_ns\":%.0f}\n",
                 a.tag.c_str(), c0.offset_ns, c0.rtt_ns, c0.gpu_tick_ns);
     std::fflush(stdout);
 
     HostMoeMailboxConfig cfg;
-    cfg.device = 0, cfg.layers = L, cfg.max_tokens = kHostMaxTokens, cfg.top_k = TOPK, cfg.hidden = H,
-    cfg.intermediate = I;
+    cfg.device = 0, cfg.layers = L, cfg.max_tokens = kHostMaxTokens, cfg.top_k = TOPK,
+    cfg.hidden = H, cfg.intermediate = I;
     cfg.cpus           = spread_cpus(a.threads);
     cfg.executor       = {a.min_mt, a.slices};
     cfg.trace_capacity = L * 4;
-    HostMoeMailbox mailbox(cfg, std::vector<HostExpertLayer>(static_cast<std::size_t>(L), bank.layer));
+    HostMoeMailbox mailbox(cfg,
+                           std::vector<HostExpertLayer>(static_cast<std::size_t>(L), bank.layer));
 
-    const std::size_t nx = static_cast<std::size_t>(L) * T * H, nr = static_cast<std::size_t>(L) * T * TOPK;
+    const std::size_t nx = static_cast<std::size_t>(L) * T * H,
+                      nr = static_cast<std::size_t>(L) * T * TOPK;
     __nv_bfloat16 *dx = nullptr, *dy = nullptr;
     std::int32_t *dids = nullptr, *dslot = nullptr;
     float* dalpha = nullptr;
-    long long* dstamp = nullptr; // [L][4]: before publish, after accumulate, resident start, resident end
+    long long* dstamp =
+        nullptr; // [L][4]: before publish, after accumulate, resident start, resident end
     CK(cudaMalloc(&dx, nx * 2));
     CK(cudaMalloc(&dy, nx * 2));
     CK(cudaMalloc(&dids, nr * 4));
@@ -931,11 +1062,16 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
         cudaGraphExec_t e;
         CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
         for (int l = 0; l < L; ++l) {
-            const std::size_t ox = static_cast<std::size_t>(l) * T * H, orr = static_cast<std::size_t>(l) * T * TOPK;
-            if (dense_us > 0) standin_kernel<<<sms, 32, 0, s>>>(static_cast<long long>(dense_us * 1e3), nullptr);
+            const std::size_t ox  = static_cast<std::size_t>(l) * T * H,
+                              orr = static_cast<std::size_t>(l) * T * TOPK;
+            if (dense_us > 0)
+                standin_kernel<<<sms, 32, 0, s>>>(static_cast<long long>(dense_us * 1e3), nullptr);
             if (stamps) stamp_kernel<<<1, 1, 0, s>>>(dstamp + 4 * l);
-            if (arm.handshake) mailbox.publish(s, l, T, dx + ox, dids + orr, dalpha + orr, dslot + orr);
-            if (res_us > 0) standin_kernel<<<sms, 32, 0, s>>>(static_cast<long long>(res_us * 1e3), stamps ? dstamp + 4 * l + 2 : nullptr);
+            if (arm.handshake)
+                mailbox.publish(s, l, T, dx + ox, dids + orr, dalpha + orr, dslot + orr);
+            if (res_us > 0)
+                standin_kernel<<<sms, 32, 0, s>>>(static_cast<long long>(res_us * 1e3),
+                                                  stamps ? dstamp + 4 * l + 2 : nullptr);
             if (arm.handshake) mailbox.accumulate(s, l, T, dy + ox);
             if (stamps) stamp_kernel<<<1, 1, 0, s>>>(dstamp + 4 * l + 1);
         }
@@ -980,19 +1116,26 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
                 CK(cudaGraphLaunch(exec, s));
                 CK(cudaEventRecord(e1, s));
                 CK(cudaStreamSynchronize(s));
-                if (mailbox.failed()) { std::fprintf(stderr, "mailbox failed: %s\n", mailbox.error().c_str()); std::exit(1); }
+                if (mailbox.failed()) {
+                    std::fprintf(stderr, "mailbox failed: %s\n", mailbox.error().c_str());
+                    std::exit(1);
+                }
                 if (r < a.warmup) continue;
                 float ms = 0;
                 CK(cudaEventElapsedTime(&ms, e0, e1));
                 window_us.push_back(ms * 1e3);
                 if (!stamps || !arm.handshake) continue;
                 std::vector<long long> st(4 * L);
-                CK(cudaMemcpy(st.data(), dstamp, sizeof(long long) * 4 * L, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(st.data(), dstamp, sizeof(long long) * 4 * L,
+                              cudaMemcpyDeviceToHost));
                 const auto tr = mailbox.trace();
-                if (static_cast<int>(tr.size()) != L) { std::fprintf(stderr, "trace %zu != %d\n", tr.size(), L); std::exit(1); }
+                if (static_cast<int>(tr.size()) != L) {
+                    std::fprintf(stderr, "trace %zu != %d\n", tr.size(), L);
+                    std::exit(1);
+                }
                 for (int l = 0; l < L; ++l) {
-                    const auto& rec   = tr[l];
-                    const double g0   = st[4 * l] + cal.offset_ns, g1 = st[4 * l + 1] + cal.offset_ns;
+                    const auto& rec = tr[l];
+                    const double g0 = st[4 * l] + cal.offset_ns, g1 = st[4 * l + 1] + cal.offset_ns;
                     const double rend = st[4 * l + 3] + cal.offset_ns;
                     const double rd   = res_us > 0 ? (st[4 * l + 3] - st[4 * l + 2]) / 1e3 : 0.0;
                     const double cu   = (rec.done_ns - rec.seen_ns) / 1e3;
@@ -1012,25 +1155,34 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
                 }
             }
             CK(cudaGraphExecDestroy(exec));
-            std::printf("{\"mode\":\"%s\",\"tag\":\"%s\",\"arm\":\"%s\",\"stamps\":%d,\"layers\":%d,\"T\":%d,\"threads\":%d,"
-                        "\"min_mt\":%d,\"dense_us\":%.1f,\"resident_us\":%.1f,\"experts\":\"%d-%d\",\"p2\":%.2f,"
+            std::printf("{\"mode\":\"%s\",\"tag\":\"%s\",\"arm\":\"%s\",\"stamps\":%d,\"layers\":%"
+                        "d,\"T\":%d,\"threads\":%d,"
+                        "\"min_mt\":%d,\"dense_us\":%.1f,\"resident_us\":%.1f,\"experts\":\"%d-%"
+                        "d\",\"p2\":%.2f,"
                         "\"fill_gpus\":%d,\"window_us\":%s",
-                        calib_only ? "calib" : "graph", a.tag.c_str(), arm.name.c_str(), stamps ? 1 : 0, L, T, a.threads,
-                        a.min_mt, dense_us, res_us, arm.host_work ? a.umin : 0, arm.host_work ? a.umax : 0, a.p2,
-                        a.fill_gpus, js(stat(window_us)).c_str());
+                        calib_only ? "calib" : "graph", a.tag.c_str(), arm.name.c_str(),
+                        stamps ? 1 : 0, L, T, a.threads, a.min_mt, dense_us, res_us,
+                        arm.host_work ? a.umin : 0, arm.host_work ? a.umax : 0, a.p2, a.fill_gpus,
+                        js(stat(window_us)).c_str());
             if (stamps && arm.handshake) {
-                // Overlap efficiency over the window: (sum resident + sum cpu - sum moe) / sum min(resident, cpu).
+                // Overlap efficiency over the window: (sum resident + sum cpu - sum moe) / sum
+                // min(resident, cpu).
                 double sum_min = 0;
-                for (std::size_t i = 0; i < cpu_us.size(); ++i) sum_min += std::min(res_dur[i], cpu_us[i]);
+                for (std::size_t i = 0; i < cpu_us.size(); ++i)
+                    sum_min += std::min(res_dur[i], cpu_us[i]);
                 const double eff = sum_min > 0 ? (sum_res + sum_cpu - sum_moe) / sum_min : 0.0;
-                std::printf(",\"layer_moe_us\":%s,\"cpu_us\":%s,\"cpu_us_per_expert\":%s,\"gpu_to_cpu_us\":%s,"
-                            "\"cpu_to_gpu_us\":%s,\"sync_rtt_us\":%s,\"cpu_critical_layers\":%d,\"layer_samples\":%d,"
-                            "\"sum_moe_us\":%.1f,\"sum_ideal_us\":%.1f,\"sum_cpu_us\":%.1f,\"sum_resident_us\":%.1f,"
+                std::printf(",\"layer_moe_us\":%s,\"cpu_us\":%s,\"cpu_us_per_expert\":%s,\"gpu_to_"
+                            "cpu_us\":%s,"
+                            "\"cpu_to_gpu_us\":%s,\"sync_rtt_us\":%s,\"cpu_critical_layers\":%d,"
+                            "\"layer_samples\":%d,"
+                            "\"sum_moe_us\":%.1f,\"sum_ideal_us\":%.1f,\"sum_cpu_us\":%.1f,\"sum_"
+                            "resident_us\":%.1f,"
                             "\"overlap_eff\":%.3f",
-                            js(stat(moe)).c_str(), js(stat(cpu_us)).c_str(), js(stat(per_expert)).c_str(),
-                            js(stat(sig)).c_str(), js(stat(comp)).c_str(), js(stat(rtt)).c_str(), cpu_critical,
-                            layers_seen, sum_moe / a.replays, sum_ideal / a.replays, sum_cpu / a.replays,
-                            sum_res / a.replays, eff);
+                            js(stat(moe)).c_str(), js(stat(cpu_us)).c_str(),
+                            js(stat(per_expert)).c_str(), js(stat(sig)).c_str(),
+                            js(stat(comp)).c_str(), js(stat(rtt)).c_str(), cpu_critical,
+                            layers_seen, sum_moe / a.replays, sum_ideal / a.replays,
+                            sum_cpu / a.replays, sum_res / a.replays, eff);
             }
             std::printf("}\n");
             std::fflush(stdout);
@@ -1038,10 +1190,12 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
     }
     if (a.fill_gpus > 0) {
         fill.finish();
-        std::printf("{\"mode\":\"fill\",\"tag\":\"%s\",\"gbps\":%s}\n", a.tag.c_str(), fill_json(fill).c_str());
+        std::printf("{\"mode\":\"fill\",\"tag\":\"%s\",\"gbps\":%s}\n", a.tag.c_str(),
+                    fill_json(fill).c_str());
     }
     const Calib c1 = calibrate();
-    std::printf("{\"mode\":\"calib_end\",\"tag\":\"%s\",\"offset_ns\":%.0f,\"rtt_min_ns\":%.0f,\"drift_ns\":%.0f}\n",
+    std::printf("{\"mode\":\"calib_end\",\"tag\":\"%s\",\"offset_ns\":%.0f,\"rtt_min_ns\":%.0f,"
+                "\"drift_ns\":%.0f}\n",
                 a.tag.c_str(), c1.offset_ns, c1.rtt_ns, c1.offset_ns - c0.offset_ns);
     CK(cudaFree(dx));
     CK(cudaFree(dy));
@@ -1059,21 +1213,24 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "needs AVX-512 VNNI\n");
         return 77;
     }
-    Bank bank = make_bank(a.bank_gib, 12, a.huge != 0);
+    Bank bank            = make_bank(a.bank_gib, 12, a.huge != 0);
     const bool need_cuda = a.mode != "cpu" || a.fill_gpus > 0;
     if (need_cuda) {
         CK(cudaSetDevice(0));
-        CK(cudaHostRegister(bank.base, bank.bytes, cudaHostRegisterPortable | cudaHostRegisterMapped));
+        CK(cudaHostRegister(bank.base, bank.bytes,
+                            cudaHostRegisterPortable | cudaHostRegisterMapped));
     }
     g_thp = thp_fraction(bank.base, bank.bytes);
-    std::fprintf(stderr, "bank: %d experts, %.2f GiB, THP %.3f\n", bank.experts, bank.bytes / double(1ULL << 30), g_thp);
+    std::fprintf(stderr, "bank: %d experts, %.2f GiB, THP %.3f\n", bank.experts,
+                 bank.bytes / double(1ULL << 30), g_thp);
     if (a.mode == "cpu") {
         Fill fill;
         if (a.fill_gpus > 0 && a.fill_mode == "cont") fill.start(bank, a.fill_gpus);
         run_cpu(a, bank);
         if (a.fill_gpus > 0 && a.fill_mode == "cont") {
             fill.finish();
-            std::printf("{\"mode\":\"fill\",\"tag\":\"%s\",\"gbps\":%s}\n", a.tag.c_str(), fill_json(fill).c_str());
+            std::printf("{\"mode\":\"fill\",\"tag\":\"%s\",\"gbps\":%s}\n", a.tag.c_str(),
+                        fill_json(fill).c_str());
         }
     } else if (a.mode == "probe") {
         Fill fill;

@@ -13,8 +13,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 ROOT = Path(__file__).resolve().parents[2]
 RENDERER = ROOT / "build" / "tests" / "ninfer_jinja_test"
 SOURCES = {
-    version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text()
-    for version in ("qwen3_6", "qwen3_8")
+    version: (ROOT / "tools" / "chat_templates" / f"{version}.jinja").read_text() for version in ("qwen3_6", "qwen3_8")
 }
 
 
@@ -23,13 +22,9 @@ def fail(message):
 
 
 def compile_template(source):
-    env = ImmutableSandboxedEnvironment(
-        trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"]
-    )
+    env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
     # Transformers' chat-template JSON convention, with insertion order preserved.
-    env.filters["tojson"] = lambda value, **kwargs: json.dumps(
-        value, **{"ensure_ascii": False, **kwargs}
-    )
+    env.filters["tojson"] = lambda value, **kwargs: json.dumps(value, **{"ensure_ascii": False, **kwargs})
     env.globals["raise_exception"] = fail
     return env.from_string(source)
 
@@ -63,8 +58,7 @@ class ChatTemplates(unittest.TestCase):
                 ]
                 self.assertEqual(
                     self.render(version, appended),
-                    before
-                    + "<|im_start|>system\ndiagnostic<|im_end|>\n<|im_start|>system\nreminder<|im_end|>\n",
+                    before + "<|im_start|>system\ndiagnostic<|im_end|>\n<|im_start|>system\nreminder<|im_end|>\n",
                 )
 
     def test_defaults_and_reasoning_retention(self):
@@ -94,9 +88,7 @@ class ChatTemplates(unittest.TestCase):
                 )
         self.assertNotIn("prior reasoning", self.render("qwen3_6", next_user))
         self.assertIn("prior reasoning", self.render("qwen3_8", next_user))
-        default = TEMPLATES["qwen3_8"].render(
-            messages=[message("user", "hello")], add_generation_prompt=True
-        )
+        default = TEMPLATES["qwen3_8"].render(messages=[message("user", "hello")], add_generation_prompt=True)
         self.assertIn("Reasoning effort is set to xhigh.", default)
         self.assertTrue(default.endswith("<|im_start|>assistant\n<think>\n"))
 
@@ -134,9 +126,7 @@ class ChatTemplates(unittest.TestCase):
                     "<|im_start|>user\n<tool_response>\none\n</tool_response>\n<tool_response>\ntwo\n</tool_response><|im_end|>",
                     text,
                 )
-                self.assertTrue(
-                    text.endswith("<|im_start|>system\ndiagnostic<|im_end|>\n")
-                )
+                self.assertTrue(text.endswith("<|im_start|>system\ndiagnostic<|im_end|>\n"))
 
     def test_tool_result_without_original_user(self):
         results = [message("tool", "one"), message("tool", "two")]
@@ -169,9 +159,7 @@ class ChatTemplates(unittest.TestCase):
         history = [message("user", "question"), message("assistant", "answer prefix")]
         for version in TEMPLATES:
             with self.subTest(template=version):
-                text = self.render(
-                    version, history, continue_final_message=True, enable_thinking=False
-                )
+                text = self.render(version, history, continue_final_message=True, enable_thinking=False)
                 self.assertEqual(
                     text,
                     "<|im_start|>user\nquestion<|im_end|>\n<|im_start|>assistant\nanswer prefix",
@@ -258,10 +246,7 @@ class ChatTemplates(unittest.TestCase):
             capture_output=True,
             check=True,
             input="".join(
-                json.dumps(
-                    {"source": SOURCES[name], "context": context}, ensure_ascii=False
-                )
-                + "\n"
+                json.dumps({"source": SOURCES[name], "context": context}, ensure_ascii=False) + "\n"
                 for name, context in cases
             ),
             timeout=30,

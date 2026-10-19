@@ -7,9 +7,9 @@ namespace {
 using Geometry = Nvfp4Geometry<5120, 17408>;
 using Gemv =
     Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
-using C2      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+using C2 = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
+                                Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 // C4 (T=3..4) and C5 ask for 6 CTAs per SM (<= 80 registers instead of 112); rows stay one per
 // warp, so only speed changes. On an RTX 5070 Ti [5120,8704] T=3/4/5: 50.1/50.4/53.3 ->
 // 44.7/44.8/49.0 us; [5120,17408]: 94.2/94.7/99.3 -> 85.5/85.9/97.0 us.

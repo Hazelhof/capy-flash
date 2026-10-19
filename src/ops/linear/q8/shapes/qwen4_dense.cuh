@@ -13,11 +13,16 @@ namespace ninfer::ops::detail::qwen4_dense {
 using Access = Q8ScaleAccess;
 using Stage  = Q8ActivationStage;
 // 8 K-warps (BlockK 512), one stage, direct scales: the 27B T <= 4 schedule family.
-using D8   = Q8A16SlicedKMmaSchedule<8, 8, 1, 2, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
-using D4   = Q8A16SlicedKMmaSchedule<8, 4, 2, 2, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
-using S8   = Q8A16SlicedKMmaSchedule<8, 8, 2, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
-using D16  = Q8A16SlicedKMmaSchedule<8, 16, 1, 2, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
-using D8x3 = Q8A16SlicedKMmaSchedule<8, 8, 1, 3, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
+using D8 =
+    Q8A16SlicedKMmaSchedule<8, 8, 1, 2, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
+using D4 =
+    Q8A16SlicedKMmaSchedule<8, 4, 2, 2, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
+using S8 =
+    Q8A16SlicedKMmaSchedule<8, 8, 2, 2, Access::Shared, Cache::ca, Cache::cg, Stage::ActiveOnly>;
+using D16 = Q8A16SlicedKMmaSchedule<8, 16, 1, 2, Access::Direct, Cache::ca, Cache::cg,
+                                    Stage::RuntimeActive>;
+using D8x3 =
+    Q8A16SlicedKMmaSchedule<8, 8, 1, 3, Access::Direct, Cache::ca, Cache::cg, Stage::RuntimeActive>;
 
 inline int variant() {
     static const int v = [] {
@@ -32,15 +37,44 @@ template <class Geometry>
 Q8Launch candidate(int v, Q8Launch fallback) {
     constexpr int K = Geometry::kInputRows;
     switch (v) {
-    case 0: return launch_q8_a16_simt_r8_t4;
-    case 1: return launch_q8_a16_simt_r4_t4_w2_g16_s2;
-    case 2: if constexpr (K % 512 == 0) { return launch_q8_a16_sliced<Geometry, 4, D8>; } else { return fallback; }
-    case 3: if constexpr (K % 256 == 0) { return launch_q8_a16_sliced<Geometry, 4, D4>; } else { return fallback; }
-    case 4: if constexpr (K % 512 == 0) { return launch_q8_a16_sliced<Geometry, 4, S8>; } else { return fallback; }
-    case 5: if constexpr (K % 1024 == 0) { return launch_q8_a16_sliced<Geometry, 4, D16>; } else { return fallback; }
-    case 6: if constexpr (K % 512 == 0) { return launch_q8_a16_sliced<Geometry, 4, D8x3>; } else { return fallback; }
-    case 7: return launch_q8_a16_sliced_r16_t16_w8_s2;
-    default: return fallback;
+    case 0:
+        return launch_q8_a16_simt_r8_t4;
+    case 1:
+        return launch_q8_a16_simt_r4_t4_w2_g16_s2;
+    case 2:
+        if constexpr (K % 512 == 0) {
+            return launch_q8_a16_sliced<Geometry, 4, D8>;
+        } else {
+            return fallback;
+        }
+    case 3:
+        if constexpr (K % 256 == 0) {
+            return launch_q8_a16_sliced<Geometry, 4, D4>;
+        } else {
+            return fallback;
+        }
+    case 4:
+        if constexpr (K % 512 == 0) {
+            return launch_q8_a16_sliced<Geometry, 4, S8>;
+        } else {
+            return fallback;
+        }
+    case 5:
+        if constexpr (K % 1024 == 0) {
+            return launch_q8_a16_sliced<Geometry, 4, D16>;
+        } else {
+            return fallback;
+        }
+    case 6:
+        if constexpr (K % 512 == 0) {
+            return launch_q8_a16_sliced<Geometry, 4, D8x3>;
+        } else {
+            return fallback;
+        }
+    case 7:
+        return launch_q8_a16_sliced_r16_t16_w8_s2;
+    default:
+        return fallback;
     }
 }
 

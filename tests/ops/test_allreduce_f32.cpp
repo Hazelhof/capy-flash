@@ -106,9 +106,9 @@ struct RankBuffers {
         const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
         for (int rank = 0; rank < 2; ++rank) {
             set_device(ec, rank);
-            partial[rank]   = std::make_unique<GuardedDeviceBuffer>(count * 4);
-            staging[rank]   = std::make_unique<GuardedDeviceBuffer>(count * 4);
-            out[rank]       = std::make_unique<GuardedDeviceBuffer>(count * 2);
+            partial[rank] = std::make_unique<GuardedDeviceBuffer>(count * 4);
+            staging[rank] = std::make_unique<GuardedDeviceBuffer>(count * 4);
+            out[rank]     = std::make_unique<GuardedDeviceBuffer>(count * 2);
             staging[rank]->fill(0);
             out[rank]->fill(0xff);
             partial_t[rank] = Tensor(partial[rank]->data(), DType::FP32, {ne0, ne1});
@@ -187,8 +187,8 @@ int run_captured_case(const char* label, std::int32_t ne0, std::int32_t ne1, int
                                    events);
         }
     });
-    int failures            = 0;
-    const std::size_t nodes = definition.node_count();
+    int failures                = 0;
+    const std::size_t nodes     = definition.node_count();
     const bool mailbox_expected = expect_nodes_per_site == 2;
     if (mailbox_expected ? nodes != 1 + 2 * static_cast<std::size_t>(sites)
                          : nodes <= 1 + 2 * static_cast<std::size_t>(sites)) {
@@ -280,9 +280,9 @@ int run_interleaved_case(const ExecutionContext& ec, const ops::PeerEvents& stag
             launch_two_devices(ec, executable);
             Expected expected = oracle(a, b, sum_scale);
             expected.bf16     = oracle(a, b, out_scale).bf16;
-            failures += moe.verify(ec, std::string("interleaved ") + transport + " replay " +
-                                           std::to_string(replay),
-                                   expected, true);
+            failures += moe.verify(
+                ec, std::string("interleaved ") + transport + " replay " + std::to_string(replay),
+                expected, true);
             for (int rank = 0; rank < 2; ++rank) {
                 set_device(ec, rank);
                 attention_out.push_back(from_device<std::uint16_t>(attention[rank]->data(), count));
@@ -294,8 +294,8 @@ int run_interleaved_case(const ExecutionContext& ec, const ops::PeerEvents& stag
     };
     int failures              = 0;
     std::size_t mailbox_nodes = 0, staged_nodes = 0;
-    const auto via_mailbox    = run(mailbox_events, "mailbox", mailbox_nodes, failures);
-    const auto via_staged     = run(staged, "staged", staged_nodes, failures);
+    const auto via_mailbox = run(mailbox_events, "mailbox", mailbox_nodes, failures);
+    const auto via_staged  = run(staged, "staged", staged_nodes, failures);
     if (mailbox_nodes != 2 * 3 * kSites || staged_nodes <= 2 * 3 * kSites) {
         std::cerr << "interleaved: " << mailbox_nodes << " / " << staged_nodes
                   << " graph nodes do not match the mailbox / staged transports\n";
@@ -328,7 +328,7 @@ int run_rejections(const ExecutionContext& ec, const ops::PeerEvents& events) {
         ++failures;
     };
     expect_throw("bf16 partial", [&] {
-        auto partial    = buffers.partial_t;
+        auto partial     = buffers.partial_t;
         partial[0].dtype = DType::BF16;
         ops::allreduce_sum_f32(partial, buffers.staging_t, nullptr, ec, events);
     });
@@ -444,7 +444,8 @@ int run_host_exchange_case(const char* label, std::int32_t ne0, std::int32_t ne1
 // case used to compare with the driver-staged pull of the same calls, but without peer access that
 // pull is not ordered after the previous call's in-place combine on the source device and reads
 // stale operands back to back, ~25 % of runs. The staged result is still computed and reported,
-// not counted: it is the reference no longer, and production eager exchanges take the HostExchange.)
+// not counted: it is the reference no longer, and production eager exchanges take the
+// HostExchange.)
 int run_host_exchange_bf16_case(const char* label, std::int32_t ne0, std::int32_t ne1, int calls,
                                 std::uint32_t seed, const ExecutionContext& ec,
                                 const ops::PeerEvents& staged, const ops::PeerEvents& host) {
@@ -508,6 +509,90 @@ int run_host_exchange_bf16_case(const char* label, std::int32_t ne0, std::int32_
     return failures;
 }
 
+// Prefill overlap: the split-phase BF16 sum (allreduce_sum_begin / allreduce_sum_finish) on two
+// lanes over the two column halves [0,split) and [split,ne1) of one buffer, issued as the
+// overlapped prefill issues them (begin A, begin B, then per round finish A, begin A, finish B,
+// begin B), a 64 MB memset skewing rank 1 before every begin, then one allreduce_sum() of the
+// whole buffer through the same exchange. Exact oracle: RNE_bf16(x0 + x1) after a half's first
+// call, doubled exactly by every later call, so a lane finished early, a host buffer or staging
+// reused before the peer read it, or an operand overwritten before it was copied out breaks the
+// bits.
+int run_split_lane_case(const char* label, std::int32_t ne0, std::int32_t ne1, std::int32_t split,
+                        int rounds, std::uint32_t seed, const ExecutionContext& ec,
+                        const ops::PeerEvents& host) {
+    const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
+    std::array<std::vector<std::uint16_t>, 2> input;
+    for (int rank = 0; rank < 2; ++rank) {
+        std::vector<float> v(count);
+        fill_uniform(v, seed + static_cast<std::uint32_t>(rank), -2.0F, 2.0F);
+        input[rank].resize(count);
+        for (std::size_t i = 0; i < count; ++i) { input[rank][i] = f32_to_bf16(v[i]); }
+    }
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> buffer, staging;
+    std::array<Tensor, 2> buffer_t, staging_t;
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        buffer[rank]  = std::make_unique<GuardedDeviceBuffer>(count * 2);
+        staging[rank] = std::make_unique<GuardedDeviceBuffer>(count * 2);
+        buffer[rank]->copy_from_host(input[rank].data(), count * 2);
+        buffer_t[rank]  = Tensor(buffer[rank]->data(), DType::BF16, {ne0, ne1});
+        staging_t[rank] = Tensor(staging[rank]->data(), DType::BF16, {ne0, ne1});
+    }
+    std::array<std::array<Tensor, 2>, 2> half_buffer, half_staging;
+    for (int h = 0; h < 2; ++h) {
+        const std::int32_t first = h == 0 ? 0 : split;
+        const std::int32_t n     = h == 0 ? split : ne1 - split;
+        for (int rank = 0; rank < 2; ++rank) {
+            half_buffer[h][rank]  = buffer_t[rank].slice(1, first, n);
+            half_staging[h][rank] = staging_t[rank].slice(1, first, n);
+        }
+    }
+    set_device(ec, 1);
+    DeviceBuffer skew(64u << 20);
+    synchronize_both(ec);
+    int failures = 0;
+    if (!ops::allreduce_sum_split_available(ec, host)) {
+        std::cerr << label << ": split all-reduce unavailable with a host exchange\n";
+        return 1;
+    }
+    for (int round = 0; round < rounds; ++round) {
+        for (int h = 0; h < 2; ++h) {
+            if (round > 0) { ops::allreduce_sum_finish(ec, host, h); }
+            set_device(ec, 1);
+            cuda_check(cudaMemsetAsync(skew.p, round * 2 + h, skew.bytes, ec.dev[1]->stream),
+                       "skew memset");
+            ops::allreduce_sum_begin(half_buffer[h], half_staging[h], ec, host, h);
+        }
+    }
+    ops::allreduce_sum_finish(ec, host, 0);
+    ops::allreduce_sum_finish(ec, host, 1);
+    ops::allreduce_sum(buffer_t, staging_t, ec, host);
+    synchronize_both(ec);
+    std::vector<std::uint16_t> oracle(count);
+    const auto widen = [](std::uint16_t b) {
+        const std::uint32_t u = static_cast<std::uint32_t>(b) << 16;
+        float v               = 0.0F;
+        std::memcpy(&v, &u, sizeof(v));
+        return v;
+    };
+    for (std::size_t i = 0; i < count; ++i) {
+        const volatile float s = widen(input[0][i]) + widen(input[1][i]);
+        std::uint16_t b        = f32_to_bf16(s);
+        for (int call = 0; call < rounds; ++call) {
+            const volatile float d = widen(b) + widen(b);
+            b                      = f32_to_bf16(d);
+        }
+        oracle[i] = b;
+    }
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        const auto result = from_device<std::uint16_t>(buffer[rank]->data(), count);
+        failures += verify_exact((std::string(label) + " rank " + std::to_string(rank)).c_str(),
+                                 result, oracle);
+    }
+    return failures;
+}
+
 // T62: the pipelined prefill exchange (HostExchange::begin_sum_f32 / columns_ready /
 // finish_sum_f32). Oracle, exact: S = fl32(n(a) + n(b)) with n = identity (FP32), RNE to binary16
 // (FP16, the host's _Float16 conversion) or RNE to bfloat16 (BF16); both ranks hold S and
@@ -517,11 +602,12 @@ int run_host_exchange_bf16_case(const char* label, std::int32_t ne0, std::int32_
 float narrow_host(float v, ops::HostExchange::Payload payload) {
     switch (payload) {
     case ops::HostExchange::Payload::FP16: {
-        // T128b: the device payload is f16(sat(v * 2^-k)) * 2^k, k = NINFER_TP_AR_SHIFT (default 2).
+        // T128b: the device payload is f16(sat(v * 2^-k)) * 2^k, k = NINFER_TP_AR_SHIFT (default
+        // 2).
         const char* e = std::getenv("NINFER_TP_AR_SHIFT");
-        int k = e != nullptr ? std::atoi(e) : 2;
-        k = k < 0 ? 0 : (k > 14 ? 14 : k);
-        float x = std::ldexp(v, -k);
+        int k         = e != nullptr ? std::atoi(e) : 2;
+        k             = k < 0 ? 0 : (k > 14 ? 14 : k);
+        float x       = std::ldexp(v, -k);
         if (std::fabs(x) > 65504.0F) { x = std::copysign(65504.0F, x); }
         return std::ldexp(static_cast<float>(static_cast<_Float16>(x)), k);
     }
@@ -531,7 +617,8 @@ float narrow_host(float v, ops::HostExchange::Payload payload) {
         std::memcpy(&out, &bits, sizeof(out));
         return out;
     }
-    default: return v;
+    default:
+        return v;
     }
 }
 
@@ -541,8 +628,8 @@ int run_pipelined_case(const char* label, std::int32_t ne0, std::int32_t ne1,
                        bool mixed, std::uint32_t seed, const ExecutionContext& ec,
                        ops::HostExchange& exchange, const ops::PeerEvents& events) {
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
-    auto a       = make_partial(count, seed);
-    auto b       = make_partial(count, seed + 1);
+    auto a                  = make_partial(count, seed);
+    auto b                  = make_partial(count, seed + 1);
     RankBuffers buffers(ec, ne0, ne1);
     buffers.upload(ec, a, b);
     set_device(ec, 1);
@@ -599,13 +686,14 @@ int run_host_copy_case(const ExecutionContext& ec, ops::HostExchange& exchange,
         std::cerr << "host copy: eager_exchange did not select the attached exchange\n";
         ++failures;
     }
-    for (const std::size_t bytes : {std::size_t{1}, std::size_t{4096}, std::size_t{10001},
-                                    std::size_t{3} << 20}) {
+    for (const std::size_t bytes :
+         {std::size_t{1}, std::size_t{4096}, std::size_t{10001}, std::size_t{3} << 20}) {
         for (int from = 0; from < 2; ++from) {
             const int to = 1 - from;
             std::vector<std::uint8_t> host(bytes), back(bytes, 0);
             for (std::size_t i = 0; i < bytes; ++i) {
-                host[i] = static_cast<std::uint8_t>((i * 131u + bytes + static_cast<std::size_t>(from) * 7u) & 0xFFu);
+                host[i] = static_cast<std::uint8_t>(
+                    (i * 131u + bytes + static_cast<std::size_t>(from) * 7u) & 0xFFu);
             }
             void* src = nullptr;
             void* dst = nullptr;
@@ -679,12 +767,12 @@ int main(int argc, char** argv) {
     failures += run_captured_case("captured staged [2560]", kHidden, 1, 5, 0, ec, events, nullptr);
     failures += run_captured_case("captured mailbox [2560]", kHidden, 1, 5, 2, ec, mailbox_events,
                                   &mailbox);
-    failures += run_captured_case("captured mailbox [2560,4]", kHidden, 4, 5, 2, ec,
-                                  mailbox_events, &mailbox);
-    failures += run_captured_case("captured mailbox [2560,3]", kHidden, 3, 3, 2, ec,
-                                  mailbox_events, &mailbox);
-    failures += run_captured_case("captured mailbox [4,1] minimal", 4, 1, 3, 2, ec,
-                                  mailbox_events, &mailbox);
+    failures += run_captured_case("captured mailbox [2560,4]", kHidden, 4, 5, 2, ec, mailbox_events,
+                                  &mailbox);
+    failures += run_captured_case("captured mailbox [2560,3]", kHidden, 3, 3, 2, ec, mailbox_events,
+                                  &mailbox);
+    failures += run_captured_case("captured mailbox [4,1] minimal", 4, 1, 3, 2, ec, mailbox_events,
+                                  &mailbox);
     failures += run_captured_case("captured oversized [2560,5] stays staged", kHidden, 5, 3, 0, ec,
                                   mailbox_events, &mailbox);
     failures += run_captured_case("captured [5,1] unaligned stays staged", 5, 1, 3, 0, ec,
@@ -700,14 +788,20 @@ int main(int argc, char** argv) {
         ops::PeerEvents host_events(ec);
         host_events.attach_host_exchange(&exchange);
         failures += run_eager_case("host exchange [2560]", kHidden, 1, 201u, true, ec, host_events);
-        failures += run_eager_case("host exchange [2560,48]", kHidden, 48, 203u, true, ec,
-                                   host_events);
-        failures += run_eager_case("host exchange [17,3] fp32 only", 17, 3, 205u, false, ec,
-                                   host_events);
+        failures +=
+            run_eager_case("host exchange [2560,48]", kHidden, 48, 203u, true, ec, host_events);
+        failures +=
+            run_eager_case("host exchange [17,3] fp32 only", 17, 3, 205u, false, ec, host_events);
         failures += run_host_exchange_case("host exchange back to back [2560,64] x4", kHidden, 64,
                                            4, 207u, ec, host_events);
         failures += run_host_exchange_bf16_case("host exchange bf16 [2560,33] x3", kHidden, 33, 3,
                                                 209u, ec, events, host_events);
+        failures += run_split_lane_case("split lanes bf16 [2560,96] 32+64 x3 + sum", kHidden, 96,
+                                        32, 3, 213u, ec, host_events);
+        if (ops::allreduce_sum_split_available(ec, events)) {
+            std::cerr << "split all-reduce available without a host exchange\n";
+            ++failures;
+        }
         if (exchange.capacity() < static_cast<std::size_t>(kHidden) * 64 * 4) {
             std::cerr << "host exchange: buffers did not grow (" << exchange.capacity() << ")\n";
             ++failures;
@@ -721,6 +815,9 @@ int main(int argc, char** argv) {
         wide_events.attach_host_exchange(&wide);
         failures += run_host_exchange_case("host exchange 8 MiB chunks [2560,1024] x3", kHidden,
                                            1024, 3, 211u, ec, wide_events);
+        // Prefill-sized halves: 5 MiB per lane, three 2 MiB chunks each.
+        failures += run_split_lane_case("split lanes bf16 [2560,2048] 1024+1024 x2 + sum", kHidden,
+                                        2048, 1024, 2, 215u, ec, wide_events);
     }
 
     {
@@ -739,19 +836,18 @@ int main(int argc, char** argv) {
         failures += run_pipelined_case("pipelined bf16 [2560,48] one group x2 + pull", kHidden, 48,
                                        Payload::BF16, {{{48}, {48}}}, 2, true, 305u, ec, exchange,
                                        host_events);
-        failures += run_pipelined_case("pipelined fp16 [17,5] empty group", 17, 5, Payload::FP16,
-                                       {{{0, 5}, {2, 3}}}, 1, false, 307u, ec, exchange,
-                                       host_events);
+        failures +=
+            run_pipelined_case("pipelined fp16 [17,5] empty group", 17, 5, Payload::FP16,
+                               {{{0, 5}, {2, 3}}}, 1, false, 307u, ec, exchange, host_events);
         ops::HostExchange wide(ec);
         ops::PeerEvents wide_events(ec);
         wide_events.attach_host_exchange(&wide);
         failures += run_pipelined_case("pipelined fp32 8 MiB chunks [2560,1024] 512+512 / 1024",
                                        kHidden, 1024, Payload::FP32, {{{512, 512}, {1024}}}, 2,
                                        true, 309u, ec, wide, wide_events);
-        failures += run_pipelined_case("pipelined fp16 8 MiB chunks [2560,2048] 4x512 / 2048",
-                                       kHidden, 2048, Payload::FP16,
-                                       {{{512, 512, 512, 512}, {2048}}}, 2, false, 311u, ec, wide,
-                                       wide_events);
+        failures += run_pipelined_case(
+            "pipelined fp16 8 MiB chunks [2560,2048] 4x512 / 2048", kHidden, 2048, Payload::FP16,
+            {{{512, 512, 512, 512}, {2048}}}, 2, false, 311u, ec, wide, wide_events);
     }
 
     {

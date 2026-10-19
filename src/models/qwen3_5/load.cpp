@@ -72,7 +72,7 @@ void validate_tensor_parallel(const Config& config, const LoadOptions& options) 
 } // namespace
 
 LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
-    auto out     = std::make_unique<LoadPlan::Impl>();
+    auto out = std::make_unique<LoadPlan::Impl>();
     validate_tensor_parallel(options);
     out->options = options;
     out->config  = parse_config(reader.directory(), options);

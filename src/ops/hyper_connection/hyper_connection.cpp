@@ -70,7 +70,7 @@ std::int32_t validate_mix(const Tensor& residual, const HyperConnectionWeights& 
         require(residual.ne[1] <= kHcFusedMaxT, op,
                 "NVFP4 hyper-connection weights are supported for T <= 8 only (no general route)");
     } else if (weights.down.qtype == QType::BF16 || weights.up.qtype == QType::BF16) {
-        // T103 option: BF16 Down(+inject)/Up (as the checkpoint), always the general route.
+        // T103 option: BF16 Down(+inject)/Up (as the checkpoint), small-T route for T <= 8.
         require(weights.down.qtype == QType::BF16 && weights.up.qtype == QType::BF16, op,
                 "down and up must share the weight format");
         require(weights.down.qdata != nullptr && weights.up.qdata != nullptr, op,
@@ -106,8 +106,8 @@ void validate_combine(const Tensor& y, const Tensor& inject, const Tensor& resid
             "y and inject must not overlap residual");
 }
 
-// T103 diagnostic: NINFER_QWEN4_HC_GENERAL=1 sends Q8/NVFP4 mixers through the general route too
-// (the route BF16 mixers always take), to separate the route from the weight format.
+// T103 diagnostic: NINFER_QWEN4_HC_GENERAL=1 sends small-T mixers through the general route too
+// (the route of T > 8), to separate the route from the weight format.
 bool general_route_forced() {
     static const bool forced = [] {
         const char* value = std::getenv("NINFER_QWEN4_HC_GENERAL");
@@ -117,10 +117,10 @@ bool general_route_forced() {
 }
 
 bool fused_route(std::int32_t tokens, const HyperConnectionWeights& weights) {
-    // BF16 weights (T103) have no fused route: Down/Up go through ops::linear.
-    return weights.down.qtype != QType::BF16 && !general_route_forced() && tokens <= kHcFusedMaxT && aligned16(weights.down.qdata) && aligned16(weights.up.qdata) &&
-           aligned16(weights.down.scales) && aligned16(weights.up.scales) &&
-           aligned16(weights.norm.data) && detail::hyper_connection_fused_supported();
+    return !general_route_forced() && tokens <= kHcFusedMaxT && aligned16(weights.down.qdata) &&
+           aligned16(weights.up.qdata) && aligned16(weights.down.scales) &&
+           aligned16(weights.up.scales) && aligned16(weights.norm.data) &&
+           detail::hyper_connection_fused_supported();
 }
 
 void run_fused(Tensor& residual, const Tensor* previous_y, const Tensor* previous_inject,
@@ -135,10 +135,12 @@ void run_fused(Tensor& residual, const Tensor* previous_y, const Tensor* previou
         params.previous_y      = static_cast<const __nv_bfloat16*>(previous_y->data);
         params.previous_inject = static_cast<const float*>(previous_inject->data);
     }
-    params.norm        = static_cast<const __nv_bfloat16*>(weights.norm.data);
-    params.down_codes  = static_cast<const std::int8_t*>(weights.down.qdata);
-    params.up_codes    = static_cast<const std::int8_t*>(weights.up.qdata);
-    if (weights.down.qtype == QType::NVFP4) {
+    params.norm       = static_cast<const __nv_bfloat16*>(weights.norm.data);
+    params.down_codes = static_cast<const std::int8_t*>(weights.down.qdata);
+    params.up_codes   = static_cast<const std::int8_t*>(weights.up.qdata);
+    if (weights.down.qtype == QType::BF16) {
+        params.bf16 = true;
+    } else if (weights.down.qtype == QType::NVFP4) {
         params.fp4              = true;
         params.down_fp4_scales  = static_cast<const std::uint8_t*>(weights.down.scales);
         params.up_fp4_scales    = static_cast<const std::uint8_t*>(weights.up.scales);
@@ -178,8 +180,8 @@ void run_general(const Tensor& residual, const HyperConnectionWeights& weights, 
 std::size_t align256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 
 std::size_t general_bytes(std::int32_t tokens, bool inject) {
-    const auto t            = static_cast<std::size_t>(tokens);
-    const std::size_t rows  = kHcRank + (inject ? kHcStreams : 0);
+    const auto t           = static_cast<std::size_t>(tokens);
+    const std::size_t rows = kHcRank + (inject ? kHcStreams : 0);
     return align256(t * kHcWide * 2) + align256(t * rows * 2) + align256(t * kHcRank * 2) +
            t * kHcWide * 2;
 }
@@ -239,8 +241,8 @@ void hyper_connection_combine_mix(Tensor& residual, const Tensor& previous_y,
                                   const Tensor& previous_inject,
                                   const HyperConnectionWeights& weights, float eps, Tensor& mixed,
                                   Tensor* inject, WorkspaceArena& workspace, cudaStream_t stream) {
-    constexpr const char* op  = "hyper_connection_combine_mix";
-    const std::int32_t rows   = validate_mix(residual, weights, eps, mixed, inject, op);
+    constexpr const char* op = "hyper_connection_combine_mix";
+    const std::int32_t rows  = validate_mix(residual, weights, eps, mixed, inject, op);
     validate_combine(previous_y, previous_inject, residual, op);
     require(previous_inject.ne[0] == kHcStreams, op, "previous_inject must be FP32 [4,T]");
     const std::int32_t tokens = residual.ne[1];

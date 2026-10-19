@@ -31,9 +31,7 @@ def load_cli_messages(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
     if isinstance(root, dict):
         unknown = set(root) - {"messages", "tools"}
         if unknown:
-            raise RuntimeError(
-                "messages object contains unsupported fields: " + ", ".join(sorted(unknown))
-            )
+            raise RuntimeError("messages object contains unsupported fields: " + ", ".join(sorted(unknown)))
         tools = root.get("tools")
         root = root.get("messages")
         if tools is not None and not isinstance(tools, list):
@@ -85,9 +83,7 @@ def _as_data_uri(
     if not media_type:
         media_type, _ = mimetypes.guess_type(path.name)
     if not media_type or not media_type.startswith(f"{kind}/"):
-        raise RuntimeError(
-            f"{where} cannot infer a {kind} media type for {path}; set media_type explicitly"
-        )
+        raise RuntimeError(f"{where} cannot infer a {kind} media type for {path}; set media_type explicitly")
     encoded = base64.b64encode(payload).decode("ascii")
     return f"data:{media_type};base64,{encoded}"
 
@@ -111,31 +107,21 @@ def _convert_content_part(
     if kind in {"image", "image_url"} or "image" in part or "image_url" in part:
         source, _ = _media_source(part, "image", where)
         url = _as_data_uri(source, "image", part.get("media_type"), media_root, where)
-        result = {
-            key: value
-            for key, value in part.items()
-            if key not in {"type", "image", "image_url", "media_type"}
-        }
+        result = {key: value for key, value in part.items() if key not in {"type", "image", "image_url", "media_type"}}
         result.update({"type": "image_url", "image_url": {"url": url, "detail": "auto"}})
         return result
 
     if kind in {"video", "video_url"} or "video" in part or "video_url" in part:
         source, _ = _media_source(part, "video", where)
         url = _as_data_uri(source, "video", part.get("media_type"), media_root, where)
-        result = {
-            key: value
-            for key, value in part.items()
-            if key not in {"type", "video", "video_url", "media_type"}
-        }
+        result = {key: value for key, value in part.items() if key not in {"type", "video", "video_url", "media_type"}}
         result.update({"type": "video_url", "video_url": url})
         return result
 
     raise RuntimeError(f"{where} has unsupported type: {kind!r}")
 
 
-def to_openai_messages(
-    messages: list[dict[str, Any]], media_root: Path
-) -> list[dict[str, Any]]:
+def to_openai_messages(messages: list[dict[str, Any]], media_root: Path) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for message_index, message in enumerate(messages):
         item = dict(message)

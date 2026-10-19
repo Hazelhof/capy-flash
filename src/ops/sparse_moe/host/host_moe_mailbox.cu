@@ -43,7 +43,8 @@ void cu_check(CUresult status, const char* what) {
     if (status != CUDA_SUCCESS) {
         const char* name = nullptr;
         cuGetErrorName(status, &name);
-        throw std::runtime_error(std::string("host MoE mailbox: ") + what + ": " + (name ? name : "?"));
+        throw std::runtime_error(std::string("host MoE mailbox: ") + what + ": " +
+                                 (name ? name : "?"));
     }
 }
 
@@ -75,9 +76,9 @@ constexpr int kSplitWords     = HostMoeRouteLog::kSplitWords;
 
 // Optional routing log of the layer (publish_table) and the publish stamp.
 struct LogDevice {
-    std::uint32_t* published = nullptr; // [0] published flag, [1] tokens logged
-    std::int32_t* ids        = nullptr; // at the call's token offset
-    std::uint32_t end_token  = 0;
+    std::uint32_t* published  = nullptr; // [0] published flag, [1] tokens logged
+    std::int32_t* ids         = nullptr; // at the call's token offset
+    std::uint32_t end_token   = 0;
     unsigned long long* stamp = nullptr;
     std::uint32_t* split_word = nullptr; // this publish's word of the layer's split counters
 };
@@ -100,6 +101,7 @@ struct Doorbell {
 __device__ __forceinline__ float host_cost(const HostMoeSplit& s, int columns) {
     return s.host_expert_us + s.host_column_us * static_cast<float>(columns - 1);
 }
+
 __device__ __forceinline__ float device_cost(const HostMoeSplit& s, int columns) {
     return s.device_expert_us + s.device_column_us * static_cast<float>(columns - 1);
 }
@@ -110,9 +112,11 @@ __device__ int device_share_size(const HostMoeSplit& s, int n, const unsigned ch
     if (n <= 0) return 0;
     const int cap = min(n, min(s.max_reads, kMaxDeviceReads));
     switch (s.mode) {
-    case HostMoeSplit::Mode::Count: return max(0, min(s.count, cap));
+    case HostMoeSplit::Mode::Count:
+        return max(0, min(s.count, cap));
     case HostMoeSplit::Mode::Fraction:
-        return max(0, min(cap, static_cast<int>(floorf(s.fraction * static_cast<float>(n) + 0.5F))));
+        return max(0,
+                   min(cap, static_cast<int>(floorf(s.fraction * static_cast<float>(n) + 0.5F))));
     case HostMoeSplit::Mode::Cost: {
         if (n <= s.min_misses) return 0;
         float rest = 0.0F;
@@ -129,7 +133,8 @@ __device__ int device_share_size(const HostMoeSplit& s, int n, const unsigned ch
         }
         return g;
     }
-    default: return 0;
+    default:
+        return 0;
     }
 }
 
@@ -153,24 +158,27 @@ __global__ void publish_kernel(const uint4* __restrict__ x, const std::int32_t* 
         __shared__ int pick_routes;
         const auto resident_at = [&](int j, std::int32_t e) {
             if (resident.slot != nullptr) return resident.slot[j] >= 0;
-            if (resident.table != nullptr) return e >= 0 && e < resident.experts && resident.table[e] >= 0;
+            if (resident.table != nullptr)
+                return e >= 0 && e < resident.experts && resident.table[e] >= 0;
             return false;
         };
         const HostMoeSplit& split = resident.split;
         if (split.mode != HostMoeSplit::Mode::Off) {
-            __shared__ std::int32_t route_id[kMaxRoutes];     // missing id of the route, or -1
-            __shared__ unsigned char first[kMaxRoutes];       // first route of its id
-            __shared__ unsigned char columns[kMaxRoutes];     // routes of that id
+            __shared__ std::int32_t route_id[kMaxRoutes]; // missing id of the route, or -1
+            __shared__ unsigned char first[kMaxRoutes];   // first route of its id
+            __shared__ unsigned char columns[kMaxRoutes]; // routes of that id
             __shared__ unsigned char order_columns[kMaxRoutes];
-            __shared__ std::int32_t order_id[kMaxRoutes];     // r-th distinct miss in split order
+            __shared__ std::int32_t order_id[kMaxRoutes]; // r-th distinct miss in split order
             __shared__ int misses;
             if (threadIdx.x == 0) misses = 0;
-            for (int j = static_cast<int>(threadIdx.x); j < routes; j += static_cast<int>(blockDim.x)) {
+            for (int j = static_cast<int>(threadIdx.x); j < routes;
+                 j += static_cast<int>(blockDim.x)) {
                 const std::int32_t e = ids[j];
                 route_id[j]          = (!resident_at(j, e) && e >= 0) ? e : -1;
             }
             __syncthreads();
-            for (int j = static_cast<int>(threadIdx.x); j < routes; j += static_cast<int>(blockDim.x)) {
+            for (int j = static_cast<int>(threadIdx.x); j < routes;
+                 j += static_cast<int>(blockDim.x)) {
                 const std::int32_t e = route_id[j];
                 int f = 0, c = 0;
                 if (e >= 0) {
@@ -187,13 +195,15 @@ __global__ void publish_kernel(const uint4* __restrict__ x, const std::int32_t* 
             }
             __syncthreads();
             const bool by_route = split.mode == HostMoeSplit::Mode::Count;
-            for (int j = static_cast<int>(threadIdx.x); j < routes; j += static_cast<int>(blockDim.x)) {
+            for (int j = static_cast<int>(threadIdx.x); j < routes;
+                 j += static_cast<int>(blockDim.x)) {
                 if (first[j] == 0) continue;
                 int rank = 0;
                 for (int i = 0; i < routes; ++i) {
                     if (first[i] == 0 || i == j) continue;
-                    rank += by_route ? (i < j)
-                                     : (columns[i] > columns[j] || (columns[i] == columns[j] && i < j));
+                    rank += by_route
+                                ? (i < j)
+                                : (columns[i] > columns[j] || (columns[i] == columns[j] && i < j));
                 }
                 order_id[rank]      = route_id[j];
                 order_columns[rank] = columns[j];
@@ -217,14 +227,15 @@ __global__ void publish_kernel(const uint4* __restrict__ x, const std::int32_t* 
             const bool missing   = !resident_at(j, e) && e >= 0;
             bool device_read     = false;
             for (int k = 0; k < picks; ++k) device_read = device_read || picked[k] == e;
-            device_read  = device_read && missing;
+            device_read = device_read && missing;
             if (out.ids != nullptr) out.ids[j] = missing && !device_read ? e : -1;
             if (out.alpha != nullptr) out.alpha[j] = alpha[j];
             if (log.ids != nullptr) log.ids[j] = e;
             if (resident.share.reads != nullptr) resident.share.reads[j] = device_read ? e : -1;
         }
         if (resident.share.stage_table != nullptr) {
-            for (int e = static_cast<int>(threadIdx.x); e < resident.experts; e += static_cast<int>(blockDim.x)) {
+            for (int e = static_cast<int>(threadIdx.x); e < resident.experts;
+                 e += static_cast<int>(blockDim.x)) {
                 int k = -1;
                 for (int i = 0; i < picks; ++i) k = picked[i] == e ? i : k;
                 resident.share.stage_table[e] = k;
@@ -232,29 +243,30 @@ __global__ void publish_kernel(const uint4* __restrict__ x, const std::int32_t* 
         }
         if (threadIdx.x == 0) {
             if (resident.share.picks != nullptr) {
-                for (int k = 0; k < kMaxDeviceReads; ++k) resident.share.picks[k] = k < picks ? picked[k] : -1;
+                for (int k = 0; k < kMaxDeviceReads; ++k)
+                    resident.share.picks[k] = k < picks ? picked[k] : -1;
                 resident.share.picks[kMaxDeviceReads] = picks;
             }
             if (log.split_word != nullptr) {
-                *log.split_word = static_cast<std::uint32_t>(picks) | (static_cast<std::uint32_t>(pick_routes) << 16);
+                *log.split_word = static_cast<std::uint32_t>(picks) |
+                                  (static_cast<std::uint32_t>(pick_routes) << 16);
             }
         }
-        if (threadIdx.x == 0 && out.tokens != nullptr) *out.tokens = tokens;
+        if (threadIdx.x == 0) {
+            // Data words of the flags below: the token counts and the reset of done (the host
+            // writes done only after it has seen this ready).
+            if (out.tokens != nullptr) *out.tokens = tokens;
+            if (log.published != nullptr) log.published[1] = log.end_token;
+            if (bell.ready != nullptr) *bell.done = 0;
+        }
         if (log.published != nullptr || bell.ready != nullptr) {
-            // Every writer (x, ids, alpha, log) fences before the flags (uniform branch).
+            // One system-wide fence of every writer (x, ids, alpha, log, the words above) before
+            // the flags (uniform branch): the doorbell costs one fence, not three.
             __threadfence_system();
             __syncthreads();
             if (threadIdx.x == 0) {
-                if (log.published != nullptr) {
-                    log.published[1] = log.end_token;
-                    __threadfence_system();
-                    log.published[0] = 1;
-                }
-                if (bell.ready != nullptr) {
-                    *bell.done = 0;
-                    __threadfence_system();
-                    *bell.ready = 1;
-                }
+                if (log.published != nullptr) log.published[0] = 1;
+                if (bell.ready != nullptr) *bell.ready = 1;
             }
         }
     }
@@ -264,8 +276,8 @@ __global__ void stamp_kernel(unsigned long long* stamp) { *stamp = global_ns(); 
 
 // One block: the routed ids into the log, then (after a system-wide fence of every thread's
 // writes) the logged token count and the published flag, as publish_kernel does.
-__global__ void __launch_bounds__(1024) log_routes_kernel(const std::int32_t* __restrict__ ids, int routes,
-                                                          LogDevice log) {
+__global__ void __launch_bounds__(1024)
+    log_routes_kernel(const std::int32_t* __restrict__ ids, int routes, LogDevice log) {
     for (int j = static_cast<int>(threadIdx.x); j < routes; j += static_cast<int>(blockDim.x)) {
         log.ids[j] = ids[j];
     }
@@ -282,7 +294,7 @@ struct StagePlanes {
     const std::byte* src[4];
     std::byte* dst[4];
     long long units[4]; // copy units per expert in each plane
-    int wide[4];        // 1: 16-byte units, 0: 4-byte units (a plane base or size not 16-byte aligned)
+    int wide[4]; // 1: 16-byte units, 0: 4-byte units (a plane base or size not 16-byte aligned)
 };
 
 // Grid-stride copy of picks[0..n) experts' planes, 4 independent loads in flight per thread
@@ -290,12 +302,12 @@ struct StagePlanes {
 __global__ void stage_kernel(StagePlanes p, const std::int32_t* __restrict__ picks) {
     const int n = picks[kMaxDeviceReads];
     if (n <= 0) return;
-    const long long per = p.units[0] + p.units[1] + p.units[2] + p.units[3];
+    const long long per    = p.units[0] + p.units[1] + p.units[2] + p.units[3];
     const long long total  = static_cast<long long>(n) * per;
     const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
-    constexpr int U = 4;
-    for (long long base = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; base < total;
-         base += stride * U) {
+    constexpr int U        = 4;
+    for (long long base = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x;
+         base < total; base += stride * U) {
         uint4 v[U];
         int plane[U], k[U];
         long long off[U];
@@ -347,10 +359,10 @@ __global__ void accumulate_bf16_kernel(__nv_bfloat16* __restrict__ y, const floa
     if (!host_partial_present(active)) return;
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= vectors) return;
-    const float4 a = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i);
-    const float4 b = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
-    uint4 raw      = reinterpret_cast<uint4*>(y)[i];
-    auto* h        = reinterpret_cast<__nv_bfloat162*>(&raw);
+    const float4 a   = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i);
+    const float4 b   = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
+    uint4 raw        = reinterpret_cast<uint4*>(y)[i];
+    auto* h          = reinterpret_cast<__nv_bfloat162*>(&raw);
     const float p[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
@@ -361,16 +373,19 @@ __global__ void accumulate_bf16_kernel(__nv_bfloat16* __restrict__ y, const floa
 }
 
 // y += device_partial (when given), then y += the host partial (when the host had experts).
-__global__ void accumulate_f32_kernel(float* __restrict__ y, const float* partial, const std::uint32_t* active,
-                                      int vectors, unsigned long long* stamp,
-                                      const float* __restrict__ device_partial, float* echo, float* echo_y) {
+__global__ void accumulate_f32_kernel(float* __restrict__ y, const float* partial,
+                                      const std::uint32_t* active, int vectors,
+                                      unsigned long long* stamp,
+                                      const float* __restrict__ device_partial, float* echo,
+                                      float* echo_y) {
     if (stamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *stamp = global_ns();
     const bool host = host_partial_present(active);
     if (!host && device_partial == nullptr && echo_y == nullptr) return;
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= vectors) return;
     float4 v = reinterpret_cast<float4*>(y)[i];
-    if (echo_y != nullptr) reinterpret_cast<float4*>(echo_y)[i] = v; // T98: the device's own partial
+    if (echo_y != nullptr)
+        reinterpret_cast<float4*>(echo_y)[i] = v; // T98: the device's own partial
     if (!host && device_partial == nullptr) return;
     if (device_partial != nullptr) {
         const float4 d = reinterpret_cast<const float4*>(device_partial)[i];
@@ -397,19 +412,24 @@ void stage_device_share(cudaStream_t stream, const std::int32_t* picks,
                         const std::array<std::byte*, 4>& staging,
                         const std::array<std::int64_t, 4>& plane_bytes, int blocks) {
     StagePlanes p{};
-    const auto aligned = [](const void* ptr, std::uintptr_t a) { return reinterpret_cast<std::uintptr_t>(ptr) % a == 0; };
+    const auto aligned = [](const void* ptr, std::uintptr_t a) {
+        return reinterpret_cast<std::uintptr_t>(ptr) % a == 0;
+    };
     for (int q = 0; q < 4; ++q) {
-        if (bank[q] == nullptr || staging[q] == nullptr || plane_bytes[q] <= 0 || plane_bytes[q] % 4 != 0 ||
-            !aligned(bank[q], 4) || !aligned(staging[q], 4)) {
-            throw std::invalid_argument("stage_device_share: planes must be 4-byte aligned multiples of 4");
+        if (bank[q] == nullptr || staging[q] == nullptr || plane_bytes[q] <= 0 ||
+            plane_bytes[q] % 4 != 0 || !aligned(bank[q], 4) || !aligned(staging[q], 4)) {
+            throw std::invalid_argument(
+                "stage_device_share: planes must be 4-byte aligned multiples of 4");
         }
-        const bool wide = plane_bytes[q] % 16 == 0 && aligned(bank[q], 16) && aligned(staging[q], 16);
-        p.src[q]        = bank[q];
-        p.dst[q]        = staging[q];
-        p.wide[q]       = wide ? 1 : 0;
-        p.units[q]      = plane_bytes[q] / (wide ? 16 : 4);
+        const bool wide =
+            plane_bytes[q] % 16 == 0 && aligned(bank[q], 16) && aligned(staging[q], 16);
+        p.src[q]   = bank[q];
+        p.dst[q]   = staging[q];
+        p.wide[q]  = wide ? 1 : 0;
+        p.units[q] = plane_bytes[q] / (wide ? 16 : 4);
     }
-    if (picks == nullptr || blocks < 1) throw std::invalid_argument("stage_device_share: picks and blocks >= 1");
+    if (picks == nullptr || blocks < 1)
+        throw std::invalid_argument("stage_device_share: picks and blocks >= 1");
     stage_kernel<<<blocks, 256, 0, stream>>>(p, picks);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -424,7 +444,8 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     : config_(std::move(config)), layers_(std::move(layers)) {
     // Measurement overrides (T35 A/B runs of the engine without a rebuild).
     if (const char* v = std::getenv("NINFER_HOST_MOE_SCHEDULE"); v != nullptr && *v != 0) {
-        config_.executor.schedule = std::string(v) == "dynamic" ? Schedule::Dynamic : Schedule::Static;
+        config_.executor.schedule =
+            std::string(v) == "dynamic" ? Schedule::Dynamic : Schedule::Static;
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_MEMBER_QUANT"); v != nullptr && *v != 0) {
         config_.executor.member_quantize = std::atoi(v) != 0;
@@ -434,6 +455,9 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_PREFETCH"); v != nullptr && *v != 0) {
         config_.executor.prefetch_rows = std::atoi(v);
+    }
+    if (const char* v = std::getenv("NINFER_HOST_MOE_DOWN_PREFETCH"); v != nullptr && *v != 0) {
+        config_.executor.down_prefetch_kib = std::atoi(v);
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_W4A4"); v != nullptr && *v != 0) {
         config_.executor.emulate_w4a4 = std::atoi(v) != 0; // T98 validation
@@ -446,7 +470,8 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
         for (const char* p = v; *p != 0;) {
             char* end = nullptr;
             config_.cpus.push_back(static_cast<int>(std::strtol(p, &end, 10)));
-            if (end == p) throw std::invalid_argument("NINFER_HOST_MOE_CPUS: not a list of cpu numbers");
+            if (end == p)
+                throw std::invalid_argument("NINFER_HOST_MOE_CPUS: not a list of cpu numbers");
             p = *end == ',' ? end + 1 : end;
         }
     }
@@ -474,10 +499,14 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     log_stride_ = align_up(kLine + static_cast<std::size_t>(c.route_log_tokens) *
                                        static_cast<std::size_t>(c.top_k) * sizeof(std::int32_t),
                            kLine);
-    if (c.route_log_tokens > 0) end = align_up(log_off_ + log_stride_ * static_cast<std::size_t>(c.layers), 4096);
+    if (c.route_log_tokens > 0)
+        end = align_up(log_off_ + log_stride_ * static_cast<std::size_t>(c.layers), 4096);
     stamp_off_ = end;
-    if (c.gpu_stamps) end = align_up(stamp_off_ + kStampCount * sizeof(std::uint64_t) * static_cast<std::size_t>(c.layers), kLine);
-    clock_off_ = end;
+    if (c.gpu_stamps)
+        end = align_up(stamp_off_ +
+                           kStampCount * sizeof(std::uint64_t) * static_cast<std::size_t>(c.layers),
+                       kLine);
+    clock_off_              = end;
     const std::size_t bytes = align_up(clock_off_ + kLine, 4096);
 
     CUDA_CHECK(cudaSetDevice(c.device));
@@ -498,10 +527,13 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
         cudaStream_t s = nullptr;
         CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
         const SlotView v = slot(0);
-        cu_check(cuStreamWriteValue32(reinterpret_cast<CUstream>(s), device_word(v.done), 7, 0), "probe write");
-        cu_check(cuStreamWaitValue32(reinterpret_cast<CUstream>(s), device_word(v.done), 7, CU_STREAM_WAIT_VALUE_GEQ),
+        cu_check(cuStreamWriteValue32(reinterpret_cast<CUstream>(s), device_word(v.done), 7, 0),
+                 "probe write");
+        cu_check(cuStreamWaitValue32(reinterpret_cast<CUstream>(s), device_word(v.done), 7,
+                                     CU_STREAM_WAIT_VALUE_GEQ),
                  "probe wait");
-        cu_check(cuStreamWriteValue32(reinterpret_cast<CUstream>(s), device_word(v.done), 0, 0), "probe reset");
+        cu_check(cuStreamWriteValue32(reinterpret_cast<CUstream>(s), device_word(v.done), 0, 0),
+                 "probe reset");
         CUDA_CHECK(cudaStreamSynchronize(s));
         CUDA_CHECK(cudaStreamDestroy(s));
     }
@@ -516,9 +548,10 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     if (const char* path = std::getenv("NINFER_HOST_MOE_DUMP"); path != nullptr && *path != 0) {
         dump_path_ = path;
         dump_max_  = 40000;
-        if (const char* v = std::getenv("NINFER_HOST_MOE_DUMP_MAX"); v != nullptr && *v != 0) dump_max_ = std::atoll(v);
-        const std::size_t echo_bytes = 2 * sizeof(float) * static_cast<std::size_t>(c.layers) * kHostMaxTokens *
-                                       static_cast<std::size_t>(c.hidden);
+        if (const char* v = std::getenv("NINFER_HOST_MOE_DUMP_MAX"); v != nullptr && *v != 0)
+            dump_max_ = std::atoll(v);
+        const std::size_t echo_bytes = 2 * sizeof(float) * static_cast<std::size_t>(c.layers) *
+                                       kHostMaxTokens * static_cast<std::size_t>(c.hidden);
         void* e = nullptr;
         CUDA_CHECK(cudaHostAlloc(&e, echo_bytes, cudaHostAllocMapped | cudaHostAllocPortable));
         std::memset(e, 0xFF, echo_bytes);
@@ -545,23 +578,25 @@ HostMoeMailbox::~HostMoeMailbox() {
             std::fwrite(dump_.data(), 1, dump_.size(), f);
             std::fclose(f);
         }
-        std::fprintf(stderr, "host MoE dump: %lld records, %zu bytes -> %s\n", static_cast<long long>(dump_records_),
-                     dump_.size(), dump_path_.c_str());
+        std::fprintf(stderr, "host MoE dump: %lld records, %zu bytes -> %s\n",
+                     static_cast<long long>(dump_records_), dump_.size(), dump_path_.c_str());
     }
     if (echo_) cudaFreeHost(echo_);
     if (host_) cudaFreeHost(host_);
     if (!call_log_path_.empty()) {
         if (std::FILE* f = std::fopen(call_log_path_.c_str(), "a")) {
-            std::fprintf(f, "layer,tokens,experts,pairs,seen_ns,done_ns,dispatch_ns,gate_end_ns,down_end_ns,end_ns,"
+            std::fprintf(f, "layer,tokens,experts,pairs,seen_ns,done_ns,dispatch_ns,gate_end_ns,"
+                            "down_end_ns,end_ns,"
                             "wake_max_ns,gate_min_ns,gate_max_ns,down_min_ns,down_max_ns\n");
             for (const HostMoeCallRecord& r : call_log_) {
-                std::fprintf(f, "%d,%d,%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n", r.layer, r.tokens,
-                             r.experts, r.pairs, static_cast<long long>(r.seen_ns), static_cast<long long>(r.done_ns),
-                             static_cast<long long>(r.dispatch_ns), static_cast<long long>(r.gate_end_ns),
-                             static_cast<long long>(r.down_end_ns), static_cast<long long>(r.end_ns),
-                             static_cast<long long>(r.wake_max_ns), static_cast<long long>(r.gate_min_ns),
-                             static_cast<long long>(r.gate_max_ns), static_cast<long long>(r.down_min_ns),
-                             static_cast<long long>(r.down_max_ns));
+                std::fprintf(
+                    f, "%d,%d,%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld\n",
+                    r.layer, r.tokens, r.experts, r.pairs, static_cast<long long>(r.seen_ns),
+                    static_cast<long long>(r.done_ns), static_cast<long long>(r.dispatch_ns),
+                    static_cast<long long>(r.gate_end_ns), static_cast<long long>(r.down_end_ns),
+                    static_cast<long long>(r.end_ns), static_cast<long long>(r.wake_max_ns),
+                    static_cast<long long>(r.gate_min_ns), static_cast<long long>(r.gate_max_ns),
+                    static_cast<long long>(r.down_min_ns), static_cast<long long>(r.down_max_ns));
             }
             std::fclose(f);
         }
@@ -601,14 +636,16 @@ void HostMoeMailbox::clear_trace() noexcept { trace_size_.store(0, std::memory_o
 void HostMoeMailbox::publish(cudaStream_t stream, std::int32_t layer, std::int32_t tokens,
                              const __nv_bfloat16* x, const std::int32_t* ids, const float* alpha,
                              const std::int32_t* device_slot) const {
-    publish_impl(stream, layer, tokens, x, ids, alpha, Residency{device_slot, nullptr, 0, HostMoeSplit{}, HostMoeDeviceShare{}}, -1);
+    publish_impl(stream, layer, tokens, x, ids, alpha,
+                 Residency{device_slot, nullptr, 0, HostMoeSplit{}, HostMoeDeviceShare{}}, -1);
 }
 
 void HostMoeMailbox::publish_table(cudaStream_t stream, std::int32_t layer, std::int32_t tokens,
                                    const __nv_bfloat16* x, const std::int32_t* ids,
                                    const float* alpha, const std::int32_t* slot_table,
                                    std::int32_t experts, std::int32_t log_offset,
-                                   const HostMoeSplit& split, const HostMoeDeviceShare& share) const {
+                                   const HostMoeSplit& split,
+                                   const HostMoeDeviceShare& share) const {
     if (slot_table == nullptr || experts <= 0) {
         throw std::invalid_argument("host MoE mailbox: publish_table needs a slot table");
     }
@@ -620,15 +657,16 @@ void HostMoeMailbox::publish_table(cudaStream_t stream, std::int32_t layer, std:
     const auto mode      = static_cast<std::int32_t>(split.mode);
     if (mode < 0 || mode > static_cast<std::int32_t>(HostMoeSplit::Mode::Cost) ||
         (splitting && (share.reads == nullptr || tokens * config_.top_k > kMaxRoutes ||
-                       split.max_reads < 0 || split.max_reads > kMaxDeviceReads || split.count < 0 ||
-                       !(split.fraction >= 0.0F && split.fraction <= 1.0F) || split.min_misses < 0 ||
-                       !(split.host_read_slowdown >= 1.0F)))) {
+                       split.max_reads < 0 || split.max_reads > kMaxDeviceReads ||
+                       split.count < 0 || !(split.fraction >= 0.0F && split.fraction <= 1.0F) ||
+                       split.min_misses < 0 || !(split.host_read_slowdown >= 1.0F)))) {
         throw std::invalid_argument("host MoE mailbox: a split needs a reads output, <= 8 tokens, "
                                     "max_reads/count in [0,16], fraction in [0,1], slowdown >= 1");
     }
-    publish_impl(stream, layer, tokens, x, ids, alpha,
-                 Residency{nullptr, slot_table, experts, split, splitting ? share : HostMoeDeviceShare{}},
-                 config_.route_log_tokens > 0 ? log_offset : -1);
+    publish_impl(
+        stream, layer, tokens, x, ids, alpha,
+        Residency{nullptr, slot_table, experts, split, splitting ? share : HostMoeDeviceShare{}},
+        config_.route_log_tokens > 0 ? log_offset : -1);
 }
 
 void HostMoeMailbox::publish_impl(cudaStream_t stream, std::int32_t layer, std::int32_t tokens,
@@ -638,15 +676,16 @@ void HostMoeMailbox::publish_impl(cudaStream_t stream, std::int32_t layer, std::
     if (layer < 0 || layer >= config_.layers || tokens < 1 || tokens > config_.max_tokens) {
         throw std::invalid_argument("host MoE mailbox: publish out of range");
     }
-    const SlotView v     = slot(layer);
-    const int routes     = tokens * config_.top_k;
-    const int x_vectors  = tokens * config_.hidden / 8;
+    const SlotView v       = slot(layer);
+    const int routes       = tokens * config_.top_k;
+    const int x_vectors    = tokens * config_.hidden / 8;
     constexpr int kThreads = 256;
     // Decode-sized calls (x of <= 8 rows) in one block that rings the doorbell itself; wider calls
     // (prefill chunks) over many blocks, the doorbell then by two stream memory writes.
     const bool kernel_bell = tokens <= kHostMaxTokens;
     const int blocks       = kernel_bell ? 1 : (x_vectors + kThreads - 1) / kThreads;
-    const SlotDevice out{const_cast<std::uint32_t*>(v.tokens), v.ids, v.alpha, reinterpret_cast<uint4*>(v.x)};
+    const SlotDevice out{const_cast<std::uint32_t*>(v.tokens), v.ids, v.alpha,
+                         reinterpret_cast<uint4*>(v.x)};
     LogDevice log;
     if (log_offset >= 0) {
         std::byte* base = host_ + log_off_ + log_stride_ * static_cast<std::size_t>(layer);
@@ -659,20 +698,37 @@ void HostMoeMailbox::publish_impl(cudaStream_t stream, std::int32_t layer, std::
         }
     }
     if (config_.gpu_stamps) {
-        log.stamp = reinterpret_cast<unsigned long long*>(const_cast<std::uint64_t*>(gpu_stamps(layer))) +
-                    kStampPublish;
+        log.stamp =
+            reinterpret_cast<unsigned long long*>(const_cast<std::uint64_t*>(gpu_stamps(layer))) +
+            kStampPublish;
     }
     Doorbell bell;
     if (kernel_bell) bell = Doorbell{v.done, v.ready};
     CUDA_CHECK(pdl::launch_dependent({dim3(blocks), dim3(kThreads), 0, stream}, publish_kernel,
-                                     reinterpret_cast<const uint4*>(x), ids, alpha, resident, routes, x_vectors,
-                                     static_cast<std::uint32_t>(tokens), out, log, bell));
+                                     reinterpret_cast<const uint4*>(x), ids, alpha, resident,
+                                     routes, x_vectors, static_cast<std::uint32_t>(tokens), out,
+                                     log, bell));
     if (kernel_bell) return;
     const auto s = reinterpret_cast<CUstream>(stream);
     // done before ready: the service only writes done after it has seen this ready.
-    cu_check(cuStreamWriteValue32(s, device_word(v.done), 0, CU_STREAM_WRITE_VALUE_DEFAULT), "reset done");
-    cu_check(cuStreamWriteValue32(s, device_word(v.ready), 1, CU_STREAM_WRITE_VALUE_DEFAULT), "doorbell");
+    cu_check(cuStreamWriteValue32(s, device_word(v.done), 0, CU_STREAM_WRITE_VALUE_DEFAULT),
+             "reset done");
+    cu_check(cuStreamWriteValue32(s, device_word(v.ready), 1, CU_STREAM_WRITE_VALUE_DEFAULT),
+             "doorbell");
 }
+
+void consume_host_flag(cudaStream_t stream, std::uint32_t* word) {
+    if (word == nullptr) throw std::invalid_argument("consume_host_flag: no word");
+    const auto s = reinterpret_cast<CUstream>(stream);
+    cu_check(cuStreamWaitValue32(s, device_word(word), 1, CU_STREAM_WAIT_VALUE_GEQ),
+             "wait host flag");
+    cu_check(cuStreamWriteValue32(s, device_word(word), 0, CU_STREAM_WRITE_VALUE_DEFAULT),
+             "lower host flag");
+}
+
+void raise_host_flag(std::uint32_t* word) noexcept { store_release(word, 1); }
+
+void lower_host_flag(std::uint32_t* word) noexcept { store_release(word, 0); }
 
 void select_device_share(cudaStream_t stream, std::int32_t tokens, std::int32_t top_k,
                          const std::int32_t* ids, const std::int32_t* slot_table,
@@ -680,14 +736,14 @@ void select_device_share(cudaStream_t stream, std::int32_t tokens, std::int32_t 
                          const HostMoeDeviceShare& share) {
     if (split.mode == HostMoeSplit::Mode::Off || share.reads == nullptr || slot_table == nullptr ||
         tokens < 1 || tokens * top_k > kMaxRoutes) {
-        throw std::invalid_argument("select_device_share: a split mode, reads, a table and <= 8 tokens");
+        throw std::invalid_argument(
+            "select_device_share: a split mode, reads, a table and <= 8 tokens");
     }
     // The publish kernel's block 0 without any mailbox output: no x, no host ids, no log, no bell.
     const SlotDevice out{nullptr, nullptr, nullptr, nullptr};
-    publish_kernel<<<1, 256, 0, stream>>>(nullptr, ids, nullptr,
-                                          Residency{nullptr, slot_table, experts, split, share},
-                                          tokens * top_k, 0, static_cast<std::uint32_t>(tokens), out,
-                                          LogDevice{}, Doorbell{});
+    publish_kernel<<<1, 256, 0, stream>>>(
+        nullptr, ids, nullptr, Residency{nullptr, slot_table, experts, split, share},
+        tokens * top_k, 0, static_cast<std::uint32_t>(tokens), out, LogDevice{}, Doorbell{});
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -713,7 +769,8 @@ void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::in
         throw std::invalid_argument("host MoE mailbox: accumulate out of range");
     }
     const SlotView v = slot(layer);
-    cu_check(cuStreamWaitValue32(reinterpret_cast<CUstream>(stream), device_word(v.done), 1, CU_STREAM_WAIT_VALUE_GEQ),
+    cu_check(cuStreamWaitValue32(reinterpret_cast<CUstream>(stream), device_word(v.done), 1,
+                                 CU_STREAM_WAIT_VALUE_GEQ),
              "wait done");
     const int vectors      = tokens * config_.hidden / 8;
     constexpr int kThreads = 256;
@@ -722,23 +779,27 @@ void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::in
     CUDA_CHECK(cudaGetLastError());
 }
 
-void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::int32_t tokens, float* y,
-                                const float* device_partial) const {
+void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::int32_t tokens,
+                                float* y, const float* device_partial) const {
     if (layer < 0 || layer >= config_.layers || tokens < 1 || tokens > config_.max_tokens) {
         throw std::invalid_argument("host MoE mailbox: accumulate out of range");
     }
     const SlotView v = slot(layer);
-    cu_check(cuStreamWaitValue32(reinterpret_cast<CUstream>(stream), device_word(v.done), 1, CU_STREAM_WAIT_VALUE_GEQ),
+    cu_check(cuStreamWaitValue32(reinterpret_cast<CUstream>(stream), device_word(v.done), 1,
+                                 CU_STREAM_WAIT_VALUE_GEQ),
              "wait done");
     const int vectors      = tokens * config_.hidden / 4;
     constexpr int kThreads = 256;
     accumulate_f32_kernel<<<(vectors + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        y, v.out, const_cast<const std::uint32_t*>(v.active), vectors, accumulate_stamp(layer), device_partial,
+        y, v.out, const_cast<const std::uint32_t*>(v.active), vectors, accumulate_stamp(layer),
+        device_partial,
         echo_ != nullptr && tokens <= kHostMaxTokens
-            ? echo_ + static_cast<std::size_t>(2 * layer) * kHostMaxTokens * static_cast<std::size_t>(config_.hidden)
+            ? echo_ + static_cast<std::size_t>(2 * layer) * kHostMaxTokens *
+                          static_cast<std::size_t>(config_.hidden)
             : nullptr,
         echo_ != nullptr && tokens <= kHostMaxTokens
-            ? echo_ + static_cast<std::size_t>(2 * layer + 1) * kHostMaxTokens * static_cast<std::size_t>(config_.hidden)
+            ? echo_ + static_cast<std::size_t>(2 * layer + 1) * kHostMaxTokens *
+                          static_cast<std::size_t>(config_.hidden)
             : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -755,7 +816,8 @@ void HostMoeMailbox::stamp(cudaStream_t stream, std::int32_t layer, std::int32_t
         throw std::invalid_argument("host MoE mailbox: stamp out of range");
     }
     stamp_kernel<<<1, 1, 0, stream>>>(
-        reinterpret_cast<unsigned long long*>(const_cast<std::uint64_t*>(gpu_stamps(layer))) + index);
+        reinterpret_cast<unsigned long long*>(const_cast<std::uint64_t*>(gpu_stamps(layer))) +
+        index);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -789,7 +851,8 @@ std::int64_t HostMoeMailbox::device_share_routes(std::int32_t layer) const noexc
 void HostMoeMailbox::clear_route_flags() noexcept {
     if (config_.route_log_tokens <= 0) return;
     for (std::int32_t l = 0; l < config_.layers; ++l) {
-        auto* w = reinterpret_cast<volatile std::uint32_t*>(host_ + log_off_ + log_stride_ * static_cast<std::size_t>(l));
+        auto* w = reinterpret_cast<volatile std::uint32_t*>(
+            host_ + log_off_ + log_stride_ * static_cast<std::size_t>(l));
         w[0] = 0;
         w[1] = 0;
         for (int i = 0; i < kSplitWords; ++i) w[4 + i] = 0;
@@ -812,14 +875,15 @@ __global__ void clock_probe_kernel(unsigned long long* word) {
 } // namespace
 
 std::int64_t HostMoeMailbox::calibrate_clock(cudaStream_t stream, int rounds) const {
-    auto* word = reinterpret_cast<volatile std::uint64_t*>(host_ + clock_off_);
+    auto* word        = reinterpret_cast<volatile std::uint64_t*>(host_ + clock_off_);
     std::int64_t best = std::numeric_limits<std::int64_t>::max();
     for (int r = 0; r < rounds; ++r) {
         *word = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        clock_probe_kernel<<<1, 1, 0, stream>>>(reinterpret_cast<unsigned long long*>(const_cast<std::uint64_t*>(word)));
+        clock_probe_kernel<<<1, 1, 0, stream>>>(
+            reinterpret_cast<unsigned long long*>(const_cast<std::uint64_t*>(word)));
         CUDA_CHECK(cudaGetLastError());
-        std::uint64_t g = 0;
+        std::uint64_t g     = 0;
         const auto deadline = now_ns() + 1000000000LL;
         while ((g = *word) == 0 && now_ns() < deadline) _mm_pause();
         const std::int64_t host = now_ns();
@@ -833,7 +897,7 @@ std::int64_t HostMoeMailbox::calibrate_clock(cudaStream_t stream, int rounds) co
 }
 
 void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
-    const SlotView v     = slot(layer);
+    const SlotView v = slot(layer);
     HostMoeTraceRecord r;
     r.seen_ns = now_ns();
     *v.ready  = 0;
@@ -842,7 +906,7 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
     // T98: the previous dumped call's accumulate ran before this publish (stream order).
     if (!dump_path_.empty()) dump_fill_echo();
     const std::int32_t routes = r.tokens * config_.top_k;
-    bool any = false;
+    bool any                  = false;
     for (std::int32_t i = 0; i < routes && !any; ++i) any = v.ids[i] >= 0;
     HostMoeCallStats st;
     if (any) {
@@ -854,11 +918,13 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
         served_calls_.fetch_add(1, std::memory_order_relaxed);
     }
     if (!dump_path_.empty() && r.tokens <= kHostMaxTokens && dump_records_ < dump_max_) {
-        if (!any) std::memset(v.out, 0, sizeof(float) * static_cast<std::size_t>(r.tokens) * config_.hidden);
+        if (!any)
+            std::memset(v.out, 0,
+                        sizeof(float) * static_cast<std::size_t>(r.tokens) * config_.hidden);
         dump_record(layer, r.tokens, r.experts);
     }
-    *v.active = static_cast<std::uint32_t>(r.experts);
-    r.done_ns = now_ns();
+    *v.active    = static_cast<std::uint32_t>(r.experts);
+    r.done_ns    = now_ns();
     const auto n = trace_size_.load(std::memory_order_relaxed);
     if (n < static_cast<std::int64_t>(trace_.size())) {
         trace_[static_cast<std::size_t>(n)] = r;
@@ -870,17 +936,20 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
         HostMoeCallRecord c;
         c.layer = r.layer, c.tokens = r.tokens, c.experts = r.experts, c.pairs = r.pairs;
         c.seen_ns = r.seen_ns, c.done_ns = r.done_ns;
-        c.dispatch_ns = st.dispatch_ns, c.gate_end_ns = st.phase_ns[1], c.down_end_ns = st.phase_ns[2];
-        c.end_ns = st.end_ns;
+        c.dispatch_ns = st.dispatch_ns, c.gate_end_ns = st.phase_ns[1],
+        c.down_end_ns = st.phase_ns[2];
+        c.end_ns      = st.end_ns;
         if (st.members != nullptr) {
-            std::int64_t gmin = std::numeric_limits<std::int64_t>::max(), dmin = gmin, gmax = 0, dmax = 0, wake = 0;
+            std::int64_t gmin = std::numeric_limits<std::int64_t>::max(), dmin = gmin, gmax = 0,
+                         dmax = 0, wake = 0;
             for (std::int32_t m = 0; m < st.member_count; ++m) {
                 const auto& ns = st.members[m].ns;
-                wake = std::max(wake, ns[0] - st.dispatch_ns);
+                wake           = std::max(wake, ns[0] - st.dispatch_ns);
                 gmin = std::min(gmin, ns[3] - ns[2]), gmax = std::max(gmax, ns[3] - ns[2]);
                 dmin = std::min(dmin, ns[5] - ns[4]), dmax = std::max(dmax, ns[5] - ns[4]);
             }
-            c.wake_max_ns = wake, c.gate_min_ns = gmin, c.gate_max_ns = gmax, c.down_min_ns = dmin, c.down_max_ns = dmax;
+            c.wake_max_ns = wake, c.gate_min_ns = gmin, c.gate_max_ns = gmax, c.down_min_ns = dmin,
+            c.down_max_ns = dmax;
         }
         call_log_.push_back(c);
     }
@@ -892,13 +961,15 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
 // read it), f32 ydev[T*H] (the device partial before the host one was added), u32 echo_valid.
 void HostMoeMailbox::dump_record(std::int32_t layer, std::int32_t tokens, std::int32_t experts) {
     const SlotView v = slot(layer);
-    const std::size_t R = static_cast<std::size_t>(tokens) * static_cast<std::size_t>(config_.top_k);
-    const std::size_t X = static_cast<std::size_t>(tokens) * static_cast<std::size_t>(config_.hidden);
+    const std::size_t R =
+        static_cast<std::size_t>(tokens) * static_cast<std::size_t>(config_.top_k);
+    const std::size_t X =
+        static_cast<std::size_t>(tokens) * static_cast<std::size_t>(config_.hidden);
     const auto put = [&](const void* p, std::size_t n) {
         const auto* b = static_cast<const std::byte*>(p);
         dump_.insert(dump_.end(), b, b + n);
     };
-    const std::uint32_t magic = 0x52383954U;
+    const std::uint32_t magic  = 0x52383954U;
     const std::int32_t head[5] = {layer, tokens, config_.top_k, config_.hidden, experts};
     put(&magic, 4);
     put(head, sizeof head);
@@ -923,10 +994,11 @@ void HostMoeMailbox::dump_record(std::int32_t layer, std::int32_t tokens, std::i
 
 void HostMoeMailbox::dump_fill_echo() noexcept {
     if (dump_pending_ < 0) return;
-    const std::size_t X = static_cast<std::size_t>(dump_pending_tokens_) * static_cast<std::size_t>(config_.hidden);
+    const std::size_t X =
+        static_cast<std::size_t>(dump_pending_tokens_) * static_cast<std::size_t>(config_.hidden);
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const std::size_t per = kHostMaxTokens * static_cast<std::size_t>(config_.hidden);
-    float* e = echo_ + static_cast<std::size_t>(2 * dump_pending_layer_) * per;
+    float* e              = echo_ + static_cast<std::size_t>(2 * dump_pending_layer_) * per;
     std::memcpy(dump_.data() + dump_pending_, e, 4 * X);
     std::memcpy(dump_.data() + dump_pending_ + 4 * X, e + per, 4 * X);
     std::uint32_t valid = 0;
@@ -943,13 +1015,13 @@ void HostMoeMailbox::service() {
     std::int32_t layer = 0;
     try {
         HostCpuPool pool(config_.cpus);
-        HostMoeExecutor executor(pool, config_.hidden, config_.intermediate, config_.max_tokens, config_.top_k,
-                                 config_.executor);
+        HostMoeExecutor executor(pool, config_.hidden, config_.intermediate, config_.max_tokens,
+                                 config_.top_k, config_.executor);
         started_.store(1, std::memory_order_release);
-        using clock          = std::chrono::steady_clock;
-        auto last            = clock::now();
-        const auto idle_for  = std::chrono::duration<double, std::milli>(config_.idle_ms);
-        bool sleeping        = false;
+        using clock         = std::chrono::steady_clock;
+        auto last           = clock::now();
+        const auto idle_for = std::chrono::duration<double, std::milli>(config_.idle_ms);
+        bool sleeping       = false;
         std::int32_t served = -1;
         for (std::uint32_t polls = 1; !stop_.load(std::memory_order_acquire); ++polls) {
             std::int32_t found = -1;

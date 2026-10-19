@@ -64,10 +64,13 @@ Expert cache and prompt streaming:
 | `NINFER_QWEN4_FILLS_AFTER_HOST` | `1` (default), `0` | Cache fills for layer l are issued after the CPU finishes layer l, not at its doorbell, so the DMA does not take DRAM bandwidth from CPU experts (T35). | performance | timing | capy |
 | `NINFER_QWEN4_REFILL_ORDER` | `1` (default), `0` | After a prompt, refill lent layers hottest-first across layers; `0` refills layer by layer (T69). | performance | timing (residency) | capy |
 | `NINFER_QWEN4_EARLY_RECLAIM` | `1` (default), `2`, `0` | Reclaim lent layers before a short tail chunk: `1` overlaps the refill with the chunk, `2` makes the chunk wait for it, `0` turns it off (T69). | performance | timing (residency) | capy |
-| `NINFER_QWEN4_LEND_KEEP_ELASTIC` | `1` (default), `0` | A prompt borrows only base slots; elastic slots keep the prompt's hottest experts for the decode (T69). | performance | timing (residency) | capy |
+| `NINFER_QWEN4_PROMPT_KEEP` | `1` (default), `0` | Prompt windows change neither the residency nor the decayed frequencies, and lent layers refill with the experts they held when lent (T211); `0` restores the T69 rule (the prompt's hottest experts become resident and refill the lent layers). Ignored under `NINFER_QWEN4_EXPERT_FREEZE=1`, which keeps the T69 rule. | performance | timing (residency) | capy |
+| `NINFER_QWEN4_PROMPT_KEEP_MIN_CACHED` | `0.5` (default) | Share of the prompt that must be restored from the context cache for the prompt to count as a continuation (keeps the residency); below it the prompt is a new conversation and updates the residency and frequencies (T211b). `0` = every prompt keeps. | performance | timing (residency) | capy |
+| `NINFER_QWEN4_PROMPT_NEW_CAP` | `-1` (default), `0` = slot count, `N` | A new conversation's prompt counts are applied when its first decode window begins: `-1` to the frequencies only, otherwise also that many targets per layer and GPU made resident (T211b). | performance | timing (residency) | capy |
+| `NINFER_QWEN4_LEND_KEEP_ELASTIC` | `1` (default), `0` | A prompt borrows only base slots; the elastic slots stay resident through the prompt (T69; with `NINFER_QWEN4_PROMPT_KEEP=0` the prompt fills them with its hottest experts). | performance | timing (residency) | capy |
 | `NINFER_QWEN4_SCALE_WORKSPACE` | `1` (default), `0` | The prompt workspace borrows the layers for the narrowest planned width that fits the chunk; `0` always uses the widest (T69). | performance | timing (residency) | capy |
 | `NINFER_QWEN4_PROMPT_FREQ_WEIGHT` | `1` (default), `0` | Prompt routing counts are weighted by recency in the eviction policy; `0` gives full weight (T69). | performance | timing (residency) | capy |
-| `NINFER_QWEN4_BOOST_WINDOWS` | `0` (default, off) | Number of decode windows after a prompt with a raised insert cap (T69 C6; built, not measured). | performance | timing (residency) | capy |
+| `NINFER_QWEN4_BOOST_WINDOWS` | `24` (default), `0` = off | Number of decode windows after a prompt with a raised insert cap (T69 C6; on since T211: replay rounds -2.9 %). | performance | timing (residency) | capy |
 | `NINFER_QWEN4_BOOST_CAP` | `8` | Insert cap per layer during the boost windows; `0` = no cap. | performance | timing (residency) | capy |
 | `NINFER_QWEN4_TP2_HALF_RING` | on (default), `0` | At TP2 each GPU streams only its expert partition, so the prompt ring is half size; `0` keeps the 1-GPU size (T56). | performance | same bits | capy |
 | `NINFER_QWEN4_STREAM_DEFER` | on (default), `0` | At TP2 the next layer's expert copies wait for this layer's MoE all-reduce on the shared link; `0` issues them at release (T56). | performance | same bits | capy |
@@ -103,7 +106,7 @@ equivalent transports.
 | `NINFER_TP_AR_GROUP` | 2,048 columns (default), `0` = one group, multiples of 2,048 | Column groups that overlap the prefill exchange with the expert GEMM (T62). | performance | same bits | capy |
 | `NINFER_TP_AR_PIPE` | `1` / unset | `1` uses the pipelined exchange even with an FP32 payload and no groups. | performance | timing | capy |
 | `NINFER_TP_MIX` | FP32 partials (default since T138), `bf16` | Attention/GDN output exchange: FP32 partials (FP16 transport in prefill, FP32 in decode, one BF16 rounding as at 1 GPU), or the older BF16 partials (T128c, T138). | legacy A/B | numerics | capy |
-| `NINFER_TP_HOST_EXCHANGE` | on (default), `0` | Eager (prefill) exchanges go through pinned host buffers asynchronously (T56). `0` brings back the driver-staged peer pull, which blocks per call and is unstable on closely spaced calls (T65). With `--elastic` at TP2, `0` also turns off prompt-workspace borrowing, and from the code path the T62 grouped/narrow exchange is not used. | legacy A/B | timing; prefill exchange precision | capy (generic TP2 code) |
+| `NINFER_TP_HOST_EXCHANGE` | auto (default), `0`, `1` | Eager (prefill) exchanges go through pinned host buffers asynchronously (T56). Auto: on without P2P or with `--elastic`, off with P2P (direct peer copy, faster: issue #3); `0` / `1` force it. `0` brings back the driver-staged peer pull, which blocks per call and is unstable on closely spaced calls (T65). With `--elastic` at TP2, `0` also turns off prompt-workspace borrowing, and from the code path the T62 grouped/narrow exchange is not used. | legacy A/B | timing; prefill exchange precision | capy (generic TP2 code) |
 | `NINFER_QWEN4_REWRITE_SPLITS` | `1` / unset (off) | `1` splits the prefill at every rewrite frontier, not only at capture frontiers: much slower on multi-turn prompts (T66). | legacy A/B | numerics (chunking) and timing | capy |
 
 ## 5. Diagnostics: observation (dumps, logs, probes)
@@ -125,6 +128,7 @@ note above). Variables marked *eager* need `--no-cuda-graph`.
 | `NINFER_QWEN4_TFDUMP_MTP` | `1` (eager) | Every prompt column also runs the MTP layer; draft logits go to `mtp_logits/`. | capy |
 | `NINFER_QWEN4_TFDUMP_STRIDE` | `1` (default), n | Logits only at positions divisible by n (KL over long windows). | capy |
 | `NINFER_QWEN4_TFDUMP_SEQUENCES` | `1` | One subdirectory per scored sequence. | capy |
+| `NINFER_VISION_DUMP` | directory | Each encoded image/video item: `itemN.patches.bf16` (the patches the tower received, BF16 [patches, 1536]), `itemN.merged.bf16` (its merged embeddings, BF16 [merged, H]) and `itemN.json` (grid, counts). Synchronizes the encoding device per item. Compare with an independent tower reference on the same patches. | capy |
 | `NINFER_QWEN4_XDUMP` | directory | The two rank partials of each TP2 prefill exchange, before the sum (T128). | capy |
 | `NINFER_QWEN4_XDUMP_STRIDE` | `16` (default), n | Column stride of the exchange taps. | capy |
 | `NINFER_QWEN4_REPLAY_RECORD` | file | Records `req` / `win` lines (prompt, MTP rounds) for the deterministic fast bench (T59). | capy |
@@ -200,7 +204,7 @@ These are not read by the server. The list is not exhaustive; see `tests/README.
 
 | variable | used by |
 |---|---|
-| `NINFER_TEST_ARTIFACT`, `NINFER_TEST_QWEN4_ARTIFACT` | real-artifact tests (skipped when unset) |
+| `NINFER_TEST_ARTIFACT`, `NINFER_TEST_QWEN4_ARTIFACT`, `NINFER_TEST_QWEN4_VISION_ARTIFACT` | real-artifact tests (skipped when unset) |
 | `NINFER_TEST_QWEN4_REUSE_ONLY`, `NINFER_PREFIX_REAL_SCENARIO`, `NINFER_TEST_PORT`, `NINFER_TEST_SCRATCH_DIR` | integration test selection and setup |
 | `NINFER_OP_REPORT_STATS` | op tests print statistics |
 | `NINFER_DRIVER_TEMPS` | validation driver: one sampling temperature per prompt line (T121) |

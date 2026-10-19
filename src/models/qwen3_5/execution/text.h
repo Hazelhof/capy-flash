@@ -60,6 +60,11 @@ struct DFlashFeatureSink {
 
     void begin(const Tensor& value);
     void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
+    // A prefill chunk's layer output for the column window [first, first + value.ne[1]) only (the
+    // TP2 prefill overlap captures each half once its exchange has finished). The same bytes, at
+    // the same place, as capture_layer copies for those columns.
+    void capture_layer_columns(int layer, const Tensor& value, std::int32_t first,
+                               cudaStream_t stream);
     void capture_positions(const Tensor& source, cudaStream_t stream);
     void consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint);
 };
@@ -76,7 +81,7 @@ public:
                 qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr,
-                const TpExecution* tp                      = nullptr);
+                const TpExecution* tp = nullptr, std::int32_t rope_delta = 0);
     ~TextContext();
 
     TextContext(const TextContext&)            = delete;
@@ -231,15 +236,33 @@ private:
 
     // Qwen4Exp (execution/qwen4_text.cpp).
     [[nodiscard]] bool qwen4() const noexcept { return parameters_.qwen4.has_value(); }
+
     // Rows of the hidden a round carries: Qwen4Exp carries the wide residual (S*H), the other
     // architectures the final-normed hidden (H).
     [[nodiscard]] std::int32_t carried_hidden_rows() const noexcept {
         return qwen4() ? dimension(config_.residual_width()) : dimension(config_.hidden_size);
     }
+
     [[nodiscard]] const Qwen4Runtime& qwen4_runtime() const;
+    [[nodiscard]] std::span<const int> qwen4_prompt(std::span<const int> ids,
+                                                    const TextPrefill* text_prefill,
+                                                    const MultimodalPrefill* multimodal) const;
+    // One prompt chunk of a text (`text_prefill`) or multimodal (`multimodal`) prompt: exactly one
+    // of them names the whole prompt.
     [[nodiscard]] PrefillChunkResult qwen4_prefill(std::span<const int> ids,
                                                    const TextPrefill* text_prefill,
+                                                   const MultimodalPrefill* multimodal,
                                                    bool finalize_at_end);
+
+    // The shifted visual columns of a multimodal chunk's MTP prompt input: each rank's merged
+    // Vision embeddings of the chunk's item (rank 1's only at tp 2), the chunk-relative MTP
+    // columns whose shifted token is visual and the item's first merged token among them.
+    struct Qwen4MtpVisual {
+        RankTensors merged;
+        std::span<const std::int32_t> columns;
+        std::size_t source_begin = 0;
+    };
+
     void qwen4_ordinary_decode(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& source_slots, const Tensor& destination_slots,
@@ -250,6 +273,7 @@ private:
     [[nodiscard]] const Qwen4Runtime& qwen4_peer_runtime() const;
     [[nodiscard]] PrefillChunkResult qwen4_prefill_tp2(std::span<const int> ids,
                                                        const TextPrefill* text_prefill,
+                                                       const MultimodalPrefill* multimodal,
                                                        bool finalize_at_end);
     void qwen4_ordinary_decode_tp2(const Tensor& ids, const Tensor& cache_positions,
                                    const Tensor& rope_positions, const Tensor& kv_table_rows,
@@ -261,12 +285,10 @@ private:
     // the vocabulary-split head, and the prompt's MTP KV and drafts.
     void qwen4_target_verify_tp2(const RankTensors& ids, const RankTensors& cache_positions,
                                  const RankTensors& rope_positions,
-                                 const RankTensors& valid_columns,
-                                 const RankTensors& kv_table_rows,
+                                 const RankTensors& valid_columns, const RankTensors& kv_table_rows,
                                  const RankTensors& source_slots,
                                  ops::CausalAttentionExecutionEnvelope envelope,
-                                 const RankTensors& hidden, Tensor& logits,
-                                 Tensor& target_tokens);
+                                 const RankTensors& hidden, Tensor& logits, Tensor& target_tokens);
     void qwen4_mtp_forward_decode_tp2(const Tensor& ids, const RankTensors& hidden,
                                       const RankTensors& cache_positions,
                                       const RankTensors& rope_positions,
@@ -278,7 +300,8 @@ private:
                                Tensor* draft_logprobs = nullptr);
     void qwen4_mtp_prefill_tp2(const Tensor& ids, const RankTensors& hidden,
                                const RankTensors& positions, const RankTensors& rope_positions,
-                               std::uint32_t max_visible, bool propose);
+                               std::uint32_t max_visible, bool propose,
+                               const Qwen4MtpVisual* visual = nullptr);
     // T66b: the prefix-reuse bridge column and its proposal steps over both ranks.
     void qwen4_mtp_forward_batch_tp2(const Tensor& ids, const RankTensors& hidden,
                                      const RankTensors& positions,
@@ -307,8 +330,8 @@ private:
     void qwen4_mtp_propose(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens,
                            Tensor* draft_logprobs = nullptr);
     void qwen4_mtp_prefill(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
-                           const Tensor& rope_positions, std::uint32_t max_visible,
-                           bool propose);
+                           const Tensor& rope_positions, std::uint32_t max_visible, bool propose,
+                           const Qwen4MtpVisual* visual = nullptr);
     DeviceContext& ctx_;
     const Parameters& parameters_;
     const TextConfig& config_;

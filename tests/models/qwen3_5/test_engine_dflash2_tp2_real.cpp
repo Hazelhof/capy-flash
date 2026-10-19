@@ -11,8 +11,8 @@
 //     broken features, a draft copy that reaches rank 1 late, or a rank 1 verification that
 //     disagrees with rank 0 (KV rows, GDN records, masked columns) changes the answer.
 //   * acceptance: over the parity prompts at least 30 % of the drafted tokens are accepted and
-//     every request runs DFlash2 rounds. Rank 0's drafter reads the target features its tap captures
-//     from the replicated residual; features captured from a partial residual collapse the
+//     every request runs DFlash2 rounds. Rank 0's drafter reads the target features its tap
+//     captures from the replicated residual; features captured from a partial residual collapse the
 //     acceptance while the output stays right.
 //   * concurrent: "What is 17*23?" answers 391 while a long answer holds the other lane, in
 //     shared two-row DFlash2 rounds.
@@ -201,8 +201,8 @@ int exercise_concurrent(ninfer::Engine& engine) {
 
 int exercise_prefix_reuse(ninfer::Engine& engine) {
     const auto conversation = [] {
-        ninfer::PromptInput input = user_prompt(
-            "Remember the code 4817 and the color green. For now, reply only: OK.");
+        ninfer::PromptInput input =
+            user_prompt("Remember the code 4817 and the color green. For now, reply only: OK.");
         input.context_cache.session_key = "dflash2-tp2-real";
         input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
         return input;

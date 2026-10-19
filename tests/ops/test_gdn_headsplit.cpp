@@ -342,11 +342,11 @@ struct Runner {
         state = DeviceBuffer(static_cast<std::size_t>(kStateDim) * kStateDim * value_heads * 4);
         // The query legitimately returns 0 below 16 tokens (the recurrent route needs no
         // staging); an arena still has to own something, so floor it.
-        workspace.emplace(std::max<std::size_t>(ops::gated_delta_net_workspace_capacity_bytes(
-                                                    qk_heads, value_heads, 1, max_tokens),
-                                                256));
-        CUDA_CHECK(cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount,
-                                          device));
+        workspace.emplace(std::max<std::size_t>(
+            ops::gated_delta_net_workspace_capacity_bytes(qk_heads, value_heads, 1, max_tokens),
+            256));
+        CUDA_CHECK(
+            cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device));
     }
 
     void load_state(const std::vector<float>& values) {
@@ -361,9 +361,9 @@ struct Runner {
         const auto qk_off = static_cast<std::size_t>(token_begin) *
                             static_cast<std::size_t>(kStateDim) *
                             static_cast<std::size_t>(qk_heads);
-        const auto v_off  = static_cast<std::size_t>(token_begin) *
-                            static_cast<std::size_t>(kStateDim) *
-                            static_cast<std::size_t>(value_heads);
+        const auto v_off = static_cast<std::size_t>(token_begin) *
+                           static_cast<std::size_t>(kStateDim) *
+                           static_cast<std::size_t>(value_heads);
         const auto gate_off =
             static_cast<std::size_t>(token_begin) * static_cast<std::size_t>(value_heads);
         const auto qk_count =
@@ -568,10 +568,9 @@ void oracle_case(int tokens, bool normalize_qk, std::uint64_t salt) {
         shard.run(in, 0, tokens, normalize_qk);
         const gdn_ref::Result ref =
             gdn_ref::evaluate(in, static_cast<double>(kScale), normalize_qk);
-        const std::string name = tag + " rank " + std::to_string(rank);
-        const OracleLeg out_leg =
-            oracle_leg(name + " out vs oracle", doubles(shard.read_out(tokens)), ref.out,
-                       criteria.out);
+        const std::string name  = tag + " rank " + std::to_string(rank);
+        const OracleLeg out_leg = oracle_leg(
+            name + " out vs oracle", doubles(shard.read_out(tokens)), ref.out, criteria.out);
         const OracleLeg state_leg =
             oracle_leg(name + " state vs oracle", doubles(shard.read_state()), ref.final_state,
                        criteria.state);

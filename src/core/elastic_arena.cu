@@ -41,18 +41,19 @@ ElasticArena::ElasticArena(int device, std::size_t bytes, std::span<const Elasti
     std::size_t g                  = 0;
     cu_check(cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM),
              "cuMemGetAllocationGranularity");
-    granule_  = g;
-    reserved_ = (bytes_ + granule_ - 1) / granule_ * granule_;
+    granule_       = g;
+    reserved_      = (bytes_ + granule_ - 1) / granule_ * granule_;
     CUdeviceptr va = 0;
     cu_check(cuMemAddressReserve(&va, reserved_, granule_, 0, 0), "cuMemAddressReserve");
-    base_ = reinterpret_cast<std::byte*>(va);
+    base_                      = reinterpret_cast<std::byte*>(va);
     const std::size_t granules = reserved_ / granule_;
     fixed_.assign(granules, 1);
     handle_.assign(granules, 0);
     // A granule is fixed unless an elastic range covers it whole.
     auto sorted = ranges_;
-    std::sort(sorted.begin(), sorted.end(),
-              [](const ElasticRangeSpec& a, const ElasticRangeSpec& b) { return a.offset < b.offset; });
+    std::sort(
+        sorted.begin(), sorted.end(),
+        [](const ElasticRangeSpec& a, const ElasticRangeSpec& b) { return a.offset < b.offset; });
     for (std::size_t i = 0; i < sorted.size(); ++i) {
         const ElasticRangeSpec& r = sorted[i];
         if (r.mapped > r.bytes || r.offset + r.bytes > bytes_ ||
@@ -112,7 +113,8 @@ ElasticArena::~ElasticArena() {
     (void)cuMemAddressFree(ptr_of(base_), reserved_);
 }
 
-void ElasticArena::needed(std::span<const std::size_t> mapped, std::vector<std::uint8_t>& out) const {
+void ElasticArena::needed(std::span<const std::size_t> mapped,
+                          std::vector<std::uint8_t>& out) const {
     if (mapped.size() != ranges_.size()) {
         throw std::invalid_argument("ElasticArena: one prefix per elastic range");
     }
@@ -133,7 +135,8 @@ std::int64_t ElasticArena::physical_delta(std::span<const std::size_t> mapped) c
     needed(mapped, want);
     std::int64_t delta = 0;
     for (std::size_t k = 0; k < want.size(); ++k) {
-        delta += static_cast<std::int64_t>(want[k] != 0) - static_cast<std::int64_t>(handle_[k] != 0);
+        delta +=
+            static_cast<std::int64_t>(want[k] != 0) - static_cast<std::int64_t>(handle_[k] != 0);
     }
     return delta * static_cast<std::int64_t>(granule_);
 }

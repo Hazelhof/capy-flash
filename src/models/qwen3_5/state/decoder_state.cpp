@@ -50,10 +50,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         geometry.planes.push_back({DType::BF16, ops::kQsaBlockKeyWords, 1, 256});
     }
     return PagedKVCacheLayout{
-        .pages = plan_device_kv_page_pool(
-            pages_builder != nullptr ? *pages_builder : builder,
-            DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
-                                          .geometry         = std::move(geometry)}),
+        .pages =
+            plan_device_kv_page_pool(pages_builder != nullptr ? *pages_builder : builder,
+                                     DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
+                                                          .geometry         = std::move(geometry)}),
         .execution_tables = plan_kv_execution_tables(
             builder,
             KVExecutionTableSpec{.logical_page_capacity = logical_pages, .table_rows = table_rows}),
@@ -82,11 +82,10 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     return layout;
 }
 
-PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout,
-                           DeviceSpan elastic)
+PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout, DeviceSpan elastic)
     : pages_(layout.elastic_pages ? elastic : backing, layout.pages),
-      execution_tables_(backing, layout.execution_tables, pages_),
-      layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
+      execution_tables_(backing, layout.execution_tables, pages_), layers_(layout.layers),
+      max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       layer_storage_(layout.layer_storage), qsa_index_(layout.qsa_index) {
     if (pages_.plane_count() != static_cast<std::size_t>(layers_) *
                                     (layer_storage_.planes_per_layer() + (qsa_index_ ? 2U : 0U))) {
@@ -161,8 +160,7 @@ std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }
 
-DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout,
-                           DeviceSpan elastic)
+DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout, DeviceSpan elastic)
     : text_kv(backing, layout.text_kv, elastic) {
     if (layout.text_kv.elastic_pages && elastic.data == nullptr) {
         throw std::invalid_argument("elastic KV pages need their backing");

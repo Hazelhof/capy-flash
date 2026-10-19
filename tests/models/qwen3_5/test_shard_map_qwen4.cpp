@@ -69,8 +69,8 @@ qwen::Config flash_next(std::uint32_t layers = 48) {
 }
 
 const LoadOptions kTp2{.speculative = SpeculativeBackend::Mtp, .tp = 2};
-const LoadOptions kTp2Split{.speculative = SpeculativeBackend::Mtp, .tp = 2,
-                            .hc_split_streams = true};
+const LoadOptions kTp2Split{
+    .speculative = SpeculativeBackend::Mtp, .tp = 2, .hc_split_streams = true};
 
 Ranges halves(std::uint64_t total, int device) {
     return {{static_cast<std::uint64_t>(device) * total / 2, total / 2}};
@@ -89,7 +89,7 @@ void expect(const qwen::Config& config, const std::string& name, artifact::Shape
 }
 
 void logical_policy() {
-    const auto config = flash_next();
+    const auto config         = flash_next();
     constexpr std::uint64_t q = 6144, k = 512, gk = 2048, gv = 6144;
     for (const std::string p : {"text/layers/3/", "mtp/layers/0/"}) {
         // 12 query heads and their 1 KV head per rank.
@@ -148,9 +148,11 @@ void logical_policy() {
             }
         }
     }
-    for (const auto& [p, rank] : std::vector<std::pair<std::string, int>>{
-             {"text/layers/0/", 0}, {"text/layers/1/", 1}, {"text/layers/46/", 0},
-             {"text/layers/47/", 1}, {"mtp/layers/0/", 0}}) {
+    for (const auto& [p, rank] : std::vector<std::pair<std::string, int>>{{"text/layers/0/", 0},
+                                                                          {"text/layers/1/", 1},
+                                                                          {"text/layers/46/", 0},
+                                                                          {"text/layers/47/", 1},
+                                                                          {"mtp/layers/0/", 0}}) {
         for (const auto* leaf : {"moe/shared/gate", "moe/shared/up"}) {
             expect(config, p + leaf, {640, kH}, ShardAxis::SingleDevice, {}, rank);
         }
@@ -210,8 +212,8 @@ void logical_policy() {
     expect(config, "mtp/hidden_norm", {kWide}, ShardAxis::Replicated);
     expect(config, "mtp/hidden_norm", {kWide}, ShardAxis::Rows,
            {halves(kWide, 0), halves(kWide, 1)}, 0, kTp2Split);
-    expect(config, "vision/layers/0/attention/query", {1152, 1152}, ShardAxis::SingleDevice, {},
-           1, {.tp = 2, .vision_rank = 1});
+    expect(config, "vision/layers/0/attention/query", {1152, 1152}, ShardAxis::SingleDevice, {}, 1,
+           {.tp = 2, .vision_rank = 1});
 
     // Rejections.
     rejects<std::invalid_argument>(
@@ -223,8 +225,8 @@ void logical_policy() {
     rejects<std::invalid_argument>(
         [&] { (void)loading::logical_shard("text/layersX/attn_hc/norm", {kWide}, config, kTp2); },
         "a malformed block name was placed");
-    auto three                                 = config;
-    three.text.hyper_connection->hc_count      = 3;
+    auto three                            = config;
+    three.text.hyper_connection->hc_count = 3;
     rejects<std::invalid_argument>(
         [&] {
             (void)loading::logical_shard("text/layers/0/attn_hc/norm", {3 * kH}, three, kTp2Split);
@@ -250,6 +252,7 @@ struct Format {
     QType format;
     QuantLayout layout;
 };
+
 constexpr Format kNvfp4{QType::NVFP4, QuantLayout::BlockScaleK16M128x4};
 constexpr Format kQ8{QType::Q8_G32_FP16, QuantLayout::RowSplit};
 constexpr Format kQ6{QType::Q6_G64_FP16, QuantLayout::RowSplit};
@@ -261,12 +264,12 @@ struct ParentSpec {
     Format format;
     artifact::Shape shape;
     std::vector<std::pair<std::string, std::uint64_t>> rows; // Logical parameter, row count.
-    std::string kind; // Inventory class.
+    std::string kind;                                        // Inventory class.
 };
 
 struct Recipe {
     const char* name;
-    Format dense;  // attention q|k|gate|v and output, GDN q|k|v|z and output, shared expert
+    Format dense; // attention q|k|gate|v and output, GDN q|k|v|z and output, shared expert
     Format head;
 };
 
@@ -276,30 +279,42 @@ void block_parents(std::vector<ParentSpec>& out, const std::string& p, bool atte
     for (const auto* mixer : {"attn_hc/", "ffn_hc/"}) {
         const std::string m = p + mixer;
         out.push_back({m + "norm", kBf16, {kWide}, {{m + "norm", kWide}}, "hc"});
-        out.push_back({m + "down|inject", kQ8, {324, kWide}, {{m + "down", 320}, {m + "inject", 4}},
-                       "hc"});
+        out.push_back(
+            {m + "down|inject", kQ8, {324, kWide}, {{m + "down", 320}, {m + "inject", 4}}, "hc"});
         out.push_back({m + "up", kQ8, {kWide, 320}, {{m + "up", kWide}}, "hc"});
     }
     if (attention) {
         const std::string a = p + "attention/";
-        out.push_back({a + "q|k|gate|v", recipe.dense, {13312, kH},
-                       {{a + "query", 6144}, {a + "key", 512}, {a + "gate", 6144}, {a + "value", 512}},
-                       "attention"});
+        out.push_back(
+            {a + "q|k|gate|v",
+             recipe.dense,
+             {13312, kH},
+             {{a + "query", 6144}, {a + "key", 512}, {a + "gate", 6144}, {a + "value", 512}},
+             "attention"});
         out.push_back({a + "output", recipe.dense, {kH, 6144}, {{a + "output", kH}}, "attention"});
         out.push_back({a + "query_norm", kBf16, {256}, {{a + "query_norm", 256}}, "attention"});
         out.push_back({a + "key_norm", kBf16, {256}, {{a + "key_norm", 256}}, "attention"});
-        out.push_back({a + "indexer", kQ8, {640, kH},
-                       {{a + "indexer_query", 512}, {a + "indexer_key", 128}}, "indexer"});
-        out.push_back({a + "indexer_query_norm", kBf16, {128}, {{a + "indexer_query_norm", 128}},
+        out.push_back({a + "indexer",
+                       kQ8,
+                       {640, kH},
+                       {{a + "indexer_query", 512}, {a + "indexer_key", 128}},
                        "indexer"});
-        out.push_back({a + "indexer_key_norm", kBf16, {128}, {{a + "indexer_key_norm", 128}},
-                       "indexer"});
+        out.push_back(
+            {a + "indexer_query_norm", kBf16, {128}, {{a + "indexer_query_norm", 128}}, "indexer"});
+        out.push_back(
+            {a + "indexer_key_norm", kBf16, {128}, {{a + "indexer_key_norm", 128}}, "indexer"});
     } else {
         const std::string g = p + "gdn/";
-        out.push_back({g + "q|k|v|z", recipe.dense, {16384, kH},
-                       {{g + "query", 2048}, {g + "key", 2048}, {g + "value", 6144}, {g + "z", 6144}},
-                       "gdn"});
-        out.push_back({g + "a|b", kQ8, {96, kH}, {{g + "a_projection", 48}, {g + "b_projection", 48}},
+        out.push_back(
+            {g + "q|k|v|z",
+             recipe.dense,
+             {16384, kH},
+             {{g + "query", 2048}, {g + "key", 2048}, {g + "value", 6144}, {g + "z", 6144}},
+             "gdn"});
+        out.push_back({g + "a|b",
+                       kQ8,
+                       {96, kH},
+                       {{g + "a_projection", 48}, {g + "b_projection", 48}},
                        "gdn"});
         out.push_back({g + "a_log", kFp32, {48}, {{g + "a_log", 48}}, "gdn"});
         out.push_back({g + "dt_bias", kFp32, {48}, {{g + "dt_bias", 48}}, "gdn"});
@@ -308,16 +323,22 @@ void block_parents(std::vector<ParentSpec>& out, const std::string& p, bool atte
         out.push_back({g + "output", recipe.dense, {kH, 6144}, {{g + "output", kH}}, "gdn"});
     }
     const std::string m = p + "moe/";
-    out.push_back({m + "router|shared_score", kBf16, {513, kH},
-                   {{m + "router", 512}, {m + "shared_score", 1}}, "router"});
-    out.push_back({m + "shared/gate|up", recipe.dense, {1280, kH},
-                   {{m + "shared/gate", 640}, {m + "shared/up", 640}}, "shared expert"});
-    out.push_back({m + "shared/down", recipe.dense, {kH, 640}, {{m + "shared/down", kH}},
+    out.push_back({m + "router|shared_score",
+                   kBf16,
+                   {513, kH},
+                   {{m + "router", 512}, {m + "shared_score", 1}},
+                   "router"});
+    out.push_back({m + "shared/gate|up",
+                   recipe.dense,
+                   {1280, kH},
+                   {{m + "shared/gate", 640}, {m + "shared/up", 640}},
                    "shared expert"});
+    out.push_back(
+        {m + "shared/down", recipe.dense, {kH, 640}, {{m + "shared/down", kH}}, "shared expert"});
     if (ple) {
         const std::string e = p + "ple/";
-        out.push_back({e + "key|value", kQ8, {12800, kH}, {{e + "key", kWide}, {e + "value", kH}},
-                       "ple"});
+        out.push_back(
+            {e + "key|value", kQ8, {12800, kH}, {{e + "key", kWide}, {e + "value", kH}}, "ple"});
         for (const auto* leaf : {"key_norm", "query_norm", "conv_norm"}) {
             out.push_back({e + leaf, kBf16, {kWide}, {{e + leaf, kWide}}, "ple"});
         }
@@ -327,9 +348,15 @@ void block_parents(std::vector<ParentSpec>& out, const std::string& p, bool atte
 
 std::vector<ParentSpec> model_parents(const qwen::Config& config, const Recipe& recipe) {
     std::vector<ParentSpec> out;
-    out.push_back({"text/token_embedding", kQ8, {kVocab, kH}, {{"text/token_embedding", kVocab}},
+    out.push_back({"text/token_embedding",
+                   kQ8,
+                   {kVocab, kH},
+                   {{"text/token_embedding", kVocab}},
                    "embedding"});
-    out.push_back({"text/output_head", recipe.head, {kVocab, kH}, {{"text/output_head", kVocab}},
+    out.push_back({"text/output_head",
+                   recipe.head,
+                   {kVocab, kH},
+                   {{"text/output_head", kVocab}},
                    "output head"});
     for (const std::string h : {"text/hc_head/", "mtp/hc_head/"}) {
         out.push_back({h + "norm", kBf16, {kWide}, {{h + "norm", kWide}}, "hc"});
@@ -384,8 +411,8 @@ Totals place(const qwen::Config& config, const std::vector<ParentSpec>& parents,
         [&](artifact::ObjectHandle object) -> const WeightGeometry& {
         return geometry.at(object.index);
     };
-    const auto placements = loading::parent_placements(weights, parents.size(), lookup, config,
-                                                       options);
+    const auto placements =
+        loading::parent_placements(weights, parents.size(), lookup, config, options);
     Totals totals;
     for (std::size_t object = 0; object < parents.size(); ++object) {
         const auto& placement = placements.at(object);
@@ -441,16 +468,20 @@ void print(const char* label, const Totals& totals, std::uint64_t whole) {
 
 void combined_placements() {
     const auto config = flash_next();
-    for (const Recipe& recipe : {Recipe{"qwen3_8_flash_next_nvfp4 (dense Q8, head Q6)", kQ8, kQ6},
-                                 Recipe{"qwen3_8_flash_next_nvfp4_dense (dense/head NVFP4)", kNvfp4,
-                                        kNvfp4}}) {
+    for (const Recipe& recipe :
+         {Recipe{"qwen3_8_flash_next_nvfp4 (dense Q8, head Q6)", kQ8, kQ6},
+          Recipe{"qwen3_8_flash_next_nvfp4_dense (dense/head NVFP4)", kNvfp4, kNvfp4}}) {
         const auto parents = model_parents(config, recipe);
         // Per-rank problems the split Ops are registered for.
         const std::map<std::string, artifact::Shape> shards{
-            {"attention/q|k|gate|v", {6656, kH}}, {"attention/output", {kH, 3072}},
-            {"gdn/q|k|v|z", {8192, kH}},          {"gdn/a|b", {48, kH}},
-            {"gdn/a_log", {24}},                  {"gdn/convolution", {4, 5120}},
-            {"gdn/output", {kH, 3072}},           {"text/output_head", {kVocab / 2, kH}},
+            {"attention/q|k|gate|v", {6656, kH}},
+            {"attention/output", {kH, 3072}},
+            {"gdn/q|k|v|z", {8192, kH}},
+            {"gdn/a|b", {48, kH}},
+            {"gdn/a_log", {24}},
+            {"gdn/convolution", {4, 5120}},
+            {"gdn/output", {kH, 3072}},
+            {"text/output_head", {kVocab / 2, kH}},
         };
         std::map<std::string, artifact::Shape> split_shards = shards;
         split_shards.insert({{"down|inject", {324, 5120}},

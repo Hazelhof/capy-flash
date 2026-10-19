@@ -38,7 +38,8 @@ using namespace ninfer::test::host_moe;
 
 namespace {
 
-// The shares are checked against W4A8 references; A4 (the GPU activation codec) is the default since v0.2.1.
+// The shares are checked against W4A8 references; A4 (the GPU activation codec) is the default
+// since v0.2.1.
 HostMoeExecutor::Options w4a8_options() {
     HostMoeExecutor::Options o;
     o.a4 = false;
@@ -46,6 +47,7 @@ HostMoeExecutor::Options w4a8_options() {
 }
 
 int g_failures = 0;
+
 void expect(bool ok, const std::string& what) {
     if (!ok) {
         ++g_failures;
@@ -53,13 +55,13 @@ void expect(bool ok, const std::string& what) {
     }
 }
 
-#define CK(x)                                                                                    \
-    do {                                                                                         \
-        cudaError_t e_ = (x);                                                                    \
-        if (e_ != cudaSuccess) {                                                                 \
-            std::printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__); \
-            std::exit(1);                                                                        \
-        }                                                                                        \
+#define CK(x)                                                                                      \
+    do {                                                                                           \
+        cudaError_t e_ = (x);                                                                      \
+        if (e_ != cudaSuccess) {                                                                   \
+            std::printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e_), __FILE__, __LINE__);   \
+            std::exit(1);                                                                          \
+        }                                                                                          \
     } while (0)
 
 __global__ void busy_kernel(long long ns) {
@@ -87,8 +89,9 @@ Routing route(int L, int T, int K, int E, std::mt19937_64& rng, bool all_device_
             std::shuffle(all.begin(), all.end(), rng);
             for (int s = 0; s < K; ++s) {
                 const std::size_t i = (static_cast<std::size_t>(l) * T + t) * K + s;
-                r.ids[i]   = all[s];
-                r.slot[i]  = (all_device_layer0 && l == 0) || host(rng) != 0 ? s : -1; // ~1 in 4 on the host
+                r.ids[i]            = all[s];
+                r.slot[i] =
+                    (all_device_layer0 && l == 0) || host(rng) != 0 ? s : -1; // ~1 in 4 on the host
                 r.alpha[i] = w(rng);
             }
         }
@@ -106,7 +109,8 @@ void table_and_slices(HostMoeMailboxConfig cfg, const std::vector<HostExpertLaye
     const int L = cfg.layers, E = layers[0].experts;
     cfg.route_log_tokens = T * S;
     cfg.trace_capacity   = 4 * L * S; // cleared before every replay
-    const std::size_t nx = static_cast<std::size_t>(L) * T * S * H, nr = static_cast<std::size_t>(L) * T * S * K;
+    const std::size_t nx = static_cast<std::size_t>(L) * T * S * H,
+                      nr = static_cast<std::size_t>(L) * T * S * K;
     std::vector<std::uint16_t> xs(nx);
     for (std::size_t i = 0; i < nx; ++i) xs[i] = x[i % x.size()];
     __nv_bfloat16* dx = nullptr;
@@ -127,7 +131,8 @@ void table_and_slices(HostMoeMailboxConfig cfg, const std::vector<HostExpertLaye
     for (int l = 0; l < L; ++l) {
         for (int slice = 0; slice < S; ++slice) {
             const std::size_t t0 = static_cast<std::size_t>(l * S + slice) * T;
-            mailbox.publish_table(s, l, T, dx + t0 * H, dids + t0 * K, dalpha + t0 * K, dtable + l * E, E, slice * T);
+            mailbox.publish_table(s, l, T, dx + t0 * H, dids + t0 * K, dalpha + t0 * K,
+                                  dtable + l * E, E, slice * T);
             busy_kernel<<<1, 32, 0, s>>>(5000);
             mailbox.accumulate(s, l, T, dyf + t0 * H);
         }
@@ -138,7 +143,7 @@ void table_and_slices(HostMoeMailboxConfig cfg, const std::vector<HostExpertLaye
     std::vector<float> y0s(nx);
     for (std::size_t i = 0; i < nx; ++i) y0s[i] = y0f[i % y0f.size()];
     double max_gap_us = 0;
-    int compared = 0;
+    int compared      = 0;
     for (int replay = 0; replay < 4; ++replay) {
         std::vector<std::int32_t> ids(nr), table(static_cast<std::size_t>(L) * E);
         std::vector<float> alpha(nr);
@@ -164,12 +169,15 @@ void table_and_slices(HostMoeMailboxConfig cfg, const std::vector<HostExpertLaye
         CK(cudaStreamSynchronize(s));
         expect(!mailbox.failed(), "table: mailbox failed: " + mailbox.error());
         const auto records = mailbox.trace();
-        expect(records.size() == static_cast<std::size_t>(L * S), "table: one trace record per slice");
+        expect(records.size() == static_cast<std::size_t>(L * S),
+               "table: one trace record per slice");
         // Host gap from a layer's first slice done to its second slice seen: the device needs a few
         // us in between (accumulate, publish); a resync scan would add a millisecond.
         for (std::size_t r = 1; r < records.size(); ++r) {
             if (records[r].layer == records[r - 1].layer) {
-                max_gap_us = std::max(max_gap_us, 1e-3 * static_cast<double>(records[r].seen_ns - records[r - 1].done_ns));
+                max_gap_us =
+                    std::max(max_gap_us, 1e-3 * static_cast<double>(records[r].seen_ns -
+                                                                    records[r - 1].done_ns));
             }
         }
         CK(cudaMemcpy(yf.data(), dyf, nx * 4, cudaMemcpyDeviceToHost));
@@ -180,29 +188,37 @@ void table_and_slices(HostMoeMailboxConfig cfg, const std::vector<HostExpertLaye
             expect(*log.published == 1 && *log.tokens == static_cast<std::uint32_t>(T * S),
                    "table: layer " + std::to_string(l) + " log flag and token count");
             int log_bad = 0;
-            for (int i = 0; i < T * S * K; ++i) log_bad += log.ids[i] != ids[static_cast<std::size_t>(l) * T * S * K + i];
-            expect(log_bad == 0, "table: layer " + std::to_string(l) + " logged ids (" + std::to_string(log_bad) + " wrong)");
+            for (int i = 0; i < T * S * K; ++i)
+                log_bad += log.ids[i] != ids[static_cast<std::size_t>(l) * T * S * K + i];
+            expect(log_bad == 0, "table: layer " + std::to_string(l) + " logged ids (" +
+                                     std::to_string(log_bad) + " wrong)");
             for (int slice = 0; slice < S; ++slice) {
                 const std::size_t t0 = static_cast<std::size_t>(l * S + slice) * T;
-                std::vector<std::int32_t> host_ids(ids.begin() + t0 * K, ids.begin() + (t0 + T) * K);
+                std::vector<std::int32_t> host_ids(ids.begin() + t0 * K,
+                                                   ids.begin() + (t0 + T) * K);
                 bool any = false;
                 for (auto& e : host_ids) {
                     if (table[static_cast<std::size_t>(l) * E + e] >= 0) e = -1;
                     any = any || e >= 0;
                 }
-                const HostMoeJob job{T, K, xs.data() + t0 * H, host_ids.data(), alpha.data() + t0 * K, p.data()};
+                const HostMoeJob job{
+                    T, K, xs.data() + t0 * H, host_ids.data(), alpha.data() + t0 * K, p.data()};
                 ex.run(layers[l], job);
                 int bad = 0;
-                for (int i = 0; i < T * H; ++i) bad += yf[t0 * H + i] != (any ? y0s[t0 * H + i] + p[i] : y0s[t0 * H + i]);
+                for (int i = 0; i < T * H; ++i)
+                    bad += yf[t0 * H + i] != (any ? y0s[t0 * H + i] + p[i] : y0s[t0 * H + i]);
                 compared += T * H;
-                expect(bad == 0, "table: replay " + std::to_string(replay) + " layer " + std::to_string(l) + " slice " +
-                                     std::to_string(slice) + ": " + std::to_string(bad) + " mismatches");
+                expect(bad == 0, "table: replay " + std::to_string(replay) + " layer " +
+                                     std::to_string(l) + " slice " + std::to_string(slice) + ": " +
+                                     std::to_string(bad) + " mismatches");
             }
         }
     }
-    expect(max_gap_us < 300.0, "table: second slice of a layer served without a resync stall (largest gap " +
-                                   std::to_string(max_gap_us) + " us)");
-    std::printf("table + log + slices: %d outputs bit-exact, largest slice-to-slice host gap %.1f us (%d layers x %d "
+    expect(max_gap_us < 300.0,
+           "table: second slice of a layer served without a resync stall (largest gap " +
+               std::to_string(max_gap_us) + " us)");
+    std::printf("table + log + slices: %d outputs bit-exact, largest slice-to-slice host gap %.1f "
+                "us (%d layers x %d "
                 "slices)\n",
                 compared, max_gap_us, L, S);
     CK(cudaGraphExecDestroy(exec));
@@ -223,21 +239,27 @@ int reference_share(const HostMoeSplit& s, const std::vector<int>& cols) {
     if (n == 0) return 0;
     const int cap = std::min({n, s.max_reads, HostMoeSplit::kMaxReads});
     switch (s.mode) {
-    case HostMoeSplit::Mode::Off: return 0;
-    case HostMoeSplit::Mode::Count: return std::max(0, std::min(s.count, cap));
+    case HostMoeSplit::Mode::Off:
+        return 0;
+    case HostMoeSplit::Mode::Count:
+        return std::max(0, std::min(s.count, cap));
     case HostMoeSplit::Mode::Fraction:
-        return std::max(0, std::min(cap, static_cast<int>(std::floor(s.fraction * static_cast<float>(n) + 0.5F))));
+        return std::max(
+            0,
+            std::min(cap, static_cast<int>(std::floor(s.fraction * static_cast<float>(n) + 0.5F))));
     case HostMoeSplit::Mode::Cost: {
         if (n <= s.min_misses) return 0;
         auto host = [&](int from, float slow) {
             if (from >= n) return 0.0F;
             float t = 0.0F;
-            for (int i = from; i < n; ++i) t += s.host_expert_us + s.host_column_us * static_cast<float>(cols[i] - 1);
+            for (int i = from; i < n; ++i)
+                t += s.host_expert_us + s.host_column_us * static_cast<float>(cols[i] - 1);
             return s.host_fixed_us + slow * t;
         };
         auto dev = [&](int g) {
             float t = s.device_fixed_us;
-            for (int i = 0; i < g; ++i) t += s.device_expert_us + s.device_column_us * static_cast<float>(cols[i] - 1);
+            for (int i = 0; i < g; ++i)
+                t += s.device_expert_us + s.device_column_us * static_cast<float>(cols[i] - 1);
             return t;
         };
         // The test's costs are small multiples of 1/4: every sum and product is exact in FP32, so
@@ -257,23 +279,34 @@ int reference_share(const HostMoeSplit& s, const std::vector<int>& cols) {
 // FP64 routed partial over the experts in `which`, unquantized activations (fixture decode).
 struct Oracle {
     const LayerData& d;
-    std::map<int, std::vector<float>> decoded; // expert -> gate|up rows [2I][H], then down rows [H][I]
+    std::map<int, std::vector<float>>
+        decoded; // expert -> gate|up rows [2I][H], then down rows [H][I]
+
     explicit Oracle(const LayerData& data) : d(data) {}
+
     const std::vector<float>& expert(int e) {
         auto it = decoded.find(e);
         if (it != decoded.end()) return it->second;
         const int H = d.hidden, I = d.intermediate;
         std::vector<float> w(static_cast<std::size_t>(2 * I) * H + static_cast<std::size_t>(H) * I);
         for (int r = 0; r < 2 * I; ++r)
-            for (int c = 0; c < H; ++c) w[static_cast<std::size_t>(r) * H + c] = static_cast<float>(d.gate_up.weight(static_cast<std::int64_t>(e) * 2 * I + r, c));
+            for (int c = 0; c < H; ++c)
+                w[static_cast<std::size_t>(r) * H + c] = static_cast<float>(
+                    d.gate_up.weight(static_cast<std::int64_t>(e) * 2 * I + r, c));
         float* dn = w.data() + static_cast<std::size_t>(2 * I) * H;
         for (int r = 0; r < H; ++r)
-            for (int c = 0; c < I; ++c) dn[static_cast<std::size_t>(r) * I + c] = static_cast<float>(d.down.weight(static_cast<std::int64_t>(e) * H + r, c));
+            for (int c = 0; c < I; ++c)
+                dn[static_cast<std::size_t>(r) * I + c] =
+                    static_cast<float>(d.down.weight(static_cast<std::int64_t>(e) * H + r, c));
         return decoded.emplace(e, std::move(w)).first->second;
     }
+
     double hmax = 0; // largest |SwiGLU output| seen by partial()
-    std::vector<double> partial(const std::vector<std::uint16_t>& x, const std::vector<std::int32_t>& ids,
-                                const std::vector<float>& alpha, const std::vector<int>& which, int T, int K) {
+
+    std::vector<double> partial(const std::vector<std::uint16_t>& x,
+                                const std::vector<std::int32_t>& ids,
+                                const std::vector<float>& alpha, const std::vector<int>& which,
+                                int T, int K) {
         const int H = d.hidden, I = d.intermediate;
         std::vector<double> y(static_cast<std::size_t>(T) * H, 0.0);
         for (const int e : which) {
@@ -296,7 +329,8 @@ struct Oracle {
                 }
                 for (int o = 0; o < H; ++o) {
                     double acc = 0;
-                    for (int r = 0; r < I; ++r) acc += dn[static_cast<std::size_t>(o) * I + r] * h[r];
+                    for (int r = 0; r < I; ++r)
+                        acc += dn[static_cast<std::size_t>(o) * I + r] * h[r];
                     y[static_cast<std::size_t>(t) * H + o] += a * acc;
                 }
             }
@@ -307,18 +341,20 @@ struct Oracle {
 
 double rel_l2(const std::vector<double>& got, const std::vector<double>& ref) {
     double num = 0, den = 0;
-    for (std::size_t i = 0; i < ref.size(); ++i) num += (got[i] - ref[i]) * (got[i] - ref[i]), den += ref[i] * ref[i];
+    for (std::size_t i = 0; i < ref.size(); ++i)
+        num += (got[i] - ref[i]) * (got[i] - ref[i]), den += ref[i] * ref[i];
     return den > 0 ? std::sqrt(num / den) : std::sqrt(num);
 }
 
 void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::vector<int>& ref_cpus,
                   std::mt19937_64& rng) {
-    namespace nops = ninfer::ops;
+    namespace nops  = ninfer::ops;
     constexpr int T = 4, K = 10, H = 2560, I = 640;
     const int E = data.experts;
     // The bank in mapped pinned memory (the engine reads its bank in place from such memory).
     void *gu = nullptr, *dn = nullptr;
-    CK(cudaHostAlloc(&gu, data.gate_up.payload.size(), cudaHostAllocMapped | cudaHostAllocPortable));
+    CK(cudaHostAlloc(&gu, data.gate_up.payload.size(),
+                     cudaHostAllocMapped | cudaHostAllocPortable));
     CK(cudaHostAlloc(&dn, data.down.payload.size(), cudaHostAllocMapped | cudaHostAllocPortable));
     std::memcpy(gu, data.gate_up.payload.data(), data.gate_up.payload.size());
     std::memcpy(dn, data.down.payload.data(), data.down.payload.size());
@@ -335,15 +371,20 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
         .down_scales    = {layer.down.scales, nops::kMoeSlotsDownScaleBytes},
         .slots          = E,
     };
-    const std::array<std::int64_t, 4> plane_bytes{nops::kMoeSlotsGateUpCodeBytes, nops::kMoeSlotsGateUpScaleBytes,
-                                                  nops::kMoeSlotsDownCodeBytes, nops::kMoeSlotsDownScaleBytes};
+    const std::array<std::int64_t, 4> plane_bytes{
+        nops::kMoeSlotsGateUpCodeBytes, nops::kMoeSlotsGateUpScaleBytes,
+        nops::kMoeSlotsDownCodeBytes, nops::kMoeSlotsDownScaleBytes};
     std::array<std::byte*, 4> staging{}, staging_narrow{};
-    for (int q = 0; q < 4; ++q) CK(cudaMalloc(&staging[q], plane_bytes[q] * HostMoeSplit::kMaxReads));
-    for (int q = 0; q < 4; ++q) CK(cudaMalloc(&staging_narrow[q], plane_bytes[q] * HostMoeSplit::kMaxReads));
+    for (int q = 0; q < 4; ++q)
+        CK(cudaMalloc(&staging[q], plane_bytes[q] * HostMoeSplit::kMaxReads));
+    for (int q = 0; q < 4; ++q)
+        CK(cudaMalloc(&staging_narrow[q], plane_bytes[q] * HostMoeSplit::kMaxReads));
     // The scale planes again at base + 4 (only 4-byte aligned): the copy kernel's 4-byte path.
-    std::byte* narrow_host = nullptr;
-    const std::size_t gu_scales = static_cast<std::size_t>(plane_bytes[1]) * E, dn_scales = static_cast<std::size_t>(plane_bytes[3]) * E;
-    CK(cudaHostAlloc(reinterpret_cast<void**>(&narrow_host), gu_scales + dn_scales + 64, cudaHostAllocMapped | cudaHostAllocPortable));
+    std::byte* narrow_host      = nullptr;
+    const std::size_t gu_scales = static_cast<std::size_t>(plane_bytes[1]) * E,
+                      dn_scales = static_cast<std::size_t>(plane_bytes[3]) * E;
+    CK(cudaHostAlloc(reinterpret_cast<void**>(&narrow_host), gu_scales + dn_scales + 64,
+                     cudaHostAllocMapped | cudaHostAllocPortable));
     std::memcpy(narrow_host + 4, layer.gate_up.scales, gu_scales);
     std::memcpy(narrow_host + 32 + 4 + gu_scales, layer.down.scales, dn_scales);
     const std::array<const std::byte*, 4> narrow_bank{
@@ -356,9 +397,10 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
         .down_scales    = {staging[3], plane_bytes[3]},
         .slots          = HostMoeSplit::kMaxReads,
     };
-    float *d13 = nullptr, *d2 = nullptr, *dyf = nullptr, *dz = nullptr, *ds = nullptr, *dalpha = nullptr;
-    std::int32_t *dids = nullptr, *dtable = nullptr, *dreads = nullptr, *dpicks = nullptr, *dstage = nullptr,
-                 *dident = nullptr;
+    float *d13 = nullptr, *d2 = nullptr, *dyf = nullptr, *dz = nullptr, *ds = nullptr,
+          *dalpha      = nullptr;
+    std::int32_t *dids = nullptr, *dtable = nullptr, *dreads = nullptr, *dpicks = nullptr,
+                 *dstage = nullptr, *dident = nullptr;
     __nv_bfloat16* dx = nullptr;
     CK(cudaMalloc(&d13, 4 * 2 * E));
     CK(cudaMalloc(&d2, 4 * E));
@@ -402,6 +444,7 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
         std::string name;
         HostMoeSplit split;
     };
+
     std::vector<Case> cases;
     {
         HostMoeSplit c;
@@ -412,7 +455,8 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
         f.mode     = HostMoeSplit::Mode::Fraction;
         f.fraction = 0.4F;
         cases.push_back({"fraction0.4", f});
-        HostMoeSplit a; // cost: device 2.5x host per expert, host columns cost a lot (ordering matters)
+        HostMoeSplit
+            a; // cost: device 2.5x host per expert, host columns cost a lot (ordering matters)
         a.mode               = HostMoeSplit::Mode::Cost;
         a.host_fixed_us      = 13.0F;
         a.host_expert_us     = 56.0F;
@@ -421,8 +465,8 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
         a.device_fixed_us    = 10.0F;
         a.device_expert_us   = 140.0F;
         cases.push_back({"cost", a});
-        HostMoeSplit a2 = a;
-        a2.max_reads    = 2;
+        HostMoeSplit a2     = a;
+        a2.max_reads        = 2;
         a2.device_expert_us = 60.0F;
         cases.push_back({"cost-max2", a2});
         HostMoeSplit m = a;
@@ -445,13 +489,15 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
             for (auto& v : y0) v = normal(rng);
             std::vector<std::int32_t> ids(T * K), table(E);
             std::vector<float> alpha(T * K);
-            // tokens route 3..10 of the E experts (columns per expert vary), ~half the experts resident
+            // tokens route 3..10 of the E experts (columns per expert vary), ~half the experts
+            // resident
             for (int t = 0; t < T; ++t) {
                 std::vector<int> all(E);
                 for (int e = 0; e < E; ++e) all[e] = e;
                 std::shuffle(all.begin(), all.end(), rng);
                 const int used = 3 + static_cast<int>(rng() % 8);
-                for (int k = 0; k < K; ++k) ids[t * K + k] = k < used ? all[k] : -1, alpha[t * K + k] = w(rng);
+                for (int k = 0; k < K; ++k)
+                    ids[t * K + k] = k < used ? all[k] : -1, alpha[t * K + k] = w(rng);
             }
             for (int e = 0; e < E; ++e) table[e] = (rng() % 2) ? 7 : -1;
             // FP64 contribution of every missing expert (before the launch: it sets the divisors).
@@ -459,7 +505,8 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
             oracle.hmax = 0;
             for (int j = 0; j < T * K; ++j) {
                 const int e = ids[j];
-                if (e >= 0 && table[e] < 0 && !ref_of.count(e)) ref_of[e] = oracle.partial(x, ids, alpha, {e}, T, K);
+                if (e >= 0 && table[e] < 0 && !ref_of.count(e))
+                    ref_of[e] = oracle.partial(x, ids, alpha, {e}, T, K);
             }
             double xmax = 0;
             for (auto v : x) xmax = std::max(xmax, std::abs(static_cast<double>(from_bf16(v))));
@@ -473,10 +520,11 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
             mailbox.clear_route_flags();
             mailbox.publish_table(s, 0, T, dx, dids, dalpha, dtable, E, 0, c.split,
                                   HostMoeDeviceShare{dreads, dpicks, dstage});
-            ninfer::Tensor tx(dx, ninfer::DType::BF16, {H, T}), tr(dreads, ninfer::DType::I32, {K, T}),
-                tw(dalpha, ninfer::DType::FP32, {K, T}), tz(dz, ninfer::DType::FP32, {H, T}),
-                ts(ds, ninfer::DType::FP32, {H, T});
-            nops::moe_slots_nvfp4(tx, tr, tw, slots_layer(dident), bank, nops::MoeSlotsOutput::Store, tz, work, s);
+            ninfer::Tensor tx(dx, ninfer::DType::BF16, {H, T}),
+                tr(dreads, ninfer::DType::I32, {K, T}), tw(dalpha, ninfer::DType::FP32, {K, T}),
+                tz(dz, ninfer::DType::FP32, {H, T}), ts(ds, ninfer::DType::FP32, {H, T});
+            nops::moe_slots_nvfp4(tx, tr, tw, slots_layer(dident), bank,
+                                  nops::MoeSlotsOutput::Store, tz, work, s);
             stage_device_share(s, dpicks,
                                {static_cast<const std::byte*>(bank.gate_up_codes.base),
                                 static_cast<const std::byte*>(bank.gate_up_scales.base),
@@ -484,21 +532,27 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
                                 static_cast<const std::byte*>(bank.down_scales.base)},
                                staging, plane_bytes, 8);
             stage_device_share(s, dpicks, narrow_bank, staging_narrow, plane_bytes, 8);
-            nops::moe_slots_nvfp4(tx, tr, tw, slots_layer(dstage), scratch_pool, nops::MoeSlotsOutput::Store, ts,
-                                  work, s);
+            nops::moe_slots_nvfp4(tx, tr, tw, slots_layer(dstage), scratch_pool,
+                                  nops::MoeSlotsOutput::Store, ts, work, s);
             mailbox.accumulate(s, 0, T, dyf, ds);
             CK(cudaStreamSynchronize(s));
             expect(!mailbox.failed(), "split: mailbox failed: " + mailbox.error());
 
             // Reference selection: distinct misses with first route and columns, in split order.
-            struct Miss { int id, first, cols; };
+            struct Miss {
+                int id, first, cols;
+            };
+
             std::vector<Miss> miss;
             for (int j = 0; j < T * K; ++j) {
                 const int e = ids[j];
                 if (e < 0 || table[e] >= 0) continue;
-                auto it = std::find_if(miss.begin(), miss.end(), [&](const Miss& m) { return m.id == e; });
-                if (it == miss.end()) miss.push_back({e, j, 1});
-                else ++it->cols;
+                auto it = std::find_if(miss.begin(), miss.end(),
+                                       [&](const Miss& m) { return m.id == e; });
+                if (it == miss.end())
+                    miss.push_back({e, j, 1});
+                else
+                    ++it->cols;
             }
             if (c.split.mode != HostMoeSplit::Mode::Count) {
                 std::stable_sort(miss.begin(), miss.end(), [](const Miss& a, const Miss& b) {
@@ -520,19 +574,23 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
             CK(cudaMemcpy(picks.data(), dpicks, 4 * picks.size(), cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(stage.data(), dstage, 4 * E, cudaMemcpyDeviceToHost));
             int bad_sel = picks[HostMoeSplit::kMaxReads] != g;
-            for (int k = 0; k < HostMoeSplit::kMaxReads; ++k) bad_sel += picks[k] != (k < g ? picked[k] : -1);
+            for (int k = 0; k < HostMoeSplit::kMaxReads; ++k)
+                bad_sel += picks[k] != (k < g ? picked[k] : -1);
             for (int j = 0; j < T * K; ++j) {
                 const bool dev = std::find(picked.begin(), picked.end(), ids[j]) != picked.end();
                 bad_sel += reads[j] != (dev ? ids[j] : -1);
             }
             for (int e = 0; e < E; ++e) {
                 const auto it = std::find(picked.begin(), picked.end(), e);
-                bad_sel += stage[e] != (it == picked.end() ? -1 : static_cast<int>(it - picked.begin()));
+                bad_sel +=
+                    stage[e] != (it == picked.end() ? -1 : static_cast<int>(it - picked.begin()));
             }
             bad_sel += mailbox.device_share_experts(0) != g;
             bad_sel += mailbox.device_share_routes(0) != picked_routes;
-            expect(bad_sel == 0, tag + ": device share differs from the reference rule (" + std::to_string(bad_sel) +
-                                     " mismatches, g " + std::to_string(g) + " of " + std::to_string(miss.size()) + ")");
+            expect(bad_sel == 0, tag + ": device share differs from the reference rule (" +
+                                     std::to_string(bad_sel) + " mismatches, g " +
+                                     std::to_string(g) + " of " + std::to_string(miss.size()) +
+                                     ")");
 
             std::vector<float> zf(T * H), sf(T * H), yf(T * H), p(T * H, 0.0F);
             CK(cudaMemcpy(zf.data(), dz, 4 * T * H, cudaMemcpyDeviceToHost));
@@ -544,24 +602,35 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
                 std::vector<std::uint8_t> wide_copy(bytes), narrow_copy(bytes);
                 if (bytes == 0) continue;
                 CK(cudaMemcpy(wide_copy.data(), staging[q], bytes, cudaMemcpyDeviceToHost));
-                CK(cudaMemcpy(narrow_copy.data(), staging_narrow[q], bytes, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(narrow_copy.data(), staging_narrow[q], bytes,
+                              cudaMemcpyDeviceToHost));
                 bad_narrow += wide_copy != narrow_copy;
                 // and both equal the bank's bytes of the picked experts
                 const auto* src = reinterpret_cast<const std::uint8_t*>(
-                    q == 0 ? static_cast<const void*>(layer.gate_up.codes) : q == 1 ? static_cast<const void*>(layer.gate_up.scales)
-                    : q == 2 ? static_cast<const void*>(layer.down.codes) : static_cast<const void*>(layer.down.scales));
+                    q == 0   ? static_cast<const void*>(layer.gate_up.codes)
+                    : q == 1 ? static_cast<const void*>(layer.gate_up.scales)
+                    : q == 2 ? static_cast<const void*>(layer.down.codes)
+                             : static_cast<const void*>(layer.down.scales));
                 for (int k = 0; k < g; ++k)
-                    bad_narrow += std::memcmp(wide_copy.data() + static_cast<std::size_t>(k) * plane_bytes[q],
-                                              src + static_cast<std::size_t>(picked[k]) * plane_bytes[q], plane_bytes[q]) != 0;
+                    bad_narrow +=
+                        std::memcmp(wide_copy.data() + static_cast<std::size_t>(k) * plane_bytes[q],
+                                    src + static_cast<std::size_t>(picked[k]) * plane_bytes[q],
+                                    plane_bytes[q]) != 0;
             }
-            expect(bad_narrow == 0, tag + ": staged scratch slots differ from the bank (16-byte or 4-byte copy path)");
+            expect(bad_narrow == 0,
+                   tag +
+                       ": staged scratch slots differ from the bank (16-byte or 4-byte copy path)");
             int bad_stage = 0;
             for (int i = 0; i < T * H; ++i) bad_stage += std::memcmp(&zf[i], &sf[i], 4) != 0;
-            expect(bad_stage == 0, tag + ": staged share differs from zero-copy in " + std::to_string(bad_stage) + " outputs");
+            expect(bad_stage == 0, tag + ": staged share differs from zero-copy in " +
+                                       std::to_string(bad_stage) + " outputs");
             std::vector<std::int32_t> host_ids(ids);
             for (auto& e : host_ids)
-                if (e >= 0 && (table[e] >= 0 || std::find(picked.begin(), picked.end(), e) != picked.end())) e = -1;
-            const bool any = std::any_of(host_ids.begin(), host_ids.end(), [](int e) { return e >= 0; });
+                if (e >= 0 &&
+                    (table[e] >= 0 || std::find(picked.begin(), picked.end(), e) != picked.end()))
+                    e = -1;
+            const bool any =
+                std::any_of(host_ids.begin(), host_ids.end(), [](int e) { return e >= 0; });
             if (any) {
                 const HostMoeJob job{T, K, x.data(), host_ids.data(), alpha.data(), p.data()};
                 ex.run(layer, job);
@@ -573,7 +642,8 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
                 if (any) v += p[i];
                 bad_sum += std::memcmp(&v, &yf[i], 4) != 0;
             }
-            expect(bad_sum == 0, tag + ": y != y0 + device + host partial in " + std::to_string(bad_sum) + " outputs");
+            expect(bad_sum == 0, tag + ": y != y0 + device + host partial in " +
+                                     std::to_string(bad_sum) + " outputs");
 
             // FP64 oracle per side and for the sum of both.
             std::vector<double> ref_dev(static_cast<std::size_t>(T) * H, 0.0), ref_host(ref_dev);
@@ -591,33 +661,40 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
             if (!picked.empty()) {
                 const double e = rel_l2(got_dev, ref_dev);
                 worst_dev      = std::max(worst_dev, e);
-                expect(e <= 0.18, tag + ": device share rel L2 vs FP64 " + std::to_string(e) + " > 0.18");
+                expect(e <= 0.18,
+                       tag + ": device share rel L2 vs FP64 " + std::to_string(e) + " > 0.18");
             }
             if (!rest.empty()) {
                 const double e = rel_l2(got_host, ref_host);
                 worst_host     = std::max(worst_host, e);
-                expect(e <= 0.05, tag + ": host share rel L2 vs FP64 " + std::to_string(e) + " > 0.05");
+                expect(e <= 0.05,
+                       tag + ": host share rel L2 vs FP64 " + std::to_string(e) + " > 0.05");
             }
             if (!miss.empty()) {
                 const double e = rel_l2(got_sum, ref_sum);
                 worst_sum      = std::max(worst_sum, e);
-                expect(e <= 0.18, tag + ": split sum rel L2 vs FP64 " + std::to_string(e) + " > 0.18");
+                expect(e <= 0.18,
+                       tag + ": split sum rel L2 vs FP64 " + std::to_string(e) + " > 0.18");
             }
             ++checked;
             device_experts += g;
             host_experts += static_cast<int>(rest.size());
-            std::printf("  %-12s replay %d: misses %zu (columns", c.name.c_str(), replay, miss.size());
+            std::printf("  %-12s replay %d: misses %zu (columns", c.name.c_str(), replay,
+                        miss.size());
             for (int v : cols) std::printf(" %d", v);
             std::printf(") -> device %d, host %zu\n", g, rest.size());
         }
     }
-    std::printf("miss split: %d calls, device %d / host %d experts; selection, complement and staged==zero-copy "
-                "exact (16- and 4-byte copy paths); rel L2 vs FP64 worst device %.4f (<= 0.18), host %.4f (<= 0.05), sum %.4f (<= 0.18)\n",
+    std::printf("miss split: %d calls, device %d / host %d experts; selection, complement and "
+                "staged==zero-copy "
+                "exact (16- and 4-byte copy paths); rel L2 vs FP64 worst device %.4f (<= 0.18), "
+                "host %.4f (<= 0.05), sum %.4f (<= 0.18)\n",
                 checked, device_experts, host_experts, worst_dev, worst_host, worst_sum);
     CK(cudaStreamDestroy(s));
-    for (void* q : {static_cast<void*>(d13), static_cast<void*>(d2), static_cast<void*>(dyf), static_cast<void*>(dz),
-                    static_cast<void*>(ds), static_cast<void*>(dalpha), static_cast<void*>(dids),
-                    static_cast<void*>(dtable), static_cast<void*>(dreads), static_cast<void*>(dpicks),
+    for (void* q : {static_cast<void*>(d13), static_cast<void*>(d2), static_cast<void*>(dyf),
+                    static_cast<void*>(dz), static_cast<void*>(ds), static_cast<void*>(dalpha),
+                    static_cast<void*>(dids), static_cast<void*>(dtable),
+                    static_cast<void*>(dreads), static_cast<void*>(dpicks),
                     static_cast<void*>(dstage), static_cast<void*>(dident), static_cast<void*>(dx)})
         CK(cudaFree(q));
     for (auto* q : staging) CK(cudaFree(q));
@@ -631,7 +708,8 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
 
 int main() {
     int devices = 0;
-    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 || !host_avx512_vnni_supported()) {
+    if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
+        !host_avx512_vnni_supported()) {
         std::printf("SKIP: needs a CUDA device and AVX-512 VNNI\n");
         return 77;
     }
@@ -643,15 +721,18 @@ int main() {
     for (int l = 0; l < L; ++l) layers.push_back(l % 2 ? b.layer() : a.layer());
 
     HostMoeMailboxConfig cfg;
-    cfg.device = 0, cfg.layers = L, cfg.max_tokens = 8, cfg.top_k = K, cfg.hidden = H, cfg.intermediate = I;
+    cfg.device = 0, cfg.layers = L, cfg.max_tokens = 8, cfg.top_k = K, cfg.hidden = H,
+    cfg.intermediate   = I;
     cfg.cpus           = spread_cpus(6);
     cfg.trace_capacity = 1024;
-    cfg.executor.a4    = false; // the shares are checked against the W4A8 reference (A4 is the default since v0.2.1)
+    cfg.executor.a4 =
+        false; // the shares are checked against the W4A8 reference (A4 is the default since v0.2.1)
 
     // Host reference executor on its own pool (the mailbox's service thread owns the first cpus).
     const auto ref_cpus = std::vector<int>(cfg.cpus.begin() + 3, cfg.cpus.end());
 
-    const std::size_t nx = static_cast<std::size_t>(L) * T * H, nr = static_cast<std::size_t>(L) * T * K;
+    const std::size_t nx = static_cast<std::size_t>(L) * T * H,
+                      nr = static_cast<std::size_t>(L) * T * K;
     std::vector<std::uint16_t> x(nx), y0(nx);
     std::normal_distribution<float> normal(0.0F, 1.0F);
     for (auto& v : x) v = to_bf16(normal(rng));
@@ -678,7 +759,8 @@ int main() {
         cudaGraphExec_t exec;
         CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
         for (int l = 0; l < L; ++l) {
-            const std::size_t ox = static_cast<std::size_t>(l) * T * H, orr = static_cast<std::size_t>(l) * T * K;
+            const std::size_t ox  = static_cast<std::size_t>(l) * T * H,
+                              orr = static_cast<std::size_t>(l) * T * K;
             mailbox.publish(s, l, T, dx + ox, dids + orr, dalpha + orr, dslot + orr);
             busy_kernel<<<1, 32, 0, s>>>(20000);
             mailbox.accumulate(s, l, T, dy + ox);
@@ -704,37 +786,45 @@ int main() {
             expect(!mailbox.failed(), "mailbox failed: " + mailbox.error());
             CK(cudaMemcpy(y.data(), dy, nx * 2, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(yf.data(), dyf, nx * 4, cudaMemcpyDeviceToHost));
-            expect(mailbox.trace().size() == static_cast<std::size_t>(L), "one trace record per layer");
+            expect(mailbox.trace().size() == static_cast<std::size_t>(L),
+                   "one trace record per layer");
 
             // Reference partials (pool built on this thread for the comparison only).
             HostCpuPool pool(ref_cpus);
             HostMoeExecutor ex(pool, H, I, 8, K, w4a8_options());
             for (int l = 0; l < L; ++l) {
-                const std::size_t ox = static_cast<std::size_t>(l) * T * H, orr = static_cast<std::size_t>(l) * T * K;
-                std::vector<std::int32_t> host_ids(r.ids.begin() + orr, r.ids.begin() + orr + T * K);
+                const std::size_t ox  = static_cast<std::size_t>(l) * T * H,
+                                  orr = static_cast<std::size_t>(l) * T * K;
+                std::vector<std::int32_t> host_ids(r.ids.begin() + orr,
+                                                   r.ids.begin() + orr + T * K);
                 bool any = false;
                 for (int i = 0; i < T * K; ++i) {
                     if (r.slot[orr + i] >= 0) host_ids[i] = -1;
                     any = any || host_ids[i] >= 0;
                 }
                 expect(l != 0 || !any, "layer 0 is all-device");
-                const HostMoeJob job{T, K, x.data() + ox, host_ids.data(), r.alpha.data() + orr, p.data()};
+                const HostMoeJob job{
+                    T, K, x.data() + ox, host_ids.data(), r.alpha.data() + orr, p.data()};
                 ex.run(layers[l], job);
                 int bad = 0, badf = 0;
                 for (int i = 0; i < T * H; ++i) {
-                    const std::uint16_t want = any ? to_bf16(from_bf16(y0[ox + i]) + p[i]) : y0[ox + i];
-                    const float wantf        = any ? y0f[ox + i] + p[i] : y0f[ox + i];
+                    const std::uint16_t want =
+                        any ? to_bf16(from_bf16(y0[ox + i]) + p[i]) : y0[ox + i];
+                    const float wantf = any ? y0f[ox + i] + p[i] : y0f[ox + i];
                     bad += y[ox + i] != want;
                     badf += yf[ox + i] != wantf;
                 }
                 compared += T * H;
-                expect(bad == 0, "replay " + std::to_string(replay) + " layer " + std::to_string(l) + ": " +
-                                     std::to_string(bad) + " bf16 mismatches");
-                expect(badf == 0, "replay " + std::to_string(replay) + " layer " + std::to_string(l) + ": " +
-                                      std::to_string(badf) + " fp32 mismatches");
+                expect(bad == 0, "replay " + std::to_string(replay) + " layer " +
+                                     std::to_string(l) + ": " + std::to_string(bad) +
+                                     " bf16 mismatches");
+                expect(badf == 0, "replay " + std::to_string(replay) + " layer " +
+                                      std::to_string(l) + ": " + std::to_string(badf) +
+                                      " fp32 mismatches");
             }
         }
-        std::printf("graph: %d layers x 4 replays, %d outputs compared bit-exact (bf16 and fp32)\n", L, compared);
+        std::printf("graph: %d layers x 4 replays, %d outputs compared bit-exact (bf16 and fp32)\n",
+                    L, compared);
 
         // Failure path: an out-of-range id makes the executor throw inside the service.
         Routing r = route(L, T, K, E, rng, false);
@@ -749,10 +839,12 @@ int main() {
         CK(cudaMemcpy(y.data(), dy, nx * 2, cudaMemcpyDeviceToHost));
         int touched = 0;
         for (std::size_t i = 2 * T * H; i < nx; ++i) touched += y[i] != y0[i];
-        expect(touched == 0, "after the failure no partial is added (" + std::to_string(touched) + " changed)");
+        expect(touched == 0,
+               "after the failure no partial is added (" + std::to_string(touched) + " changed)");
         CK(cudaGraphLaunch(exec, s)); // a failed mailbox keeps answering
         CK(cudaStreamSynchronize(s));
-        std::printf("failure path: graph completed, failed() = %d (%s)\n", mailbox.failed(), mailbox.error().c_str());
+        std::printf("failure path: graph completed, failed() = %d (%s)\n", mailbox.failed(),
+                    mailbox.error().c_str());
         CK(cudaGraphExecDestroy(exec));
         CK(cudaGraphDestroy(graph));
         CK(cudaStreamDestroy(s));

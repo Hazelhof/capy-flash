@@ -105,9 +105,7 @@ def read_events(path: Path) -> list[dict[str, Any]]:
 
 def protocol_events(events: list[dict[str, Any]], event: str, protocol: str) -> list[dict[str, Any]]:
     return [
-        item
-        for item in events
-        if item.get("event") == event and item.get("request", {}).get("protocol") == protocol
+        item for item in events if item.get("event") == event and item.get("request", {}).get("protocol") == protocol
     ]
 
 
@@ -130,15 +128,11 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         chat_payload(model, fixture, "reset_messages"),
         chat_payload(model, fixture, "second_tool_messages"),
     ]
-    chat_responses = [
-        request_json(base_url, "POST", "/v1/chat/completions", payload)
-        for payload in chat_payloads
-    ]
+    chat_responses = [request_json(base_url, "POST", "/v1/chat/completions", payload) for payload in chat_payloads]
     for response in chat_responses:
         chat_choice(response)
         completed = response.get("usage", {}).get("completion_tokens")
-        require(isinstance(completed, int) and 0 < completed <= 16,
-                "tool-loop request did not honor its output budget")
+        require(isinstance(completed, int) and 0 < completed <= 16, "tool-loop request did not honor its output budget")
 
     closed_messages = [
         *fixture["chat"]["second_tool_messages"],
@@ -147,14 +141,10 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     closed_payload = chat_payload(model, fixture, "second_tool_messages")
     closed_payload["messages"] = closed_messages
     closed_payload["chat_template_kwargs"] = {"preserve_thinking": False}
-    closed_without_thinking = request_json(
-        base_url, "POST", "/v1/chat/completions", closed_payload
-    )
+    closed_without_thinking = request_json(base_url, "POST", "/v1/chat/completions", closed_payload)
     preserved_payload = dict(closed_payload)
     preserved_payload["chat_template_kwargs"] = {"preserve_thinking": True}
-    closed_with_thinking = request_json(
-        base_url, "POST", "/v1/chat/completions", preserved_payload
-    )
+    closed_with_thinking = request_json(base_url, "POST", "/v1/chat/completions", preserved_payload)
     stripped_prompt_tokens = chat_prompt_tokens(closed_without_thinking)
     preserved_prompt_tokens = chat_prompt_tokens(closed_with_thinking)
     require(
@@ -172,9 +162,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     parent_id = parent.get("id")
     require(isinstance(parent_id, str) and parent_id, "Responses parent id is invalid")
 
-    inherited_payload = response_payload(
-        model, responses_fixture["inherited_child_input"], None
-    )
+    inherited_payload = response_payload(model, responses_fixture["inherited_child_input"], None)
     inherited_payload["previous_response_id"] = parent_id
     request_json(base_url, "POST", "/v1/responses", inherited_payload)
 
@@ -193,9 +181,13 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     second_restore = chat_done[2]["result"].get("prefix_cache_hit_tokens")
     for index, frontier in ((1, first_restore), (2, second_restore)):
         prompt_tokens = chat_done[index]["result"].get("prompt_tokens")
-        require(isinstance(frontier, int) and isinstance(prompt_tokens, int)
-                and 0 < frontier <= prompt_tokens and paths[index] != "root",
-                "tool-loop request did not reuse a valid compatible prefix")
+        require(
+            isinstance(frontier, int)
+            and isinstance(prompt_tokens, int)
+            and 0 < frontier <= prompt_tokens
+            and paths[index] != "root",
+            "tool-loop request did not reuse a valid compatible prefix",
+        )
     for index in (1, 2):
         speculative = chat_done[index].get("speculative", {})
         require(speculative.get("backend") == backend, "request used the wrong speculative backend")
@@ -204,10 +196,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     chat_start = protocol_events(events, "request_start", "openai_chat_completions")
     require(
         len(chat_start) == 7
-        and all(
-            item.get("request", {}).get("preserve_thinking") is False
-            for item in chat_start[:6]
-        )
+        and all(item.get("request", {}).get("preserve_thinking") is False for item in chat_start[:6])
         and chat_start[6].get("request", {}).get("preserve_thinking") is True,
         "Chat requests did not resolve preserve_thinking consistently",
     )
@@ -227,9 +216,7 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
     )
     responses_done = protocol_events(events, "request_done", "openai_responses")
     require(len(responses_done) == 3, "expected three Responses request_done events")
-    response_paths = [
-        item.get("result", {}).get("prefix_reuse_path") for item in responses_done
-    ]
+    response_paths = [item.get("result", {}).get("prefix_reuse_path") for item in responses_done]
     require(
         response_paths[0] == "root"
         and response_paths[1] != "root"
@@ -241,9 +228,10 @@ def exercise(base_url: str, fixture: dict[str, Any], log_path: Path, backend: st
         result = item.get("result", {})
         frontier = result.get("prefix_cache_hit_tokens")
         prompt_tokens = result.get("prompt_tokens")
-        require(isinstance(frontier, int) and isinstance(prompt_tokens, int)
-                and 0 <= frontier <= prompt_tokens,
-                "Responses request reported an invalid compatible frontier")
+        require(
+            isinstance(frontier, int) and isinstance(prompt_tokens, int) and 0 <= frontier <= prompt_tokens,
+            "Responses request reported an invalid compatible frontier",
+        )
 
     return {
         "backend": backend,

@@ -261,6 +261,61 @@ std::uint32_t DeviceKVPagePool::allocated_extent() const noexcept {
     return 0;
 }
 
+std::uint32_t DeviceKVPagePool::relocate_lower(std::span<DeviceKVPageLease* const> leases,
+                                               cudaStream_t stream) {
+    struct Move {
+        std::int32_t source      = 0;
+        std::int32_t destination = 0;
+    };
+
+    std::vector<Move> moves;
+    std::vector<DeviceKVPageLease*> moved;
+    moves.reserve(leases.size());
+    moved.reserve(leases.size());
+    for (DeviceKVPageLease* lease : leases) {
+        if (lease == nullptr || !lease->belongs_to(*this) || !valid_handle(lease->handle())) {
+            throw std::invalid_argument("Paged KV relocation lease is stale");
+        }
+        if (free_page_runs_.empty() || free_page_runs_.front().begin >= lease->index_) { continue; }
+        // Every destination is taken before any source is returned, so no copy reads a page
+        // that another one of this batch writes.
+        FreePageRun& run               = free_page_runs_.front();
+        const std::int32_t destination = run.begin++;
+        if (--run.count == 0) { free_page_runs_.erase(free_page_runs_.begin()); }
+        page_allocated_[static_cast<std::size_t>(destination)] = true;
+        ++allocated_pages_;
+        moves.push_back(Move{.source = lease->index_, .destination = destination});
+        moved.push_back(lease);
+    }
+    if (moves.empty()) { return 0; }
+    // One copy per plane for every run that is contiguous on both sides.
+    std::vector<Move> ordered = moves;
+    std::sort(ordered.begin(), ordered.end(),
+              [](const Move& a, const Move& b) { return a.source < b.source; });
+    for (std::size_t begin = 0; begin < ordered.size();) {
+        std::size_t end = begin + 1;
+        while (end < ordered.size() && ordered[end].source == ordered[end - 1].source + 1 &&
+               ordered[end].destination == ordered[end - 1].destination + 1) {
+            ++end;
+        }
+        const auto count = static_cast<std::int32_t>(end - begin);
+        copy_run(ordered[begin].source, ordered[begin].destination, stream, count);
+        if (mirror_ != nullptr) {
+            const ScopedCurrentDevice scope(mirror_where_.device);
+            mirror_->copy_run(ordered[begin].source, ordered[begin].destination,
+                              mirror_where_.stream, count);
+        }
+        begin = end;
+    }
+    for (std::size_t index = 0; index < moves.size(); ++index) {
+        const std::int32_t destination = moves[index].destination;
+        // Move-assignment returns the old page to the free runs.
+        *moved[index] = DeviceKVPageLease(*this, destination,
+                                          page_generations_[static_cast<std::size_t>(destination)]);
+    }
+    return static_cast<std::uint32_t>(moves.size());
+}
+
 void DeviceKVPagePool::require_backed(std::uint32_t pages) {
     if (pages <= backed_pages_) { return; }
     if (!grow_backing_) { throw std::logic_error("Paged KV page is not backed"); }
@@ -916,8 +971,8 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
     if (mirror_ != nullptr) {
         // Same row, same logical range, same physical indices: the mirror pool's pages are
         // allocated by this pool's bookkeeping, so its addressing must be byte-identical.
-        Tensor mirror_row        = mirror_->block_tables_.slice(1, row_handle.row_, 1)
-                                       .view({static_cast<std::int32_t>(logical_page_capacity())});
+        Tensor mirror_row = mirror_->block_tables_.slice(1, row_handle.row_, 1)
+                                .view({static_cast<std::int32_t>(logical_page_capacity())});
         auto* mirror_destination = static_cast<std::int32_t*>(mirror_row.data) + logical_begin;
         const ScopedCurrentDevice scope(mirror_where_.device);
         CUDA_CHECK(cudaMemcpyAsync(mirror_destination, indices.data(), indices.size_bytes(),

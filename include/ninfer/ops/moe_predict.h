@@ -10,7 +10,8 @@
 namespace ninfer::ops {
 
 // Router-ahead prediction of the routed experts of the next Qwen4Exp (Qwen3.8-Flash-Next) MoE
-// layer, for expert prefetch (predictor `post_uni` of T19, prefetch T25; see docs/capy-flash/development-log.md).
+// layer, for expert prefetch (predictor `post_uni` of T19, prefetch T25; see
+// docs/capy-flash/development-log.md).
 
 inline constexpr std::int32_t kMoePredictHidden        = 2560;
 inline constexpr std::int32_t kMoePredictStreams       = 4;

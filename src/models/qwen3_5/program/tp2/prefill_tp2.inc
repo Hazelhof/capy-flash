@@ -32,7 +32,8 @@ void project_split_output_head(PrefillContext& state, const Tensor& hidden, Tens
                            *tp.events);
         } else {
             CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, tp.events->inputs_ready(0), 0));
-            CUDA_CHECK(::ninfer::memcpy_device_async(rank1_hidden.data, rank0_hidden.data, rank1_hidden.bytes(), rank1.stream));
+            CUDA_CHECK(::ninfer::memcpy_device_async(rank1_hidden.data, rank0_hidden.data,
+                                                     rank1_hidden.bytes(), rank1.stream));
         }
     }
     const auto part0 =

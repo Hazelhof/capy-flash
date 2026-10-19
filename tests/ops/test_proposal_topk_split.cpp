@@ -85,12 +85,12 @@ struct SplitBuffers {
             candidates[r].emplace(packed);
             staging[r].emplace(packed);
             candidates[r]->fill(0x7f);
-            ids_t[r]        = Tensor(ids[r]->data(), DType::I32, {kTopK, columns});
-            scores_t[r]     = Tensor(scores[r]->data(), DType::FP32, {kTopK, columns});
-            candidates_t[r] = Tensor(candidates[r]->data(), DType::BF16,
-                                     {ops::kTopKSplitCandidateRows, columns});
-            staging_t[r]    = Tensor(staging[r]->data(), DType::BF16,
-                                     {ops::kTopKSplitCandidateRows, columns});
+            ids_t[r]    = Tensor(ids[r]->data(), DType::I32, {kTopK, columns});
+            scores_t[r] = Tensor(scores[r]->data(), DType::FP32, {kTopK, columns});
+            candidates_t[r] =
+                Tensor(candidates[r]->data(), DType::BF16, {ops::kTopKSplitCandidateRows, columns});
+            staging_t[r] =
+                Tensor(staging[r]->data(), DType::BF16, {ops::kTopKSplitCandidateRows, columns});
         }
         set_device(ec, 0);
         merged_ids.emplace(count * kTopK * sizeof(std::int32_t));
@@ -134,13 +134,11 @@ void issue_exchange(const ExecutionContext& ec, const ops::PeerEvents& events, S
     for (int rank = 0; rank < 2; ++rank) {
         const auto r = static_cast<std::size_t>(rank);
         set_device(ec, rank);
-        ops::topk_split_pack(b.ids_t[r], b.scores_t[r], rank, b.candidates_t[r],
-                             ec.dev[r]->stream);
+        ops::topk_split_pack(b.ids_t[r], b.scores_t[r], rank, b.candidates_t[r], ec.dev[r]->stream);
     }
     ops::allreduce_sum(b.candidates_t, b.staging_t, ec, events);
     set_device(ec, 0);
-    ops::topk_split_merge(b.candidates_t[0], b.merged_ids_t, b.merged_scores_t,
-                          ec.dev[0]->stream);
+    ops::topk_split_merge(b.candidates_t[0], b.merged_ids_t, b.merged_scores_t, ec.dev[0]->stream);
 }
 
 int verify_result(const std::string& label, const SplitBuffers::Result& got,
@@ -204,8 +202,9 @@ int run_head(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
     constexpr std::uint32_t kSeed = 811U;
     int failures                  = 0;
     const qw::PackedWeight parent = make_weight(kQType, kRows, kHidden, kSeed, 0, 0);
-    const std::array<qw::PackedWeight, 2> half{make_weight(kQType, kHalf, kHidden, kSeed, 0, 0),
-                                               make_weight(kQType, kHalf, kHidden, kSeed, kHalf, 0)};
+    const std::array<qw::PackedWeight, 2> half{
+        make_weight(kQType, kHalf, kHidden, kSeed, 0, 0),
+        make_weight(kQType, kHalf, kHidden, kSeed, kHalf, 0)};
     // Distinct global ids in [0, kValidRows), shuffled so that the rows' order and the ids' differ.
     std::vector<std::int32_t> map(kValidRows);
     std::iota(map.begin(), map.end(), 0);
@@ -259,8 +258,8 @@ int run_head(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
                              ec.dev[0]->stream);
             cuda_check(cudaStreamSynchronize(ec.dev[0]->stream), "cudaStreamSynchronize");
             const auto count = static_cast<std::size_t>(columns) * kTopK;
-            expected = {from_device<std::int32_t>(ids.data(), count),
-                        from_device<std::uint32_t>(scores.data(), count)};
+            expected         = {from_device<std::int32_t>(ids.data(), count),
+                                from_device<std::uint32_t>(scores.data(), count)};
         }
         std::array<std::optional<WorkspaceArena>, 2> arena;
         for (std::size_t rank = 0; rank < 2; ++rank) {
@@ -273,7 +272,9 @@ int run_head(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
             // How many of the whole head's winners sit in rank 1's block (the map's second half).
             std::vector<char> in_rank1(kValidRows, 0);
             for (const auto id : half_map[1]) { in_rank1[static_cast<std::size_t>(id)] = 1; }
-            for (const auto id : expected.ids) { from_rank1 += in_rank1[static_cast<std::size_t>(id)]; }
+            for (const auto id : expected.ids) {
+                from_rank1 += in_rank1[static_cast<std::size_t>(id)];
+            }
         }
         std::cout << "  " << label << ": " << from_rank1 << "/" << columns * kTopK
                   << " winners from rank 1's block\n";
@@ -295,21 +296,25 @@ int run_planted(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
     struct Column {
         std::array<std::vector<std::pair<float, std::int32_t>>, 2> lists; // descending per rank
     };
+
     std::vector<Column> cases;
     const auto list = [](float top, float step, std::int32_t id0, std::int32_t id_step) {
         std::vector<std::pair<float, std::int32_t>> out;
         for (int i = 0; i < kTopK; ++i) { out.emplace_back(top - step * i, id0 + id_step * i); }
         return out;
     };
-    cases.push_back({{list(9.0F, 0.5F, 100, 1), list(9.0F, 0.5F, 50, 1)}});   // equal scores, rank 1 ids lower
-    cases.push_back({{list(9.0F, 0.5F, 50, 1), list(9.0F, 0.5F, 100, 1)}});   // equal scores, rank 0 ids lower
-    cases.push_back({{list(1.0F, 0.1F, 7, 3), list(20.0F, 0.1F, 900, 3)}});   // all of rank 1 wins
-    cases.push_back({{list(20.0F, 0.1F, 900, 3), list(1.0F, 0.1F, 7, 3)}});   // all of rank 0 wins
-    cases.push_back({{list(0.0F, 0.25F, 10, 2), list(0.25F, 0.25F, 11, 2)}}); // interleaved around 0
+    cases.push_back(
+        {{list(9.0F, 0.5F, 100, 1), list(9.0F, 0.5F, 50, 1)}}); // equal scores, rank 1 ids lower
+    cases.push_back(
+        {{list(9.0F, 0.5F, 50, 1), list(9.0F, 0.5F, 100, 1)}}); // equal scores, rank 0 ids lower
+    cases.push_back({{list(1.0F, 0.1F, 7, 3), list(20.0F, 0.1F, 900, 3)}}); // all of rank 1 wins
+    cases.push_back({{list(20.0F, 0.1F, 900, 3), list(1.0F, 0.1F, 7, 3)}}); // all of rank 0 wins
+    cases.push_back(
+        {{list(0.0F, 0.25F, 10, 2), list(0.25F, 0.25F, 11, 2)}}); // interleaved around 0
     {
         Column c{{list(3.0F, 1.0F, 400, 1), list(3.0F, 1.0F, 300, 1)}};
-        c.lists[0][3] = {-0.0F, 7};   // -0 and +0 are one score: the lower id first
-        c.lists[1][3] = {0.0F, 6};
+        c.lists[0][3]  = {-0.0F, 7}; // -0 and +0 are one score: the lower id first
+        c.lists[1][3]  = {0.0F, 6};
         c.lists[0][15] = {-1e30F, INT_MAX}; // the sentinel sorts below every finite key
         cases.push_back(c);
     }
@@ -344,24 +349,20 @@ int run_planted(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
         ids_device[r]    = to_device(ids[r]);
         scores_device[r] = to_device(scores[r]);
     }
-    return check_exchange("planted", ec, mailbox, columns, expected,
-                          [&](SplitBuffers& b, const ops::PeerEvents*) {
-                              for (int rank = 0; rank < 2; ++rank) {
-                                  const auto r = static_cast<std::size_t>(rank);
-                                  set_device(ec, rank);
-                                  cuda_check(cudaMemcpyAsync(b.ids_t[r].data, ids_device[r].p,
-                                                             b.ids_t[r].bytes(),
-                                                             cudaMemcpyDeviceToDevice,
-                                                             ec.dev[r]->stream),
-                                             "cudaMemcpyAsync");
-                                  cuda_check(cudaMemcpyAsync(b.scores_t[r].data,
-                                                             scores_device[r].p,
-                                                             b.scores_t[r].bytes(),
-                                                             cudaMemcpyDeviceToDevice,
-                                                             ec.dev[r]->stream),
-                                             "cudaMemcpyAsync");
-                              }
-                          });
+    return check_exchange(
+        "planted", ec, mailbox, columns, expected, [&](SplitBuffers& b, const ops::PeerEvents*) {
+            for (int rank = 0; rank < 2; ++rank) {
+                const auto r = static_cast<std::size_t>(rank);
+                set_device(ec, rank);
+                cuda_check(cudaMemcpyAsync(b.ids_t[r].data, ids_device[r].p, b.ids_t[r].bytes(),
+                                           cudaMemcpyDeviceToDevice, ec.dev[r]->stream),
+                           "cudaMemcpyAsync");
+                cuda_check(cudaMemcpyAsync(b.scores_t[r].data, scores_device[r].p,
+                                           b.scores_t[r].bytes(), cudaMemcpyDeviceToDevice,
+                                           ec.dev[r]->stream),
+                           "cudaMemcpyAsync");
+            }
+        });
 }
 
 int verify_registry() {

@@ -1,15 +1,15 @@
 // Qwen4Exp (Qwen3.8-Flash-Next) at tensor-parallel width 2 through the public Engine, against the
 // same artifact at tp 1. Needs NINFER_TEST_QWEN4_ARTIFACT (a Qwen4Exp artifact; the synthetic
-// 4-layer artifact of tools/capy_flash/make_test_artifact.sh is the intended one) and two CUDA devices; skips (77)
-// otherwise.
+// 4-layer artifact of tools/capy_flash/make_test_artifact.sh is the intended one) and two CUDA
+// devices; skips (77) otherwise.
 //
 //   1. CausalScoring of 160 pg19 tokens: per-token log-probabilities at tp 2 within the tp 1
 //      values' rounding envelope. tp 2 changes summation orders (two BF16 partial roundings of the
 //      mixer output, the FP32 MoE partials summed across ranks) and, through them, the NVFP4
 //      activation quantization of the W4A4 experts; on fn4 that measured mean |d| 0.011 and max
 //      0.039 nats (0.0145 / 0.078 with QSA selection active), both PASS against the FP64 reference
-//      (T31, docs/capy-flash/development-log.md). The bounds (mean 0.05, max 0.4) leave 3-5x margin and
-//      still catch a lost expert partition, a wrong head shard or an unsynchronized rank, which
+//      (T31, docs/capy-flash/development-log.md). The bounds (mean 0.05, max 0.4) leave 3-5x margin
+//      and still catch a lost expert partition, a wrong head shard or an unsynchronized rank, which
 //      move the near-uniform fn4 log-probabilities by far more.
 //   2. Greedy generation at tp 2 with CUDA Graphs (captured all-reduces through the pinned-host
 //      mailbox) and eager (staged copies): identical tokens. Both transports and both execution
@@ -30,20 +30,19 @@ namespace {
 // 160 pg19 tokens (Qwen tokenizer): crosses one 128-column
 // prefill chunk.
 const std::vector<ninfer::TokenId> kIds = {
-    987, 17956, 1931, 539, 81249, 28442, 321, 279, 7849, 42500, 198, 30058,
-    5961, 7659, 506, 1696, 1074, 2068, 83846, 9504, 4909, 318, 1919, 999,
-    557, 198, 8293, 1931, 494, 5167, 76409, 1801, 2420, 539, 561, 198,
-    34499, 28732, 10052, 15256, 52682, 5946, 26467, 669, 206717, 4616, 357, 177414,
-    80281, 15810, 13, 14200, 262, 1897, 206717, 4616, 357, 177414, 80281, 15810,
-    271, 262, 7466, 198, 262, 72614, 710, 4537, 49, 10369, 417, 5052,
-    50, 271, 262, 353, 43604, 6457, 8733, 7466, 198, 262, 458, 13,
-    380, 13, 5574, 1736, 271, 262, 498, 92831, 362, 60, 271, 262,
-    15689, 44762, 198, 262, 423, 13, 462, 13, 423, 1966, 95630, 594,
-    73798, 198, 262, 13578, 52067, 36693, 5370, 1358, 262, 14119, 11, 220,
-    16, 23, 24, 17, 13, 198, 262, 7466, 72614, 710, 4537, 49,
-    10369, 417, 5052, 50, 13, 14200, 262, 4981, 198, 262, 423, 1966,
-    95630, 13, 14200, 84424, 353, 13, 271, 16721, 20357, 13, 1358, 1,
-    6614, 3667, 3667, 3667,
+    987,   17956, 1931,   539,   81249, 28442,  321,   279,   7849,   42500, 198,   30058, 5961,
+    7659,  506,   1696,   1074,  2068,  83846,  9504,  4909,  318,    1919,  999,   557,   198,
+    8293,  1931,  494,    5167,  76409, 1801,   2420,  539,   561,    198,   34499, 28732, 10052,
+    15256, 52682, 5946,   26467, 669,   206717, 4616,  357,   177414, 80281, 15810, 13,    14200,
+    262,   1897,  206717, 4616,  357,   177414, 80281, 15810, 271,    262,   7466,  198,   262,
+    72614, 710,   4537,   49,    10369, 417,    5052,  50,    271,    262,   353,   43604, 6457,
+    8733,  7466,  198,    262,   458,   13,     380,   13,    5574,   1736,  271,   262,   498,
+    92831, 362,   60,     271,   262,   15689,  44762, 198,   262,    423,   13,    462,   13,
+    423,   1966,  95630,  594,   73798, 198,    262,   13578, 52067,  36693, 5370,  1358,  262,
+    14119, 11,    220,    16,    23,    24,     17,    13,    198,    262,   7466,  72614, 710,
+    4537,  49,    10369,  417,   5052,  50,     13,    14200, 262,    4981,  198,   262,   423,
+    1966,  95630, 13,     14200, 84424, 353,    13,    271,   16721,  20357, 13,    1358,  1,
+    6614,  3667,  3667,   3667,
 };
 
 ninfer::EngineOptions base_options(const char* artifact, int tp,
@@ -52,7 +51,9 @@ ninfer::EngineOptions base_options(const char* artifact, int tp,
     options.routed_experts.backend = experts;
     // Offload (T33): a fixed small cache, so most routes of the synthetic checkpoint (near-uniform
     // routing) run on the CPU and the device/host split is exercised on both ranks.
-    if (experts == ninfer::RoutedExpertBackend::Offload) { options.routed_experts.slots_per_layer = 24; }
+    if (experts == ninfer::RoutedExpertBackend::Offload) {
+        options.routed_experts.slots_per_layer = 24;
+    }
     options.artifact_path = artifact;
     options.kv_cache      = ninfer::KvCacheStorage::BFloat16;
     options.prefill_chunk = 128;
@@ -64,9 +65,9 @@ ninfer::EngineOptions base_options(const char* artifact, int tp,
 std::vector<float> score(const char* artifact, int tp, const std::vector<ninfer::TokenId>& ids,
                          ninfer::RoutedExpertBackend experts) {
     ninfer::EngineOptions options = base_options(artifact, tp, experts);
-    options.purpose     = ninfer::EnginePurpose::CausalScoring;
-    options.max_context = 256;
-    options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(256);
+    options.purpose               = ninfer::EnginePurpose::CausalScoring;
+    options.max_context           = 256;
+    options.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(256);
     ninfer::Engine engine(options);
     return engine.score_tokens(ids, 1);
 }

@@ -58,8 +58,8 @@ namespace {
 
 constexpr int kH = 2560, kI = 640, kK = 10, kE = 512, kRows13 = 2 * kI;
 constexpr int kHB = kH / 16, kIB = kI / 16;
-constexpr std::int64_t kSlotBytes = ops::kMoeSlotsGateUpCodeBytes +
-                                    ops::kMoeSlotsGateUpScaleBytes + ops::kMoeSlotsDownCodeBytes +
+constexpr std::int64_t kSlotBytes = ops::kMoeSlotsGateUpCodeBytes + ops::kMoeSlotsGateUpScaleBytes +
+                                    ops::kMoeSlotsDownCodeBytes +
                                     ops::kMoeSlotsDownScaleBytes; // 2 764 800
 
 // W4A4 vs the unquantized FP64 oracle. Two NVFP4 activation quantizations in series (x before
@@ -83,8 +83,10 @@ const float kE2M1[16] = {0.F,  0.5F,  1.F,  1.5F,  2.F,  3.F,  4.F,  6.F,
 float e4m3_decode(std::uint8_t c) {
     const int sign = c >> 7, e = (c >> 3) & 15, m = c & 7;
     float v = 0.F;
-    if (e == 0) v = static_cast<float>(m) * std::ldexp(1.0F, -9);
-    else v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
+    if (e == 0)
+        v = static_cast<float>(m) * std::ldexp(1.0F, -9);
+    else
+        v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
     return sign ? -v : v;
 }
 
@@ -93,8 +95,8 @@ float e4m3_rn(float v) {
     if (!(v > 0.0F)) return 0.0F;
     if (v >= 448.0F) return 448.0F;
     int ex = 0;
-    std::frexp(v, &ex);                                // v = f * 2^ex, f in [0.5,1)
-    const int exponent = std::max(ex - 1, -6);         // subnormal step below 2^-6
+    std::frexp(v, &ex);                        // v = f * 2^ex, f in [0.5,1)
+    const int exponent = std::max(ex - 1, -6); // subnormal step below 2^-6
     const float step   = std::ldexp(1.0F, exponent - 3);
     return std::min(std::nearbyint(v / step) * step, 448.0F);
 }
@@ -102,8 +104,8 @@ float e4m3_rn(float v) {
 // E2M1 round-to-nearest-even (ties to the even code), satfinite.
 float e2m1_rn(float v) {
     static const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
-    const float a = std::fabs(v);
-    float r       = 6.0F;
+    const float a              = std::fabs(v);
+    float r                    = 6.0F;
     for (int i = 0; i < 7; ++i) {
         if (a > grid[i + 1]) continue;
         const float mid = 0.5F * (grid[i] + grid[i + 1]);
@@ -185,8 +187,8 @@ void decode(const std::vector<std::uint8_t>& codes, const std::vector<std::uint8
 }
 
 struct Model {
-    std::vector<int> ids;          // materialized expert ids
-    std::vector<int> index_of;     // [512] -> index in experts or -1
+    std::vector<int> ids;      // materialized expert ids
+    std::vector<int> index_of; // [512] -> index in experts or -1
     std::vector<Expert> experts;
     std::vector<float> div13, div2; // [2E], [E]
 };
@@ -268,7 +270,7 @@ DevicePool make_pool(const Model& m, const std::vector<std::vector<int>>& placem
     DevicePool d;
     d.memory = DeviceBuffer(total);
     d.memory.copy_from_host(host.data(), total);
-    auto* dev = static_cast<std::uint8_t*>(d.memory.p);
+    auto* dev             = static_cast<std::uint8_t*>(d.memory.p);
     d.pool.gate_up_codes  = {dev + base[0], stride[0]};
     d.pool.gate_up_scales = {dev + base[1], stride[1]};
     d.pool.down_codes     = {dev + base[2], stride[2]};
@@ -458,8 +460,8 @@ double relative_l2(const std::vector<double>& got, const std::vector<double>& re
     return den > 0 ? std::sqrt(num / den) : std::sqrt(num);
 }
 
-
-// ---- two-device partition -------------------------------------------------------------------------
+// ---- two-device partition
+// -------------------------------------------------------------------------
 
 constexpr int kRanks = 2;
 
@@ -517,24 +519,25 @@ std::unique_ptr<RankState> make_rank(const Model& m, int rank, bool whole) {
         std::vector<std::vector<int>> all(m.ids.size());
         for (std::size_t i = 0; i < all.size(); ++i) { all[i] = {static_cast<int>(i)}; }
         s->resident_slots = static_cast<int>(m.ids.size());
-        s->resident = make_pool(m, all, s->resident_slots, Layout::Planar, 91U);
-        table_r     = table_from(m, all);
+        s->resident       = make_pool(m, all, s->resident_slots, Layout::Planar, 91U);
+        table_r           = table_from(m, all);
     } else {
         const auto pr = partition_placement(m, rank, true, s->resident_slots);
         const auto pm = partition_placement(m, rank, false, s->missing_slots);
         // Contiguous slots in the cache pool (ninfer-ext's layout), planar for the CPU stand-in;
         // a few spare slots of garbage in each.
         s->resident = make_pool(m, pr, s->resident_slots + 3, Layout::Contiguous, 93U + rank);
-        s->missing  = make_pool(m, pm, std::max(s->missing_slots, 1) + 2, Layout::Planar, 95U + rank);
-        table_r     = table_from(m, pr);
-        table_m     = table_from(m, pm);
+        s->missing =
+            make_pool(m, pm, std::max(s->missing_slots, 1) + 2, Layout::Planar, 95U + rank);
+        table_r = table_from(m, pr);
+        table_m = table_from(m, pm);
     }
-    s->table_resident = to_device_i32(table_r);
-    s->table_missing  = to_device_i32(whole ? std::vector<int>(kE, -1) : table_m);
+    s->table_resident       = to_device_i32(table_r);
+    s->table_missing        = to_device_i32(whole ? std::vector<int>(kE, -1) : table_m);
     const std::size_t count = static_cast<std::size_t>(ops::kMoeSlotsMaxTokens) * kH;
-    s->partial = std::make_unique<GuardedDeviceBuffer>(count * 4);
-    s->staging = std::make_unique<GuardedDeviceBuffer>(count * 4);
-    s->out     = std::make_unique<GuardedDeviceBuffer>(count * 2);
+    s->partial              = std::make_unique<GuardedDeviceBuffer>(count * 4);
+    s->staging              = std::make_unique<GuardedDeviceBuffer>(count * 4);
+    s->out                  = std::make_unique<GuardedDeviceBuffer>(count * 2);
     s->staging->fill(0);
     s->x   = DeviceBuffer(count * 2);
     s->ids = DeviceBuffer(static_cast<std::size_t>(ops::kMoeSlotsMaxTokens) * kK * 4);
@@ -587,8 +590,8 @@ Result read_result(const ExecutionContext& ec, std::array<std::unique_ptr<RankSt
     const std::size_t count = static_cast<std::size_t>(tokens) * kH;
     for (int rank = 0; rank < kRanks; ++rank) {
         set_device(ec, rank);
-        out.sum[rank]  = from_device<std::uint32_t>(r[rank]->partial->data(), count);
-        out.bf16[rank] = from_device<std::uint16_t>(r[rank]->out->data(), count);
+        out.sum[rank]                = from_device<std::uint32_t>(r[rank]->partial->data(), count);
+        out.bf16[rank]               = from_device<std::uint16_t>(r[rank]->out->data(), count);
         const std::string rank_label = label + " rank " + std::to_string(rank);
         failures += r[rank]->partial->verify_guards(rank_label + " partial");
         failures += r[rank]->staging->verify_guards(rank_label + " staging");
@@ -608,7 +611,7 @@ int check(const std::string& label, const Result& tp2, const std::vector<std::ui
     std::vector<std::uint16_t> rounded(got.size());
     for (std::size_t i = 0; i < got.size(); ++i) { rounded[i] = f32_to_bf16(got[i]); }
     failures += verify_exact((label + " bf16 == RNE(fp32 sum)").c_str(), tp2.bf16[0], rounded);
-    double worst = 0.0;
+    double worst  = 0.0;
     int ulp_diffs = 0;
     for (int t = 0; t < tokens; ++t) {
         double column_max = 0.0;
@@ -630,7 +633,8 @@ int check(const std::string& label, const Result& tp2, const std::vector<std::ui
             if (tp2.bf16[0][i] != full_bf16[i]) {
                 ++ulp_diffs;
                 const float a = bf16_to_f32(tp2.bf16[0][i]), b = bf16_to_f32(full_bf16[i]);
-                const float ulp = std::ldexp(1.0F, std::ilogb(std::max(std::fabs(a), std::fabs(b))) - 7);
+                const float ulp =
+                    std::ldexp(1.0F, std::ilogb(std::max(std::fabs(a), std::fabs(b))) - 7);
                 if (std::fabs(a - b) > ulp) {
                     std::cerr << label << ": bf16 differs by more than one ulp at " << i << '\n';
                     ++failures;
@@ -646,7 +650,8 @@ int check(const std::string& label, const Result& tp2, const std::vector<std::ui
     failures += verify_reduction(label + " recipe oracle", got_d, ref.recipe, kRecipe);
     if (expect_exact) {
         failures += verify_exact((label + " exact vs 1 GPU (fp32)").c_str(), tp2.sum[0], full_sum);
-        failures += verify_exact((label + " exact vs 1 GPU (bf16)").c_str(), tp2.bf16[0], full_bf16);
+        failures +=
+            verify_exact((label + " exact vs 1 GPU (bf16)").c_str(), tp2.bf16[0], full_bf16);
     }
     return failures;
 }
@@ -656,7 +661,7 @@ void reference_run(const ExecutionContext& ec, RankState& whole, const Call& c, 
                    std::vector<std::uint32_t>& sum, std::vector<std::uint16_t>& bf16) {
     set_device(ec, 0);
     upload_call(whole, c);
-    auto t = tensors(whole, tokens);
+    auto t              = tensors(whole, tokens);
     cudaStream_t stream = ec.dev[0]->stream;
     ops::moe_slots_nvfp4(t.x, t.ids, t.w, whole.layer(whole.table_resident, c), whole.resident.pool,
                          ops::MoeSlotsOutput::Store, t.partial, *whole.workspace, stream);
@@ -664,8 +669,8 @@ void reference_run(const ExecutionContext& ec, RankState& whole, const Call& c, 
                          ops::MoeSlotsOutput::Store, t.out, *whole.workspace, stream);
     cuda_check(cudaStreamSynchronize(stream), "reference");
     const std::size_t count = static_cast<std::size_t>(tokens) * kH;
-    sum  = from_device<std::uint32_t>(whole.partial->data(), count);
-    bf16 = from_device<std::uint16_t>(whole.out->data(), count);
+    sum                     = from_device<std::uint32_t>(whole.partial->data(), count);
+    bf16                    = from_device<std::uint16_t>(whole.out->data(), count);
 }
 
 void rank_pass(const ExecutionContext& ec, std::array<std::unique_ptr<RankState>, kRanks>& r,
@@ -717,11 +722,13 @@ int run(const ExecutionContext& ec) {
     mailbox_events.attach_mailbox(&mailbox);
 
     int failures = 0;
+
     struct Case {
         int tokens;
         std::uint32_t seed;
         bool one_rank;
     };
+
     for (const Case& k : {Case{1, 31U, false}, Case{2, 33U, false}, Case{4, 35U, false},
                           Case{8, 37U, false}, Case{4, 39U, true}, Case{1, 41U, true}}) {
         Call c  = k.one_rank ? one_rank_call(m, k.tokens, k.seed) : make_call(m, k.tokens, k.seed);

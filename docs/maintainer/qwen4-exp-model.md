@@ -309,7 +309,22 @@ state in `program/` and `state/`:
     layer per window) and issues the copies (`ExpertCache::submit_fills_unfenced`) as soon as the GPU
     has published the next layer, i.e. has left the layer whose slots are rewritten; a copied expert
     is published at the first window that begins after its copy. A prefill chunk is a prompt
-    window: its most routed experts per layer become resident (`decide_prompt`, no cap).
+    window. A prompt that continues a cached conversation (T211b: its first text chunk starts at
+    position >= half the prompt, i.e. at least half of it restored from the context cache) changes
+    neither the residency nor the decayed frequencies (`count_prompt`): on agentic turns the
+    decode after a prompt routes like the decode before it, not like the prompt. A new
+    conversation's prompt routes like its own decode: its routing counts are summed over its
+    prompt windows and applied once, when its first decode window begins
+    (`ExpertCache::apply_prompt`), by default to the decayed frequencies only, so the post-prompt
+    boost inserts the prompt's hottest experts first (`NINFER_QWEN4_PROMPT_NEW_CAP` > 0 also
+    makes that many targets per layer and GPU resident, as T69 did); copies issued during the
+    prompt would slow it (T194: TTFT 0.58 -> 0.69 s with the T69 rule). Either way the layers a prompt lends (streaming ring, borrowed workspace)
+    refill afterwards with the experts they held when lent, most recently used first.
+    `NINFER_QWEN4_PROMPT_KEEP=0` restores the T69 rule (the prompt's most routed experts per layer
+    become resident, `decide_prompt`, no cap; lent layers refill with the prompt's hottest).
+    Prompt chunks of at least `routed_experts.stream_min_tokens` tokens (`--stream-min-tokens`)
+    stream the non-resident experts over PCIe and run every routed expert on the GPU; shorter
+    chunks leave them to the CPU.
   - Slots per layer: `routed_experts.slots_per_layer`, or 0 = the device memory the rest of the
     Program leaves minus `slot_headroom_bytes` (Engine resolves it before the final plan;
     `MemorySummary::routed_expert_slots`).

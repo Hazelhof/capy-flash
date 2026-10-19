@@ -29,12 +29,8 @@ class SourceInputs(Mapping):
     def __getitem__(self, name):
         if name not in self._sources:
             if name not in self._paths:
-                raise ValueError(
-                    f"selected recipe requires source {name!r}; provide --source {name}=PATH"
-                )
-            self._sources[name] = self._stack.enter_context(
-                SafetensorsSource(self._paths[name])
-            )
+                raise ValueError(f"selected recipe requires source {name!r}; provide --source {name}=PATH")
+            self._sources[name] = self._stack.enter_context(SafetensorsSource(self._paths[name]))
         return self._sources[name]
 
     def __iter__(self):
@@ -44,9 +40,7 @@ class SourceInputs(Mapping):
         return len(set(self._sources) | set(self._paths))
 
     def provenance(self):
-        return {
-            name: {"path": str(source.path)} for name, source in self._sources.items()
-        }
+        return {name: {"path": str(source.path)} for name, source in self._sources.items()}
 
 
 def _pairs(values, label):
@@ -141,15 +135,11 @@ def main(argv=None):
     with ExitStack() as stack:
         base = stack.enter_context(SafetensorsSource(args.model))
         sources = SourceInputs(base, paths, stack)
-        companions = {
-            key: sources[key] for key in ("dflash", "dflash2") if key in components
-        }
+        companions = {key: sources[key] for key in ("dflash", "dflash2") if key in components}
         if is_qwen4_exp(base.config):
             if companions:
                 raise ValueError("Qwen4Exp has no DFlash companions")
-            model = build_qwen4_exp_model(
-                base, components=components, resource_overrides=overrides
-            )
+            model = build_qwen4_exp_model(base, components=components, resource_overrides=overrides)
         else:
             model = build_model(
                 base,
@@ -167,9 +157,9 @@ def main(argv=None):
         def progress(index, total, job):
             label = job.parameters[0]
             if len(job.parameters) > 1:
-                label += f" (+{len(job.parameters)-1})"
+                label += f" (+{len(job.parameters) - 1})"
             print(
-                f"[{index+1}/{total}] {label}: {job.spec.format} {job.spec.shape}",
+                f"[{index + 1}/{total}] {label}: {job.spec.format} {job.spec.shape}",
                 flush=True,
             )
 

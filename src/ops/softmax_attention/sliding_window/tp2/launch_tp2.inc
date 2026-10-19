@@ -17,10 +17,9 @@ void sliding_window_attention_head_block_launch(
     constexpr int KVHeads = kSlidingWindowHeadBlockKVHeads;
     const bool direct     = plan.route == SlidingWindowAttentionRoute::Direct;
     if ((plan.window != 2048 && plan.window != 4096) ||
-        context.capacity != static_cast<std::uint32_t>(plan.window) ||
-        plan.key_block != 32 || plan.reduce_warps != (plan.window == 2048 ? 4 : 1) ||
-        plan.split_capacity < 1 || plan.split_capacity > kSlidingWindowMaxSplits ||
-        (direct && plan.split_capacity != 1))
+        context.capacity != static_cast<std::uint32_t>(plan.window) || plan.key_block != 32 ||
+        plan.reduce_warps != (plan.window == 2048 ? 4 : 1) || plan.split_capacity < 1 ||
+        plan.split_capacity > kSlidingWindowMaxSplits || (direct && plan.split_capacity != 1))
         throw std::invalid_argument("sliding_window_attention head block: inconsistent plan");
     dispatch_tokens(q.ne[2], [&]<int Tokens, int Warps>() {
         constexpr int KeyBlock = 32;
@@ -43,9 +42,9 @@ void sliding_window_attention_head_block_launch(
                     static_cast<const __nv_bfloat16*>(context.k.data),
                     static_cast<const __half*>(context.v.data),
                     static_cast<int>(context.padded_capacity), plan.window - 1, plan.max_context,
-                    Direct ? 1 : plan.split_capacity, scale,
-                    static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
-                    static_cast<float*>(partial_l.data), static_cast<__nv_bfloat16*>(out.data));
+                    Direct ? 1 : plan.split_capacity, scale, static_cast<float*>(partial_acc.data),
+                    static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                    static_cast<__nv_bfloat16*>(out.data));
             CUDA_CHECK(cudaGetLastError());
         };
         if (direct) {

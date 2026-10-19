@@ -55,9 +55,9 @@ struct StateImageHostLayout {
     std::size_t ple_layer_bytes = 0;
     // At tp 2 a Host image holds rank 1's own image (its layout, its half of the GDN heads) at
     // peer_offset, after rank 0's; image_bytes covers both. Zero without a mirror.
-    std::size_t peer_offset     = 0;
-    std::size_t peer_bytes      = 0;
-    std::size_t image_bytes     = 0;
+    std::size_t peer_offset = 0;
+    std::size_t peer_bytes  = 0;
+    std::size_t image_bytes = 0;
 };
 
 struct StateImageDeviceLayout {
@@ -171,6 +171,7 @@ public:
 
     // PLE convolution states of PLE layer `layer`, BF16 [rows, slots]; requires a PLE spec.
     [[nodiscard]] Tensor ple_states(std::uint32_t layer) const;
+
     [[nodiscard]] std::uint32_t ple_layers() const noexcept {
         return ple_ ? static_cast<std::uint32_t>(ple_->ne[2]) : 0U;
     }
@@ -211,9 +212,9 @@ private:
     std::optional<CyclicKVCache> dflash_local_;
     std::optional<Tensor> ple_;
     StateImageHostLayout host_layout_;
-    StateImageDevicePool* mirror_ = nullptr;
-    int mirror_device_            = -1;
-    cudaStream_t mirror_stream_   = nullptr;
+    StateImageDevicePool* mirror_               = nullptr;
+    int mirror_device_                          = -1;
+    cudaStream_t mirror_stream_                 = nullptr;
     cudaStream_t mirror_transfer_stream_        = nullptr;
     CudaCompletionEvent* mirror_transfer_order_ = nullptr;
 };

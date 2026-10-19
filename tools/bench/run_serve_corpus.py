@@ -133,9 +133,7 @@ class CampaignError(RuntimeError):
 
 
 class ServerLogTail:
-    def __init__(
-        self, path: Path, process: subprocess.Popen[bytes], initial_offset: int
-    ) -> None:
+    def __init__(self, path: Path, process: subprocess.Popen[bytes], initial_offset: int) -> None:
         self.path = path
         self.process = process
         self.offset = initial_offset
@@ -247,9 +245,7 @@ class RunningServer:
             finally:
                 connection.close()
             if time.monotonic() >= deadline:
-                raise CampaignError(
-                    f"timed out waiting for ninfer-serve at http://{self.host}:{self.port}"
-                )
+                raise CampaignError(f"timed out waiting for ninfer-serve at http://{self.host}:{self.port}")
             time.sleep(0.2)
 
         return self.tail.wait_for(
@@ -513,9 +509,7 @@ def validate_server_start(event: dict[str, Any], spec: RunSpec, device: int) -> 
     }
     if actual != expected:
         raise CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
-    if event.get("sampling_defaults", {}).get("greedy") != (
-        spec.sampling_mode == "greedy"
-    ):
+    if event.get("sampling_defaults", {}).get("greedy") != (spec.sampling_mode == "greedy"):
         raise CampaignError("server_start sampling mode does not match the campaign")
     if Path(event.get("artifact", {}).get("path", "")).resolve() != spec.artifact.resolve():
         raise CampaignError("loaded artifact path does not match the campaign")
@@ -565,9 +559,7 @@ def build_result_record(
         "seed": request.get("sampling", {}).get("seed"),
     }
     if actual_request != expected_request:
-        raise CampaignError(
-            f"request_done does not match the submitted request: {actual_request!r}"
-        )
+        raise CampaignError(f"request_done does not match the submitted request: {actual_request!r}")
 
     try:
         prompt_tokens = int(result["prompt_tokens"])
@@ -591,9 +583,7 @@ def build_result_record(
         engine_host_exposed_seconds = float(host_exposed["total"])
         device_wait_exposed_seconds = float(engine_timing["device_wait_exposed_seconds"])
         decode_host_exposed_seconds = float(decode_engine["host_exposed_seconds"])
-        decode_device_wait_exposed_seconds = float(
-            decode_engine["device_wait_exposed_seconds"]
-        )
+        decode_device_wait_exposed_seconds = float(decode_engine["device_wait_exposed_seconds"])
         decode_rounds = int(decode_engine["rounds"])
     except (KeyError, TypeError, ValueError) as exc:
         raise CampaignError(f"request_done is missing required metrics: {exc}") from exc
@@ -605,22 +595,14 @@ def build_result_record(
         + engine_commit_output_exposed_seconds
         + engine_maintenance_exposed_seconds
     )
-    if not math.isclose(
-        host_phase_sum, engine_host_exposed_seconds, rel_tol=1.0e-12, abs_tol=1.0e-12
-    ):
+    if not math.isclose(host_phase_sum, engine_host_exposed_seconds, rel_tol=1.0e-12, abs_tol=1.0e-12):
         raise CampaignError("request_done engine Host phase total is inconsistent")
 
     if backend != spec.speculative_backend:
-        raise CampaignError(
-            f"request_done speculative backend {backend!r} != "
-            f"{spec.speculative_backend!r}"
-        )
+        raise CampaignError(f"request_done speculative backend {backend!r} != {spec.speculative_backend!r}")
 
     usage = response.get("usage", {})
-    if (
-        usage.get("prompt_tokens") != prompt_tokens
-        or usage.get("completion_tokens") != completion_tokens
-    ):
+    if usage.get("prompt_tokens") != prompt_tokens or usage.get("completion_tokens") != completion_tokens:
         raise CampaignError("HTTP response usage does not match request_done token counts")
 
     decode_tokens = max(completion_tokens - 1, 0)
@@ -660,12 +642,8 @@ def build_result_record(
         "decode_rounds": decode_rounds,
         "queue_wait_ms": queue_wait_seconds * 1000.0,
         "engine_host_exposed_ms": engine_host_exposed_seconds * 1000.0,
-        "decode_host_us_per_round": safe_ratio(
-            decode_host_exposed_seconds * 1.0e6, float(decode_rounds)
-        ),
-        "decode_device_wait_us_per_round": safe_ratio(
-            decode_device_wait_exposed_seconds * 1.0e6, float(decode_rounds)
-        ),
+        "decode_host_us_per_round": safe_ratio(decode_host_exposed_seconds * 1.0e6, float(decode_rounds)),
+        "decode_device_wait_us_per_round": safe_ratio(decode_device_wait_exposed_seconds * 1.0e6, float(decode_rounds)),
     }
     return {
         "artifact_type": RUN_ARTIFACT_TYPE,
@@ -719,9 +697,7 @@ def load_existing_records(
                 identity = (record.get("artifact_type"), record.get("schema_version"))
                 expected_identity = (RUN_ARTIFACT_TYPE, RUN_SCHEMA_VERSION)
                 if identity != expected_identity:
-                    raise CampaignError(
-                        f"{path}:{line_number}: unexpected record identity {identity!r}"
-                    )
+                    raise CampaignError(f"{path}:{line_number}: unexpected record identity {identity!r}")
                 key = record_key(record)
                 if key not in expected_specs:
                     raise CampaignError(f"{path}:{line_number}: result is outside this campaign")
@@ -729,13 +705,9 @@ def load_existing_records(
                     raise CampaignError(f"{path}:{line_number}: duplicate result for {key!r}")
                 spec = expected_specs[key]
                 if record.get("kv_dtype") != spec.kv_dtype:
-                    raise CampaignError(
-                        f"{path}:{line_number}: KV dtype differs from the current command"
-                    )
+                    raise CampaignError(f"{path}:{line_number}: KV dtype differs from the current command")
                 if Path(record.get("artifact_path", "")).resolve() != spec.artifact:
-                    raise CampaignError(
-                        f"{path}:{line_number}: artifact path differs from the current command"
-                    )
+                    raise CampaignError(f"{path}:{line_number}: artifact path differs from the current command")
                 records[key] = record
     except (OSError, json.JSONDecodeError) as exc:
         raise CampaignError(f"failed to read existing results from {path}: {exc}") from exc
@@ -834,17 +806,14 @@ def run_block(
     )
     command = server_command(serve, first, server_log, port, device)
     print(
-        f"start {first.target}/{first.speculative_mode}: "
-        f"{len(block_specs)} missing request(s)",
+        f"start {first.target}/{first.speculative_mode}: {len(block_specs)} missing request(s)",
         flush=True,
     )
     with RunningServer(command, "127.0.0.1", port, server_log) as server:
         server_start = server.wait_until_ready()
         server_instance_id, prefill_signature = validate_server_start(server_start, first, device)
 
-        connection = http.client.HTTPConnection(
-            "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
-        )
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS)
         last_request_id: int | None = None
         try:
             warmup = fixtures[WARMUP_FIXTURE]
@@ -868,8 +837,7 @@ def run_block(
                 records[spec.key] = record
                 completed = completed_before_block + block_index
                 print(
-                    f"[{completed}/{total}] {spec.target}/{spec.speculative_mode} "
-                    f"{spec.fixture.name} seed={spec.seed}",
+                    f"[{completed}/{total}] {spec.target}/{spec.speculative_mode} {spec.fixture.name} seed={spec.seed}",
                     flush=True,
                 )
         finally:
@@ -901,11 +869,7 @@ def select_records(
     sampling_mode: str,
     fixtures: Sequence[str],
 ) -> list[dict[str, Any]]:
-    return [
-        records[(target, speculative_mode, sampling_mode, fixture, seed)]
-        for fixture in fixtures
-        for seed in SEEDS
-    ]
+    return [records[(target, speculative_mode, sampling_mode, fixture, seed)] for fixture in fixtures for seed in SEEDS]
 
 
 SUMMARY_FIELDS = (
@@ -1024,9 +988,7 @@ def build_summary_rows(
                             fixture,
                             mode_name,
                             sampling_mode,
-                            select_records(
-                                records, target, mode_name, sampling_mode, (fixture,)
-                            ),
+                            select_records(records, target, mode_name, sampling_mode, (fixture,)),
                         )
                     )
                 continue
@@ -1040,9 +1002,7 @@ def build_summary_rows(
                         fixture,
                         mode_name,
                         sampling_mode,
-                        select_records(
-                            records, target, mode_name, sampling_mode, (fixture,)
-                        ),
+                        select_records(records, target, mode_name, sampling_mode, (fixture,)),
                     )
                 )
 
@@ -1056,9 +1016,7 @@ def build_summary_rows(
                             fixture,
                             mode_name,
                             sampling_mode,
-                            select_records(
-                                records, target, mode_name, sampling_mode, (fixture,)
-                            ),
+                            select_records(records, target, mode_name, sampling_mode, (fixture,)),
                         )
                     )
 
@@ -1070,9 +1028,7 @@ def build_summary_rows(
                         "",
                         mode_name,
                         sampling_mode,
-                        select_records(
-                            records, target, mode_name, sampling_mode, fixture_names
-                        ),
+                        select_records(records, target, mode_name, sampling_mode, fixture_names),
                     )
                 )
     return rows
@@ -1125,24 +1081,16 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(
-            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
-        )
+        writer.writerows({field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows)
 
     sections: list[str] = []
     mode_names = list(dict.fromkeys(str(row["speculative_mode"]) for row in rows))
     for mode_name in mode_names:
         label = mode_display_name(mode_name)
         mode_rows = [row for row in rows if row["speculative_mode"] == mode_name]
-        context_rows = [
-            row for row in mode_rows if row["section"] == "context_profile"
-        ]
-        long_decode_rows = [
-            row for row in mode_rows if row["section"] == "long_decode"
-        ]
-        category_rows = [
-            row for row in mode_rows if row["section"] == "scenario_category"
-        ]
+        context_rows = [row for row in mode_rows if row["section"] == "context_profile"]
+        long_decode_rows = [row for row in mode_rows if row["section"] == "long_decode"]
+        category_rows = [row for row in mode_rows if row["section"] == "scenario_category"]
 
         if context_rows:
             table = markdown_table(
@@ -1201,9 +1149,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         format_mean_stddev(row, "decode_host_us_per_round"),
                         format_mean_stddev(row, "decode_device_wait_us_per_round"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
-                        format_mean_stddev(
-                            row, "speculative_tokens_per_round", digits=2
-                        ),
+                        format_mean_stddev(row, "speculative_tokens_per_round", digits=2),
                     )
                     for row in long_decode_rows
                 ],
@@ -1233,9 +1179,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
                         format_mean_stddev(row, "decode_host_us_per_round"),
                         format_mean_stddev(row, "decode_device_wait_us_per_round"),
                         format_percent_mean_stddev(row, "speculative_acceptance"),
-                        format_mean_stddev(
-                            row, "speculative_tokens_per_round", digits=2
-                        ),
+                        format_mean_stddev(row, "speculative_tokens_per_round", digits=2),
                     )
                     for row in category_rows
                 ],
@@ -1245,9 +1189,7 @@ def write_summaries(rows: Sequence[dict[str, Any]], output_dir: Path) -> None:
         "# Serving corpus performance summary\n\n"
         "All values are arithmetic mean ± sample standard deviation. "
         f"Sampling: {rows[0]['sampling_mode'] if rows else 'n/a'}. "
-        f"KV: {rows[0]['kv_dtype'] if rows else 'n/a'}.\n\n"
-        + "\n\n".join(sections)
-        + "\n"
+        f"KV: {rows[0]['kv_dtype'] if rows else 'n/a'}.\n\n" + "\n\n".join(sections) + "\n"
     )
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
 
@@ -1286,9 +1228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 block_specs = [
                     spec
                     for spec in specs
-                    if spec.target == target
-                    and spec.speculative_mode == mode_name
-                    and spec.key not in records
+                    if spec.target == target and spec.speculative_mode == mode_name and spec.key not in records
                 ]
                 if not block_specs:
                     print(f"skip {target}/{mode_name}: block complete", flush=True)

@@ -40,17 +40,11 @@ def main():
         "inline constexpr Mapping mappings[] = {",
     ]
     cases = sorted(
-        (
-            row
-            for row in records(args.ucd_directory / "SpecialCasing.txt")
-            if not row[4]
-        ),
+        (row for row in records(args.ucd_directory / "SpecialCasing.txt") if not row[4]),
         key=lambda row: int(row[0], 16),
     )
     for row in cases:
-        lines.append(
-            f"{{0x{row[0]}, {cpp_string(row[1])}, {cpp_string(row[2])}, {cpp_string(row[3])}}},"
-        )
+        lines.append(f"{{0x{row[0]}, {cpp_string(row[1])}, {cpp_string(row[2])}, {cpp_string(row[3])}}},")
     lines += ["};", "struct Range { std::int32_t first, last; };"]
     props = list(records(args.ucd_directory / "DerivedCoreProperties.txt"))
     for prop, name in (("Cased", "cased"), ("Case_Ignorable", "case_ignorable")):
@@ -64,10 +58,7 @@ def main():
             lines.append(f"{{0x{first:X}, 0x{last:X}}},")
         lines.append("};")
     lines.append("} // namespace jinja::unicode::data")
-    output = (
-        Path(__file__).resolve().parents[1]
-        / "third_party/llama-jinja/jinja/unicode_data.h"
-    )
+    output = Path(__file__).resolve().parents[1] / "third_party/llama-jinja/jinja/unicode_data.h"
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

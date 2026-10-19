@@ -114,11 +114,13 @@ void output_logits_split_rank0(const std::array<Tensor, 2>& hidden,
         exchange->copy(1, partial[1].data, staging.data, bytes1 * height, execution, events);
         CUDA_CHECK(cudaSetDevice(rank0.device));
     } else {
-        CUDA_CHECK(::ninfer::memcpy_device_async(staging.data, partial[1].data, bytes1 * height, rank0.stream));
+        CUDA_CHECK(::ninfer::memcpy_device_async(staging.data, partial[1].data, bytes1 * height,
+                                                 rank0.stream));
     }
     CUDA_CHECK(cudaEventRecord(events.pull_done(0), rank0.stream));
     // A kernel, not two pitched copies: the column count and the buffers differ between the CUDA
-    // Graph profiles of one class, and a captured 2D memcpy node cannot take such a change in place.
+    // Graph profiles of one class, and a captured 2D memcpy node cannot take such a change in
+    // place.
     Tensor gathered = logits;
     ops::detail::concat_rows_bf16_launch(partial[0], staging, gathered, rank0.stream);
     // Rank 1 may overwrite partial[1] only after rank 0's pull has read it.
@@ -137,7 +139,8 @@ void proposal_argmax_split(const std::array<Tensor, 2>& hidden,
     const std::int32_t rows = partial[0].ne[0];
     if (partial[1].ne[0] != rows || head[0] == nullptr || head[1] == nullptr ||
         head[0]->weight.n != rows || head[1]->weight.n != rows) {
-        throw std::invalid_argument("tensor-parallel proposal argmax: the ranks' head blocks differ");
+        throw std::invalid_argument(
+            "tensor-parallel proposal argmax: the ranks' head blocks differ");
     }
     if (!events.live()) {
         throw std::invalid_argument("tensor-parallel proposal argmax: dead events");

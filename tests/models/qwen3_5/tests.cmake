@@ -107,6 +107,17 @@ set_tests_properties(
   ninfer_qwen4_mtp_engine_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
+# Qwen4Exp with Vision at tp 2 and tp 1 (MTP, offload experts): text invariance, MTP == no-draft
+# on an image prompt and its resumed second turn, tower copy parity across ranks. Skips (77)
+# without NINFER_TEST_QWEN4_VISION_ARTIFACT (a synthetic artifact with Vision and MTP components).
+ninfer_add_test(ninfer_qwen4_vision_engine_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_qwen4_vision.cpp"
+  LIBRARIES ninfer_engine ninfer_core)
+
+set_tests_properties(
+  ninfer_qwen4_vision_engine_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES ninfer_engine)

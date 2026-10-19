@@ -29,8 +29,7 @@ grouped_ksplit_topk_initialize(GroupedKSplitTopKStorage<Capacity, Warps>& storag
 
 template <int Capacity, int TileColumns, int Warps>
 __device__ __forceinline__ void
-grouped_ksplit_topk_consume(const float* scores,
-                            GroupedKSplitTopKStorage<Capacity, Warps>& storage,
+grouped_ksplit_topk_consume(const float* scores, GroupedKSplitTopKStorage<Capacity, Warps>& storage,
                             std::int32_t row_begin, std::int32_t valid_rows, int columns) {
     const int warp = static_cast<int>(threadIdx.x) >> 5;
     const int lane = static_cast<int>(threadIdx.x) & 31;
@@ -53,7 +52,8 @@ grouped_ksplit_topk_consume(const float* scores,
 template <int Capacity, int Warps>
 __device__ __forceinline__ void
 grouped_ksplit_topk_publish(const GroupedKSplitTopKStorage<Capacity, Warps>& storage,
-                            std::uint64_t* partial_keys, std::int32_t producer_groups, int columns) {
+                            std::uint64_t* partial_keys, std::int32_t producer_groups,
+                            int columns) {
     const int tid   = static_cast<int>(threadIdx.x);
     const int group = static_cast<int>(blockIdx.x);
     for (int p = tid; p < columns * kLinearTopK; p += blockDim.x) {

@@ -36,27 +36,27 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kS          = kHcStreams;      // streams of the model
-constexpr int kLS         = kHcStreams / 2;  // streams of a rank
-constexpr int kH          = kHcHidden;
-constexpr int kLW         = kLS * kH;         // the rank's residual rows
-constexpr int kR          = kHcRank;
-constexpr int kThreads    = 256;
-constexpr int kWarps      = kThreads / 32;
-constexpr int kPerThread  = kH / kThreads;    // 10
-constexpr int kDownWarpK  = kH / kWarps;      // 320 K per warp inside one lane
-constexpr int kDownChunks = kDownWarpK / 32;  // 10 Q8 groups per warp
-constexpr int kDownGroups = kLW / 32;         // scale words per Down row of the shard
-constexpr int kUpKPad     = 384;
-constexpr int kUpGroups   = kUpKPad / 32;
-constexpr int kUpChunks   = kR / 2 / 32;
-constexpr int kActStride  = kH + 32;
-constexpr int kLowStride  = kR + 32;
-constexpr int kMinGrid    = 56;
-constexpr int kMaxTiles   = 2;
-constexpr int kUpPasses   = 2;
-constexpr int kMaxColumns = (kH + kMinGrid - 1) / kMinGrid; // 46
-constexpr int kMaxUpRows  = kLS * kMaxColumns;               // 92
+constexpr int kS           = kHcStreams;     // streams of the model
+constexpr int kLS          = kHcStreams / 2; // streams of a rank
+constexpr int kH           = kHcHidden;
+constexpr int kLW          = kLS * kH; // the rank's residual rows
+constexpr int kR           = kHcRank;
+constexpr int kThreads     = 256;
+constexpr int kWarps       = kThreads / 32;
+constexpr int kPerThread   = kH / kThreads;   // 10
+constexpr int kDownWarpK   = kH / kWarps;     // 320 K per warp inside one lane
+constexpr int kDownChunks  = kDownWarpK / 32; // 10 Q8 groups per warp
+constexpr int kDownGroups  = kLW / 32;        // scale words per Down row of the shard
+constexpr int kUpKPad      = 384;
+constexpr int kUpGroups    = kUpKPad / 32;
+constexpr int kUpChunks    = kR / 2 / 32;
+constexpr int kActStride   = kH + 32;
+constexpr int kLowStride   = kR + 32;
+constexpr int kMinGrid     = 56;
+constexpr int kMaxTiles    = 2;
+constexpr int kUpPasses    = 2;
+constexpr int kMaxColumns  = (kH + kMinGrid - 1) / kMinGrid; // 46
+constexpr int kMaxUpRows   = kLS * kMaxColumns;              // 92
 constexpr int kVecsPerLane = kPeerPipelinedVecsPerLane;      // 2: one lane = 1 KiB
 static_assert((kHcRowsCap + 7) / 8 <= kMaxTiles * (kMinGrid / kLS));
 static_assert(kMaxUpRows <= kUpPasses * 64);
@@ -73,8 +73,9 @@ __device__ __forceinline__ uint2 load_streaming_u2(const std::int8_t* pointer) {
 }
 
 __device__ __forceinline__ std::uint32_t half2_minus_1152(std::uint32_t word) {
-    const __half2 value = __hsub2(*reinterpret_cast<const __half2*>(&word),
-                                  __halves2half2(__ushort_as_half(0x6480U), __ushort_as_half(0x6480U)));
+    const __half2 value =
+        __hsub2(*reinterpret_cast<const __half2*>(&word),
+                __halves2half2(__ushort_as_half(0x6480U), __ushort_as_half(0x6480U)));
     return *reinterpret_cast<const std::uint32_t*>(&value);
 }
 
@@ -92,8 +93,8 @@ __device__ __forceinline__ std::uint32_t pack_f16(float low, float high) {
 }
 
 __device__ __forceinline__ void mma_f16(float (&c)[4], std::uint32_t a0, std::uint32_t a1,
-                                         std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
-                                         std::uint32_t b1) {
+                                        std::uint32_t a2, std::uint32_t a3, std::uint32_t b0,
+                                        std::uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, "
                  "{%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
@@ -116,7 +117,7 @@ __device__ __forceinline__ void grid_exchange(const PeerVec* source, const HcSpl
     const int lane = static_cast<int>(threadIdx.x & 31u);
     const int warp = static_cast<int>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     if (warp * (32 * kVecsPerLane) >= vecs) { return; } // warp-uniform
-    const int base = warp * (32 * kVecsPerLane) + lane;
+    const int base             = warp * (32 * kVecsPerLane) + lane;
     PeerVec mine[kVecsPerLane] = {};
 #pragma unroll
     for (int j = 0; j < kVecsPerLane; ++j) {
@@ -249,15 +250,16 @@ __global__ void __launch_bounds__(kThreads, 1) hc_split_fused_kernel(HcSplitFuse
     }
     __syncthreads();
 
-    const int columns_per_cta = (kH + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
-    const int column_begin    = static_cast<int>(blockIdx.x) * columns_per_cta;
-    const int columns         = max(0, min(columns_per_cta, kH - column_begin));
-    const int up_rows         = kLS * columns;
-    const int up_tile         = warp >> 1;
-    const int up_half         = warp & 1;
+    const int columns_per_cta =
+        (kH + static_cast<int>(gridDim.x) - 1) / static_cast<int>(gridDim.x);
+    const int column_begin = static_cast<int>(blockIdx.x) * columns_per_cta;
+    const int columns      = max(0, min(columns_per_cta, kH - column_begin));
+    const int up_rows      = kLS * columns;
+    const int up_tile      = warp >> 1;
+    const int up_half      = warp & 1;
     uint2 up_top[kUpPasses][kUpChunks], up_bottom[kUpPasses][kUpChunks];
     __half up_scale_top[kUpPasses][kUpChunks], up_scale_bottom[kUpPasses][kUpChunks];
-    const auto load_up = [&](int local_row, uint2 (&out)[kUpChunks], __half (&scale)[kUpChunks]) {
+    const auto load_up = [&](int local_row, uint2(&out)[kUpChunks], __half(&scale)[kUpChunks]) {
         if (local_row >= up_rows) {
 #pragma unroll
             for (int c = 0; c < kUpChunks; ++c) {
@@ -266,10 +268,11 @@ __global__ void __launch_bounds__(kThreads, 1) hc_split_fused_kernel(HcSplitFuse
             }
             return;
         }
-        const std::int64_t global_row =
-            static_cast<std::int64_t>(local_row / columns) * kH + column_begin + local_row % columns;
-        const std::int8_t* codes = p.up_codes + global_row * kUpKPad + up_half * (kR / 2) + 8 * quad;
-        const __half* s          = p.up_scales + global_row * kUpGroups + up_half * kUpChunks;
+        const std::int64_t global_row = static_cast<std::int64_t>(local_row / columns) * kH +
+                                        column_begin + local_row % columns;
+        const std::int8_t* codes =
+            p.up_codes + global_row * kUpKPad + up_half * (kR / 2) + 8 * quad;
+        const __half* s = p.up_scales + global_row * kUpGroups + up_half * kUpChunks;
 #pragma unroll
         for (int c = 0; c < kUpChunks; ++c) {
             out[c]   = load_streaming_u2(codes + 32 * c);
@@ -323,9 +326,10 @@ __global__ void __launch_bounds__(kThreads, 1) hc_split_fused_kernel(HcSplitFuse
         if (i >= Tokens * columns) continue;
         const int token = i / columns;
         const int d     = column_begin + i % columns;
-        const float y   = p.previous_y != nullptr
-                              ? __bfloat162float(p.previous_y[d + static_cast<std::int64_t>(kH) * token])
-                              : 0.0F;
+        const float y =
+            p.previous_y != nullptr
+                ? __bfloat162float(p.previous_y[d + static_cast<std::int64_t>(kH) * token])
+                : 0.0F;
 #pragma unroll
         for (int s = 0; s < kLS; ++s) {
             const float h =
@@ -334,7 +338,7 @@ __global__ void __launch_bounds__(kThreads, 1) hc_split_fused_kernel(HcSplitFuse
                                   ? __bfloat162float(__float2bfloat16_rn(
                                         h + p.previous_inject[s + kLS * token] * y))
                                   : h;
-            mix_norm[k][s] = 1.0F + __bfloat162float(p.norm[kH * s + d]);
+            mix_norm[k][s]  = 1.0F + __bfloat162float(p.norm[kH * s + d]);
         }
     }
 
@@ -355,10 +359,9 @@ __global__ void __launch_bounds__(kThreads, 1) hc_split_fused_kernel(HcSplitFuse
         }
     }
     grid.sync();
-    grid_exchange(reinterpret_cast<const PeerVec*>(p.projection), p.exchange1, p.hang,
-                  Tokens * rows / 4, [&](int v, const float4& sum) {
-                      reinterpret_cast<float4*>(p.projection)[v] = sum;
-                  });
+    grid_exchange(
+        reinterpret_cast<const PeerVec*>(p.projection), p.exchange1, p.hang, Tokens * rows / 4,
+        [&](int v, const float4& sum) { reinterpret_cast<float4*>(p.projection)[v] = sum; });
     grid.sync();
 
     // Phase 2.
@@ -382,8 +385,7 @@ __global__ void __launch_bounds__(kThreads, 1) hc_split_fused_kernel(HcSplitFuse
     }
     if (blockIdx.x == 0 && p.inject != nullptr && tid < Tokens * kLS) {
         const int token = tid / kLS;
-        const float v =
-            p.projection[token * rows + kR + p.first_stream + tid % kLS] * (1.0F / kS);
+        const float v = p.projection[token * rows + kR + p.first_stream + tid % kLS] * (1.0F / kS);
         p.inject[tid] = 2.0F * sigmoidf_(v);
     }
     __syncthreads();

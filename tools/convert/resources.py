@@ -15,21 +15,13 @@ TEXT_RESOURCES = (
 VISION_RESOURCES = ("preprocessor_config.json", "video_preprocessor_config.json")
 
 
-def token_domain(
-    tokenizer: dict, config: dict, vocab_size: int
-) -> tuple[int, tuple[int, ...]]:
+def token_domain(tokenizer: dict, config: dict, vocab_size: int) -> tuple[int, tuple[int, ...]]:
     ids: dict[int, str] = {}
     special: dict[int, bool] = {}
 
     def add(index: object, content: object) -> None:
-        if (
-            type(index) is not int
-            or not 0 <= index < vocab_size
-            or not isinstance(content, str)
-        ):
-            raise ValueError(
-                f"invalid tokenizer entry id={index!r}, content={content!r}"
-            )
+        if type(index) is not int or not 0 <= index < vocab_size or not isinstance(content, str):
+            raise ValueError(f"invalid tokenizer entry id={index!r}, content={content!r}")
         if index in ids and ids[index] != content:
             raise ValueError(f"tokenizer resources disagree about token {index}")
         ids[index] = content
@@ -39,9 +31,7 @@ def token_domain(
         if type(flag) is not bool:
             raise ValueError(f"token {index}: special must be boolean")
         if index in special and special[index] != flag:
-            raise ValueError(
-                f"tokenizer resources disagree about token {index} special flag"
-            )
+            raise ValueError(f"tokenizer resources disagree about token {index} special flag")
         special[index] = flag
 
     model = tokenizer.get("model", {})
@@ -75,9 +65,7 @@ def load_resources(
         roles["vision"] = VISION_RESOURCES
     allowed = {role for names in roles.values() for role in names}
     if overrides.keys() - allowed:
-        raise ValueError(
-            f"resource overrides have no selected consumer: {sorted(overrides.keys()-allowed)}"
-        )
+        raise ValueError(f"resource overrides have no selected consumer: {sorted(overrides.keys() - allowed)}")
     references: dict[str, dict[str, str]] = {}
     payloads: dict[str, bytes] = {}
     parsed: dict[str, dict] = {}
@@ -100,17 +88,10 @@ def load_resources(
                         ("temporal_patch_size", "temporal_patch_size"),
                         ("merge_size", "spatial_merge_size"),
                     ):
-                        if (
-                            type(value.get(field)) is not int
-                            or value[field] != vision_config[config_field]
-                        ):
-                            raise ValueError(
-                                f"{path}: {field} differs from Vision config"
-                            )
+                        if type(value.get(field)) is not int or value[field] != vision_config[config_field]:
+                            raise ValueError(f"{path}: {field} differs from Vision config")
             object_id = f"resource/{component}/{role}"
             references[component][role] = object_id
             payloads[object_id] = data
-    count, special = token_domain(
-        parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size
-    )
+    count, special = token_domain(parsed["tokenizer.json"], parsed["tokenizer_config.json"], vocab_size)
     return references, payloads, count, special

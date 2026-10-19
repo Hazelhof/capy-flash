@@ -59,10 +59,10 @@ struct Qwen4PrefetchCounters {
 class Qwen4ExpertPrefetch {
 public:
     struct DeviceMemory {
-        std::uint32_t* tags        = nullptr; // [2 * slots_per_layer]
-        std::uint32_t* epoch       = nullptr; // one word
-        std::int32_t* rows         = nullptr; // [text_layers * 512] effective slot rows
-        void* predict_workspace    = nullptr; // ops::moe_predict_workspace_bytes()
+        std::uint32_t* tags     = nullptr; // [2 * slots_per_layer]
+        std::uint32_t* epoch    = nullptr; // one word
+        std::int32_t* rows      = nullptr; // [text_layers * 512] effective slot rows
+        void* predict_workspace = nullptr; // ops::moe_predict_workspace_bytes()
     };
 
     // `layout` / `pool` = the ExpertCache's (bank bases of the Text layers first); the staging
@@ -78,10 +78,12 @@ public:
     [[nodiscard]] static std::int32_t staging_slots(const Qwen4PrefetchOptions& options) noexcept {
         return 2 * options.slots_per_layer;
     }
+
     // Layer `layer` is a target (its experts may be staged).
     [[nodiscard]] bool stages(std::int32_t layer) const noexcept {
         return layer >= options_.first_layer && layer < text_layers_;
     }
+
     [[nodiscard]] bool predicts(std::int32_t layer) const noexcept { return stages(layer + 1); }
 
     // ---- Enqueue (compute stream; CUDA Graph capturable) ----
@@ -105,7 +107,9 @@ public:
     void end_window();
 
     [[nodiscard]] const Qwen4PrefetchCounters& counters() const noexcept { return counters_; }
+
     [[nodiscard]] double layer_period_us() const noexcept { return period_us_; }
+
     [[nodiscard]] double rate_scale() const noexcept { return rate_scale_; }
 
 private:
@@ -115,10 +119,12 @@ private:
         float* scores            = nullptr; // [text_layers * 32]
         std::uint32_t* stats     = nullptr; // [text_layers * 4]
     };
+
     struct InFlight {
         cudaEvent_t done   = nullptr;
         std::int32_t count = 0;
     };
+
     [[nodiscard]] std::int32_t pending_copies();
 
     Qwen4PrefetchOptions options_;
@@ -127,7 +133,7 @@ private:
     std::array<std::byte*, 4> pool_{};
     std::int32_t first_slot_ = 0;
     DeviceMemory memory_;
-    int device_ = 0;
+    int device_                = 0;
     std::int64_t expert_bytes_ = 0;
     double copy_us_            = 0;
 
@@ -141,9 +147,9 @@ private:
     std::vector<std::uint8_t> issued_layer_; // [text_layers] this window
     std::int64_t first_seen_ns_ = 0, last_seen_ns_ = 0;
     std::int32_t first_seen_layer_ = -1, last_seen_layer_ = -1;
-    double period_us_ = 400.0;
-    double rate_scale_ = 1.0;          // landing feedback on link_gbps
-    std::int64_t window_issued_at_ = 0; // counters_.issued at the previous end_window
+    double period_us_              = 400.0;
+    double rate_scale_             = 1.0; // landing feedback on link_gbps
+    std::int64_t window_issued_at_ = 0;   // counters_.issued at the previous end_window
     Qwen4PrefetchCounters counters_;
 
     // Scratch of issue().

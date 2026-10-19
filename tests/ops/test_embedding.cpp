@@ -375,7 +375,7 @@ public:
             for (std::int32_t d = 0; d < d_; ++d) {
                 const std::uint8_t raw = row->codes[d];
                 const int code = raw < 0x80u ? static_cast<int>(raw) : static_cast<int>(raw) - 256;
-                const double scale     = static_cast<double>(f16_to_f32(
+                const double scale                           = static_cast<double>(f16_to_f32(
                     load_u16_le(row->scales, static_cast<std::size_t>(d / kQ8Group) * 2)));
                 result[t * static_cast<std::size_t>(d_) + d] = static_cast<double>(code) * scale;
             }

@@ -20,9 +20,8 @@ void launch_int8_kv_grouped_mma(const CausalAttentionOperands& p, Int8KvCacheVie
         Masked != (cache.valid_columns != nullptr) || partition.capacity < 1 ||
         partition.target > CausalKvPartition::kMaxSplits || partition.target < 1 ||
         (1 << partition.key_shift) < S::kKeyRows || partition.key_shift > 12 ||
-        !partition.balanced ||
-        partition.capacity != partition.bound(p.visible_capacity) || !partial.acc ||
-        !partial.maximum || !partial.sum)
+        !partition.balanced || partition.capacity != partition.bound(p.visible_capacity) ||
+        !partial.acc || !partial.maximum || !partial.sum)
         throw std::invalid_argument("INT8 grouped attention: invalid schedule/partials");
     if constexpr (Input::writes_cache)
         if (!input.k || !input.v) throw std::invalid_argument("INT8 append requires K/V");
@@ -49,7 +48,7 @@ void launch_int8_kv_tiled_mma(const CausalAttentionOperands& p, Int8KvReadView c
     if (p.batch != 1)
         throw std::invalid_argument("INT8 tiled attention requires a complete single query row");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel    = int8_kv_tiled_mma_kernel<G, S, Metadata>;
+        constexpr auto kernel = int8_kv_tiled_mma_kernel<G, S, Metadata>;
         static FuncAttrPerDevice attribute;
         attribute.ensure(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);

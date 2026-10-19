@@ -12,7 +12,7 @@ void launch_nvfp4_kv_tiled_mma(const CausalAttentionOperands& p, Nvfp4KvReadView
     if (p.batch != 1)
         throw std::invalid_argument("NVFP4 tiled attention requires a complete single query row");
     const auto invoke = [&]<class Metadata>(Metadata metadata) {
-        constexpr auto kernel    = nvfp4_kv_tiled_mma_kernel<G, S, Metadata>;
+        constexpr auto kernel = nvfp4_kv_tiled_mma_kernel<G, S, Metadata>;
         static FuncAttrPerDevice attribute;
         attribute.ensure(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, S::kSharedBytes);
         const dim3 grid(div_up(p.width, S::kQueryRows), G::QHeads);

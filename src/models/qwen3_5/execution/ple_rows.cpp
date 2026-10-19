@@ -81,11 +81,9 @@ PleRowReader::~PleRowReader() {
 
 PleRowReader::Page PleRowReader::page_of(std::uint64_t object_offset, std::uint32_t bytes,
                                          std::uint32_t& pages, std::uint32_t& within) const {
-    const auto it =
-        std::upper_bound(segments_.begin(), segments_.end(), object_offset,
-                         [](std::uint64_t offset, const PleTableSegment& s) {
-                             return offset < s.object_offset;
-                         });
+    const auto it = std::upper_bound(
+        segments_.begin(), segments_.end(), object_offset,
+        [](std::uint64_t offset, const PleTableSegment& s) { return offset < s.object_offset; });
     if (it == segments_.begin()) { throw std::out_of_range("n-gram offset is outside the table"); }
     const auto& segment        = *std::prev(it);
     const std::uint64_t inside = object_offset - segment.object_offset;

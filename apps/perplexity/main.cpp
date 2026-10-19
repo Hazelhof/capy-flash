@@ -275,12 +275,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         domain_reports.push_back(std::move(item));
     }
 
-    json execution{{"purpose", "causal_scoring"},
-                   {"device", options.device},
-                   {"context_tokens", options.context},
-                   {"stride_tokens", options.stride},
-                   {"prefill_chunk_tokens", 1024},
-                   {"score_tile_tokens", 1024},
+    json execution{{"purpose", "causal_scoring"},       {"device", options.device},
+                   {"context_tokens", options.context}, {"stride_tokens", options.stride},
+                   {"prefill_chunk_tokens", 1024},      {"score_tile_tokens", 1024},
                    {"kv_dtype", kv_name(options.kv)}};
     if (options.tp != 1) {
         execution["tp"]      = options.tp;

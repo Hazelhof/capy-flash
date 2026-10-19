@@ -139,8 +139,7 @@ class PreparedServeExchange:
                 media_type = value.headers.get("content-type", "").split(";", 1)[0].strip().lower()
                 if media_type != "text/event-stream":
                     protocol_error = (
-                        "streaming response Content-Type is not text/event-stream: "
-                        f"{media_type or '<missing>'}"
+                        f"streaming response Content-Type is not text/event-stream: {media_type or '<missing>'}"
                     )
 
         def consume_frame(frame: SseEvent) -> None:
@@ -190,9 +189,7 @@ class PreparedServeExchange:
             except SseDecodeError as error:
                 protocol_error = str(error)
 
-        error_code, error_message = parse_http_error(
-            self.request.protocol, http.status, http.body
-        )
+        error_code, error_message = parse_http_error(self.request.protocol, http.status, http.body)
         for event in events:
             if event.kind == "error":
                 error_code = event.error_code or error_code
@@ -247,8 +244,7 @@ class NInferServeClient:
         result = exchange.execute()
         if result.status != 200:
             raise ServeProtocolError(
-                f"GET {path} returned HTTP {result.status}: "
-                + result.body.decode("utf-8", errors="replace")
+                f"GET {path} returned HTTP {result.status}: " + result.body.decode("utf-8", errors="replace")
             )
         try:
             value = json.loads(result.body)

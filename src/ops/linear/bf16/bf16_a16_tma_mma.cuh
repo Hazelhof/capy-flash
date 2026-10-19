@@ -8,6 +8,7 @@
 #include <cuda.h>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -43,8 +44,9 @@ inline CUtensorMap bf16_tma_map(const __nv_bfloat16* pointer, int rows, int k, i
 template <class Schedule>
 Bf16TmaDescriptors make_bf16_tma_descriptors(const Bf16A16Operands& p) {
     validate_bf16_operands<Schedule>(p);
-    if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
-        throw std::invalid_argument("BF16 TMA requires complete row/K tiles");
+    // A row tail reads zero-filled rows past `rows` (the box crosses the tensor bound); the
+    // launcher admits it only where the epilogue predicates rows.
+    if (p.k % Schedule::kBlockK) throw std::invalid_argument("BF16 TMA requires complete K tiles");
     return {bf16_tma_map(p.weight, p.rows, p.k, Schedule::kBlockRows, Schedule::kBlockK),
             bf16_tma_map(p.x, p.tokens, p.k, Schedule::kBlockTokens, Schedule::kBlockK)};
 }
@@ -66,7 +68,7 @@ inline constexpr int bf16_tma_scratch_bytes =
           : bf16_epilogue_bytes<Schedule, Epilogue>)+127) /
     128 * 128;
 
-template <class Schedule, bool FullTokens, class Output, class Epilogue>
+template <class Schedule, bool FullTokens, class Output, class Epilogue, bool FullRows = true>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_tma_mma_kernel(
     const __grid_constant__ Bf16TmaDescriptors descriptors, Output output, Epilogue epilogue,
@@ -74,7 +76,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
     constexpr int BR = Schedule::kBlockRows, BT = Schedule::kBlockTokens, BK = Schedule::kBlockK;
     constexpr int S   = Schedule::kStages;
     const int K       = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
-    const int tiles_r = rows / BR, tiles_t = (count + BT - 1) / BT;
+    const int tiles_r = FullRows ? rows / BR : (rows + BR - 1) / BR;
+    const int tiles_t = (count + BT - 1) / BT;
     int tile_r, tile_t;
     bf16_mma_tile_coordinates<Schedule>(blockIdx.x, tiles_r, tiles_t, tile_r, tile_t);
     const int row_begin = tile_r * BR, token_begin = token_offset + tile_t * BT;
@@ -120,8 +123,9 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void bf16_a16_t
         __syncwarp();
         if (lane == 0) cta_mbarrier_arrive(empty + stage);
     }
-    bf16_finish_mma_tile<Schedule, FullTokens>(output, epilogue, storage, accum, row_begin,
-                                               token_begin, rows, token_offset + count, warp, lane);
+    bf16_finish_mma_tile<Schedule, FullTokens, FullRows>(output, epilogue, storage, accum,
+                                                         row_begin, token_begin, rows,
+                                                         token_offset + count, warp, lane);
 }
 
 template <class Schedule, class Output, class Epilogue>
@@ -129,13 +133,20 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                              cudaStream_t stream) {
     // Descriptors are launch-owned values, copied into kernel parameters during Graph capture.
     const auto descriptors = make_bf16_tma_descriptors<Schedule>(p);
+    // Row tails (e.g. the 324-row hyper-connection Down|inject) only for the plain linear store,
+    // whose element-wise epilogue predicates rows; fused consumers keep complete row tiles.
+    constexpr bool kRowTail = std::is_same_v<Epilogue, LinearIdentityEpilogue>;
+    const bool full_rows    = p.rows % Schedule::kBlockRows == 0;
+    if (!kRowTail && !full_rows)
+        throw std::invalid_argument("BF16 TMA requires complete row tiles for this epilogue");
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const auto blocks = static_cast<std::int64_t>(p.rows / Schedule::kBlockRows) *
+        const auto blocks = static_cast<std::int64_t>(div_up(p.rows, Schedule::kBlockRows)) *
                             div_up(count, Schedule::kBlockTokens);
         if (blocks > 2147483647LL)
             throw std::invalid_argument("BF16 TMA grid exceeds CUDA grid.x capacity");
-        const auto launch = [&]<bool Full>() {
-            constexpr auto kernel = bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue>;
+        const auto launch = [&]<bool Full, bool FullRows>() {
+            constexpr auto kernel =
+                bf16_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, FullRows>;
             constexpr int bytes =
                 bf16_tma_scratch_bytes<Schedule, Epilogue> + Schedule::kBarrierBytes;
             bf16_prepare_shared<bytes, kernel>();
@@ -143,10 +154,20 @@ void launch_bf16_a16_tma_mma(const Bf16A16Operands& p, Output output, Epilogue e
                 descriptors, output, epilogue, p.rows, p.k, offset, count);
             CUDA_CHECK(cudaGetLastError());
         };
-        if (count % Schedule::kBlockTokens == 0)
-            launch.template operator()<true>();
+        const bool full_tokens = count % Schedule::kBlockTokens == 0;
+        if constexpr (kRowTail) {
+            if (!full_rows) {
+                if (full_tokens)
+                    launch.template operator()<true, false>();
+                else
+                    launch.template operator()<false, false>();
+                return;
+            }
+        }
+        if (full_tokens)
+            launch.template operator()<true, true>();
         else
-            launch.template operator()<false>();
+            launch.template operator()<false, true>();
     });
 }
 

@@ -64,13 +64,9 @@ def expectations(tensors: dict, directory: Path, dense: bool) -> Path:
     for layer in range(len(fixture.LAYER_TYPES)):
         for expert in range(fixture.E):
             name = f"slot_text_{layer}_{expert}.bin"
-            (directory / name).write_bytes(
-                slot_bytes(tensors, f"{lm}layers.{layer}.mlp.experts.{expert}.")
-            )
+            (directory / name).write_bytes(slot_bytes(tensors, f"{lm}layers.{layer}.mlp.experts.{expert}."))
             slots.append({"component": "text", "layer": layer, "expert": expert, "file": name})
-    table = torch.cat(
-        [tensors[f"{emb}ngram_embedding.shard_{s}.weight"].view(torch.uint8) for s in (0, 1)]
-    )
+    table = torch.cat([tensors[f"{emb}ngram_embedding.shard_{s}.weight"].view(torch.uint8) for s in (0, 1)])
     scale = tensors[emb + "ngram_embedding.weight_scale"].view(torch.uint8).numpy().tobytes()
     rows = [
         {"row": r, "codes": table[r].numpy().tobytes().hex(), "scale": scale.hex()}

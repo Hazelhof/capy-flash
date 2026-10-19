@@ -842,12 +842,12 @@ int main() {
     ThroughputReport sampled = throughput;
     sampled.gpus             = std::vector<GpuTelemetrySample>{
         GpuTelemetrySample{.device              = 0,
-                           .sm_clock_mhz        = 2100,
-                           .memory_clock_mhz    = 13801,
-                           .power_watts         = 182.25,
-                           .energy_joules       = 364.5,
-                           .temperature_celsius = 61,
-                           .clock_event_reasons = 0x4},
+                                       .sm_clock_mhz        = 2100,
+                                       .memory_clock_mhz    = 13801,
+                                       .power_watts         = 182.25,
+                                       .energy_joules       = 364.5,
+                                       .temperature_celsius = 61,
+                                       .clock_event_reasons = 0x4},
         GpuTelemetrySample{.device = 1},
     };
     const Json gpus = Json::parse(format_throughput_json("serve-test", 5002, sampled)).at("gpus");

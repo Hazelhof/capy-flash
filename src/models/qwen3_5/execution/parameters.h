@@ -224,7 +224,8 @@ struct Qwen4Parameters {
 //     the largest activation and ~64x it (E4M3 block scales keep three mantissa bits over that
 //     span); on the real model the MTP inputs reach 24.5 (x) and 826 (h) against Text ranges of
 //     13.9 and 57.8, and margins 16-64 give the minimum error with no saturated block, 4 saturates
-//     h blocks (T24, docs/capy-flash/development-log.md). 32 centres both inputs in the flat region.
+//     h blocks (T24, docs/capy-flash/development-log.md). 32 centres both inputs in the flat
+//     region.
 inline constexpr float kQwen4MtpActivationRangeMargin = 32.0F;
 
 struct Qwen4MtpParameters {
@@ -232,8 +233,8 @@ struct Qwen4MtpParameters {
     Tensor hidden_norm;    // [S*H]: one RMS over the whole wide residual
     LinearParameters embedding_projection;
     LinearParameters hidden_projection;
-    HyperConnectionParameters head; // no inject
-    Qwen4BlockParameters layer;     // QSA mixer, MoE over the MTP banks
+    HyperConnectionParameters head;       // no inject
+    Qwen4BlockParameters layer;           // QSA mixer, MoE over the MTP banks
     float uniform_gate_up_divisor = 0.0F; // > 0: the bank keeps one weight divisor per projection
     float uniform_down_divisor    = 0.0F;
     bool derived_activation_divisors = false;

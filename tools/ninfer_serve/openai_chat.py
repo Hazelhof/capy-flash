@@ -59,9 +59,7 @@ class ChatStreamAdapter:
                     event.received_ns,
                     payload=payload,
                     error_code=error.get("code") if isinstance(error.get("code"), str) else None,
-                    error_message=(
-                        error.get("message") if isinstance(error.get("message"), str) else None
-                    ),
+                    error_message=(error.get("message") if isinstance(error.get("message"), str) else None),
                 )
             ]
         response_id = payload.get("id") if isinstance(payload.get("id"), str) else None

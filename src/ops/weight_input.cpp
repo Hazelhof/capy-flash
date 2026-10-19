@@ -109,7 +109,20 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
         // Keep that ABI detail out of the artifact's optional Use auxiliaries.
         if (divisor == 0) { divisor = 1.0F; }
     }
-    return {native_weight(view, divisor), policy};
+    auto weight = native_weight(view, divisor);
+    if (weight.qtype == QType::MXFP8_E4M3FN_G32_UE8M0) {
+        // E4M3FN code plane + UE8M0 scale plane, one byte per 32 columns, both row-major.
+        require(weight.layout == QuantLayout::BlockScaleK32 && weight.group_size == 32 &&
+                    weight.k % 32 == 0 && weight.qhigh == nullptr,
+                "MXFP8 native input requires BlockScaleK32 with 32-column groups");
+        weight.scale_dtype = DType::U8;
+        weight.scale_ne[0] = weight.k / 32;
+        weight.scale_ne[1] = weight.n;
+        weight.scale_nb[0] = 1;
+        weight.scale_nb[1] = weight.k / 32;
+        weight.scale_nb[2] = weight.scale_nb[3] = weight.scale_nb[1] * weight.n;
+    }
+    return {weight, policy};
 }
 
 ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool attention) {

@@ -25,15 +25,11 @@ def test_quantization_uses_stored_fp16_scale_and_zero_padding() -> None:
     assert torch.count_nonzero(quantized.codes[0, 1]) == 0
     assert quantized.scales[0, 1] == 0
 
-    payload = encode_row_split(
-        quantized.codes, quantized.scales, "q4_g64_fp16", weight.shape
-    )
+    payload = encode_row_split(quantized.codes, quantized.scales, "q4_g64_fp16", weight.shape)
     scales, codes = decode_row_split_codes(payload, "q4_g64_fp16", tuple(weight.shape))
     assert torch.equal(scales, quantized.scales)
     assert torch.equal(codes, quantized.codes)
-    decoded = dequantize_row_split(
-        payload, "q4_g64_fp16", tuple(weight.shape), dtype=torch.float32
-    )
+    decoded = dequantize_row_split(payload, "q4_g64_fp16", tuple(weight.shape), dtype=torch.float32)
     expected = expected_codes.float().reshape(1, 128)[:, :65]
     assert torch.equal(decoded, expected)
 
@@ -48,16 +44,12 @@ def test_quantization_uses_canonical_scale_rounding_on_cuda() -> None:
     assert int(cpu.scales.view(torch.int16)[0, 0]) == 6
     if torch.cuda.is_available():
         cuda = quantize_matrix(weight, "q4_g64_fp16", device="cuda")
-        assert torch.equal(
-            cuda.scales.cpu().view(torch.int16), cpu.scales.view(torch.int16)
-        )
+        assert torch.equal(cuda.scales.cpu().view(torch.int16), cpu.scales.view(torch.int16))
         assert torch.equal(cuda.codes.cpu(), cpu.codes)
 
 
 def test_quantization_uses_reciprocal_multiply_and_ties_to_even() -> None:
-    words = torch.tensor([0x41A0B334, 0x417C7BFF], dtype=torch.int32).view(
-        torch.float32
-    )
+    words = torch.tensor([0x41A0B334, 0x417C7BFF], dtype=torch.int32).view(torch.float32)
     weight = torch.zeros((1, 64), dtype=torch.float32)
     weight[0, :2] = words
     quantized = quantize_matrix(weight, "q4_g64_fp16", device="cpu")

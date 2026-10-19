@@ -14,9 +14,7 @@ from tools.convert.sources.logical import select_rows
 
 
 def test_nvfp4_source_preserves_words_and_decodes_independently(tmp_path):
-    codes = torch.tensor(
-        [[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]] * 2, dtype=torch.uint8
-    )
+    codes = torch.tensor([[0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE]] * 2, dtype=torch.uint8)
     scales = torch.tensor([[0x38], [0x40]], dtype=torch.uint8)
     save_file(
         {

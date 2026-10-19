@@ -93,8 +93,10 @@ int lane_offset_case(int width, int batch, int axes, bool in_place) {
     cuda_synchronize();
     const auto launch = [&] {
         for (int b = 0; b < batch; ++b) {
-            Tensor src(static_cast<std::int32_t*>(input.data()) + b * lane_size, DType::I32, {lane_size});
-            Tensor dst(static_cast<std::int32_t*>(destination) + b * lane_size, DType::I32, {lane_size});
+            Tensor src(static_cast<std::int32_t*>(input.data()) + b * lane_size, DType::I32,
+                       {lane_size});
+            Tensor dst(static_cast<std::int32_t*>(destination) + b * lane_size, DType::I32,
+                       {lane_size});
             Tensor d(static_cast<std::int32_t*>(offsets.data()) + b, DType::I32, {1});
             ops::offset_i32_positions(src, d, dst, stream);
         }
@@ -110,8 +112,10 @@ int lane_offset_case(int width, int batch, int axes, bool in_place) {
         CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
             for (auto& value : delta) value += 7;
-            CUDA_CHECK(cudaMemcpyAsync(input.data(), source.data(), input.bytes(), cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaMemcpyAsync(offsets.data(), delta.data(), offsets.bytes(), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(input.data(), source.data(), input.bytes(),
+                                       cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(offsets.data(), delta.data(), offsets.bytes(),
+                                       cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
@@ -122,10 +126,13 @@ int lane_offset_case(int width, int batch, int axes, bool in_place) {
     for (int b = 0; b < batch; ++b)
         for (int i = 0; i < lane_size; ++i)
             expected[b * lane_size + i] = source[b * lane_size + i] + delta[b];
-    int failures = verify_exact("lane offsets", from_device<std::int32_t>(destination, expected.size()), expected);
+    int failures = verify_exact("lane offsets",
+                                from_device<std::int32_t>(destination, expected.size()), expected);
     if (!in_place)
-        failures += verify_exact("lane source unchanged", from_device<std::int32_t>(input.data(), source.size()), source);
-    failures += verify_exact("lane delta unchanged", from_device<std::int32_t>(offsets.data(), delta.size()), delta);
+        failures += verify_exact("lane source unchanged",
+                                 from_device<std::int32_t>(input.data(), source.size()), source);
+    failures += verify_exact("lane delta unchanged",
+                             from_device<std::int32_t>(offsets.data(), delta.size()), delta);
     failures += input.verify_guards("lane source");
     failures += output.verify_guards("lane destination");
     failures += offsets.verify_guards("lane deltas");

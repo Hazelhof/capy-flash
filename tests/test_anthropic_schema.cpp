@@ -475,7 +475,7 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
-    body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
+    body["thinking"]                      = Json{{"type", "adaptive"}, {"display", "omitted"}};
     const AnthropicMessagesRequest hidden = parse(body);
     failures += check(hidden.hide_thinking && hidden.generation.enable_thinking == true &&
                           !parse(base_request()).hide_thinking,
@@ -820,11 +820,11 @@ int test_hidden_reasoning_round_trip() {
     const Json aggregate =
         Json::parse(make_anthropic_messages_response(identity, outcome, /*hide_thinking=*/true));
     const Json& block = aggregate["content"][0];
-    int failures = check(block["type"] == "thinking" && block["thinking"] == "" &&
-                             decode_thinking_signature(block["signature"].get<std::string>()) ==
-                                 outcome.reasoning &&
-                             aggregate["content"][1]["text"] == "answer",
-                         "aggregate hidden Thinking leaked text or lost its signature");
+    int failures      = check(block["type"] == "thinking" && block["thinking"] == "" &&
+                                  decode_thinking_signature(block["signature"].get<std::string>()) ==
+                                      outcome.reasoning &&
+                                  aggregate["content"][1]["text"] == "answer",
+                              "aggregate hidden Thinking leaked text or lost its signature");
 
     AnthropicMessagesStream stream(identity, 100, /*hide_thinking=*/true);
     std::vector<std::string> events{stream.start()};

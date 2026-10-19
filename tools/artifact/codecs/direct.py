@@ -27,13 +27,9 @@ def encode_direct(tensor: torch.Tensor, format: str | DirectFormat) -> bytes:
         raise ValueError("direct encoding requires BF16, FP32, or I32")
     expected_dtype = _DIRECT_DTYPES[spec.name]
     if tensor.dtype != expected_dtype:
-        raise TypeError(
-            f"{spec.name} encoding requires {expected_dtype}, got {tensor.dtype}"
-        )
+        raise TypeError(f"{spec.name} encoding requires {expected_dtype}, got {tensor.dtype}")
     if tensor.dim() > 16 or any(dim <= 0 for dim in tensor.shape):
-        raise ValueError(
-            "contiguous_le_v1 requires rank 0..16 with positive dimensions"
-        )
+        raise ValueError("contiguous_le_v1 requires rank 0..16 with positive dimensions")
     host = tensor.detach().contiguous().cpu().reshape(-1)
     raw = host.view(torch.uint8).reshape(host.numel(), spec.word_bytes)
     if sys.byteorder != "little":
@@ -57,9 +53,7 @@ def decode_direct(
         raise ValueError("contiguous_le_v1 supports rank 0 through 16")
     expected = prod(dims) * spec.word_bytes
     if _payload_length(payload) != expected:
-        raise ValueError(
-            f"direct payload has {_payload_length(payload)} bytes, expected {expected}"
-        )
+        raise ValueError(f"direct payload has {_payload_length(payload)} bytes, expected {expected}")
     target = torch.device(device)
     raw = _payload_tensor(payload, target)
     if sys.byteorder != "little" and target.type == "cpu":

@@ -110,6 +110,4 @@ class AnthropicStreamAdapter:
                     ),
                 )
             ]
-        return [
-            ProtocolEvent("metadata", event_type, event.received_ns, payload=payload)
-        ]
+        return [ProtocolEvent("metadata", event_type, event.received_ns, payload=payload)]

@@ -10,11 +10,10 @@ namespace ninfer::ops::detail {
 void q8_dflash2_attn_input_shard_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
                                           Tensor& k, Tensor& v, cudaStream_t stream) {
     const std::int32_t cols = x.ne[1];
-    if (weight.qtype != QType::Q8_G32_FP16 || weight.n != kQ8DFlash2ShardRows ||
-        weight.k != 5120 || weight.padded_shape[1] != 5120 || x.ne[0] != 5120 || cols < 1 ||
+    if (weight.qtype != QType::Q8_G32_FP16 || weight.n != kQ8DFlash2ShardRows || weight.k != 5120 ||
+        weight.padded_shape[1] != 5120 || x.ne[0] != 5120 || cols < 1 ||
         q.ne[0] != kQ8DFlash2ShardQueryRows || k.ne[0] != kQ8DFlash2ShardKvRows ||
-        v.ne[0] != kQ8DFlash2ShardKvRows || q.ne[1] != cols || k.ne[1] != cols ||
-        v.ne[1] != cols) {
+        v.ne[0] != kQ8DFlash2ShardKvRows || q.ne[1] != cols || k.ne[1] != cols || v.ne[1] != cols) {
         throw std::invalid_argument("Q8 DFlash2 attention input shard: invalid problem");
     }
     if (cols <= 48) return q8_dflash2_attn_input_shard_small_t_launch(x, weight, q, k, v, stream);

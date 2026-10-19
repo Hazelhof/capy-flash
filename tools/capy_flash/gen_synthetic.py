@@ -1,11 +1,19 @@
-# Copied unchanged (below this header) from sybrix/qwen3.8-flash-next-ninfer @a2fd69bb, flash-next-reference/gen_synthetic.py
-# Copyright sybrix, Apache License 2.0 (see the repository LICENSE / NOTICE).
-"""Write a small random Qwen3.8-Flash-Next checkpoint in the NVIDIA ModelOpt NVFP4 layout.
+# Copied from sybrix/qwen3.8-flash-next-ninfer @a2fd69bb, flash-next-reference/gen_synthetic.py
+# Copyright sybrix, Apache License 2.0 (see the repository LICENSE / NOTICE). capy-flash adds the
+# fp4_local variant; the CSF reference encoder is from vLLM PR #60646 (Apache-2.0).
+"""Write a small random Qwen3.8-Flash-Next checkpoint in an NVIDIA ModelOpt layout.
 
 Real per-layer geometry (hidden 2560, 512 NVFP4 experts, GDN 16/48 heads, 24/2 attention heads,
 4 hyper-connection streams, PLE at block 1) with only `--layers` Text blocks and a tiny n-gram
 table, so the converter, NInfer and the layer-streaming reference can be compared end to end
 without the 133 GB checkpoint. Tokenizer and template files are copied from a real snapshot.
+
+--variant nvfp4 (default) follows Qwen3.8-Flash-Next-NVFP4: BF16 dense, NVFP4 routed experts, an
+FP8 n-gram table, FP8_PB_WO MTP experts. --variant fp4_local follows Qwen3.8-Flash-Next-FP4-Local
+(pass that snapshot as --source): MXFP8 dense Text matrices (E4M3FN weight + UE8M0 weight_scale
+per 32 columns), NVFP4 routed experts with CSF-compressed scales, a row-scaled NVFP4 n-gram table
+(80 code bytes + 10 E4M3FN scales per row, one FP32 weight_scale_2), W4A16 NVFP4 MTP experts,
+F32 Text hyper-connection and PLE norms, BF16 elsewhere (embedding, head, router, MTP dense part).
 """
 
 from __future__ import annotations
@@ -42,7 +50,7 @@ def is_prime(v):
 def ple_constants(t, ple_index):
     vocab, order, per = t["vocab_size"], t["ngram_size"], t["heads_per_ngram"]
     bound = max(1, ((1 << 63) - 1) // vocab // 2)
-    seed = t["seed"] + 10007 * ple_index
+    seed = t.get("seed", 1234) + 10007 * ple_index  # the FP4-Local config omits the default
     mult = [2 * (splitmix64((seed + GAMMA * (i + 1)) & MASK64) % bound) + 1 for i in range(order)]
     heads = (order - 1) * per
     prime, sizes, offsets, total = t["ngram_vocab_size_base"] - 1, [], [], 0
@@ -77,6 +85,65 @@ def nvfp4(rows, cols, gen, rng):
     }
 
 
+def nvfp4_w4a16(rows, cols, gen, rng):
+    """NVFP4 weights only (W4A16): no activation input_scale."""
+    out = nvfp4(rows, cols, gen, rng)
+    del out["input_scale"]
+    return out
+
+
+def mxfp8(rows, cols, std, gen, rng):
+    """E4M3FN codes of about N(0, 64^2) and UE8M0 scales near std / 64, one per 32 columns."""
+    codes = (torch.randn(rows, cols, generator=gen) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+    exponent = 127 + round(math.log2(std / 64))
+    scales = rng.integers(exponent - 1, exponent + 2, size=(rows, cols // 32), dtype=np.uint8)
+    return {"weight": codes, "weight_scale": torch.from_numpy(scales)}
+
+
+def csf_encode(scales):
+    """CSF (byte-window4-fixed-stream-u24-exceptions/1) reference encoder, vLLM PR #60646 test.
+
+    Row base = row minimum (at most 240), 4-bit codes base + code, outliers as sorted U32 words
+    (scale byte << 24 | row * cols + col).
+    """
+    raw = scales.view(torch.uint8).to(torch.int64)
+    rows, cols = raw.shape
+    bases = raw.min(dim=1, keepdim=True).values.clamp(max=240)
+    codes = raw - bases
+    outlier = (codes < 0) | (codes > 15)
+    codes = torch.where(outlier, 0, codes)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+    fixed = torch.cat((bases.to(torch.uint8).reshape(rows // 16, 16), packed.reshape(rows // 16, -1)), dim=1)
+    positions = outlier.reshape(-1).nonzero().reshape(-1)
+    words = (raw.reshape(-1)[positions] << 24) | positions
+    return fixed, words.to(torch.int32).view(torch.uint32)
+
+
+def nvfp4_csf(rows, cols, gen, rng):
+    """NVFP4 with CSF scales: a few scales (3.0, word 0x44) leave the 16-word window."""
+    out = nvfp4(rows, cols, gen, rng)
+    scale = out.pop("weight_scale").view(torch.uint8).clone()
+    flat = scale.view(-1)
+    flat[torch.from_numpy(rng.choice(flat.numel(), size=8, replace=False))] = 0x44
+    fixed, exceptions = csf_encode(scale)
+    out["weight_scale.nvfp4_csf_fixed"] = fixed
+    out["weight_scale.nvfp4_csf_exceptions"] = exceptions
+    return out
+
+
+def quantization_config(real, layers, mtp):
+    """The real ModelOpt quantization_config restricted to the generated modules."""
+    kept = {}
+    for name, value in real["quantized_layers"].items():
+        if name.startswith("model.language_model.layers."):
+            if int(name.split(".")[3]) >= layers:
+                continue
+        elif not (mtp and name.startswith("mtp.")):
+            continue
+        kept[name] = value
+    return {**real, "quantized_layers": kept}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--source", required=True, help="real snapshot for config and tokenizer files")
@@ -87,16 +154,31 @@ def main():
     p.add_argument("--lm-head-std", type=float, default=0.02)
     p.add_argument("--mtp", action="store_true", help="add the MTP head (FP8_PB_WO experts)")
     p.add_argument("--vision", action="store_true", help="add the (Qwen3.5-shaped) vision tower")
+    p.add_argument("--variant", choices=("nvfp4", "fp4_local"), default="nvfp4")
     args = p.parse_args()
+    fp4_local = args.variant == "fp4_local"
+    if fp4_local and args.vision:
+        p.error("the fp4_local variant has no vision tower (served as text,mtp)")
     src, out = Path(args.source), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
-                 "chat_template.jinja", "generation_config.json", "preprocessor_config.json",
-                 "video_preprocessor_config.json"):
+    for name in (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt",
+        "chat_template.jinja",
+        "generation_config.json",
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+    ):
         if (src / name).exists():
             shutil.copy(src / name, out / name)
     config = json.loads((src / "config.json").read_text())
-    config.pop("quantization_config", None)
+    real_quantization = config.pop("quantization_config", None)
+    if fp4_local:
+        if not real_quantization or real_quantization.get("quant_algo") != "MIXED_PRECISION":
+            p.error("--variant fp4_local needs the Qwen3.8-Flash-Next-FP4-Local snapshot as --source")
+        config["quantization_config"] = quantization_config(real_quantization, args.layers, args.mtp)
     t = config["text_config"]
     n = args.layers
     t["num_hidden_layers"] = n
@@ -115,69 +197,81 @@ def main():
     tensors[pre + "embed_tokens.weight"] = bf16((V, H), 0.02, gen)
     tensors["lm_head.weight"] = bf16((V, H), args.lm_head_std, gen)
 
-    def gated(prefix, inject=True):
-        tensors[prefix + "hc_norm.weight"] = bf16((S * H,), 0.05, gen)
+    def norm_weight(shape, std, f32):
+        value = bf16(shape, std, gen)
+        return value.float() if f32 else value
+
+    def dense(name, shape, std=0.02, quantized=False):
+        if not quantized:
+            tensors[name + ".weight"] = bf16(shape, std, gen)
+            return
+        for key, value in mxfp8(*shape, std, gen, rng).items():
+            tensors[f"{name}.{key}"] = value
+
+    # FP4-Local: MXFP8 Text matrices and F32 Text norms; the MTP layer stays BF16.
+    def gated(prefix, inject=True, f32=False):
+        tensors[prefix + "hc_norm.weight"] = norm_weight((S * H,), 0.05, f32)
         tensors[prefix + "input_mix_weight_down.weight"] = bf16((R, S * H), 0.02, gen)
         tensors[prefix + "input_mix_weight_up.weight"] = bf16((S * H, R), 0.02, gen)
         if inject:
             tensors[prefix + "block_inject_weight.weight"] = bf16((S, S * H), 0.02, gen)
 
-    gated(pre + "hyper_connection_mixer.", inject=False)
+    gated(pre + "hyper_connection_mixer.", inject=False, f32=fp4_local)
     nk, kd = t["linear_num_key_heads"], t["linear_key_head_dim"]
     nv, vd = t["linear_num_value_heads"], t["linear_value_head_dim"]
     qh, kvh, hd = t["num_attention_heads"], t["num_key_value_heads"], t["head_dim"]
     ih, ihd = t["indexer_n_heads"], t["indexer_head_dim"]
     ple_blocks = [b - 1 for b in t["ple_layer_ids"]]
-    def attention(a):
-        tensors[a + "q_proj.weight"] = bf16((2 * qh * hd, H), 0.02, gen)
-        tensors[a + "k_proj.weight"] = bf16((kvh * hd, H), 0.02, gen)
-        tensors[a + "v_proj.weight"] = bf16((kvh * hd, H), 0.02, gen)
-        tensors[a + "o_proj.weight"] = bf16((H, qh * hd), 0.02, gen)
+
+    def attention(a, quantized=False):
+        dense(a + "q_proj", (2 * qh * hd, H), quantized=quantized)
+        dense(a + "k_proj", (kvh * hd, H), quantized=quantized)
+        dense(a + "v_proj", (kvh * hd, H), quantized=quantized)
+        dense(a + "o_proj", (H, qh * hd), quantized=quantized)
         tensors[a + "q_norm.weight"] = bf16((hd,), 0.05, gen)
         tensors[a + "k_norm.weight"] = bf16((hd,), 0.05, gen)
-        tensors[a + "indexer.index_qk_proj.weight"] = bf16(((ih + 1) * ihd, H), 0.02, gen)
+        dense(a + "indexer.index_qk_proj", ((ih + 1) * ihd, H), quantized=quantized)
         tensors[a + "indexer.q_layernorm.weight"] = bf16((ihd,), 0.05, gen)
         tensors[a + "indexer.k_layernorm.weight"] = bf16((ihd,), 0.05, gen)
 
-    def mlp(m, fp8=False):
+    def mlp(m, fp8=False, quantized=False, experts=nvfp4):
         tensors[m + "gate.weight"] = bf16((E, H), 0.05, gen)
-        tensors[m + "shared_expert.gate_proj.weight"] = bf16((Is, H), 0.02, gen)
-        tensors[m + "shared_expert.up_proj.weight"] = bf16((Is, H), 0.02, gen)
-        tensors[m + "shared_expert.down_proj.weight"] = bf16((H, Is), 0.02, gen)
+        dense(m + "shared_expert.gate_proj", (Is, H), quantized=quantized)
+        dense(m + "shared_expert.up_proj", (Is, H), quantized=quantized)
+        dense(m + "shared_expert.down_proj", (H, Is), quantized=quantized)
         tensors[m + "shared_expert_gate.weight"] = bf16((1, H), 0.02, gen)
         for e in range(E):
             for proj, (rows, cols) in (("gate_proj", (I, H)), ("up_proj", (I, H)), ("down_proj", (H, I))):
                 if fp8:
                     # FP8_PB_WO: E4M3 weight, one BF16 multiplier per 128x128 tile.
-                    scale = torch.empty(-(-rows // 128), -(-cols // 128)).uniform_(
-                        2e-4, 6e-4, generator=gen)
+                    scale = torch.empty(-(-rows // 128), -(-cols // 128)).uniform_(2e-4, 6e-4, generator=gen)
                     w = torch.randn(rows, cols, generator=gen).clamp(-4, 4) * 30
                     tensors[f"{m}experts.{e}.{proj}.weight"] = w.to(torch.float8_e4m3fn)
                     tensors[f"{m}experts.{e}.{proj}.weight_scale_inv"] = scale.to(torch.bfloat16)
                     continue
-                for key, value in nvfp4(rows, cols, gen, rng).items():
+                for key, value in experts(rows, cols, gen, rng).items():
                     tensors[f"{m}experts.{e}.{proj}.{key}"] = value
 
     shards = []
     for i in range(n):
         lp = f"{pre}layers.{i}."
-        gated(lp + "attn_hyper_connection.")
-        gated(lp + "mlp_hyper_connection.")
+        gated(lp + "attn_hyper_connection.", f32=fp4_local)
+        gated(lp + "mlp_hyper_connection.", f32=fp4_local)
         if t["layer_types"][i] == "linear_attention":
             g = lp + "linear_attn."
             conv = 2 * nk * kd + nv * vd
             tensors[g + "A_log"] = torch.empty(nv).uniform_(1, 16, generator=gen).log().to(torch.bfloat16)
             tensors[g + "dt_bias"] = torch.ones(nv, dtype=torch.bfloat16)
             tensors[g + "conv1d.weight"] = bf16((conv, 1, 4), 0.2, gen)
-            tensors[g + "in_proj_a.weight"] = bf16((nv, H), 0.02, gen)
-            tensors[g + "in_proj_b.weight"] = bf16((nv, H), 0.02, gen)
-            tensors[g + "in_proj_qkv.weight"] = bf16((conv, H), 0.02, gen)
-            tensors[g + "in_proj_z.weight"] = bf16((nv * vd, H), 0.02, gen)
+            dense(g + "in_proj_a", (nv, H), quantized=fp4_local)
+            dense(g + "in_proj_b", (nv, H), quantized=fp4_local)
+            dense(g + "in_proj_qkv", (conv, H), quantized=fp4_local)
+            dense(g + "in_proj_z", (nv * vd, H), quantized=fp4_local)
             tensors[g + "norm.weight"] = (1.0 + torch.randn(vd, generator=gen) * 0.05).to(torch.bfloat16)
-            tensors[g + "out_proj.weight"] = bf16((H, nv * vd), 0.02, gen)
+            dense(g + "out_proj", (H, nv * vd), quantized=fp4_local)
         else:
-            attention(lp + "self_attn.")
-        mlp(lp + "mlp.")
+            attention(lp + "self_attn.", quantized=fp4_local)
+        mlp(lp + "mlp.", quantized=fp4_local, experts=nvfp4_csf if fp4_local else nvfp4)
         if i in ple_blocks:
             index = ple_blocks.index(i)
             mult, sizes, offsets, rows = ple_constants(t, index)
@@ -186,19 +280,32 @@ def main():
             tensors[q + "conv1d.weight"] = bf16((S * H, 1, t["ple_conv_kernel_size"]), 0.2, gen)
             tensors[q + "key_proj.weight"] = bf16((S * H, t["ple_embed_dim"]), 0.02, gen)
             tensors[q + "value_proj.weight"] = bf16((H, t["ple_embed_dim"]), 0.02, gen)
-            for norm in ("norm_conv", "norm_key", "norm_query"):
-                tensors[q + norm + ".weight"] = bf16((S * H,), 0.05, gen)
+            for name in ("norm_conv", "norm_key", "norm_query"):
+                tensors[q + name + ".weight"] = norm_weight((S * H,), 0.05, fp4_local)
             emb = q + "ple_embedding."
             tensors[emb + "layer_multipliers"] = torch.tensor(mult, dtype=torch.int64)
             tensors[emb + "ngram_heads_vocab_sizes"] = torch.tensor(sizes, dtype=torch.int64)
             tensors[emb + "ngram_heads_offsets"] = torch.tensor(offsets, dtype=torch.int64)
-            tensors[emb + "ngram_embedding.weight_scale"] = torch.tensor([0.015625], dtype=torch.bfloat16)
             parts = 128
             assert rows % parts == 0, rows
-            table = torch.randn(rows, width, generator=gen).clamp(-4, 4).to(torch.float8_e4m3fn)
-            for s in range(parts):
-                chunk = rows // parts
-                tensors[f"{emb}ngram_embedding.shard_{s}.weight"] = table[s * chunk:(s + 1) * chunk].clone()
+            chunk = rows // parts
+            if fp4_local:
+                # Row-scaled NVFP4: E2M1 codes, E4M3FN scales 0.5..2 per 16 values, and one FP32
+                # multiplier that is not a power of two (exercises the single final rounding).
+                codes = torch.from_numpy(rng.integers(0, 256, size=(rows, width // 2), dtype=np.uint8))
+                scales = torch.from_numpy(rng.integers(0x30, 0x41, size=(rows, width // 16), dtype=np.uint8))
+                tensors[emb + "ngram_embedding.weight_scale_2"] = torch.tensor([0.0071234], dtype=torch.float32)
+                for s in range(parts):
+                    rows_s = slice(s * chunk, (s + 1) * chunk)
+                    tensors[f"{emb}ngram_embedding.shard_{s}.weight"] = codes[rows_s].clone()
+                    tensors[f"{emb}ngram_embedding.shard_{s}.weight_scale"] = (
+                        scales[rows_s].clone().view(torch.float8_e4m3fn)
+                    )
+            else:
+                tensors[emb + "ngram_embedding.weight_scale"] = torch.tensor([0.015625], dtype=torch.bfloat16)
+                table = torch.randn(rows, width, generator=gen).clamp(-4, 4).to(torch.float8_e4m3fn)
+                for s in range(parts):
+                    tensors[f"{emb}ngram_embedding.shard_{s}.weight"] = table[s * chunk : (s + 1) * chunk].clone()
         # Spill a file per layer to bound host memory.
         if i != n - 1:
             shards.append(dict(tensors))
@@ -244,15 +351,17 @@ def main():
         gated("mtp.layers.0.attn_hyper_connection.")
         gated("mtp.layers.0.mlp_hyper_connection.")
         attention("mtp.layers.0.self_attn.")
-        mlp("mtp.layers.0.mlp.", fp8=True)
+        if fp4_local:
+            mlp("mtp.layers.0.mlp.", experts=nvfp4_w4a16)
+        else:
+            mlp("mtp.layers.0.mlp.", fp8=True)
     shards.append(tensors)
     weight_map = {}
     for k, shard in enumerate(shards):
         name = f"model-{k + 1:05d}-of-{len(shards):05d}.safetensors"
         save_file({key: v.contiguous() for key, v in shard.items()}, str(out / name))
         weight_map.update({key: name for key in shard})
-    (out / "model.safetensors.index.json").write_text(
-        json.dumps({"metadata": {}, "weight_map": weight_map}, indent=1))
+    (out / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}, indent=1))
     print(f"wrote {len(weight_map)} tensors in {len(shards)} files to {out}")
 
 

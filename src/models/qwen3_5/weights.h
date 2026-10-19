@@ -145,6 +145,8 @@ struct QsaWeights {
 
 struct PleWeights {
     WeightId table, key, value, key_norm, query_norm, conv_norm, convolution;
+    // FP32 scalar of an nvfp4_row_e4m3_g16 table (FP4-Local); absent for row-scaled FP8 tables.
+    WeightId table_global_scale;
 };
 
 // Qwen4Exp block: hyper-connection mixers around a QSA or GDN mixer and the offloaded MoE.

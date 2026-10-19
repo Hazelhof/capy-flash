@@ -1,10 +1,10 @@
 // T103 (docs/capy-flash/development-log.md): generic BF16 A16 linear for the shapes the finite
-// registry (bf16_dispatch.cpp) does not name, e.g. Qwen3.8-Flash-Next's QSA indexer [640,2560],
-// hyper-connection Down(+inject) [320|324,10240] and Up [10240,320], GDN q|k|v|z [16384,2560] /
-// [8192,2560] and output [2560,6144] / [2560,3072] kept in BF16. Correctness first: any N, K, T
-// (16-byte vector loads when K % 8 == 0 and the operands are aligned, scalar otherwise), FP32
-// accumulation, one BF16 rounding of the output. Plain launches, no workspace, no attributes:
-// safe under CUDA graph capture and at tp 2 (each rank calls it on its own stream).
+// registry (bf16_dispatch.cpp) does not name, e.g. Qwen3.8-Flash-Next's GDN q|k|v|z
+// [16384,2560] / [8192,2560] kept in BF16, and for the small-T widths of the named
+// Qwen3.8-Flash-Next shapes (shapes/qwen4_exp.cu). Correctness first: any N, K, T (16-byte vector
+// loads when K % 8 == 0 and the operands are aligned, scalar otherwise), FP32 accumulation, one
+// BF16 rounding of the output. Plain launches, no workspace, no attributes: safe under CUDA graph
+// capture and at tp 2 (each rank calls it on its own stream).
 //   T <= 16: GEMV, a warp (or 8 warps for short N) per output row, 8 tokens per grid row.
 //   T  > 16: 64x64 tiled WMMA (bf16 16x16x16, FP32 accumulators), zero-filled edges.
 #include "core/device.h"
@@ -19,13 +19,13 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int kGemvTokens  = 8;  // tokens per GEMV grid row
-constexpr int kGemvMaxT    = 16; // larger T takes the tiled route
-constexpr int kTileRows    = 64;
-constexpr int kTileTokens  = 64;
-constexpr int kTileK       = 32;
-constexpr int kTileLds     = kTileK + 8; // BF16 leading dimension (multiple of 8)
-constexpr int kTileLdc     = kTileRows + 4;
+constexpr int kGemvTokens = 8;  // tokens per GEMV grid row
+constexpr int kGemvMaxT   = 16; // larger T takes the tiled route
+constexpr int kTileRows   = 64;
+constexpr int kTileTokens = 64;
+constexpr int kTileK      = 32;
+constexpr int kTileLds    = kTileK + 8; // BF16 leading dimension (multiple of 8)
+constexpr int kTileLdc    = kTileRows + 4;
 
 __device__ __forceinline__ void unpack8(const uint4& v, float (&f)[8]) {
     const auto* h = reinterpret_cast<const __nv_bfloat162*>(&v);
@@ -79,8 +79,9 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
                 for (int t = 0; t < kGemvTokens; ++t) {
                     if (t < count) {
-                        acc[t] = fmaf(wf, __bfloat162float(x[static_cast<std::size_t>(t0 + t) * k + c]),
-                                      acc[t]);
+                        acc[t] =
+                            fmaf(wf, __bfloat162float(x[static_cast<std::size_t>(t0 + t) * k + c]),
+                                 acc[t]);
                     }
                 }
             }
@@ -108,7 +109,8 @@ __global__ void __launch_bounds__(256)
         if (lane == 0 && row < n) {
 #pragma unroll
             for (int t = 0; t < kGemvTokens; ++t) {
-                if (t < count) out[static_cast<std::size_t>(t0 + t) * n + row] = __float2bfloat16(acc[t]);
+                if (t < count)
+                    out[static_cast<std::size_t>(t0 + t) * n + row] = __float2bfloat16(acc[t]);
             }
         }
     }
@@ -134,22 +136,23 @@ __global__ void __launch_bounds__(128)
 #pragma unroll
         for (int j = 0; j < 2; ++j) wmma::fill_fragment(acc[i][j], 0.0F);
     const __nv_bfloat16 zero = __float2bfloat16(0.0F);
-    const auto load = [&](const __nv_bfloat16* source, int limit, int base, int k0,
+    const auto load          = [&](const __nv_bfloat16* source, int limit, int base, int k0,
                           __nv_bfloat16* tile) {
         for (int i = threadIdx.x; i < kTileRows * kTileK / 8; i += 128) {
-            const int r   = i / (kTileK / 8);
-            const int c8  = (i % (kTileK / 8)) * 8;
-            const int g   = base + r;
-            const int gk  = k0 + c8;
+            const int r      = i / (kTileK / 8);
+            const int c8     = (i % (kTileK / 8)) * 8;
+            const int g      = base + r;
+            const int gk     = k0 + c8;
             __nv_bfloat16* d = tile + r * kTileLds + c8;
             if (vectorized && g < limit && gk + 8 <= k) {
-                *reinterpret_cast<uint4*>(d) = __ldg(reinterpret_cast<const uint4*>(
-                    source + static_cast<std::size_t>(g) * k + gk));
+                *reinterpret_cast<uint4*>(d) = __ldg(
+                    reinterpret_cast<const uint4*>(source + static_cast<std::size_t>(g) * k + gk));
             } else {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    d[j] = (g < limit && gk + j < k) ? source[static_cast<std::size_t>(g) * k + gk + j]
-                                                     : zero;
+                    d[j] = (g < limit && gk + j < k)
+                               ? source[static_cast<std::size_t>(g) * k + gk + j]
+                               : zero;
                 }
             }
         }
@@ -202,16 +205,18 @@ void launch_bf16_generic(const Tensor& x, const Weight& w, Tensor& out, cudaStre
         out.data == nullptr) {
         throw std::invalid_argument("bf16 generic linear: invalid operands");
     }
-    const auto* xp = static_cast<const __nv_bfloat16*>(x.data);
-    const auto* wp = static_cast<const __nv_bfloat16*>(w.qdata);
-    auto* op       = static_cast<__nv_bfloat16*>(out.data);
+    const auto* xp        = static_cast<const __nv_bfloat16*>(x.data);
+    const auto* wp        = static_cast<const __nv_bfloat16*>(w.qdata);
+    auto* op              = static_cast<__nv_bfloat16*>(out.data);
     const bool vectorized = k % 8 == 0 && aligned16(xp) && aligned16(wp);
     if (tokens <= kGemvMaxT) {
-        const unsigned token_blocks = static_cast<unsigned>((tokens + kGemvTokens - 1) / kGemvTokens);
+        const unsigned token_blocks =
+            static_cast<unsigned>((tokens + kGemvTokens - 1) / kGemvTokens);
         // Short outputs: 8 warps per row so that the grid still covers every SM.
         if (n < 4096) {
-            bf16_generic_gemv_kernel<8><<<dim3(static_cast<unsigned>(n), token_blocks), 256, 0, stream>>>(
-                xp, wp, op, n, k, tokens, vectorized);
+            bf16_generic_gemv_kernel<8>
+                <<<dim3(static_cast<unsigned>(n), token_blocks), 256, 0, stream>>>(
+                    xp, wp, op, n, k, tokens, vectorized);
         } else {
             bf16_generic_gemv_kernel<1>
                 <<<dim3(static_cast<unsigned>((n + 7) / 8), token_blocks), 256, 0, stream>>>(

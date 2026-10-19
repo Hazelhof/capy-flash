@@ -98,7 +98,14 @@ void bf16_gdn_gating_proj_small_t_split10_shard_launch(const Tensor& x, const We
                                                        const Tensor& dt_bias, void* workspace,
                                                        std::size_t workspace_bytes, Tensor& g,
                                                        Tensor& beta, cudaStream_t stream);
-// GEMV at T=1 (workspace unused) and split-10 small-T at T>=2.
+// T=2..32 in one launch: the split-10 partial sums of every slice reduced in split order inside
+// the CTA, bit-identical to bf16_gdn_gating_proj_small_t_split10_shard_launch at the same T.
+void bf16_gdn_gating_proj_small_t_fused_shard_launch(const Tensor& x, const Weight& a_weight,
+                                                     const Weight& b_weight, const Tensor& A_log,
+                                                     const Tensor& dt_bias, Tensor& g, Tensor& beta,
+                                                     cudaStream_t stream);
+// GEMV at T=1 and the fused split-10 kernel through T=32 (workspace unused), the two-kernel
+// split-10 form above that.
 void bf16_gdn_gating_dispatch_shard(const Tensor& x, const Weight& a_weight, const Weight& b_weight,
                                     const Tensor& A_log, const Tensor& dt_bias, void* workspace,
                                     std::size_t workspace_bytes, Tensor& g, Tensor& beta,

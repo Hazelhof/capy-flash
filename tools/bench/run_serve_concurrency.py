@@ -154,9 +154,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True, help="benchmark output directory")
     parser.add_argument("--port", type=int, default=8080, help="loopback serving port")
     parser.add_argument("--device", type=int, default=0, help="CUDA device index")
-    parser.add_argument(
-        "--dry-run", action="store_true", help="print point commands and request counts only"
-    )
+    parser.add_argument("--dry-run", action="store_true", help="print point commands and request counts only")
     return parser.parse_args(argv)
 
 
@@ -185,9 +183,7 @@ def validate_args(args: argparse.Namespace) -> None:
         raise corpus.CampaignError("duplicate --suite value")
 
 
-def build_points(
-    artifacts: Sequence[tuple[str, Path]], args: argparse.Namespace
-) -> list[Point]:
+def build_points(artifacts: Sequence[tuple[str, Path]], args: argparse.Namespace) -> list[Point]:
     mode_names = args.mode or list(corpus.DEFAULT_MODES)
     if len(mode_names) != len(set(mode_names)):
         raise corpus.CampaignError("duplicate --mode value")
@@ -215,9 +211,7 @@ def build_points(
     return points
 
 
-def build_jobs(
-    point: Point, fixtures: dict[str, corpus.Fixture], decode_tokens: int
-) -> list[Job]:
+def build_jobs(point: Point, fixtures: dict[str, corpus.Fixture], decode_tokens: int) -> list[Job]:
     if point.suite == "decode-saturation":
         fixture = fixtures[SATURATION_FIXTURE]
         return [
@@ -346,9 +340,7 @@ def server_command(
     return command
 
 
-def validate_server_start(
-    event: dict[str, Any], point: Point, args: argparse.Namespace
-) -> tuple[str, str]:
+def validate_server_start(event: dict[str, Any], point: Point, args: argparse.Namespace) -> tuple[str, str]:
     corpus.require_server_log_identity(event, "server_start")
     engine = event.get("engine", {})
     expected = {
@@ -370,9 +362,7 @@ def validate_server_start(
     actual = {name: engine.get(name) for name in expected}
     if actual != expected:
         raise corpus.CampaignError(f"server_start Engine configuration mismatch: {actual!r}")
-    if event.get("sampling_defaults", {}).get("greedy") != (
-        point.sampling_mode == "greedy"
-    ):
+    if event.get("sampling_defaults", {}).get("greedy") != (point.sampling_mode == "greedy"):
         raise corpus.CampaignError("server_start sampling mode does not match the point")
     if Path(event.get("artifact", {}).get("path", "")).resolve() != point.artifact.resolve():
         raise corpus.CampaignError("loaded artifact path does not match the point")
@@ -388,9 +378,7 @@ def validate_server_start(
     return server_instance_id, prefill_signature
 
 
-def parse_client_response(
-    job: Job, response: dict[str, Any], started_at: float, finished_at: float
-) -> ClientResult:
+def parse_client_response(job: Job, response: dict[str, Any], started_at: float, finished_at: float) -> ClientResult:
     try:
         usage = response["usage"]
         choices = response["choices"]
@@ -438,9 +426,7 @@ def run_clients(
 
     def worker() -> None:
         nonlocal next_dispatch_index
-        connection = http.client.HTTPConnection(
-            "127.0.0.1", port, timeout=corpus.REQUEST_TIMEOUT_SECONDS
-        )
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=corpus.REQUEST_TIMEOUT_SECONDS)
         try:
             connection.connect()
         except Exception as exc:
@@ -464,9 +450,7 @@ def run_clients(
                         )
                     if ordered_dispatch:
                         with dispatch_condition:
-                            dispatch_condition.wait_for(
-                                lambda: failed.is_set() or job.index == next_dispatch_index
-                            )
+                            dispatch_condition.wait_for(lambda: failed.is_set() or job.index == next_dispatch_index)
                             if failed.is_set():
                                 return
                             started_at = time.monotonic()
@@ -489,10 +473,7 @@ def run_clients(
         finally:
             connection.close()
 
-    threads = [
-        threading.Thread(target=worker, name=f"bench-client-{index}")
-        for index in range(point.concurrency)
-    ]
+    threads = [threading.Thread(target=worker, name=f"bench-client-{index}") for index in range(point.concurrency)]
     for thread in threads:
         thread.start()
 
@@ -515,9 +496,7 @@ def run_clients(
             raise error
         raise corpus.CampaignError(f"concurrent request failed: {error}") from error
     if len(results) != len(jobs):
-        raise corpus.CampaignError(
-            f"completed {len(results)} client request(s), expected {len(jobs)}"
-        )
+        raise corpus.CampaignError(f"completed {len(results)} client request(s), expected {len(jobs)}")
     campaign_end = max(result.finished_at for result in results)
     return sorted(results, key=lambda result: result.job.index), campaign_start, campaign_end
 
@@ -574,9 +553,7 @@ def sum_request_done(events: Sequence[dict[str, Any]]) -> dict[str, int | float 
         "speculative_rounds": speculative_rounds,
         "drafted_tokens": drafted_tokens,
         "accepted_tokens": accepted_tokens,
-        "speculative_acceptance": (
-            accepted_tokens / drafted_tokens if drafted_tokens > 0 else None
-        ),
+        "speculative_acceptance": (accepted_tokens / drafted_tokens if drafted_tokens > 0 else None),
         "fallback_steps": fallback_steps,
     }
 
@@ -599,9 +576,7 @@ def sum_throughput(events: Sequence[dict[str, Any]]) -> dict[str, int | float | 
         "committed_decode_tokens": committed_decode_tokens,
         "decode_rounds": decode_rounds,
         "decode_row_rounds": decode_row_rounds,
-        "average_decode_batch": (
-            decode_row_rounds / decode_rounds if decode_rounds > 0 else None
-        ),
+        "average_decode_batch": (decode_row_rounds / decode_rounds if decode_rounds > 0 else None),
     }
 
 
@@ -620,19 +595,14 @@ def is_steady_interval(event: dict[str, Any], concurrency: int) -> bool:
             and int(scheduler["decode_ready"]) == concurrency
         )
     except (KeyError, TypeError, ValueError) as exc:
-        raise corpus.CampaignError(
-            f"throughput event is missing steady-state fields: {exc}"
-        ) from exc
+        raise corpus.CampaignError(f"throughput event is missing steady-state fields: {exc}") from exc
 
 
-def steady_metrics(
-    events: Sequence[dict[str, Any]], concurrency: int
-) -> dict[str, int | float]:
+def steady_metrics(events: Sequence[dict[str, Any]], concurrency: int) -> dict[str, int | float]:
     selected = [event for event in events if is_steady_interval(event, concurrency)]
     if not selected:
         raise corpus.CampaignError(
-            f"concurrency {concurrency} produced no complete full-batch decode interval; "
-            "increase --decode-tokens"
+            f"concurrency {concurrency} produced no complete full-batch decode interval; increase --decode-tokens"
         )
     duration = sum(float(event["interval_seconds"]) for event in selected)
     tokens = sum(int(event["tokens"]["committed_decode"]) for event in selected)
@@ -651,9 +621,7 @@ def steady_metrics(
     }
 
 
-def client_records(
-    results: Sequence[ClientResult], campaign_start: float
-) -> list[dict[str, Any]]:
+def client_records(results: Sequence[ClientResult], campaign_start: float) -> list[dict[str, Any]]:
     return [
         {
             "index": result.job.index,
@@ -690,17 +658,13 @@ def analyze_point(
     request_done = [event for event in events if event.get("event") == "request_done"]
     throughput = [event for event in events if event.get("event") == "throughput"]
     if len(request_done) != len(results):
-        raise corpus.CampaignError(
-            f"server recorded {len(request_done)} completed request(s), expected {len(results)}"
-        )
+        raise corpus.CampaignError(f"server recorded {len(request_done)} completed request(s), expected {len(results)}")
 
     done_totals = sum_request_done(request_done)
     runtime_totals = sum_throughput(throughput)
     client_prompt = sum(result.prompt_tokens for result in results)
     client_completion = sum(result.completion_tokens for result in results)
-    if client_prompt != done_totals["prompt_tokens"] or client_completion != done_totals[
-        "completion_tokens"
-    ]:
+    if client_prompt != done_totals["prompt_tokens"] or client_completion != done_totals["completion_tokens"]:
         raise corpus.CampaignError("client usage and request_done token totals differ")
     if runtime_totals["computed_prefill_tokens"] != done_totals["computed_prefill_tokens"]:
         raise corpus.CampaignError("throughput and request_done prefill token totals differ")
@@ -712,13 +676,8 @@ def analyze_point(
         raise corpus.CampaignError("campaign makespan is not positive")
     metrics: dict[str, Any]
     if point.suite == "decode-saturation":
-        if any(
-            event.get("result", {}).get("finish_reason") != "output_limit"
-            for event in request_done
-        ):
-            raise corpus.CampaignError(
-                "decode-saturation request stopped before its output limit"
-            )
+        if any(event.get("result", {}).get("finish_reason") != "output_limit" for event in request_done):
+            raise corpus.CampaignError("decode-saturation request stopped before its output limit")
         metrics = {
             "wave_makespan_seconds": makespan,
             "steady": steady_metrics(throughput, point.concurrency),
@@ -727,9 +686,7 @@ def analyze_point(
         metrics = {
             "makespan_seconds": makespan,
             "requests_per_second": len(results) / makespan,
-            "computed_prefill_tokens_per_second": (
-                int(done_totals["computed_prefill_tokens"]) / makespan
-            ),
+            "computed_prefill_tokens_per_second": (int(done_totals["computed_prefill_tokens"]) / makespan),
             "decode_tokens_per_second": int(done_totals["decode_tokens"]) / makespan,
         }
 
@@ -795,6 +752,7 @@ def run_point(
                 (detail_dir / "results.jsonl").open("w", encoding="utf-8") as handle,
                 ThreadPoolExecutor(max_workers=1) as collector,
             ):
+
                 def save(result: ClientResult, response: dict[str, Any]) -> None:
                     job = result.job
                     event = server.wait_for_request_done(server_instance_id)
@@ -834,9 +792,7 @@ def run_point(
                 results, campaign_start, campaign_end = run_clients(point, jobs, args.port, enqueue)
                 for future in pending_records:
                     future.result()
-            rows = corpus.build_summary_rows(
-                records, (point.target,), (point.speculative_mode,), point.sampling_mode
-            )
+            rows = corpus.build_summary_rows(records, (point.target,), (point.speculative_mode,), point.sampling_mode)
             corpus.write_summaries(rows, detail_dir)
         else:
             results, campaign_start, campaign_end = run_clients(point, jobs, args.port)
@@ -865,8 +821,7 @@ def run_point(
         )
     else:
         result_text = (
-            f"makespan={report['metrics']['makespan_seconds']:.2f}s "
-            f"batch={report['decode_batch']['average_size']:.2f}"
+            f"makespan={report['metrics']['makespan_seconds']:.2f}s batch={report['decode_batch']['average_size']:.2f}"
         )
     print(f"done {point.key}: {result_text} ({point_path})", flush=True)
     return report
@@ -958,19 +913,13 @@ def summary_row(report: dict[str, Any]) -> dict[str, Any]:
     if report["suite"] == "decode-saturation":
         row["average_decode_batch"] = report["metrics"]["steady"]["average_decode_batch"]
         row["steady_seconds"] = report["metrics"]["steady"]["seconds"]
-        row["steady_decode_tokens_per_second"] = report["metrics"]["steady"][
-            "decode_tokens_per_second"
-        ]
+        row["steady_decode_tokens_per_second"] = report["metrics"]["steady"]["decode_tokens_per_second"]
         row["makespan_seconds"] = report["metrics"]["wave_makespan_seconds"]
     else:
         row["makespan_seconds"] = report["metrics"]["makespan_seconds"]
         row["requests_per_second"] = report["metrics"]["requests_per_second"]
-        row["workload_prefill_tokens_per_second"] = report["metrics"][
-            "computed_prefill_tokens_per_second"
-        ]
-        row["workload_decode_tokens_per_second"] = report["metrics"][
-            "decode_tokens_per_second"
-        ]
+        row["workload_prefill_tokens_per_second"] = report["metrics"]["computed_prefill_tokens_per_second"]
+        row["workload_decode_tokens_per_second"] = report["metrics"]["decode_tokens_per_second"]
     return row
 
 
@@ -1009,9 +958,7 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
     with (output_dir / "summary.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
         writer.writeheader()
-        writer.writerows(
-            {field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows
-        )
+        writer.writerows({field: csv_value(row.get(field)) for field in SUMMARY_FIELDS} for row in rows)
 
     groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for row in rows:
@@ -1073,16 +1020,12 @@ def write_summaries(reports: Sequence[dict[str, Any]], output_dir: Path) -> None
 
     corpus_order_note = ""
     if any(report["suite"] == "corpus-makespan" for report in reports):
-        corpus_order_note = (
-            f" Corpus-makespan uses fixed shuffle seed {CORPUS_ORDER_SEED} and ordered HTTP sends."
-        )
+        corpus_order_note = f" Corpus-makespan uses fixed shuffle seed {CORPUS_ORDER_SEED} and ordered HTTP sends."
     markdown = (
         "# Concurrent serving benchmark\n\n"
         "Saturated decode rates use only complete intervals whose decode batch equals the "
         "configured concurrency. Corpus makespan spans simultaneous client release through the "
-        f"last complete HTTP response.{corpus_order_note}\n\n"
-        + "\n\n".join(sections)
-        + "\n"
+        f"last complete HTTP response.{corpus_order_note}\n\n" + "\n\n".join(sections) + "\n"
     )
     (output_dir / "summary.md").write_text(markdown, encoding="utf-8")
 
@@ -1108,10 +1051,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for point in points:
             log_path = output_dir / "server" / f"{point.key}.jsonl"
             jobs = build_jobs(point, fixtures, args.decode_tokens)
-            print(
-                f"# {point.key}: {len(jobs)} request(s), "
-                f"order={workload_order_label(point)}"
-            )
+            print(f"# {point.key}: {len(jobs)} request(s), order={workload_order_label(point)}")
             print(shlex.join(server_command(serve, point, log_path, args)))
         return 0
 

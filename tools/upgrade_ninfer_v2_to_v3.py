@@ -64,10 +64,7 @@ def text_config(moe):
         "vocab_size": 248320,
         "tie_word_embeddings": False,
         "num_hidden_layers": layers,
-        "layer_types": [
-            "full_attention" if i % 4 == 3 else "linear_attention"
-            for i in range(layers)
-        ],
+        "layer_types": ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(layers)],
         "max_position_embeddings": 262144,
         "rms_norm_eps": f32(1e-6),
         "num_attention_heads": 16 if moe else 24,
@@ -112,15 +109,11 @@ def vision_config(moe):
 
 def draft_config(second):
     draft = {
-        "target_layer_ids": (
-            [5, 19, 33, 47, 61] if second else [1, 6, 11, 16, 22, 27, 32, 37]
-        ),
+        "target_layer_ids": ([5, 19, 33, 47, 61] if second else [1, 6, 11, 16, 22, 27, 32, 37]),
         "mask_token_id": 248070 if second else 248077,
     }
     if second:
-        draft.update(
-            conv_kernel_size=2, conv_group_size=16, selector_rank=256, selector_top_k=16
-        )
+        draft.update(conv_kernel_size=2, conv_group_size=16, selector_rank=256, selector_top_k=16)
     return {
         "architectures": ["DFlash2DraftModel" if second else "DFlashDraftModel"],
         "model_type": "qwen3",
@@ -132,8 +125,7 @@ def draft_config(second):
         "rms_norm_eps": f32(1e-6),
         "rope_parameters": {"rope_theta": f32(10000000)},
         "max_position_embeddings": 262144,
-        "layer_types": ["sliding_attention"] * 5
-        + ([] if second else ["full_attention"]),
+        "layer_types": ["sliding_attention"] * 5 + ([] if second else ["full_attention"]),
         "sliding_window": 2048 if second else 4096,
         "dflash_config": draft,
     }
@@ -160,12 +152,7 @@ def encoded_bytes(obj):
         low = n * groups * (group if bits == 8 else group // 2)
         high = n * groups * (0 if bits in (4, 8) else group * (bits - 4) // 8)
         return align(low, 256) + align(high, 256) + n * groups * 2
-    if (
-        layout == "block_scale_k16_m128x4_v1"
-        and format == "nvfp4"
-        and n % 128 == 0
-        and k % 64 == 0
-    ):
+    if layout == "block_scale_k16_m128x4_v1" and format == "nvfp4" and n % 128 == 0 and k % 64 == 0:
         return align(n * k // 2, 256) + n * k // 16 + 4
     if layout == "row_scale_v1" and format == "fp8_e4m3fn_row_bf16":
         return align(n * k, 256) + n * 2
@@ -212,13 +199,7 @@ def _input_names(name, components):
     if name == "vision/patch_embedding":
         return ["vision/patch_input"]
     if name in ("vision/merger/fc1", "vision/merger/fc2"):
-        return [
-            (
-                "vision/merger/input"
-                if name.endswith("fc1")
-                else "vision/merger/activation"
-            )
-        ]
+        return [("vision/merger/input" if name.endswith("fc1") else "vision/merger/activation")]
     match = re.fullmatch(r"(vision/layers/\d+/)(.+)", name)
     if match:
         block, role = match.groups()
@@ -298,9 +279,7 @@ def make_directory(identity, old_objects):
                 layout=LAYOUTS[value["layout"]],
             )
             if obj["offset"] % 256 or obj["bytes"] != encoded_bytes(obj):
-                raise ValueError(
-                    f"{obj['id']}: invalid tensor geometry/encoding length"
-                )
+                raise ValueError(f"{obj['id']}: invalid tensor geometry/encoding length")
         elif obj["kind"] == "resource" and value["encoding"] == "raw-bytes-v1":
             obj["encoding"] = "raw_bytes_v1"
         else:
@@ -320,9 +299,7 @@ def make_directory(identity, old_objects):
             binding = {"object": obj["id"]}
         else:
             begin, end = bounds
-            if not 0 <= begin < end <= math.prod(
-                obj["shape"]
-            ) or end - begin != math.prod(shape):
+            if not 0 <= begin < end <= math.prod(obj["shape"]) or end - begin != math.prod(shape):
                 raise ValueError(f"{name}: invalid known row mapping")
             binding = {"parts": [{"object": obj["id"], "range": [begin, end]}]}
         bindings[name] = binding
@@ -349,12 +326,7 @@ def make_directory(identity, old_objects):
             if not name.startswith("frontend/"):
                 raise ValueError(f"unknown official resource {name}")
             role = name.split("/", 1)[1]
-            component = (
-                "vision"
-                if role
-                in ("preprocessor_config.json", "video_preprocessor_config.json")
-                else "text"
-            )
+            component = "vision" if role in ("preprocessor_config.json", "video_preprocessor_config.json") else "text"
             components[component]["resources"][role] = name
             continue
         if name.endswith("/input_scale_divisor"):
@@ -382,11 +354,7 @@ def make_directory(identity, old_objects):
             continue
         if name in ("text/draft_head", "text/draft_head_token_ids"):
             put(
-                (
-                    "proposal/head"
-                    if name.endswith("draft_head")
-                    else "proposal/token_ids"
-                ),
+                ("proposal/head" if name.endswith("draft_head") else "proposal/token_ids"),
                 obj,
                 (131072, h) if name.endswith("draft_head") else (131072,),
             )
@@ -419,36 +387,22 @@ def make_directory(identity, old_objects):
                 roles = (
                     ("query", "key")
                     if role.endswith("/query_key")
-                    else (
-                        ("gate", "value")
-                        if role.endswith("/gate_value")
-                        else ("query", "key", "gate", "value")
-                    )
+                    else (("gate", "value") if role.endswith("/gate_value") else ("query", "key", "gate", "value"))
                 )
                 split(
                     obj,
-                    [
-                        (block + "attention/" + v, q if v in ("query", "gate") else k)
-                        for v in roles
-                    ],
+                    [(block + "attention/" + v, q if v in ("query", "gate") else k) for v in roles],
                     h,
                 )
             elif role in ("gdn/query_key", "gdn/value_z", "gdn/query_key_value_z"):
                 roles = (
                     ("query", "key")
                     if role.endswith("/query_key")
-                    else (
-                        ("value", "z")
-                        if role.endswith("/value_z")
-                        else ("query", "key", "value", "z")
-                    )
+                    else (("value", "z") if role.endswith("/value_z") else ("query", "key", "value", "z"))
                 )
                 split(
                     obj,
-                    [
-                        (block + "gdn/" + v, kg if v in ("query", "key") else vg)
-                        for v in roles
-                    ],
+                    [(block + "gdn/" + v, kg if v in ("query", "key") else vg) for v in roles],
                     h,
                 )
             elif role == "gdn/a_b_projection":
@@ -472,11 +426,7 @@ def make_directory(identity, old_objects):
                 shape = (
                     (nv,)
                     if role in ("gdn/a_log", "gdn/dt_bias")
-                    else (
-                        (128,)
-                        if role == "gdn/norm"
-                        else (4, channels) if role == "gdn/convolution" else (h, vg)
-                    )
+                    else ((128,) if role == "gdn/norm" else (4, channels) if role == "gdn/convolution" else (h, vg))
                 )
                 put(block + role, obj, shape)
             elif role == "mlp/gate_up" and not moe:
@@ -486,17 +436,11 @@ def make_directory(identity, old_objects):
             elif role.startswith("moe/") and moe:
                 prefix = block + "moe/"
                 if role == "moe/router_shared_gate":
-                    split(
-                        obj, [(prefix + "router", 256), (prefix + "shared_score", 1)], h
-                    )
+                    split(obj, [(prefix + "router", 256), (prefix + "shared_score", 1)], h)
                 elif role == "moe/routed_gate_up":
                     split(
                         obj,
-                        [
-                            (prefix + f"experts/{e}/" + part, 512)
-                            for e in range(256)
-                            for part in ("gate", "up")
-                        ],
+                        [(prefix + f"experts/{e}/" + part, 512) for e in range(256) for part in ("gate", "up")],
                         h,
                     )
                 elif role == "moe/routed_down":
@@ -527,11 +471,7 @@ def make_directory(identity, old_objects):
                 shape = (
                     (1152, 1536)
                     if name.endswith("patch_embedding")
-                    else (
-                        (1152,)
-                        if name.endswith("patch_embedding_bias")
-                        else (2304, 1152)
-                    )
+                    else ((1152,) if name.endswith("patch_embedding_bias") else (2304, 1152))
                 )
                 put(name, obj, shape)
                 continue
@@ -543,10 +483,7 @@ def make_directory(identity, old_objects):
                 if role == "attention/qkv":
                     split(
                         obj,
-                        [
-                            (block + "attention/" + v, 1152)
-                            for v in ("query", "key", "value")
-                        ],
+                        [(block + "attention/" + v, 1152) for v in ("query", "key", "value")],
                         1152,
                     )
                 elif role == "attention/qkv_bias":
@@ -572,9 +509,7 @@ def make_directory(identity, old_objects):
                         "norm2/weight": (1152,),
                         "norm2/bias": (1152,),
                     }
-                    role_name = role.replace("norm1/", "norm1_").replace(
-                        "norm2/", "norm2_"
-                    )
+                    role_name = role.replace("norm1/", "norm1_").replace("norm2/", "norm2_")
                     put(block + role_name, obj, sizes[role])
                 continue
             role = name.removeprefix("vision/merger/")
@@ -599,9 +534,7 @@ def make_directory(identity, old_objects):
             inter = config["intermediate_size"]
             if role in ("feature_projection", "context_norm", "final_norm"):
                 shape = (
-                    (h, len(config["dflash_config"]["target_layer_ids"]) * h)
-                    if role == "feature_projection"
-                    else (h,)
+                    (h, len(config["dflash_config"]["target_layer_ids"]) * h) if role == "feature_projection" else (h,)
                 )
                 put(name, obj, shape)
                 continue
@@ -660,11 +593,7 @@ def make_directory(identity, old_objects):
     uses = []
     for name in bindings:
         format = parameter_formats[name]
-        policy = (
-            "AllowA4"
-            if format == "nvfp4"
-            else "AllowA8" if format == "fp8_e4m3fn_row_bf16" else "A16Only"
-        )
+        policy = "AllowA4" if format == "nvfp4" else "AllowA8" if format == "fp8_e4m3fn_row_bf16" else "A16Only"
         for input_name in _input_names(name, components):
             use = {"parameter": name, "input": input_name, "activation_policy": policy}
             if name in scalar_uses:
@@ -695,9 +624,7 @@ def make_directory(identity, old_objects):
         "bindings": bindings,
         "uses": uses,
         "metadata": {"name": key[0]},
-        "provenance": {
-            "upgraded_from": {"version": 2, "model_id": key[0], "weights_id": key[1]}
-        },
+        "provenance": {"upgraded_from": {"version": 2, "model_id": key[0], "weights_id": key[1]}},
     }
 
 
@@ -757,9 +684,7 @@ def layout(entry, directory, payload):
                 )
                 remaining -= count
         directory["files"] = files
-        data = json.dumps(
-            directory, ensure_ascii=False, allow_nan=False, separators=(",", ":")
-        ).encode()
+        data = json.dumps(directory, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
         if len(data) <= reserve:
             return data + b" " * (reserve - len(data)), start
         reserve = align(32 + len(data)) - 32
@@ -771,18 +696,10 @@ def upgrade(input_path, output_path):
         raise ValueError("input and output must differ")
     old, source_start, source_payload = read_v2(input_path)
     directory = make_directory(old["identity"], old["objects"])
-    template_name = (
-        "qwen3_8.jinja"
-        if old["identity"]["model_id"].startswith("qwen3.8-")
-        else "qwen3_6.jinja"
-    )
-    template = (
-        Path(__file__).resolve().parent / "chat_templates" / template_name
-    ).read_bytes()
+    template_name = "qwen3_8.jinja" if old["identity"]["model_id"].startswith("qwen3.8-") else "qwen3_6.jinja"
+    template = (Path(__file__).resolve().parent / "chat_templates" / template_name).read_bytes()
     template_id = directory["components"]["text"]["resources"]["chat_template.jinja"]
-    template_object = next(
-        obj for obj in directory["objects"] if obj["id"] == template_id
-    )
+    template_object = next(obj for obj in directory["objects"] if obj["id"] == template_id)
     # Append the replacement so every existing weight keeps its original payload offset.
     template_offset = align(source_payload, 256)
     template_object.update(offset=template_offset, bytes=len(template))
@@ -790,9 +707,7 @@ def upgrade(input_path, output_path):
     directory["objects"].append(template_object)
     payload = template_offset + len(template)
     data, entry_start = layout(output_path, directory, payload)
-    targets = [output_path] + [
-        output_path.parent / f["path"] for f in directory["files"][1:]
-    ]
+    targets = [output_path] + [output_path.parent / f["path"] for f in directory["files"][1:]]
     if any(path.exists() for path in targets):
         raise FileExistsError("an output file already exists")
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -803,9 +718,7 @@ def upgrade(input_path, output_path):
             source.seek(source_start)
             cursor = 0
             for index, (target, file) in enumerate(zip(targets, directory["files"])):
-                fd, temp = tempfile.mkstemp(
-                    prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
-                )
+                fd, temp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
                 temporary.append(Path(temp))
                 with os.fdopen(fd, "wb") as output:
                     output.write(
@@ -823,9 +736,7 @@ def upgrade(input_path, output_path):
                     pending = output.tell()
                     while remaining:
                         if cursor < source_payload:
-                            chunk = source.read(
-                                min(remaining, CHUNK, source_payload - cursor)
-                            )
+                            chunk = source.read(min(remaining, CHUNK, source_payload - cursor))
                             if not chunk:
                                 raise ValueError("v2 payload ended prematurely")
                             os.posix_fadvise(
@@ -846,9 +757,7 @@ def upgrade(input_path, output_path):
                         if pending >= WRITEBACK:
                             output.flush()
                             os.fdatasync(output.fileno())
-                            os.posix_fadvise(
-                                output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
-                            )
+                            os.posix_fadvise(output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
                             pending = 0
                     output.flush()
                     os.fdatasync(output.fileno())

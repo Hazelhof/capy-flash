@@ -47,6 +47,7 @@ constexpr ReductionCriterion kBlock{/*relative_l2*/ 4.0e-3, /*gross_absolute*/ 1
                                     /*gross_relative_to_max_reference*/ 1.6e-2};
 
 double sigmoid(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
 double silu(double x) { return x * sigmoid(x); }
 
 std::vector<std::uint16_t> bits(const std::vector<float>& values) {
@@ -88,12 +89,12 @@ void gate_reference(const double* residual, const double* key, const double* val
 }
 
 int gate_case(std::int32_t tokens, std::uint32_t seed) {
-    const std::size_t wide = static_cast<std::size_t>(kChannels) * tokens;
+    const std::size_t wide    = static_cast<std::size_t>(kChannels) * tokens;
     const std::size_t kv_rows = kChannels + kHidden;
-    auto residual = random_bf16(wide, seed, -2.0F, 2.0F);
-    auto key_value = random_bf16(kv_rows * tokens, seed + 1U, -3.0F, 3.0F);
-    const auto query_norm = random_bf16(kChannels, seed + 2U, -0.3F, 0.3F);
-    const auto key_norm   = random_bf16(kChannels, seed + 3U, -0.3F, 0.3F);
+    auto residual             = random_bf16(wide, seed, -2.0F, 2.0F);
+    auto key_value            = random_bf16(kv_rows * tokens, seed + 1U, -3.0F, 3.0F);
+    const auto query_norm     = random_bf16(kChannels, seed + 2U, -0.3F, 0.3F);
+    const auto key_norm       = random_bf16(kChannels, seed + 3U, -0.3F, 0.3F);
     // Column 0 stream 1: a zero key gives an exactly zero dot (sign(0) and the 1e-6 floor).
     for (std::int32_t h = 0; h < kHidden; ++h) { key_value[kHidden + h] = 0.0F; }
     // Column 0 stream 2: a tiny residual exercises eps against a vanishing RMS.
@@ -151,8 +152,8 @@ int conv_case(std::int32_t width, std::int32_t lanes, std::uint32_t seed,
                                     seed + 4U, -3.0F, 3.0F);
     const std::vector<int> sources      = {2, 0};
     const std::vector<int> destinations = {1, 2};
-    const std::vector<int> valid        = {width, second_valid >= 0 ? second_valid
-                                                                    : (width > 1 ? width - 1 : 1)};
+    const std::vector<int> valid        = {width,
+                                    second_valid >= 0 ? second_valid : (width > 1 ? width - 1 : 1)};
 
     std::vector<double> reference(columns * kChannels);
     std::vector<float> advanced = states;
@@ -253,17 +254,18 @@ double e4m3fn(std::uint8_t code) {
 // Q8 key/value projection of the decoded n-gram embedding, gate, conv norm, dilated convolution
 // added to the residual, history advance. Optionally captured in a CUDA Graph.
 int block_case(std::int32_t tokens, bool graph, std::uint32_t seed) {
-    const std::size_t wide = static_cast<std::size_t>(kChannels) * tokens;
+    const std::size_t wide     = static_cast<std::size_t>(kChannels) * tokens;
     const std::int32_t kv_rows = kChannels + kHidden;
     // Embedding: FP8 E4M3 codes times a per-row BF16 scale, decoded to BF16 as the host gather
     // uploads them (16 rows of 160 per column).
     std::vector<float> embedding(static_cast<std::size_t>(kEmbed) * tokens);
     std::uint32_t state = seed * 2654435761U + 1U;
     for (std::size_t row = 0; row < embedding.size() / 160; ++row) {
-        state            = state * 1664525U + 1013904223U;
-        const float scale = bf16_to_f32(f32_to_bf16(0.002F + 0.004F * float(state >> 8) / 16777216.0F));
+        state = state * 1664525U + 1013904223U;
+        const float scale =
+            bf16_to_f32(f32_to_bf16(0.002F + 0.004F * float(state >> 8) / 16777216.0F));
         for (std::size_t i = 0; i < 160; ++i) {
-            state = state * 1664525U + 1013904223U;
+            state             = state * 1664525U + 1013904223U;
             std::uint8_t code = static_cast<std::uint8_t>(state >> 24);
             if ((code & 0x7F) == 0x7F) code &= 0xFE; // no NaN code
             embedding[row * 160 + i] =
@@ -274,10 +276,10 @@ int block_case(std::int32_t tokens, bool graph, std::uint32_t seed) {
     const auto query_norm = random_bf16(kChannels, seed + 2U, -0.1F, 0.1F);
     const auto key_norm   = random_bf16(kChannels, seed + 3U, -0.1F, 0.1F);
     const auto conv_norm  = random_bf16(kChannels, seed + 4U, -0.1F, 0.1F);
-    const auto conv       = random_bf16(static_cast<std::size_t>(kTaps) * kChannels, seed + 5U,
-                                        -0.3F, 0.3F);
-    const auto history    = random_bf16(static_cast<std::size_t>(kHistory) * kChannels, seed + 6U,
-                                        -1.0F, 1.0F);
+    const auto conv =
+        random_bf16(static_cast<std::size_t>(kTaps) * kChannels, seed + 5U, -0.3F, 0.3F);
+    const auto history =
+        random_bf16(static_cast<std::size_t>(kHistory) * kChannels, seed + 6U, -1.0F, 1.0F);
     std::vector<float> kv_source(static_cast<std::size_t>(kv_rows) * kEmbed);
     fill_uniform(kv_source, seed + 7U, -0.05F, 0.05F);
     const auto kv = quantized_weight::pack_q8_g32_row_split(kv_source, kv_rows, kEmbed);
@@ -303,7 +305,8 @@ int block_case(std::int32_t tokens, bool graph, std::uint32_t seed) {
         double* c = window.data() + static_cast<std::size_t>(kHistory + t) * kChannels;
         for (std::int32_t s = 0; s < kStreams; ++s) {
             double sum = 0.0;
-            for (std::int32_t h = 0; h < kHidden; ++h) sum += u[s * kHidden + h] * u[s * kHidden + h];
+            for (std::int32_t h = 0; h < kHidden; ++h)
+                sum += u[s * kHidden + h] * u[s * kHidden + h];
             const double inv = 1.0 / std::sqrt(sum / kHidden + double(kEps));
             for (std::int32_t h = 0; h < kHidden; ++h)
                 c[s * kHidden + h] = u[s * kHidden + h] * inv * (1.0 + conv_norm[s * kHidden + h]);
@@ -372,12 +375,12 @@ int block_case(std::int32_t tokens, bool graph, std::uint32_t seed) {
         launch();
     }
     cuda_synchronize(device.stream);
-    const std::string label =
-        "ple block T=" + std::to_string(tokens) + (graph ? " graph" : "");
-    int failures = verify_reduction(label + " residual", from_device_bf16(d_residual, wide),
-                                    expected, kBlock);
-    failures += verify_reduction(label + " history", from_device_bf16(d_state, expected_state.size()),
-                                 expected_state, kBlock);
+    const std::string label = "ple block T=" + std::to_string(tokens) + (graph ? " graph" : "");
+    int failures =
+        verify_reduction(label + " residual", from_device_bf16(d_residual, wide), expected, kBlock);
+    failures +=
+        verify_reduction(label + " history", from_device_bf16(d_state, expected_state.size()),
+                         expected_state, kBlock);
     return failures;
 }
 
@@ -390,14 +393,17 @@ int main() {
     }
     try {
         int failures = 0;
-        for (const std::int32_t tokens : {1, 5, 256}) { failures += gate_case(tokens, 0x10U + tokens); }
+        for (const std::int32_t tokens : {1, 5, 256}) {
+            failures += gate_case(tokens, 0x10U + tokens);
+        }
         failures += conv_case(1, 1, 0x100U);
         failures += conv_case(1, 2, 0x200U);
         failures += conv_case(8, 2, 0x300U);
         failures += conv_case(13, 1, 0x400U);
         failures += conv_case(4, 2, 0x500U, 0); // a cancelled row (commit count 0)
         failures += in_place_advance_case(0x500U);
-        for (const std::int32_t tokens : {1, 4, 8, 17}) failures += block_case(tokens, false, 0x600U + tokens);
+        for (const std::int32_t tokens : {1, 4, 8, 17})
+            failures += block_case(tokens, false, 0x600U + tokens);
         failures += block_case(4, true, 0x700U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " ple correctness\n";
         return failures == 0 ? 0 : 1;

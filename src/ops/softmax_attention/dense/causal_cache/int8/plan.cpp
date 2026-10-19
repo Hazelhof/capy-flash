@@ -21,14 +21,22 @@ GroupedShape grouped_shape(int tokens) {
         return GroupedShape{S::kMinBlocks, S::kKeyRows == 32 ? 5 : 6};
     };
     switch (tokens) {
-    case 1: return of.template operator()<1>();
-    case 2: return of.template operator()<2>();
-    case 3: return of.template operator()<3>();
-    case 4: return of.template operator()<4>();
-    case 5: return of.template operator()<5>();
-    case 6: return of.template operator()<6>();
-    case 7: return of.template operator()<7>();
-    default: return of.template operator()<8>();
+    case 1:
+        return of.template operator()<1>();
+    case 2:
+        return of.template operator()<2>();
+    case 3:
+        return of.template operator()<3>();
+    case 4:
+        return of.template operator()<4>();
+    case 5:
+        return of.template operator()<5>();
+    case 6:
+        return of.template operator()<6>();
+    case 7:
+        return of.template operator()<7>();
+    default:
+        return of.template operator()<8>();
     }
 }
 
@@ -42,8 +50,7 @@ GroupedShape grouped_shape(int heads, int tokens) {
 Int8KvCausalPlan make_int8_kv_causal_plan(int heads, int width, int batch,
                                           CausalAttentionExecutionEnvelope envelope, int sms) {
     if ((heads != 24 && heads != 16 && heads != 12) || width < 1 || batch < 1 || batch > 8 ||
-        sms < 1 ||
-        (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
+        sms < 1 || (batch > 1 && width > 16) || envelope.min_visible_keys == 0 ||
         envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys)
         throw std::invalid_argument("INT8 attention: invalid plan inputs");

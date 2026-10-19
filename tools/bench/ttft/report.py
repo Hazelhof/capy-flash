@@ -81,19 +81,28 @@ def _comparison(
 COMPARISONS = (
     *tuple(
         _comparison(
-            f"{kind}_state_{label}{turn}_vs_{baseline}", "State working set",
+            f"{kind}_state_{label}{turn}_vs_{baseline}",
+            "State working set",
             f"{kind.capitalize()} State {label}{turn} vs {label}{baseline}",
-            f"{kind}-state-working-set-shift", f"{label}{turn}",
-            f"{kind}-state-working-set-shift", f"{label}{baseline}",
+            f"{kind}-state-working-set-shift",
+            f"{label}{turn}",
+            f"{kind}-state-working-set-shift",
+            f"{label}{baseline}",
         )
         for kind, labels in (("shared", "def"), ("private", "cd"))
-        for label in labels for turn in range(1, 4)
+        for label in labels
+        for turn in range(1, 4)
         for baseline in ((0,) if turn == 1 else (0, 1))
     ),
     *tuple(
         _comparison(
-            f"state_hot_a{turn}_vs_a1", "State working set", f"Hot prefix a{turn} vs a1",
-            "shared-state-hot-prefix", f"a{turn}", "shared-state-hot-prefix", "a1",
+            f"state_hot_a{turn}_vs_a1",
+            "State working set",
+            f"Hot prefix a{turn} vs a1",
+            "shared-state-hot-prefix",
+            f"a{turn}",
+            "shared-state-hot-prefix",
+            "a1",
         )
         for turn in range(2, 7)
     ),
@@ -532,9 +541,7 @@ def _validate_run_artifact(value: dict[str, Any], plan: PlannedRun) -> None:
         for role in roles:
             request = by_role.get(role)
             if request is None or request.get("outcome") != "success":
-                raise ReportError(
-                    f"{context} lacks successful symmetric role {role} in group {name}"
-                )
+                raise ReportError(f"{context} lacks successful symmetric role {role} in group {name}")
 
 
 def load_campaign(path: Path) -> CampaignData:
@@ -543,18 +550,11 @@ def load_campaign(path: Path) -> CampaignData:
     manifest = _read_json(manifest_path)
     if not isinstance(manifest, dict):
         raise ReportError(f"{manifest_path} does not contain a JSON object")
-    if (
-        manifest.get("artifact_type") != "ninfer_serve_ttft_campaign"
-        or manifest.get("schema_version") != 2
-    ):
+    if manifest.get("artifact_type") != "ninfer_serve_ttft_campaign" or manifest.get("schema_version") != 2:
         raise ReportError(f"{manifest_path} is not a Serve TTFT campaign manifest")
 
     recorded_output = manifest.get("output_dir")
-    recorded_root = (
-        Path(recorded_output).expanduser()
-        if isinstance(recorded_output, str)
-        else None
-    )
+    recorded_root = Path(recorded_output).expanduser() if isinstance(recorded_output, str) else None
     raw_plans = manifest.get("plans")
     if not isinstance(raw_plans, list):
         raise ReportError(f"{manifest_path} has no plans array")
@@ -575,12 +575,8 @@ def load_campaign(path: Path) -> CampaignData:
             raise ReportError(f"{manifest_path} repeats plan {key}")
         keys.add(key)
         raw = _relocate(root, recorded_root, _required(value, "raw", str, context))
-        progress = _relocate(
-            root, recorded_root, _required(value, "progress", str, context)
-        )
-        serve_log = _relocate(
-            root, recorded_root, _required(value, "serve_log", str, context)
-        )
+        progress = _relocate(root, recorded_root, _required(value, "progress", str, context))
+        serve_log = _relocate(root, recorded_root, _required(value, "serve_log", str, context))
         request_log_value = value.get("request_log_jsonl")
         if request_log_value is None:
             request_log_jsonl = None
@@ -603,14 +599,12 @@ def load_campaign(path: Path) -> CampaignData:
 
     if manifest.get("run_count") != len(plans):
         raise ReportError(
-            f"{manifest_path} run_count={manifest.get('run_count')!r}, "
-            f"but plans contains {len(plans)} runs"
+            f"{manifest_path} run_count={manifest.get('run_count')!r}, but plans contains {len(plans)} runs"
         )
     planned_case_count = len({plan.case for plan in plans})
     if manifest.get("case_count") != planned_case_count:
         raise ReportError(
-            f"{manifest_path} case_count={manifest.get('case_count')!r}, "
-            f"but plans contains {planned_case_count} cases"
+            f"{manifest_path} case_count={manifest.get('case_count')!r}, but plans contains {planned_case_count} cases"
         )
 
     runs: list[dict[str, Any]] = []
@@ -622,10 +616,7 @@ def load_campaign(path: Path) -> CampaignData:
             value = _read_json(plan.raw)
             if not isinstance(value, dict):
                 raise ReportError("artifact is not a JSON object")
-            if (
-                value.get("artifact_type") != "ninfer_serve_ttft_run"
-                or value.get("schema_version") != 1
-            ):
+            if value.get("artifact_type") != "ninfer_serve_ttft_run" or value.get("schema_version") != 1:
                 raise ReportError("artifact type/schema is not ninfer_serve_ttft_run v1")
             if value.get("case") != plan.case or value.get("profile_label") != plan.profile:
                 raise ReportError("artifact case/profile does not match its campaign plan")
@@ -642,9 +633,7 @@ def load_campaign(path: Path) -> CampaignData:
                 "error": str(error),
             }
             if plan.request_log_jsonl is not None:
-                artifact_error["request_log_jsonl"] = _relative(
-                    root, plan.request_log_jsonl
-                )
+                artifact_error["request_log_jsonl"] = _relative(root, plan.request_log_jsonl)
             artifact_errors.append(artifact_error)
             continue
         value["_sample"] = plan.sample
@@ -652,9 +641,7 @@ def load_campaign(path: Path) -> CampaignData:
         value["_progress"] = _relative(root, plan.progress)
         value["_serve_log"] = _relative(root, plan.serve_log)
         value["_request_log_jsonl"] = (
-            _relative(root, plan.request_log_jsonl)
-            if plan.request_log_jsonl is not None
-            else None
+            _relative(root, plan.request_log_jsonl) if plan.request_log_jsonl is not None else None
         )
         value["_plan_index"] = plan.index
         runs.append(value)
@@ -673,9 +660,7 @@ def load_campaign(path: Path) -> CampaignData:
                 for field in ("raw", "progress", "serve_log", "request_log_jsonl"):
                     field_value = normalized.get(field)
                     if isinstance(field_value, str):
-                        normalized[field] = _relative(
-                            root, _relocate(root, recorded_root, field_value)
-                        )
+                        normalized[field] = _relative(root, _relocate(root, recorded_root, field_value))
                 failures.append(normalized)
         except ReportError as error:
             artifact_errors.append(
@@ -701,8 +686,7 @@ def _stats(samples: Sequence[tuple[int, int, str]]) -> dict[str, Any]:
     return {
         "samples": len(values),
         "sample_values": [
-            {"sample": sample, "ttft_ns": value, "raw": source}
-            for sample, value, source in sorted(samples)
+            {"sample": sample, "ttft_ns": value, "raw": source} for sample, value, source in sorted(samples)
         ],
         "raw_ttft_ns": values,
         "min_ttft_ns": minimum,
@@ -739,9 +723,7 @@ def _request_maps(
 ]:
     groups: dict[tuple[str, str, str, str], list[tuple[int, int, str]]] = defaultdict(list)
     run_roles: dict[tuple[str, str, int], dict[str, int]] = {}
-    rejected: dict[tuple[str, str, str, str], Counter[tuple[Any, Any]]] = defaultdict(
-        Counter
-    )
+    rejected: dict[tuple[str, str, str, str], Counter[tuple[Any, Any]]] = defaultdict(Counter)
     for run in runs:
         case = run.get("case")
         profile = run.get("profile_label")
@@ -767,33 +749,23 @@ def _request_maps(
             if request.get("outcome") == "success" and run.get("constructed") is True:
                 ttft = request.get("ttft_ns")
                 if not isinstance(ttft, int) or ttft < 0:
-                    raise ReportError(
-                        f"successful request {case}/{role} sample {sample} has invalid TTFT"
-                    )
+                    raise ReportError(f"successful request {case}/{role} sample {sample} has invalid TTFT")
                 if not isinstance(model, str) or not model:
                     raise ReportError(f"constructed run {case} has no public model identity")
                 by_role[role] = ttft
-                groups[(model, case, profile, role)].append(
-                    (sample, ttft, str(run["_source"]))
-                )
+                groups[(model, case, profile, role)].append((sample, ttft, str(run["_source"])))
             if request.get("outcome") == "rejected" and run.get("constructed") is True:
                 if not isinstance(model, str) or not model:
                     raise ReportError(f"rejected run {case} has no public model identity")
-                rejected[(model, case, profile, role)][
-                    (request.get("http_status"), request.get("error_code"))
-                ] += 1
+                rejected[(model, case, profile, role)][(request.get("http_status"), request.get("error_code"))] += 1
         if isinstance(model, str) and run.get("constructed") is True:
             run_roles[(model, case, sample)] = by_role
     return groups, run_roles, rejected
 
 
 def _symmetric_rows(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-    values: dict[
-        tuple[str, str, str, str, tuple[str, ...], int], list[tuple[int, int, str]]
-    ] = defaultdict(list)
-    roles_at_rank: dict[
-        tuple[str, str, str, str, tuple[str, ...], int], Counter[str]
-    ] = defaultdict(Counter)
+    values: dict[tuple[str, str, str, str, tuple[str, ...], int], list[tuple[int, int, str]]] = defaultdict(list)
+    roles_at_rank: dict[tuple[str, str, str, str, tuple[str, ...], int], Counter[str]] = defaultdict(Counter)
     for run in runs:
         if run.get("constructed") is not True:
             continue
@@ -826,9 +798,7 @@ def _symmetric_rows(runs: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
             for role in roles:
                 request = requests.get(role)
                 if not isinstance(request, dict) or request.get("outcome") != "success":
-                    raise ReportError(
-                        f"constructed run {case} lacks successful symmetric role {role}"
-                    )
+                    raise ReportError(f"constructed run {case} lacks successful symmetric role {role}")
                 ttft = request.get("ttft_ns")
                 if not isinstance(ttft, int) or ttft < 0:
                     raise ReportError(f"run {case} has invalid symmetric TTFT for {role}")
@@ -893,9 +863,7 @@ def _canonical_observations(
             {
                 **row,
                 "observation_kind": "symmetric_rank",
-                "observation_label": (
-                    f"{row['symmetric_group']} rank {row['rank']}"
-                ),
+                "observation_label": (f"{row['symmetric_group']} rank {row['rank']}"),
                 "request_role": None,
             }
         )
@@ -919,10 +887,7 @@ def _comparison_rows(
     groups: Sequence[dict[str, Any]],
     run_roles: dict[tuple[str, str, int], dict[str, int]],
 ) -> list[dict[str, Any]]:
-    lookup = {
-        (str(row["model"]), str(row["case"]), str(row["request_role"])): row
-        for row in groups
-    }
+    lookup = {(str(row["model"]), str(row["case"]), str(row["request_role"])): row for row in groups}
     models = sorted({str(row["model"]) for row in groups})
     rows: list[dict[str, Any]] = []
     for model in models:
@@ -949,9 +914,7 @@ def _comparison_rows(
                         **common,
                         "available": False,
                         "missing": [
-                            side
-                            for side, value in (("subject", subject), ("baseline", baseline))
-                            if value is None
+                            side for side, value in (("subject", subject), ("baseline", baseline)) if value is None
                         ],
                     }
                 )
@@ -979,9 +942,7 @@ def _comparison_rows(
                     method = "paired_within_run"
                     compared_samples = len(paired_deltas)
                     delta = float(statistics.median(paired_deltas))
-                    ratio = (
-                        float(statistics.median(paired_ratios)) if paired_ratios else None
-                    )
+                    ratio = float(statistics.median(paired_ratios)) if paired_ratios else None
 
             direction = "equal"
             if delta > 0:
@@ -1060,14 +1021,11 @@ def _validate_baseline(current: CampaignData, baseline: CampaignData) -> None:
     for field in ("model_profile", "kv_dtype"):
         if current.manifest.get(field) != baseline.manifest.get(field):
             raise ReportError(
-                f"baseline {field} mismatch: "
-                f"{baseline.manifest.get(field)!r} != {current.manifest.get(field)!r}"
+                f"baseline {field} mismatch: {baseline.manifest.get(field)!r} != {current.manifest.get(field)!r}"
             )
 
 
-def summarize_campaign(
-    campaign: CampaignData, baseline: CampaignData | None = None
-) -> dict[str, Any]:
+def summarize_campaign(campaign: CampaignData, baseline: CampaignData | None = None) -> dict[str, Any]:
     groups_map, run_roles, rejected = _request_maps(campaign.runs)
     expected_by_case = Counter(plan.case for plan in campaign.plans)
     groups: list[dict[str, Any]] = []
@@ -1123,9 +1081,7 @@ def summarize_campaign(
             "serve_log": _relative(campaign.root, plan.serve_log),
         }
         if plan.request_log_jsonl is not None:
-            missing_row["request_log_jsonl"] = _relative(
-                campaign.root, plan.request_log_jsonl
-            )
+            missing_row["request_log_jsonl"] = _relative(campaign.root, plan.request_log_jsonl)
         missing.append(missing_row)
     not_constructed = [
         {
@@ -1143,12 +1099,8 @@ def summarize_campaign(
         if run.get("constructed") is not True
     ]
     status_counts = Counter(str(run.get("status")) for run in campaign.runs)
-    constructed_by_case = Counter(
-        str(run.get("case")) for run in campaign.runs if run.get("constructed") is True
-    )
-    complete_cases = sum(
-        constructed_by_case[case] == count for case, count in expected_by_case.items()
-    )
+    constructed_by_case = Counter(str(run.get("case")) for run in campaign.runs if run.get("constructed") is True)
+    complete_cases = sum(constructed_by_case[case] == count for case, count in expected_by_case.items())
     coverage = {
         "campaign_status": campaign.manifest.get("status"),
         "planned_runs": len(campaign.plans),
@@ -1157,12 +1109,8 @@ def summarize_campaign(
         "constructed_runs": sum(run.get("constructed") is True for run in campaign.runs),
         "not_constructed_runs": len(not_constructed),
         "missing_artifacts": len(missing),
-        "invalid_artifacts": sum(
-            error.get("kind") == "run" for error in campaign.artifact_errors
-        ),
-        "auxiliary_artifact_errors": sum(
-            error.get("kind") != "run" for error in campaign.artifact_errors
-        ),
+        "invalid_artifacts": sum(error.get("kind") == "run" for error in campaign.artifact_errors),
+        "auxiliary_artifact_errors": sum(error.get("kind") != "run" for error in campaign.artifact_errors),
         "failure_records": len(campaign.failures),
         "planned_cases": len(expected_by_case),
         "complete_cases": complete_cases,

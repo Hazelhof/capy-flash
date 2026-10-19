@@ -47,10 +47,17 @@ public:
     ElasticArena& operator=(const ElasticArena&) = delete;
 
     [[nodiscard]] DeviceSpan span() const noexcept { return {base_, bytes_}; }
+
     [[nodiscard]] int device() const noexcept { return device_; }
+
     [[nodiscard]] std::size_t granule() const noexcept { return granule_; }
+
     [[nodiscard]] std::size_t range_count() const noexcept { return ranges_.size(); }
-    [[nodiscard]] const ElasticRangeSpec& range(std::size_t index) const { return ranges_.at(index); }
+
+    [[nodiscard]] const ElasticRangeSpec& range(std::size_t index) const {
+        return ranges_.at(index);
+    }
+
     // Physical bytes backing the arena now (whole granules).
     [[nodiscard]] std::size_t physical_bytes() const noexcept { return backed_ * granule_; }
 
@@ -68,13 +75,13 @@ private:
     void back(std::size_t granule_index);
     void release(std::size_t granule_index) noexcept;
 
-    int device_          = 0;
-    std::size_t bytes_   = 0;
-    std::size_t granule_ = 0;
-    std::byte* base_     = nullptr;
+    int device_           = 0;
+    std::size_t bytes_    = 0;
+    std::size_t granule_  = 0;
+    std::byte* base_      = nullptr;
     std::size_t reserved_ = 0; // bytes_ rounded up to granules
     std::vector<ElasticRangeSpec> ranges_;
-    std::vector<std::uint8_t> fixed_;       // [granules] intersects a fixed byte
+    std::vector<std::uint8_t> fixed_;        // [granules] intersects a fixed byte
     std::vector<unsigned long long> handle_; // [granules] CUmemGenericAllocationHandle or 0
     std::size_t backed_ = 0;
     std::vector<std::uint8_t> scratch_;

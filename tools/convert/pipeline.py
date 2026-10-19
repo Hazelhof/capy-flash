@@ -39,9 +39,7 @@ def convert(
     path = Path(output)
     report_path = Path(str(path) + ".conversion.json")
     if path.exists() or report_path.exists():
-        raise FileExistsError(
-            f"conversion output already exists: {path} or {report_path}"
-        )
+        raise FileExistsError(f"conversion output already exists: {path} or {report_path}")
     chosen_device = torch.device(device)
     if chosen_device.type == "cuda" and not torch.cuda.is_available():
         raise ValueError("CUDA conversion requested but CUDA is unavailable")
@@ -50,14 +48,8 @@ def convert(
     preparation_seconds = time.perf_counter() - start
     metadata = {} if name is None else {"name": name}
     provenance = {} if provenance is None else provenance
-    resources = [
-        ResourceSpec(key, len(value)) for key, value in model.resources.items()
-    ]
-    specs = (
-        resources
-        + [job.spec for job in prepared.weights]
-        + [spec for spec, _ in prepared.auxiliaries]
-    )
+    resources = [ResourceSpec(key, len(value)) for key, value in model.resources.items()]
+    specs = resources + [job.spec for job in prepared.weights] + [spec for spec, _ in prepared.auxiliaries]
     report = {
         "components": model.components,
         "name": name,
@@ -106,9 +98,7 @@ def convert(
                 job.prepared.produce(TensorOutput(writer, job.spec.id))
             except Exception as error:
                 label = ", ".join(job.parameters[:4])
-                raise ValueError(
-                    f"{label} [{job.method_name}/{job.spec.format}]: {error}"
-                ) from error
+                raise ValueError(f"{label} [{job.method_name}/{job.spec.format}]: {error}") from error
         for spec, data in prepared.auxiliaries:
             writer.write_object(spec.id, data)
         report["artifact_id"] = writer.artifact_id.hex()

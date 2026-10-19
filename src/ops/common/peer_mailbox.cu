@@ -23,6 +23,7 @@
 
 #include "core/device.h" // CUDA_CHECK
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -86,10 +87,9 @@ PeerMailbox::PeerMailbox(const ExecutionContext& ec, std::size_t slot_bytes, int
     devices_[0]       = pair[0];
     devices_[1]       = pair[1];
 
-    const std::size_t set_bytes[2] = {aligned(slot_bytes),
-                                      aligned(wide_slot_bytes) > aligned(slot_bytes)
-                                          ? aligned(wide_slot_bytes)
-                                          : 0};
+    const std::size_t set_bytes[2] = {
+        aligned(slot_bytes),
+        aligned(wide_slot_bytes) > aligned(slot_bytes) ? aligned(wide_slot_bytes) : 0};
     // Everything allocates into the sets first and the destructor's release() frees whatever was
     // allocated: a throwing constructor does not run the destructor, so it releases itself.
     const ScopedDevice scope;
@@ -210,6 +210,41 @@ detail::PeerPipelinedTuning pipelined_tuning(bool release_dependents) {
 }
 } // namespace
 
+void PeerMailbox::set_l2_prefetch(int rank, std::span<const PeerL2Range> ranges) {
+    if (rank < 0 || rank > 1 || ranges.size() > static_cast<std::size_t>(kL2PrefetchRanges)) {
+        throw std::invalid_argument("PeerMailbox: rank or L2 prefetch range count out of range");
+    }
+    L2Hint hint{};
+    for (const PeerL2Range& range : ranges) {
+        const auto begin           = reinterpret_cast<std::uintptr_t>(range.data);
+        const std::uintptr_t first = (begin + 15u) & ~std::uintptr_t{15};
+        const std::uintptr_t last  = (begin + range.bytes) & ~std::uintptr_t{15};
+        if (range.data == nullptr || last <= first) { continue; }
+        const std::size_t bytes   = std::min<std::size_t>(last - first, std::size_t{1} << 30);
+        hint.ranges[hint.count++] = {reinterpret_cast<const void*>(first), bytes};
+    }
+    l2_hint_[rank] = hint;
+}
+
+namespace {
+// Takes rank `rank`'s pending hint into `tuning` behind `blocks` exchange blocks; returns the
+// prefetching blocks to add to the grid.
+template <class Hint>
+int take_l2_hint(Hint& hint, int blocks, int threads, detail::PeerPipelinedTuning& tuning) {
+    detail::PeerL2Prefetch& prefetch = tuning.prefetch;
+    for (int r = 0; r < hint.count; ++r) {
+        prefetch.data[r]  = hint.ranges[r].data;
+        prefetch.bytes[r] = static_cast<std::uint32_t>(hint.ranges[r].bytes);
+    }
+    prefetch.ranges      = hint.count;
+    prefetch.first_block = blocks;
+    hint.count           = 0;
+    const int extra      = detail::peer_prefetch_blocks(prefetch, threads);
+    if (extra == 0) { prefetch.ranges = 0; }
+    return extra;
+}
+} // namespace
+
 void PeerMailbox::enqueue_exchange_sum(int rank, int slot, void* data, std::size_t bytes,
                                        cudaStream_t stream) const {
     if (rank < 0 || rank > 1 || slot < 0 || slot >= slots_) {
@@ -221,8 +256,9 @@ void PeerMailbox::enqueue_exchange_sum(int rank, int slot, void* data, std::size
         throw std::invalid_argument(
             "PeerMailbox: an exchange carries whole, aligned 16-byte vectors within one slot");
     }
-    const std::size_t offset    = static_cast<std::size_t>(slot) * set.slot_bytes;
-    const std::size_t lane_base = static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
+    const std::size_t offset = static_cast<std::size_t>(slot) * set.slot_bytes;
+    const std::size_t lane_base =
+        static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
     const std::size_t flag_slot = lane_base * detail::kPeerFlagStride;
     const std::size_t vecs      = bytes / sizeof(detail::PeerVec);
     std::uint32_t* words        = set.device_words[rank];
@@ -231,6 +267,7 @@ void PeerMailbox::enqueue_exchange_sum(int rank, int slot, void* data, std::size
     const auto* peer_payload =
         reinterpret_cast<const detail::PeerVecBf16*>(set.payload[1 - rank] + offset);
     if (kernel_ == PeerExchangeKernel::Legacy) {
+        l2_hint_[rank].count = 0; // the original kernel has no prefetching blocks
         detail::peer_exchange_sum_kernel<<<detail::peer_exchange_blocks(bytes), 256, 0, stream>>>(
             partial, mine_payload, set.flags[rank] + flag_slot, peer_payload,
             set.flags[1 - rank] + flag_slot, words + slots_ + slot, words + slot, hang_,
@@ -238,11 +275,14 @@ void PeerMailbox::enqueue_exchange_sum(int rank, int slot, void* data, std::size
     } else {
         constexpr int kVecsPerLane = detail::kPeerPipelinedVecsPerLane;
         constexpr int kThreads     = detail::kPeerPipelinedThreads;
+        const int blocks           = detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads);
+        auto tuning                = pipelined_tuning(release_dependents_);
+        const int prefetch_blocks  = take_l2_hint(l2_hint_[rank], blocks, kThreads, tuning);
         detail::peer_exchange_pipelined_kernel<kVecsPerLane>
-            <<<detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads), kThreads, 0, stream>>>(
+            <<<blocks + prefetch_blocks, kThreads, 0, stream>>>(
                 partial, mine_payload, set.flags[rank] + flag_slot, peer_payload,
                 set.flags[1 - rank] + flag_slot, words + lane_base, hang_, static_cast<int>(vecs),
-                pipelined_tuning(release_dependents_));
+                tuning);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -262,21 +302,24 @@ void PeerMailbox::enqueue_exchange_sum_f32(int rank, int slot, void* data, std::
         throw std::invalid_argument(
             "PeerMailbox: an exchange carries whole, aligned 16-byte vectors within one slot");
     }
-    const std::size_t offset    = static_cast<std::size_t>(slot) * set.slot_bytes;
-    const std::size_t lane_base = static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
+    const std::size_t offset = static_cast<std::size_t>(slot) * set.slot_bytes;
+    const std::size_t lane_base =
+        static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
     const std::size_t flag_slot = lane_base * detail::kPeerFlagStride;
     const std::size_t vecs      = bytes / sizeof(detail::PeerVec);
     constexpr int kVecsPerLane  = detail::kPeerPipelinedVecsPerLane;
     constexpr int kThreads      = detail::kPeerPipelinedThreads;
+    const int blocks            = detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads);
+    auto tuning                 = pipelined_tuning(release_dependents_);
+    const int prefetch_blocks   = take_l2_hint(l2_hint_[rank], blocks, kThreads, tuning);
     detail::peer_exchange_pipelined_f32_kernel<kVecsPerLane>
-        <<<detail::peer_pipelined_blocks(vecs, kVecsPerLane, kThreads), kThreads, 0, stream>>>(
+        <<<blocks + prefetch_blocks, kThreads, 0, stream>>>(
             static_cast<detail::PeerVec*>(data),
             reinterpret_cast<detail::PeerVec*>(set.payload[rank] + offset),
             set.flags[rank] + flag_slot,
             reinterpret_cast<const detail::PeerVec*>(set.payload[1 - rank] + offset),
             set.flags[1 - rank] + flag_slot, set.device_words[rank] + lane_base, hang_,
-            static_cast<int>(vecs), static_cast<__nv_bfloat16*>(bf16_out),
-            pipelined_tuning(release_dependents_));
+            static_cast<int>(vecs), static_cast<__nv_bfloat16*>(bf16_out), tuning);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -292,8 +335,9 @@ PeerExchangeSlot PeerMailbox::exchange_slot(int rank, int slot, std::size_t byte
         throw std::invalid_argument(
             "PeerMailbox: an exchange carries whole 16-byte vectors within one slot");
     }
-    const std::size_t offset    = static_cast<std::size_t>(slot) * set.slot_bytes;
-    const std::size_t lane_base = static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
+    const std::size_t offset = static_cast<std::size_t>(slot) * set.slot_bytes;
+    const std::size_t lane_base =
+        static_cast<std::size_t>(slot) * static_cast<std::size_t>(set.lanes);
     const std::size_t flag_slot = lane_base * detail::kPeerFlagStride;
     PeerExchangeSlot view;
     view.mine_payload = set.payload[rank] + offset;

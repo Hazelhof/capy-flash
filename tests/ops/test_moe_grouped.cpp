@@ -37,8 +37,8 @@ namespace {
 
 constexpr int kH = 2560, kI = 640, kK = 10, kE = 512, kRows13 = 2 * kI;
 constexpr int kHB = kH / 16, kIB = kI / 16;
-constexpr std::int64_t kSlotBytes = ops::kMoeSlotsGateUpCodeBytes +
-                                    ops::kMoeSlotsGateUpScaleBytes + ops::kMoeSlotsDownCodeBytes +
+constexpr std::int64_t kSlotBytes = ops::kMoeSlotsGateUpCodeBytes + ops::kMoeSlotsGateUpScaleBytes +
+                                    ops::kMoeSlotsDownCodeBytes +
                                     ops::kMoeSlotsDownScaleBytes; // 2 764 800
 
 // W4A4 vs the unquantized FP64 oracle. Two NVFP4 activation quantizations in series (x before
@@ -65,8 +65,10 @@ const float kE2M1[16] = {0.F,  0.5F,  1.F,  1.5F,  2.F,  3.F,  4.F,  6.F,
 float e4m3_decode(std::uint8_t c) {
     const int sign = c >> 7, e = (c >> 3) & 15, m = c & 7;
     float v = 0.F;
-    if (e == 0) v = static_cast<float>(m) * std::ldexp(1.0F, -9);
-    else v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
+    if (e == 0)
+        v = static_cast<float>(m) * std::ldexp(1.0F, -9);
+    else
+        v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
     return sign ? -v : v;
 }
 
@@ -75,8 +77,8 @@ float e4m3_rn(float v) {
     if (!(v > 0.0F)) return 0.0F;
     if (v >= 448.0F) return 448.0F;
     int ex = 0;
-    std::frexp(v, &ex);                                // v = f * 2^ex, f in [0.5,1)
-    const int exponent = std::max(ex - 1, -6);         // subnormal step below 2^-6
+    std::frexp(v, &ex);                        // v = f * 2^ex, f in [0.5,1)
+    const int exponent = std::max(ex - 1, -6); // subnormal step below 2^-6
     const float step   = std::ldexp(1.0F, exponent - 3);
     return std::min(std::nearbyint(v / step) * step, 448.0F);
 }
@@ -84,8 +86,8 @@ float e4m3_rn(float v) {
 // E2M1 round-to-nearest-even (ties to the even code), satfinite.
 float e2m1_rn(float v) {
     static const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
-    const float a = std::fabs(v);
-    float r       = 6.0F;
+    const float a              = std::fabs(v);
+    float r                    = 6.0F;
     for (int i = 0; i < 7; ++i) {
         if (a > grid[i + 1]) continue;
         const float mid = 0.5F * (grid[i] + grid[i + 1]);
@@ -167,8 +169,8 @@ void decode(const std::vector<std::uint8_t>& codes, const std::vector<std::uint8
 }
 
 struct Model {
-    std::vector<int> ids;          // materialized expert ids
-    std::vector<int> index_of;     // [512] -> index in experts or -1
+    std::vector<int> ids;      // materialized expert ids
+    std::vector<int> index_of; // [512] -> index in experts or -1
     std::vector<Expert> experts;
     std::vector<float> div13, div2; // [2E], [E]
 };
@@ -250,7 +252,7 @@ DevicePool make_pool(const Model& m, const std::vector<std::vector<int>>& placem
     DevicePool d;
     d.memory = DeviceBuffer(total);
     d.memory.copy_from_host(host.data(), total);
-    auto* dev = static_cast<std::uint8_t*>(d.memory.p);
+    auto* dev             = static_cast<std::uint8_t*>(d.memory.p);
     d.pool.gate_up_codes  = {dev + base[0], stride[0]};
     d.pool.gate_up_scales = {dev + base[1], stride[1]};
     d.pool.down_codes     = {dev + base[2], stride[2]};
@@ -440,7 +442,6 @@ double relative_l2(const std::vector<double>& got, const std::vector<double>& re
     return den > 0 ? std::sqrt(num / den) : std::sqrt(num);
 }
 
-
 // Every expert in `copies` random slots of a planar pool of `slots` slots.
 std::vector<std::vector<int>> random_placement(const Model& m, int slots, std::uint32_t seed,
                                                int copies = 1) {
@@ -464,8 +465,11 @@ public:
           div13_(to_device(m.div13)), div2_(to_device(m.div2)), table_(kE * sizeof(int)) {
         cuda_check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
     }
+
     ~Runner() { cudaStreamDestroy(stream_); }
+
     cudaStream_t stream() const { return stream_; }
+
     WorkspaceArena& workspace() { return workspace_; }
 
     ops::MoeSlotsLayer layer(const Call& c, void* table_device) const {
@@ -538,8 +542,8 @@ int oracle_cases(const Model& m, Runner& runner, const DevicePool& pool,
                  const std::vector<std::vector<int>>& place) {
     int failures = 0;
     for (const int T : {1, 9, 64, 200, 777}) {
-        Call c  = make_call(m, T, 100U + T);
-        c.table = table_from(m, place);
+        Call c                  = make_call(m, T, 100U + T);
+        c.table                 = table_from(m, place);
         const Reference ref     = reference(m, c, true);
         const std::string label = "oracle T=" + std::to_string(T);
         const auto got          = runner.run(c, pool.pool, true, failures, label);
@@ -556,18 +560,19 @@ int oracle_cases(const Model& m, Runner& runner, const DevicePool& pool,
 // (2) Slot indirection: another placement (other pool) gives bit-identical outputs.
 int permutation_case(const Model& m, Runner& runner, const DevicePool& pool,
                      const std::vector<std::vector<int>>& place) {
-    int failures = 0;
-    Call c       = make_call(m, 300, 200U);
-    c.table      = table_from(m, place);
-    c.a1 = 2688.0F / 4.5F * kDivisorJitter;
-    c.a2 = 2688.0F / 60.0F;
-    const auto base = runner.run(c, pool.pool, true, failures, "perm base");
-    const int slots = static_cast<int>(m.ids.size()) * 2 + 3;
-    const auto other = random_placement(m, slots, 201U);
+    int failures       = 0;
+    Call c             = make_call(m, 300, 200U);
+    c.table            = table_from(m, place);
+    c.a1               = 2688.0F / 4.5F * kDivisorJitter;
+    c.a2               = 2688.0F / 60.0F;
+    const auto base    = runner.run(c, pool.pool, true, failures, "perm base");
+    const int slots    = static_cast<int>(m.ids.size()) * 2 + 3;
+    const auto other   = random_placement(m, slots, 201U);
     const DevicePool d = make_pool(m, other, slots, Layout::Planar, 202U);
-    Call cp  = c;
-    cp.table = table_from(m, other);
-    failures += verify_exact("permutation == base", runner.run(cp, d.pool, true, failures, "perm"), base);
+    Call cp            = c;
+    cp.table           = table_from(m, other);
+    failures +=
+        verify_exact("permutation == base", runner.run(cp, d.pool, true, failures, "perm"), base);
     return failures;
 }
 
@@ -581,7 +586,7 @@ int missing_case(const Model& m, Runner& runner, const DevicePool& pool,
     auto partial = place;
     for (std::size_t i = 0; i < partial.size(); ++i)
         if (rng() % 10 < 3) partial[i].clear();
-    c.table = table_from(m, partial);
+    c.table              = table_from(m, partial);
     const int invalid[4] = {-1, kE, 7777, -5};
     for (int t = 0; t < c.tokens; t += 3)
         for (int k = 0; k < 2; ++k) c.ids[t * kK + k] = invalid[(t + k) % 4];
@@ -613,17 +618,17 @@ int missing_case(const Model& m, Runner& runner, const DevicePool& pool,
 // exact multiple of the piece width.
 int piece_case(const Model& m, Runner& runner, const DevicePool& pool,
                const std::vector<std::vector<int>>& place, int tail, unsigned seed) {
-    int failures = 0;
-    const int P  = ops::kMoeGroupedChunkColumns;
-    const int T  = 2 * P + tail;
-    Call c       = make_call(m, T, seed);
-    c.table      = table_from(m, place);
-    c.a1 = 2688.0F / 4.5F * kDivisorJitter;
-    c.a2 = 2688.0F / 60.0F;
-    const auto whole = runner.run(c, pool.pool, true, failures, "pieces whole");
+    int failures       = 0;
+    const int P        = ops::kMoeGroupedChunkColumns;
+    const int T        = 2 * P + tail;
+    Call c             = make_call(m, T, seed);
+    c.table            = table_from(m, place);
+    c.a1               = 2688.0F / 4.5F * kDivisorJitter;
+    c.a2               = 2688.0F / 60.0F;
+    const auto whole   = runner.run(c, pool.pool, true, failures, "pieces whole");
     const int split[3] = {P, P, tail};
     const int pieces   = tail > 0 ? 3 : 2;
-    std::size_t at = 0;
+    std::size_t at     = 0;
     for (int p = 0, b = 0; p < pieces; b += split[p], ++p) {
         Call s   = c;
         s.tokens = split[p];
@@ -632,9 +637,10 @@ int piece_case(const Model& m, Runner& runner, const DevicePool& pool,
         s.ids.assign(c.ids.begin() + b * kK, c.ids.begin() + (b + split[p]) * kK);
         s.w.assign(c.w.begin() + b * kK, c.w.begin() + (b + split[p]) * kK);
         const auto part = runner.run(s, pool.pool, true, failures, "piece");
-        failures += verify_exact(("piece " + std::to_string(p) + " == whole").c_str(), part,
-                                 std::vector<float>(whole.begin() + static_cast<std::ptrdiff_t>(at),
-                                                    whole.begin() + static_cast<std::ptrdiff_t>(at + part.size())));
+        failures += verify_exact(
+            ("piece " + std::to_string(p) + " == whole").c_str(), part,
+            std::vector<float>(whole.begin() + static_cast<std::ptrdiff_t>(at),
+                               whole.begin() + static_cast<std::ptrdiff_t>(at + part.size())));
         at += part.size();
     }
     return failures;
@@ -651,12 +657,13 @@ int graph_case(const Model& m, Runner& runner, const DevicePool& pool,
     reference(m, v1, true);
     v2.table = v1.table;
     for (int e = 0; e < kE; e += 3) v2.table[e] = -1;
-    v2.a1 = v1.a1;
-    v2.a2 = v1.a2;
+    v2.a1             = v1.a1;
+    v2.a2             = v1.a2;
     const auto eager1 = runner.run(v1, pool.pool, true, failures, "graph eager v1");
     const auto eager2 = runner.run(v2, pool.pool, true, failures, "graph eager v2");
     DeviceBuffer dx(static_cast<std::size_t>(T) * kH * 2), di(static_cast<std::size_t>(T) * kK * 4),
-        dw(static_cast<std::size_t>(T) * kK * 4), dt(kE * 4), dout(static_cast<std::size_t>(T) * kH * 4);
+        dw(static_cast<std::size_t>(T) * kK * 4), dt(kE * 4),
+        dout(static_cast<std::size_t>(T) * kH * 4);
     auto upload = [&](const Call& c) {
         std::vector<std::uint16_t> xb(c.x.size());
         for (std::size_t i = 0; i < xb.size(); ++i) xb[i] = f32_to_bf16(c.x[i]);
@@ -672,15 +679,16 @@ int graph_case(const Model& m, Runner& runner, const DevicePool& pool,
         dout.copy_to_host(v.data(), v.size() * 4);
         return v;
     };
-    cudaStream_t s = runner.stream();
-    cudaGraph_t graph = nullptr;
+    cudaStream_t s       = runner.stream();
+    cudaGraph_t graph    = nullptr;
     cudaGraphExec_t exec = nullptr;
     upload(v1);
     cuda_check(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "begin capture");
     {
         Tensor tx(dx.p, DType::BF16, {kH, T}), ti(di.p, DType::I32, {kK, T}),
             tw(dw.p, DType::FP32, {kK, T}), to(dout.p, DType::FP32, {kH, T});
-        ops::moe_grouped_nvfp4(tx, ti, tw, runner.layer(v1, dt.p), pool.pool, to, runner.workspace(), s);
+        ops::moe_grouped_nvfp4(tx, ti, tw, runner.layer(v1, dt.p), pool.pool, to,
+                               runner.workspace(), s);
     }
     cuda_check(cudaStreamEndCapture(s, &graph), "end capture");
     cuda_check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
@@ -722,13 +730,14 @@ int validation_cases(const Model& m, Runner& runner, const DevicePool& pool,
     Tensor tx(dx.p, DType::BF16, {kH, 20}), ti(di.p, DType::I32, {kK, 20}),
         tw(dw.p, DType::FP32, {kK, 20}), to(dout.p, DType::FP32, {kH, 20});
     expect_throw("contiguous-slot pool", [&] {
-        auto p = pool.pool;
+        auto p                 = pool.pool;
         p.gate_up_codes.stride = kSlotBytes;
         ops::moe_grouped_nvfp4(tx, ti, tw, layer, p, to, runner.workspace(), runner.stream());
     });
     expect_throw("BF16 out", [&] {
         Tensor o(dout.p, DType::BF16, {kH, 20});
-        ops::moe_grouped_nvfp4(tx, ti, tw, layer, pool.pool, o, runner.workspace(), runner.stream());
+        ops::moe_grouped_nvfp4(tx, ti, tw, layer, pool.pool, o, runner.workspace(),
+                               runner.stream());
     });
     expect_throw("workspace too small", [&] {
         WorkspaceArena small(ops::moe_grouped_nvfp4_workspace_bytes(20) - 1024);
@@ -745,9 +754,9 @@ int main() {
             std::cout << "SKIP: no CUDA device\n";
             return 77;
         }
-        const Model m   = make_model(64, 21U);
-        const int slots = 3 * static_cast<int>(m.ids.size()) + 7;
-        const auto place = random_placement(m, slots, 22U);
+        const Model m         = make_model(64, 21U);
+        const int slots       = 3 * static_cast<int>(m.ids.size()) + 7;
+        const auto place      = random_placement(m, slots, 22U);
         const DevicePool pool = make_pool(m, place, slots, Layout::Planar, 23U);
         Runner runner(m, 2 * ops::kMoeGroupedChunkColumns + 77);
         int failures = 0;

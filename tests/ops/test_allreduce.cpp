@@ -554,8 +554,9 @@ void run_captured_microbenchmark(const char* label, const ExecutionContext& ec,
 std::vector<std::uint16_t> captured_bits(const char* label, std::int32_t ne0, std::int32_t ne1,
                                          const std::vector<std::uint16_t>& a_bits,
                                          const std::vector<std::uint16_t>& b_bits,
-                                         const ExecutionContext& ec,
-                                         const ops::PeerEvents& events, int& failures) {
+                                         const ExecutionContext& ec, const ops::PeerEvents& events,
+                                         int& failures,
+                                         const std::function<void(int)>& before_site = {}) {
     constexpr int kSites    = 3;
     const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
     const std::size_t bytes = count * sizeof(std::uint16_t);
@@ -574,6 +575,7 @@ std::vector<std::uint16_t> captured_bits(const char* label, std::int32_t ne0, st
     DecodeGraphDefinition definition;
     capture_two_devices(ec, bridge, definition, [&] {
         for (int site = 0; site < kSites; ++site) {
+            if (before_site) { before_site(site); }
             ops::allreduce_sum(buffer, staging, ec, events);
         }
     });
@@ -613,10 +615,65 @@ int run_transport_identity_case(const char* label, std::int32_t ne0, std::int32_
         captured_bits((base + " legacy").c_str(), ne0, ne1, a_bits, b_bits, ec, legacy, failures);
     const auto pipelined_bits = captured_bits((base + " pipelined").c_str(), ne0, ne1, a_bits,
                                               b_bits, ec, pipelined, failures);
-    failures += verify_exact((base + " legacy mailbox equals staged").c_str(), legacy_bits,
-                             staged_bits);
+    failures +=
+        verify_exact((base + " legacy mailbox equals staged").c_str(), legacy_bits, staged_bits);
     failures += verify_exact((base + " pipelined mailbox equals staged").c_str(), pipelined_bits,
                              staged_bits);
+    return failures;
+}
+
+// L2 prefetch hints (PeerMailbox::set_l2_prefetch, q27/dexch). Exchanges whose launches carry
+// prefetching blocks -- four ranges of a weight-sized buffer, one unaligned and one empty, more
+// blocks than the exchange's own at the decode shape -- must leave the staged path's bits on both
+// ranks and must not touch the prefetched memory; a hint is consumed by one exchange (site 1 sets
+// none and must still match).
+int run_prefetch_identity_case(const char* label, std::int32_t ne0, std::int32_t ne1,
+                               std::uint32_t seed, const ExecutionContext& ec,
+                               const ops::PeerEvents& staged, const ops::PeerEvents& pipelined,
+                               ops::PeerMailbox& mailbox) {
+    constexpr std::size_t kWeightBytes = 24u << 20;
+    const std::size_t count = static_cast<std::size_t>(ne0) * static_cast<std::size_t>(ne1);
+    std::vector<float> a(count), b(count);
+    fill_uniform(a, seed, -8.0f, 8.0f);
+    fill_uniform(b, seed + 1, -8.0f, 8.0f);
+    const auto a_bits = encode_bf16(a);
+    const auto b_bits = encode_bf16(b);
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> weights;
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        weights[static_cast<std::size_t>(rank)] =
+            std::make_unique<GuardedDeviceBuffer>(kWeightBytes);
+        weights[static_cast<std::size_t>(rank)]->fill(0x5a);
+    }
+    const auto hint = [&](int site) {
+        if (site == 1) { return; }
+        for (int rank = 0; rank < 2; ++rank) {
+            auto* base =
+                static_cast<const std::uint8_t*>(weights[static_cast<std::size_t>(rank)]->data());
+            const std::array<ops::PeerL2Range, 4> ranges{{{base, 6u << 20},
+                                                          {base + (12u << 20) + 3, (5u << 20) + 7},
+                                                          {base + (20u << 20), 8},
+                                                          {base + (18u << 20), 1u << 20}}};
+            mailbox.set_l2_prefetch(rank, ranges);
+        }
+    };
+    int failures = 0;
+    const std::string base(label);
+    const auto staged_bits =
+        captured_bits((base + " staged").c_str(), ne0, ne1, a_bits, b_bits, ec, staged, failures);
+    const auto prefetch_bits = captured_bits((base + " prefetch").c_str(), ne0, ne1, a_bits, b_bits,
+                                             ec, pipelined, failures, hint);
+    failures += verify_exact((base + " prefetching mailbox equals staged").c_str(), prefetch_bits,
+                             staged_bits);
+    const std::vector<std::uint8_t> pattern(kWeightBytes, 0x5a);
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        const auto& weight = *weights[static_cast<std::size_t>(rank)];
+        failures += verify_exact(
+            (base + " prefetched memory unchanged, device " + std::to_string(rank)).c_str(),
+            from_device<std::uint8_t>(weight.data(), kWeightBytes), pattern);
+        failures += weight.verify_guards((base + " prefetched memory guards").c_str());
+    }
     return failures;
 }
 
@@ -627,7 +684,7 @@ int run_transport_identity_case(const char* label, std::int32_t ne0, std::int32_
 std::array<std::vector<std::uint16_t>, 2> mixed_width_bits(const ExecutionContext& ec,
                                                            const ops::PeerEvents& events,
                                                            std::size_t& nodes, int& failures) {
-    constexpr int kSites                    = 3;
+    constexpr int kSites = 3;
     constexpr std::array<std::int32_t, 2> kColumns{8, 32};
     std::array<std::vector<std::uint16_t>, 2> out;
     std::array<std::array<GuardedDeviceBuffer*, 2>, 2> buffers{};
@@ -689,9 +746,10 @@ int run_mixed_width_case(const ExecutionContext& ec, const ops::PeerEvents& stag
                   << " graph nodes do not match the mailbox / staged transports\n";
         ++failures;
     }
-    failures += verify_exact("mixed widths ordinary slots equal staged", mailbox_bits[0],
-                             staged_bits[0]);
-    failures += verify_exact("mixed widths wide slots equal staged", mailbox_bits[1], staged_bits[1]);
+    failures +=
+        verify_exact("mixed widths ordinary slots equal staged", mailbox_bits[0], staged_bits[0]);
+    failures +=
+        verify_exact("mixed widths wide slots equal staged", mailbox_bits[1], staged_bits[1]);
     if (mailbox.hang_reported()) {
         std::cerr << "mixed widths: a mailbox exchange reported a hang\n";
         ++failures;
@@ -702,8 +760,8 @@ int run_mixed_width_case(const ExecutionContext& ec, const ops::PeerEvents& stag
 // A peer that never arrives: only rank 0 enqueues its half. The poller must give up, report the
 // hang and return before a display watchdog (about 2 s on Windows WDDM) would reset the device.
 int run_mailbox_hang_case(const ExecutionContext& ec, ops::PeerExchangeKernel kernel) {
-    constexpr std::size_t kBytes         = 256;
-    constexpr double kWatchdogSeconds    = 2.0;
+    constexpr std::size_t kBytes      = 256;
+    constexpr double kWatchdogSeconds = 2.0;
     ops::PeerMailbox lonely(ec, kBytes, 2, kernel);
     set_device(ec, 0);
     GuardedDeviceBuffer buffer_0(kBytes);
@@ -813,8 +871,13 @@ int main() {
                                             legacy_events, mailbox_events);
     failures += run_transport_identity_case("identity [520,1]", 520, 1, 405u, ec, events,
                                             legacy_events, mailbox_events);
-    failures += run_transport_identity_case("identity [8,1]", 8, 1, 407u, ec, events,
-                                            legacy_events, mailbox_events);
+    failures += run_transport_identity_case("identity [8,1]", 8, 1, 407u, ec, events, legacy_events,
+                                            mailbox_events);
+
+    failures += run_prefetch_identity_case("prefetch identity [5120]", 5120, 1, 421u, ec, events,
+                                           mailbox_events, mailbox);
+    failures += run_prefetch_identity_case("prefetch identity [5120,4]", 5120, 4, 423u, ec, events,
+                                           mailbox_events, mailbox);
 
     // A slot of a full batch's width: DFlash2 K=7 at four requests, [5120, 8 x 4] = 320 KiB (160
     // blocks of the pipelined kernel), carrying every narrower exchange too; one column more stays

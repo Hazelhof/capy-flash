@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from .methods import (
+    PreparedMethod,
+    PrepareRequest,
     cast_direct,
     fp8_row_maxabs,
     grouped_absmax,
@@ -32,9 +34,7 @@ def _optional(model, recipe):
                 format = Q6
             elif name.startswith("vision/merger/"):
                 format = Q8
-            elif name.endswith(
-                ("/attention/query", "/attention/key", "/attention/value", "/mlp/fc1")
-            ):
+            elif name.endswith(("/attention/query", "/attention/key", "/attention/value", "/mlp/fc1")):
                 format = Q4
             else:
                 format = Q5
@@ -148,9 +148,7 @@ def qwen3_6_35b_a3b(model, recipe, sources):
             continue
         if "/moe/experts/" in name:
             layer = int(name.split("/")[2])
-            format = (
-                (Q6 if layer in (34, 38, 39) else Q5) if name.endswith("/down") else Q4
-            )
+            format = (Q6 if layer in (34, 38, 39) else Q5) if name.endswith("/down") else Q4
         else:
             format = Q8
         _assign(recipe, name, format)
@@ -196,9 +194,7 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         if not name.startswith("text/") or name == "text/token_embedding":
             continue
         source = model.source(name, quantized)
-        if not parameter.projection or name.endswith(
-            ("/gdn/a_projection", "/gdn/b_projection")
-        ):
+        if not parameter.projection or name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
             recipe.assign(name, source=source)
             continue
         layer = int(name.split("/")[2]) if name.startswith("text/layers/") else -1
@@ -237,18 +233,12 @@ _FLASH_NEXT_NVFP4_DENSE = tuple(s for group in _FLASH_NEXT_NVFP4_GROUPS.values()
 # BF16 linear (ops/linear/bf16/bf16_generic.cu) and the hyper-connection general route.
 _FLASH_NEXT_BF16_GROUPS = {
     "indexer": ("/attention/indexer_query", "/attention/indexer_key"),
-    "hc": tuple(
-        f"{mixer}/{role}"
-        for mixer in ("attn_hc", "ffn_hc", "hc_head")
-        for role in ("down", "inject", "up")
-    ),
+    "hc": tuple(f"{mixer}/{role}" for mixer in ("attn_hc", "ffn_hc", "hc_head") for role in ("down", "inject", "up")),
     "gdn": _FLASH_NEXT_NVFP4_GROUPS["gdn"],
 }
 
 
-def _flash_next(
-    model, recipe, *, nvfp4_dense: bool, nvfp4_groups=None, nvfp4_head=None, bf16_groups=()
-):
+def _flash_next(model, recipe, *, nvfp4_dense: bool, nvfp4_groups=None, nvfp4_head=None, bf16_groups=()):
     """Qwen3.8-Flash-Next (Qwen4Exp) from the ModelOpt NVFP4 checkpoint.
 
     Routed Text experts keep their ModelOpt NVFP4 codes, block scales, weight divisors and
@@ -278,13 +268,17 @@ def _flash_next(
     bf16_suffixes = tuple(s for group in bf16_groups for s in _FLASH_NEXT_BF16_GROUPS[group])
     if model.config.get("model_type") != "qwen4_exp_text":
         raise ValueError("this official recipe requires Qwen4Exp mathematics")
-    # Vision's mixed groupwise assignment; the loop below restates every Text and MTP choice.
+    # The MTP choices of _optional; the loop below restates every Text and MTP choice.
     _optional(model, recipe)
+    # The Vision tower Q8 (v0.6): the 27B's mixed Q4/Q5/Q6 tower departs from the BF16 reference
+    # by 0.32 (relative, merged embeddings), Q8 by 0.09, as much as a BF16 reference run departs
+    # from FP32; it costs one expert slot per layer more than Q4/Q5 at tp 2.
+    for name, parameter in model.parameters.items():
+        if name.startswith("vision/") and parameter.projection:
+            _assign(recipe, name, Q8)
     _assign(recipe, "text/token_embedding", Q8)
     if nvfp4_head:
-        recipe.assign(
-            "text/output_head", format="nvfp4", method=nvfp4_mse, activation_policy="A16Only"
-        )
+        recipe.assign("text/output_head", format="nvfp4", method=nvfp4_mse, activation_policy="A16Only")
     else:
         _assign(recipe, "text/output_head", Q6)
     for name, parameter in model.parameters.items():
@@ -308,9 +302,7 @@ def _flash_next(
                     activation_policy="AllowA4",
                 )
             else:
-                recipe.assign(
-                    name, format="nvfp4", method=nvfp4_mse_stacked, activation_policy="A16Only"
-                )
+                recipe.assign(name, format="nvfp4", method=nvfp4_mse_stacked, activation_policy="A16Only")
             continue
         if bf16_suffixes and name.endswith(bf16_suffixes):
             _assign(recipe, name, "bf16")
@@ -376,6 +368,117 @@ qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8 = _flash_next_g_bf16("indexer", "hc", g
 qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 = _flash_next_g_bf16("indexer", gdn_q8=True)
 
 
+MXFP8 = "mxfp8_e4m3fn_g32_ue8m0"
+NVFP4_ROW = "nvfp4_row_e4m3_g16"
+_VERBATIM_LAYOUTS = {MXFP8: "block_scale_k32_v1", NVFP4_ROW: "row_interleaved_v1"}
+_VERBATIM_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _verbatim_row_bytes(format: str, k: int) -> int:
+    return k + k // 32 if format == MXFP8 else k // 2 + k // 16
+
+
+def import_verbatim(request: PrepareRequest) -> PreparedMethod:
+    """Copy MXFP8 or row-NVFP4 checkpoint codes and scales into the same artifact format.
+
+    Every input must provide encoded rows in the target format; the parent is their row
+    concatenation (a fused q|k|v or gate|up group is the concatenation of both planes along N).
+    Nothing is computed: the stored words are the checkpoint words. The activations stay 16-bit.
+    """
+    format, shape = request.target.format, request.target.shape
+    if format not in _VERBATIM_LAYOUTS or len(shape) != 2:
+        raise ValueError("import_verbatim requires an MXFP8 or row-NVFP4 matrix target")
+    if request.parameters:
+        raise ValueError(f"{request.target.id}: import_verbatim accepts no numerical parameters")
+    if request.row_offsets is None or request.row_offsets[-1] != shape[0]:
+        raise ValueError(f"{request.target.id}: import_verbatim inputs must be complete rows of the parent")
+    for item in request.inputs:
+        if item.source.read_encoded is None:
+            raise ValueError(f"{item.parameter}: encoded rows are unavailable")
+        first = item.source.read_encoded(0, 1)
+        if first.format != format:
+            raise ValueError(f"{item.parameter}: source {first.format} differs from target {format}")
+        for parameter, input_name in item.uses:
+            if request.policies[(parameter, input_name)] != "A16Only":
+                raise ValueError(f"{parameter}: {format} weights take 16-bit activations (A16Only)")
+    n, k = shape
+    chunk = max(request.rows_per_chunk, _VERBATIM_CHUNK_BYTES // _verbatim_row_bytes(format, k))
+
+    def produce(output):
+        for begin in range(0, n, chunk):
+            words = request.encoded_rows(begin, min(n, begin + chunk))
+            output.write_codes(begin, words.codes, words.scales)
+
+    return request.job(produce=produce)
+
+
+def _encoded_format(source) -> str | None:
+    """The checkpoint encoding of a matrix source (None: plain values such as BF16)."""
+    if source.read_encoded is None or len(source.shape) != 2:
+        return None
+    try:
+        return source.read_encoded(0, 1).format
+    except ValueError as error:
+        # A plain matrix resolves to values only; any other error is a real source problem.
+        if "does not provide encoded rows" in str(error):
+            return None
+        raise
+
+
+def qwen3_8_flash_next_fp4_local(model, recipe, sources):
+    """Flash-Next from ``nvidia/Qwen3.8-Flash-Next-FP4-Local`` in the checkpoint's own formats.
+
+    No value is re-quantised. Routed Text experts keep their NVFP4 codes, CSF-decoded E4M3 block
+    scales, weight divisors and activation divisors (import_encoded, AllowA4); the MTP experts'
+    NVFP4 words are imported the same way with 16-bit activations (no activation calibration in
+    the checkpoint). Every MXFP8 matrix (attention, QSA indexer, GDN, shared expert) is copied into
+    ``mxfp8_e4m3fn_g32_ue8m0`` and the n-gram table's row-NVFP4 shards into ``nvfp4_row_e4m3_g16``
+    with its multiplier as ``ple/table_global_scale``. BF16 tensors (embedding, output head,
+    hyper-connections, routers, PLE projections, the MTP dense layer) stay BF16; the FP32 norm
+    vectors become BF16, the only rounding. Fused projection groups and expert banks are one parent
+    each. Text and MTP only: Vision is not served from this checkpoint.
+    """
+    if model.config.get("model_type") != "qwen4_exp_text":
+        raise ValueError("this official recipe requires Qwen4Exp mathematics")
+    if "vision" in model.components:
+        raise ValueError("qwen3_8_flash_next_fp4_local serves text and mtp only; use --components text,mtp")
+    verbatim = set()
+    for name, parameter in model.parameters.items():
+        if name.endswith("/ple/table"):
+            format = _encoded_format(parameter.source)
+            if format != NVFP4_ROW:
+                raise ValueError(f"{name}: expected a row-NVFP4 n-gram table, got {format}")
+        elif not parameter.projection:
+            continue
+        elif "/moe/experts/" in name:
+            if _encoded_format(parameter.source) != "nvfp4":
+                raise ValueError(f"{name}: expected NVFP4 expert words")
+            recipe.assign(
+                name,
+                format="nvfp4",
+                method=import_encoded,
+                source=parameter.source,
+                activation_policy="AllowA4" if name.startswith("text/") else "A16Only",
+            )
+            continue
+        else:
+            format = _encoded_format(parameter.source)
+            if format is None:
+                continue  # BF16 in the checkpoint: the default BF16 selection keeps it.
+            if format != MXFP8:
+                raise ValueError(f"{name}: unexpected checkpoint encoding {format}")
+        recipe.assign(name, format=format, layout=_VERBATIM_LAYOUTS[format], method=import_verbatim)
+        verbatim.add(name)
+    # Fused groups (q|k|gate|v, q|k|v|z, a|b, indexer q|k, shared gate|up) and the routed-expert banks
+    # become one parent each. Packing groups are listed outermost first; the first complete one wins.
+    used = set()
+    for names in model.packing_groups:
+        experts = all("/moe/experts/" in name for name in names)
+        if (experts or all(name in verbatim for name in names)) and not used & set(names):
+            recipe.group(names)
+            used.update(names)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -393,4 +496,5 @@ RECIPES = {
     "qwen3_8_flash_next_nvfp4_allbf16": qwen3_8_flash_next_nvfp4_allbf16,
     "qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8,
     "qwen3_8_flash_next_nvfp4_idxbf16_gdnq8": qwen3_8_flash_next_nvfp4_idxbf16_gdnq8,
+    "qwen3_8_flash_next_fp4_local": qwen3_8_flash_next_fp4_local,
 }

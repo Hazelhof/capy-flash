@@ -19,9 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 FIXTURE_ROOT = REPO_ROOT / "bench" / "fixtures" / "ttft"
 TEXT_ROOT = FIXTURE_ROOT / "text"
 MEDIA_ROOT = FIXTURE_ROOT / "media"
-DEFAULT_TOKENIZER = Path(
-    "/home/neroued/models/llm/qwen/Qwen3.8-27B/base-hf-bf16"
-)
+DEFAULT_TOKENIZER = Path("/home/neroued/models/llm/qwen/Qwen3.8-27B/base-hf-bf16")
 IMAGE_SIZE = 1024
 IMAGE_VISION_TOKENS = 1024
 MANY_IMAGE_COUNT = 28
@@ -50,9 +48,7 @@ def _relative(path: Path) -> str:
 def _load_tokenizer(path: Path) -> Any:
     from transformers import AutoTokenizer
 
-    return AutoTokenizer.from_pretrained(
-        str(path), local_files_only=True, trust_remote_code=True, use_fast=True
-    )
+    return AutoTokenizer.from_pretrained(str(path), local_files_only=True, trust_remote_code=True, use_fast=True)
 
 
 def _template_ids(tokenizer: Any, messages: Sequence[dict[str, Any]], *, tools: Any = None) -> list[int]:
@@ -76,9 +72,7 @@ def _prompt_tokens(tokenizer: Any, messages: Sequence[dict[str, Any]], *, tools:
 
 
 def _source_ids(tokenizer: Any) -> list[int]:
-    messages = json.loads(
-        (REPO_ROOT / "examples/cli/messages/long_niah_64k.json").read_text(encoding="utf-8")
-    )
+    messages = json.loads((REPO_ROOT / "examples/cli/messages/long_niah_64k.json").read_text(encoding="utf-8"))
     source = messages[-1]["content"]
     return list(tokenizer.encode(source, add_special_tokens=False))
 
@@ -142,9 +136,7 @@ def _common_rendered_tokens(
     return common
 
 
-def _replace_rotation_label(
-    messages: Sequence[dict[str, Any]], replacement: str
-) -> list[dict[str, Any]]:
+def _replace_rotation_label(messages: Sequence[dict[str, Any]], replacement: str) -> list[dict[str, Any]]:
     result = copy.deepcopy(list(messages))
     if not result or result[0].get("role") != "system":
         raise RuntimeError("55K rotation fixture has no leading system marker")
@@ -180,9 +172,7 @@ def _common_prefix_messages(
     return first, second, common
 
 
-def _render_template(
-    tokenizer: Any, messages: Sequence[dict[str, Any]], *, tools: Any = None
-) -> str:
+def _render_template(tokenizer: Any, messages: Sequence[dict[str, Any]], *, tools: Any = None) -> str:
     kwargs: dict[str, Any] = {
         "tokenize": False,
         "add_generation_prompt": True,
@@ -206,9 +196,7 @@ def _stable_frontier(tokenizer: Any, rendered: str, character_boundary: int) -> 
     return sum(1 for begin, end in offsets if end <= character_boundary and end > begin)
 
 
-def _shared_system(
-    tokenizer: Any, source_ids: Sequence[int], *, variant: str
-) -> tuple[str, int, int]:
+def _shared_system(tokenizer: Any, source_ids: Sequence[int], *, variant: str) -> tuple[str, int, int]:
     user = {"role": "user", "content": "Use the stable reference and answer with one word."}
     for take in range(4140, 4400):
         body = tokenizer.decode(
@@ -353,17 +341,13 @@ def _write_images() -> list[Path]:
 
 
 def _many_image_messages(paths: Sequence[Path], prompt: str) -> list[dict[str, Any]]:
-    content: list[dict[str, str]] = [
-        {"type": "image", "image": _relative(path)} for path in paths
-    ]
+    content: list[dict[str, str]] = [{"type": "image", "image": _relative(path)} for path in paths]
     content.append({"type": "text", "text": prompt})
     return [{"role": "user", "content": content}]
 
 
 def _placeholder_messages(paths: Sequence[Path], prompt: str) -> list[dict[str, Any]]:
-    content: list[dict[str, str]] = [
-        {"type": "image", "image": "placeholder"} for _ in paths
-    ]
+    content: list[dict[str, str]] = [{"type": "image", "image": "placeholder"} for _ in paths]
     content.append({"type": "text", "text": prompt})
     return [{"role": "user", "content": content}]
 
@@ -388,9 +372,11 @@ def build_state_working_set(tokenizer: Any, source_ids: Sequence[int]) -> dict[s
     records = {}
     suffix = "\nInclude one more detail."
     for label in "abcdef":
+
         def candidate(take: int) -> list[dict[str, str]]:
             body = tokenizer.decode(
-                list(source_ids[:take]), skip_special_tokens=False,
+                list(source_ids[:take]),
+                skip_special_tokens=False,
                 clean_up_tokenization_spaces=False,
             ).strip()
             return [
@@ -420,13 +406,15 @@ def build_state_working_set(tokenizer: Any, source_ids: Sequence[int]) -> dict[s
         path = TEXT_ROOT / f"state_working_set_{label}.json"
         _write_json(path, messages)
         records[f"state-2k-{label}"] = _file_record(
-            path, prompt_tokens=2048, max_output_tokens=32,
-            system_frontier_tokens=frontier, probe_suffix=suffix,
+            path,
+            prompt_tokens=2048,
+            max_output_tokens=32,
+            system_frontier_tokens=frontier,
+            probe_suffix=suffix,
             probe_prompt_tokens=variants,
         )
     common = max(
-        _common_rendered_tokens(tokenizer, left, right)
-        for i, left in enumerate(roots) for right in roots[i + 1:]
+        _common_rendered_tokens(tokenizer, left, right) for i, left in enumerate(roots) for right in roots[i + 1 :]
     )
     if common > 3:
         raise RuntimeError("state working-set roots do not diverge at the first content token")
@@ -460,18 +448,13 @@ def build(tokenizer_path: Path) -> None:
         leading_messages=[
             {
                 "role": "system",
-                "content": (
-                    "TTFT-INDEPENDENT-COLD-LONG-B. "
-                    "Answer the supplied document independently."
-                ),
+                "content": ("TTFT-INDEPENDENT-COLD-LONG-B. Answer the supplied document independently."),
             }
         ],
     )
     independent_8k_common = _common_rendered_tokens(tokenizer, seed_8k, independent_8k)
     if independent_8k_common > 3:
-        raise RuntimeError(
-            "independent 8K fixture does not diverge at the first system-content token"
-        )
+        raise RuntimeError("independent 8K fixture does not diverge at the first system-content token")
     independent_8k_path = TEXT_ROOT / "long_8k_independent.json"
     _write_json(independent_8k_path, independent_8k)
 
@@ -482,18 +465,13 @@ def build(tokenizer_path: Path) -> None:
         leading_messages=[
             {
                 "role": "system",
-                "content": (
-                    "TTFT-INDEPENDENT-COLD-LONG-64K-B. "
-                    "Answer the supplied document independently."
-                ),
+                "content": ("TTFT-INDEPENDENT-COLD-LONG-64K-B. Answer the supplied document independently."),
             }
         ],
     )
     independent_64k_common = _common_rendered_tokens(tokenizer, seed_64k, independent_64k)
     if independent_64k_common > 3:
-        raise RuntimeError(
-            "independent 64K fixture does not diverge at the first system-content token"
-        )
+        raise RuntimeError("independent 64K fixture does not diverge at the first system-content token")
     independent_64k_path = TEXT_ROOT / "long_64k_independent.json"
     _write_json(independent_64k_path, independent_64k)
 
@@ -531,9 +509,7 @@ def build(tokenizer_path: Path) -> None:
         for right in range(left + 1, len(all_rotation_55k))
     )
     if rotation_55k_common > 3:
-        raise RuntimeError(
-            "55K rotation fixtures do not diverge at the first system-content token"
-        )
+        raise RuntimeError("55K rotation fixtures do not diverge at the first system-content token")
 
     exact = _fit_user_prompt(tokenizer, source_ids, 8129)
     over = _fit_user_prompt(tokenizer, source_ids, 8193)
@@ -548,12 +524,8 @@ def build(tokenizer_path: Path) -> None:
     _write_json(common_a_path, common_a)
     _write_json(common_b_path, common_b)
 
-    system_a, system_a_frontier, system_a_prompt = _shared_system(
-        tokenizer, source_ids, variant="A"
-    )
-    system_b, system_b_frontier, system_b_prompt = _shared_system(
-        tokenizer, source_ids, variant="B"
-    )
+    system_a, system_a_frontier, system_a_prompt = _shared_system(tokenizer, source_ids, variant="A")
+    system_b, system_b_frontier, system_b_prompt = _shared_system(tokenizer, source_ids, variant="B")
     system_a_path = TEXT_ROOT / "shared_system_a.txt"
     system_b_path = TEXT_ROOT / "shared_system_b.txt"
     system_a_path.write_text(system_a, encoding="utf-8")
@@ -570,9 +542,7 @@ def build(tokenizer_path: Path) -> None:
     many_prompt = "Compare all images and answer with the smallest visible image number."
     many_a = _many_image_messages(many_a_paths, many_prompt)
     many_b = _many_image_messages(many_b_paths, many_prompt)
-    over_images = _many_image_messages(
-        image_paths[:33], "Inspect every image and answer with one short word."
-    )
+    over_images = _many_image_messages(image_paths[:33], "Inspect every image and answer with one short word.")
     many_a_path = TEXT_ROOT / "many_image_28_a.json"
     many_b_path = TEXT_ROOT / "many_image_28_b.json"
     over_images_path = TEXT_ROOT / "many_image_33.json"
@@ -636,9 +606,7 @@ def build(tokenizer_path: Path) -> None:
             "interferer-256": _existing_case("scenario_story_zh_scifi", 127, 256),
             "holder-4096": _existing_case("scenario_story_zh_scifi", 127, 4096),
             "medium-3000": _existing_case("text_smoke_zh", 30, 3000),
-            "context-exact": _file_record(
-                exact_path, prompt_tokens=8129, max_output_tokens=64
-            ),
+            "context-exact": _file_record(exact_path, prompt_tokens=8129, max_output_tokens=64),
             "context-over": _file_record(over_path, prompt_tokens=8193),
             "unmarked-common-a": _file_record(
                 common_a_path,
@@ -743,11 +711,7 @@ def check() -> None:
     records: list[dict[str, Any]] = []
     records.extend(manifest["shapes"].values())
     records.extend(manifest["shared"].values())
-    records.extend(
-        value
-        for key, value in manifest["media"].items()
-        if key not in {"load-images", "source-files"}
-    )
+    records.extend(value for key, value in manifest["media"].items() if key not in {"load-images", "source-files"})
     records.extend(manifest["media"]["source-files"])
     records.extend(manifest["media"]["load-images"])
     for record in records:
@@ -787,9 +751,7 @@ def check() -> None:
         for record in rotation
     ):
         raise RuntimeError("55K rotation fixtures are outside their qualified shape")
-    if len({record["path"] for record in rotation}) != 6 or len(
-        {record["sha256"] for record in rotation}
-    ) != 6:
+    if len({record["path"] for record in rotation}) != 6 or len({record["sha256"] for record in rotation}) != 6:
         raise RuntimeError("55K rotation fixtures are not byte-distinct")
     original_labels: list[str] = []
     for record in rotation:
@@ -804,10 +766,7 @@ def check() -> None:
         len(set(original_labels)) != len(rotation)
         or len(set(second_labels)) != len(rotation)
         or set(second_labels) & set(original_labels)
-        or any(
-            len(original) != len(second)
-            for original, second in zip(original_labels, second_labels, strict=True)
-        )
+        or any(len(original) != len(second) for original, second in zip(original_labels, second_labels, strict=True))
     ):
         raise RuntimeError("55K rotation cohort labels are not shape-preserving and distinct")
 

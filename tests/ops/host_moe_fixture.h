@@ -23,7 +23,8 @@ inline double e2m1_value(unsigned code) {
 
 inline double e4m3_value(unsigned code) {
     const unsigned e = (code >> 3) & 15U, m = code & 7U;
-    const double mag = e == 0 ? std::ldexp(m / 8.0, -6) : std::ldexp(1.0 + m / 8.0, static_cast<int>(e) - 7);
+    const double mag =
+        e == 0 ? std::ldexp(m / 8.0, -6) : std::ldexp(1.0 + m / 8.0, static_cast<int>(e) - 7);
     return code & 0x80U ? -mag : mag;
 }
 
@@ -33,15 +34,16 @@ inline std::uint8_t e4m3_encode_positive(double v) {
     double best_err   = std::abs(v);
     for (unsigned c = 1; c < 0x7F; ++c) {
         const double err = std::abs(e4m3_value(c) - v);
-        if (err < best_err || (err == best_err && (c & 1U) == 0)) best = static_cast<std::uint8_t>(c), best_err = err;
+        if (err < best_err || (err == best_err && (c & 1U) == 0))
+            best = static_cast<std::uint8_t>(c), best_err = err;
     }
     return best;
 }
 
 // E2M1 code of v, round to nearest even, saturating at +-6.
 inline std::uint8_t e2m1_encode(double v) {
-    const double a = std::abs(v);
-    unsigned best = 0;
+    const double a  = std::abs(v);
+    unsigned best   = 0;
     double best_err = a;
     for (unsigned c = 1; c < 8; ++c) {
         const double err = std::abs(e2m1_value(c) - a);
@@ -52,15 +54,15 @@ inline std::uint8_t e2m1_encode(double v) {
 
 inline std::size_t scale_offset(std::int64_t row, std::int64_t group, std::int32_t k) {
     const std::int64_t k_tiles = k / 64;
-    return static_cast<std::size_t>(((row / 128) * k_tiles + group / 4) * 512 + (row % 128 % 32) * 16 +
-                                    (row % 128 / 32) * 4 + group % 4);
+    return static_cast<std::size_t>(((row / 128) * k_tiles + group / 4) * 512 +
+                                    (row % 128 % 32) * 16 + (row % 128 / 32) * 4 + group % 4);
 }
 
 // One NVFP4 plane payload built from Gaussian weights; `sigma[i]` = weight scale of source i.
 struct PlaneData {
     std::vector<std::uint8_t> payload;
     std::int64_t rows = 0, divisors = 0;
-    std::int32_t k = 0;
+    std::int32_t k         = 0;
     std::size_t scale_base = 0;
 
     PlaneData(std::int64_t rows_, std::int32_t k_, std::int64_t divisors_, std::mt19937_64& rng)
@@ -68,8 +70,8 @@ struct PlaneData {
         payload.assign(ops::host::Nvfp4Plane::payload_bytes(rows, k, divisors), 0);
         const std::size_t codes = static_cast<std::size_t>(rows) * k / 2;
         scale_base              = (codes + 255) / 256 * 256;
-        auto* div = reinterpret_cast<float*>(payload.data() + scale_base + codes / 8);
-        constexpr double S = 64.0; // keeps the E4M3 scales in their normal range
+        auto* div               = reinterpret_cast<float*>(payload.data() + scale_base + codes / 8);
+        constexpr double S      = 64.0; // keeps the E4M3 scales in their normal range
         std::normal_distribution<double> normal(0.0, 1.0);
         std::uniform_real_distribution<double> sig(0.01, 0.04);
         for (std::int64_t d = 0; d < divisors; ++d) div[d] = static_cast<float>(S / sig(rng));
@@ -78,11 +80,11 @@ struct PlaneData {
             for (std::int64_t g = 0; g < k / 16; ++g) {
                 double amax = 0;
                 for (double& x : v) x = normal(rng), amax = std::max(amax, std::abs(x));
-                const std::uint8_t sc = e4m3_encode_positive(amax / 6.0 * S);
+                const std::uint8_t sc                       = e4m3_encode_positive(amax / 6.0 * S);
                 payload[scale_base + scale_offset(r, g, k)] = sc;
-                const double sv = e4m3_value(sc);
+                const double sv                             = e4m3_value(sc);
                 for (int j = 0; j < 16; ++j) {
-                    const std::uint8_t c = e2m1_encode(v[j] * S / sv);
+                    const std::uint8_t c   = e2m1_encode(v[j] * S / sv);
                     const std::size_t byte = static_cast<std::size_t>(r) * (k / 2) + g * 8 + j / 2;
                     payload[byte] |= static_cast<std::uint8_t>(j % 2 ? c << 4 : c);
                 }
@@ -115,9 +117,11 @@ struct PlaneData {
 struct LayerData {
     std::int32_t experts, hidden, intermediate;
     PlaneData gate_up, down;
+
     LayerData(std::int32_t e, std::int32_t h, std::int32_t i, std::mt19937_64& rng)
         : experts(e), hidden(h), intermediate(i), gate_up(std::int64_t{e} * 2 * i, h, 2 * e, rng),
           down(std::int64_t{e} * h, i, e, rng) {}
+
     [[nodiscard]] ops::host::HostExpertLayer layer() const {
         return {gate_up.plane(), down.plane(), experts, hidden, intermediate};
     }

@@ -55,9 +55,9 @@ constexpr auto kLaunchers = make_launchers(std::make_index_sequence<1>{});
 // - T<=8 and T<=16 give each CTA two 16-row tiles that share one activation stage:
 //   [17408,5120] 88.3 -> 83.2 us at T=8, 124.4 -> 114.7 us at T=16.
 template <int Tokens, int MinBlocksPerSm, int RowTiles, int StageTokens>
-using SlicedK = Nvfp4A16SlicedKMmaSchedule<8, Tokens, MinBlocksPerSm, Cache::ca, Cache::cg,
-                                           Nvfp4ActivationStage::PaddedZero, 2, RowTiles,
-                                           StageTokens>;
+using SlicedK =
+    Nvfp4A16SlicedKMmaSchedule<8, Tokens, MinBlocksPerSm, Cache::ca, Cache::cg,
+                               Nvfp4ActivationStage::PaddedZero, 2, RowTiles, StageTokens>;
 
 template <class Schedule, int Capacity = 0>
 void launch_sliced_k(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

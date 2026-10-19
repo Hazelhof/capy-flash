@@ -248,7 +248,7 @@ __global__ void moe_accumulate_shared_kernel(const float* __restrict__ shared_ga
     for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < count; i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
         const std::int64_t t = i / rows;
-        partial[i] = fmaf(shared_gate[t], __bfloat162float(shared[i]), partial[i]);
+        partial[i]           = fmaf(shared_gate[t], __bfloat162float(shared[i]), partial[i]);
     }
 }
 
@@ -291,8 +291,8 @@ void moe_combine_shared_launch(const Tensor& partial, const Tensor& shared_gate,
                                const Tensor& shared, Tensor& y, cudaStream_t stream) {
     const std::int64_t count = partial.numel();
     const int threads        = 256;
-    const auto blocks = static_cast<int>(std::min<std::int64_t>((count + threads - 1) / threads,
-                                                                std::int64_t(70) * 16));
+    const auto blocks        = static_cast<int>(
+        std::min<std::int64_t>((count + threads - 1) / threads, std::int64_t(70) * 16));
     moe_combine_shared_kernel<<<blocks, threads, 0, stream>>>(
         static_cast<const float*>(partial.data), static_cast<const float*>(shared_gate.data),
         static_cast<const __nv_bfloat16*>(shared.data), static_cast<__nv_bfloat16*>(y.data),
@@ -304,12 +304,11 @@ void moe_accumulate_shared_launch(const Tensor& shared_gate, const Tensor& share
                                   cudaStream_t stream) {
     const std::int64_t count = partial.numel();
     const int threads        = 256;
-    const auto blocks = static_cast<int>(std::min<std::int64_t>((count + threads - 1) / threads,
-                                                                std::int64_t(70) * 16));
+    const auto blocks        = static_cast<int>(
+        std::min<std::int64_t>((count + threads - 1) / threads, std::int64_t(70) * 16));
     moe_accumulate_shared_kernel<<<blocks, threads, 0, stream>>>(
-        static_cast<const float*>(shared_gate.data),
-        static_cast<const __nv_bfloat16*>(shared.data), static_cast<float*>(partial.data),
-        partial.ne[0], count);
+        static_cast<const float*>(shared_gate.data), static_cast<const __nv_bfloat16*>(shared.data),
+        static_cast<float*>(partial.data), partial.ne[0], count);
     CUDA_CHECK(cudaGetLastError());
 }
 

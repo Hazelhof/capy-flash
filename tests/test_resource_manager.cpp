@@ -1111,7 +1111,7 @@ public:
         if (finish_with_rewrite) {
             result.summary.rewrite = rewrite_checkpoint(key, finish_frontier - 1U);
         }
-        result.summary.long_anchors     = finish_long_anchors;
+        result.summary.long_anchors        = finish_long_anchors;
         catalogued_summaries_[sequence.id] = result.summary;
         result.continuation.emplace(sequence.id, key);
         return result;
@@ -2475,10 +2475,9 @@ void test_cancelled_request_is_catalogued() {
                 reuse.choice->summary().reusable_prompt_tokens == 24,
             "catalogued cancelled sequence was not reusable at its frontier");
 
-    const ActiveRequest third = start_active(manager, program, 7, make_base(7), 4);
-    program.finish_fail_next  = true;
-    const FakeFinishResult discarded =
-        manager.finish(program, third.lane, third.sequence, true);
+    const ActiveRequest third        = start_active(manager, program, 7, make_base(7), 4);
+    program.finish_fail_next         = true;
+    const FakeFinishResult discarded = manager.finish(program, third.lane, third.sequence, true);
     require(discarded.status == ConsumeStatus::Consumed &&
                 discarded.disposition == FinishDisposition::Released &&
                 program.finish_cancelled_calls == 2 && program.abort_calls == 1,
@@ -3018,8 +3017,8 @@ void test_hostless_private_capture_reclaims_cheapest_and_ages_long_continuation(
     std::uint32_t previous = side.sequence.id;
     for (std::uint32_t round = 0; round < 3; ++round) {
         const std::uint32_t digest = 73 + round;
-        const ActiveRequest active = start_active(manager, program, digest, make_base(digest),
-                                                  3 + round);
+        const ActiveRequest active =
+            start_active(manager, program, digest, make_base(digest), 3 + round);
         program.capture_assessment = FakeCaptureAssessment{
             .shortlist_key          = FakeShortlistKey{.digest = digest, .frontier = 12},
             .protected_rebuild_work = PrefillWork{.tokens = 1000},
@@ -3028,7 +3027,7 @@ void test_hostless_private_capture_reclaims_cheapest_and_ages_long_continuation(
         };
         program.capture_summary.endpoint        = endpoint(digest, 12);
         program.capture_feasible_after_releases = program.released_continuations.size() + 1;
-        const auto reserved = manager.reserve_active_capture(
+        const auto reserved                     = manager.reserve_active_capture(
             program, active.lane, FakeCaptureOffer{.id = 10 + round}, 0, {});
         require(reserved == FakeManager::ActiveCaptureReserveResult::Reserved,
                 "Host-less private capture was skipped instead of reclaiming Device state");

@@ -68,7 +68,8 @@ std::uint64_t mix(std::uint64_t a, std::uint64_t b, std::uint64_t c = 0, std::ui
     return (((a * 1000003ULL + b) * 1000033ULL + c) * 1000037ULL) + d;
 }
 
-// ==== QSA =========================================================================================
+// ==== QSA
+// =========================================================================================
 
 constexpr std::int32_t kHeadDim    = 256;
 constexpr std::int32_t kIndexHeads = 4;
@@ -182,8 +183,8 @@ void append_all(Layer& layer, int first_head, int tokens, const DeviceBuffer& ke
                 for (int h = 0; h < layer.kv_heads; ++h) {
                     for (int d = 0; d < kHeadDim; ++d) {
                         const std::size_t at = (c * layer.kv_heads + h) * kHeadDim + d;
-                        k[at] = f32_to_bf16(k_value(b, t, first_head + h, d));
-                        v[at] = f32_to_bf16(v_value(b, t, first_head + h, d));
+                        k[at]                = f32_to_bf16(k_value(b, t, first_head + h, d));
+                        v[at]                = f32_to_bf16(v_value(b, t, first_head + h, d));
                     }
                 }
                 for (int d = 0; d < kIndexDim; ++d) {
@@ -233,7 +234,7 @@ Selection select(const Layer& layer, const Query& query, std::uint32_t max_visib
     }
     DeviceBuffer dq = to_device(q), dc = to_device_i32(cache), dr = to_device_i32(rope),
                  dvalid = to_device_i32(query.valid);
-    const int max_sel = kGeometry.max_selected();
+    const int max_sel   = kGeometry.max_selected();
     GuardedDeviceBuffer selected(static_cast<std::size_t>(max_sel) * columns * 4);
     GuardedDeviceBuffer counts(columns * 4);
     selected.fill(0xff);
@@ -313,27 +314,29 @@ const char* profile_name(KvCacheStorage s) {
 }
 
 int test_qsa() {
-    int failures            = 0;
-    constexpr int kLanes    = 2;
-    constexpr int kTokens   = 2600; // 650 blocks > 512: the indexer selects
-    constexpr int kWidth    = 4;
-    const Query query{kWidth,
-                      {{kTokens - 4, kTokens - 3, kTokens - 2, kTokens - 1}, {1997, 1998, 2412, 2413}},
-                      {4, 3}};
+    int failures          = 0;
+    constexpr int kLanes  = 2;
+    constexpr int kTokens = 2600; // 650 blocks > 512: the indexer selects
+    constexpr int kWidth  = 4;
+    const Query query{
+        kWidth,
+        {{kTokens - 4, kTokens - 3, kTokens - 2, kTokens - 1}, {1997, 1998, 2412, 2413}},
+        {4, 3}};
     for (const KvCacheStorage storage :
          {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16}) {
         const std::string label = std::string("qsa tp2 ") + profile_name(storage);
         // Single device: 24/2.
         set_device(0);
-        const DeviceBuffer key_norm0 = to_device(norm_bits(0x23)), query_norm0 = to_device(norm_bits(0x22));
+        const DeviceBuffer key_norm0   = to_device(norm_bits(0x23)),
+                           query_norm0 = to_device(norm_bits(0x22));
         Layer full(kLanes, kTokens, storage, kKvHeads);
         append_all(full, 0, kTokens, key_norm0);
         const Selection full_selection = select(full, query, kTokens, query_norm0);
-        const auto full_out = attend(full, 0, kQueryHeads, kWidth, full_selection);
-        const int group     = kQueryHeads / kKvHeads; // 12
+        const auto full_out            = attend(full, 0, kQueryHeads, kWidth, full_selection);
+        const int group                = kQueryHeads / kKvHeads; // 12
         for (int rank = 0; rank < 2; ++rank) {
             set_device(rank);
-            const DeviceBuffer key_norm = to_device(norm_bits(0x23)),
+            const DeviceBuffer key_norm   = to_device(norm_bits(0x23)),
                                query_norm = to_device(norm_bits(0x22));
             Layer shard(kLanes, kTokens, storage, 1);
             append_all(shard, rank, kTokens, key_norm);
@@ -352,10 +355,11 @@ int test_qsa() {
                     for (int d = 0; d < kHeadDim; ++d) {
                         const std::uint16_t a =
                             out[(static_cast<std::size_t>(c) * group + h) * kHeadDim + d];
-                        const std::uint16_t b = full_out[(static_cast<std::size_t>(c) * kQueryHeads +
-                                                          rank * group + h) *
-                                                             kHeadDim +
-                                                         d];
+                        const std::uint16_t b =
+                            full_out[(static_cast<std::size_t>(c) * kQueryHeads + rank * group +
+                                      h) *
+                                         kHeadDim +
+                                     d];
                         identical += a == b;
                         got.push_back(bf16_to_f32(a));
                         want.push_back(bf16_to_f32(b));
@@ -371,7 +375,8 @@ int test_qsa() {
     return failures;
 }
 
-// ==== GDN =========================================================================================
+// ==== GDN
+// =========================================================================================
 
 constexpr int kDim        = 128;
 constexpr int kLayers     = 36;
@@ -383,8 +388,11 @@ constexpr float kScale    = 0.08838834764831845F; // 1/sqrt(128)
 
 struct Geometry {
     int qk_heads, value_heads;
+
     int query_rows() const { return qk_heads * kDim; }
+
     int value_rows() const { return value_heads * kDim; }
+
     int channels() const { return 2 * query_rows() + value_rows(); }
 };
 
@@ -401,10 +409,10 @@ int global_channel(int rank, int c) {
 
 // The whole logical layer state and parameters, generated once over the 16/48 geometry.
 struct Logical {
-    std::vector<float> conv_weight;               // [4][C] tap-major
-    std::vector<float> a_log, dt_bias, norm;      // [48], [48], [128]
-    std::vector<std::vector<float>> history;      // per slot [3][C]
-    std::vector<std::vector<float>> state;        // per slot [48][128][128]
+    std::vector<float> conv_weight;          // [4][C] tap-major
+    std::vector<float> a_log, dt_bias, norm; // [48], [48], [128]
+    std::vector<std::vector<float>> history; // per slot [3][C]
+    std::vector<std::vector<float>> state;   // per slot [48][128][128]
 };
 
 Logical make_logical() {
@@ -454,10 +462,10 @@ struct GdnDevice {
     std::unique_ptr<ops::GdnReplayFoldPlan> fold;
 
     int channel(int c) const { return rank < 0 ? c : global_channel(rank, c); }
+
     int head(int h) const { return rank < 0 ? h : rank * kShard.value_heads + h; }
 
-    GdnDevice(Geometry geometry, int r, const Logical& l, int verify_width)
-        : g(geometry), rank(r) {
+    GdnDevice(Geometry geometry, int r, const Logical& l, int verify_width) : g(geometry), rank(r) {
         const int C = g.channels(), Hv = g.value_heads, CF = kFull.channels();
         std::vector<float> conv(static_cast<std::size_t>(C) * 4);
         for (int j = 0; j < 4; ++j) {
@@ -499,7 +507,7 @@ struct GdnDevice {
                         l.history[slot][static_cast<std::size_t>(j) * CF + channel(c)];
                 }
             }
-            const auto h_bits = bits(history);
+            const auto h_bits      = bits(history);
             const Tensor conv_slot = pool->conv_slot(kLayer, slot);
             cuda_check(cudaMemcpy(conv_slot.data, h_bits.data(), h_bits.size() * 2,
                                   cudaMemcpyHostToDevice),
@@ -511,14 +519,14 @@ struct GdnDevice {
                        "upload state");
         }
         LayoutBuilder builder;
-        record_layout = plan_gdn_replay_records(builder, {.layers          = kLayers,
-                                                          .record_capacity = kRows,
-                                                          .width           = verify_width,
-                                                          .conv_channels   = C,
-                                                          .qk_heads        = g.qk_heads,
-                                                          .value_heads     = Hv,
-                                                          .key_dim         = kDim,
-                                                          .value_dim       = kDim});
+        record_layout           = plan_gdn_replay_records(builder, {.layers          = kLayers,
+                                                                    .record_capacity = kRows,
+                                                                    .width           = verify_width,
+                                                                    .conv_channels   = C,
+                                                                    .qk_heads        = g.qk_heads,
+                                                                    .value_heads     = Hv,
+                                                                    .key_dim         = kDim,
+                                                                    .value_dim       = kDim});
         const std::size_t bytes = builder.finish(256);
         record_storage          = DeviceBuffer(bytes);
         record_storage.fill(0);
@@ -547,12 +555,21 @@ LogicalInputs make_inputs(int width, std::uint64_t seed) {
     LogicalInputs in;
     const int C = kFull.channels(), V = kFull.value_rows(), Hv = kFull.value_heads;
     for (int row = 0; row < kRows; ++row) {
-        std::vector<float> p(static_cast<std::size_t>(C) * width), z(static_cast<std::size_t>(V) * width),
-            a(static_cast<std::size_t>(Hv) * width), b(static_cast<std::size_t>(Hv) * width);
-        for (std::size_t i = 0; i < p.size(); ++i) { p[i] = hashed(mix(seed, row, 1, i), -1.5F, 1.5F); }
-        for (std::size_t i = 0; i < z.size(); ++i) { z[i] = hashed(mix(seed, row, 2, i), -3.0F, 3.0F); }
-        for (std::size_t i = 0; i < a.size(); ++i) { a[i] = hashed(mix(seed, row, 3, i), -3.0F, 3.0F); }
-        for (std::size_t i = 0; i < b.size(); ++i) { b[i] = hashed(mix(seed, row, 4, i), -3.0F, 3.0F); }
+        std::vector<float> p(static_cast<std::size_t>(C) * width),
+            z(static_cast<std::size_t>(V) * width), a(static_cast<std::size_t>(Hv) * width),
+            b(static_cast<std::size_t>(Hv) * width);
+        for (std::size_t i = 0; i < p.size(); ++i) {
+            p[i] = hashed(mix(seed, row, 1, i), -1.5F, 1.5F);
+        }
+        for (std::size_t i = 0; i < z.size(); ++i) {
+            z[i] = hashed(mix(seed, row, 2, i), -3.0F, 3.0F);
+        }
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            a[i] = hashed(mix(seed, row, 3, i), -3.0F, 3.0F);
+        }
+        for (std::size_t i = 0; i < b.size(); ++i) {
+            b[i] = hashed(mix(seed, row, 4, i), -3.0F, 3.0F);
+        }
         in.projected.push_back(std::move(p));
         in.z.push_back(std::move(z));
         in.a.push_back(std::move(a));
@@ -579,7 +596,8 @@ struct Round {
                     p.push_back(in.projected[row][static_cast<std::size_t>(t) * CF + d.channel(c)]);
                 }
                 for (int r = 0; r < V; ++r) {
-                    zz.push_back(in.z[row][static_cast<std::size_t>(t) * VF + d.head(0) * kDim + r]);
+                    zz.push_back(
+                        in.z[row][static_cast<std::size_t>(t) * VF + d.head(0) * kDim + r]);
                 }
                 for (int h = 0; h < Hv; ++h) {
                     aa.push_back(in.a[row][static_cast<std::size_t>(t) * HF + d.head(h)]);
@@ -587,18 +605,18 @@ struct Round {
                 }
             }
         }
-        projected = to_device(bits(p));
-        z         = to_device(bits(zz));
-        a         = to_device(bits(aa));
-        b         = to_device(bits(bb));
+        projected                 = to_device(bits(p));
+        z                         = to_device(bits(zz));
+        a                         = to_device(bits(aa));
+        b                         = to_device(bits(bb));
         const std::size_t columns = static_cast<std::size_t>(w) * kRows;
-        q    = DeviceBuffer(static_cast<std::size_t>(g.query_rows()) * columns * 2);
-        k    = DeviceBuffer(static_cast<std::size_t>(g.query_rows()) * columns * 2);
+        q       = DeviceBuffer(static_cast<std::size_t>(g.query_rows()) * columns * 2);
+        k       = DeviceBuffer(static_cast<std::size_t>(g.query_rows()) * columns * 2);
         this->v = DeviceBuffer(static_cast<std::size_t>(V) * columns * 2);
-        gg   = DeviceBuffer(static_cast<std::size_t>(Hv) * columns * 4);
-        beta = DeviceBuffer(static_cast<std::size_t>(Hv) * columns * 4);
-        o    = DeviceBuffer(static_cast<std::size_t>(V) * columns * 2);
-        y    = DeviceBuffer(static_cast<std::size_t>(V) * columns * 2);
+        gg      = DeviceBuffer(static_cast<std::size_t>(Hv) * columns * 4);
+        beta    = DeviceBuffer(static_cast<std::size_t>(Hv) * columns * 4);
+        o       = DeviceBuffer(static_cast<std::size_t>(V) * columns * 2);
+        y       = DeviceBuffer(static_cast<std::size_t>(V) * columns * 2);
         y.fill(0);
         this->valid = to_device_i32(valid_rows);
         src         = to_device_i32(src_slots);
@@ -681,13 +699,14 @@ void verify_round(GdnDevice& d, Round& r, cudaStream_t stream) {
 // Compares rank `rank`'s round outputs with the 16/48 run's slices of the same heads/channels.
 int compare_round(const GdnDevice& full, const Round& rf, const GdnDevice& shard, const Round& rs,
                   int rank, const std::string& label) {
-    int failures      = 0;
-    const int W       = rf.width;
-    const auto cols   = static_cast<std::size_t>(W) * kRows;
-    const auto slice  = [&](const DeviceBuffer& whole_buffer, int whole_rows, int rows, int first,
+    int failures     = 0;
+    const int W      = rf.width;
+    const auto cols  = static_cast<std::size_t>(W) * kRows;
+    const auto slice = [&](const DeviceBuffer& whole_buffer, int whole_rows, int rows, int first,
                            int device_whole) {
         set_device(device_whole);
-        const auto all = from_device<std::uint16_t>(whole_buffer.p, static_cast<std::size_t>(whole_rows) * cols);
+        const auto all =
+            from_device<std::uint16_t>(whole_buffer.p, static_cast<std::size_t>(whole_rows) * cols);
         std::vector<std::uint16_t> out;
         for (std::size_t c = 0; c < cols; ++c) {
             out.insert(out.end(), all.begin() + static_cast<std::ptrdiff_t>(c * whole_rows + first),
@@ -720,12 +739,13 @@ int compare_slot(const GdnDevice& full, const GdnDevice& shard, int rank, int sl
     const auto full_state   = full.state(slot);
     const auto full_history = full.history(slot);
     set_device(rank);
-    const auto state   = shard.state(slot);
-    const auto history = shard.history(slot);
+    const auto state           = shard.state(slot);
+    const auto history         = shard.history(slot);
     const std::size_t per_head = static_cast<std::size_t>(kDim) * kDim;
     const std::vector<std::uint32_t> want_state(
         full_state.begin() + static_cast<std::ptrdiff_t>(rank * kShard.value_heads * per_head),
-        full_state.begin() + static_cast<std::ptrdiff_t>((rank + 1) * kShard.value_heads * per_head));
+        full_state.begin() +
+            static_cast<std::ptrdiff_t>((rank + 1) * kShard.value_heads * per_head));
     failures += verify_exact((label + " state").c_str(), state, want_state);
     const int C = kShard.channels(), CF = kFull.channels();
     std::vector<std::uint16_t> want_history(static_cast<std::size_t>(C) * 3);

@@ -29,14 +29,14 @@ namespace ninfer::ops::detail {
                                                                          std::int32_t min_tokens,
                                                                          std::int32_t max_tokens);
 
-void nvfp4_gdn_input_shard_a16_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                      Tensor& z, cudaStream_t stream);
+void nvfp4_gdn_input_shard_a16_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                      cudaStream_t stream);
 void nvfp4_gdn_input_shard_decode_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
                                          Tensor& z, cudaStream_t stream);
 void nvfp4_gdn_input_shard_small_t_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
                                           Tensor& z, cudaStream_t stream);
-void nvfp4_gdn_input_shard_a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv,
-                                     Tensor& z, Nvfp4A4Workspace workspace, cudaStream_t stream);
+void nvfp4_gdn_input_shard_a4_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                                     Nvfp4A4Workspace workspace, cudaStream_t stream);
 // In the non-RDC archive, like upstream's launch_nvfp4_a4_tma_gdn().
 void launch_nvfp4_a4_tma_gdn_shard(const Nvfp4A4Operands& p, __nv_bfloat16* qkv, __nv_bfloat16* z,
                                    cudaStream_t stream);

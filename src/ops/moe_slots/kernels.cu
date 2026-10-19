@@ -122,8 +122,7 @@ __device__ __forceinline__ uint2 quant16(const float (&v)[16], float gs, float& 
 
 // 8 E2M1 codes in one word -> int8 values x2 ({0,1,2,3,4,6,8,12} with sign), even/odd split.
 __device__ __forceinline__ int2 fp4x8_to_i8(std::uint32_t q) {
-    constexpr std::uint32_t t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u,
-                            t3 = 0xF4F8FAFCu;
+    constexpr std::uint32_t t0 = 0x03020100u, t1 = 0x0C080604u, t2 = 0xFDFEFF00u, t3 = 0xF4F8FAFCu;
     const std::uint32_t sel = 0x32103210u | ((q & 0x88888888u) >> 1);
     std::uint32_t tmp[2];
 #pragma unroll
@@ -212,10 +211,9 @@ __device__ __forceinline__ int distinct_slots(const int* s_slot, int n, int tid,
 }
 
 __global__ void __launch_bounds__(G1_THREADS, G1_MIN_BLOCKS)
-    moe_slots_gemm1_kernel(const __nv_bfloat16* __restrict__ x, int T,
-                           const int* __restrict__ ids, LayerArgs layer, PoolArgs pool,
-                           std::uint32_t* __restrict__ hq, float* __restrict__ hsf,
-                           std::uint32_t* __restrict__ done) {
+    moe_slots_gemm1_kernel(const __nv_bfloat16* __restrict__ x, int T, const int* __restrict__ ids,
+                           LayerArgs layer, PoolArgs pool, std::uint32_t* __restrict__ hq,
+                           float* __restrict__ hsf, std::uint32_t* __restrict__ done) {
     extern __shared__ int2 s_x[]; // [T][H / 8] int8 x2 split, then [T][HB] floats
     __shared__ int s_slot[MAXSLOT], s_id[MAXSLOT], s_list[MAXSLOT], s_rank[MAXSLOT];
     __shared__ unsigned s_umask[MAXSLOT];
@@ -226,8 +224,8 @@ __global__ void __launch_bounds__(G1_THREADS, G1_MIN_BLOCKS)
     const int n = T * TOPK;
     pdl::wait_for_dependencies(); // routed ids, x, previous users of the workspace
     if (tid < n) {
-        s_id[tid]   = ids[tid];
-        s_slot[tid] = slot_of(ids, layer, pool.slots, tid);
+        s_id[tid]    = ids[tid];
+        s_slot[tid]  = slot_of(ids, layer, pool.slots, tid);
         s_umask[tid] = 0;
     }
     if (blockIdx.x == 0 && tid < G2_TILES) done[tid] = 0; // gemm2 counts after its own wait
@@ -236,14 +234,16 @@ __global__ void __launch_bounds__(G1_THREADS, G1_MIN_BLOCKS)
     const int U = distinct_slots(s_slot, n, tid, s_list, s_rank, s_warp);
     if (tid < n && s_rank[tid] >= 0) atomicOr(&s_umask[s_rank[tid]], 1u << (tid / TOPK));
     __syncthreads();
-    float* s_xsf = reinterpret_cast<float*>(s_x + T * (H / 8));
+    float* s_xsf    = reinterpret_cast<float*>(s_x + T * (H / 8));
     const int items = U * G1_BLOCKS_PER_POS;
     const int r = warp * 8 + (lane >> 2), q0 = lane & 3;
     int item = blockIdx.x;
     if (item >= items) return;
     // Rolling prefetch: the weight registers of quad i are refilled with the next item's quad i
     // as soon as quad i has been decoded, so the next item's loads overlap this item's math.
-    const auto row_of = [&](int it) { return (r < 16 ? I : 0) + (it % G1_BLOCKS_PER_POS) * 16 + (r & 15); };
+    const auto row_of = [&](int it) {
+        return (r < 16 ? I : 0) + (it % G1_BLOCKS_PER_POS) * 16 + (r & 15);
+    };
     const auto slot_at = [&](int it) { return s_slot[s_list[it / G1_BLOCKS_PER_POS]]; };
     uint4 wv[10][2];
     std::uint32_t sv[10];
@@ -270,7 +270,7 @@ __global__ void __launch_bounds__(G1_THREADS, G1_MIN_BLOCKS)
     for (; item < items; item += gridDim.x) {
         const int u = item / G1_BLOCKS_PER_POS, jt = item % G1_BLOCKS_PER_POS;
         const int pos = s_list[u], e = s_id[pos];
-        const int next = item + static_cast<int>(gridDim.x);
+        const int next  = item + static_cast<int>(gridDim.x);
         const bool more = next < items;
         const int ns = more ? slot_at(next) : 0, ngrow = row_of(more ? next : item);
         const std::uint8_t* nwrow = pool.w13 + static_cast<long long>(ns) * pool.w13_stride +
@@ -306,7 +306,8 @@ __global__ void __launch_bounds__(G1_THREADS, G1_MIN_BLOCKS)
                 const uint4* p = reinterpret_cast<const uint4*>(nwrow + q * 32);
                 wv[i][0]       = __ldcs(p);
                 wv[i][1]       = __ldcs(p + 1);
-                sv[i] = __ldg(reinterpret_cast<const unsigned int*>(nsfe + sf_quad_offset(ngrow, q, HQ)));
+                sv[i]          = __ldg(
+                    reinterpret_cast<const unsigned int*>(nsfe + sf_quad_offset(ngrow, q, HQ)));
             }
 #pragma unroll
             for (int rk = 0; rk < MAXT; ++rk) {
@@ -353,8 +354,8 @@ __global__ void __launch_bounds__(G1_THREADS, G1_MIN_BLOCKS)
 #pragma unroll
             for (int j = 0; j < 16; ++j) v[j] = s_act[rk][j];
             float sf;
-            const uint2 q          = quant16(v, layer.a2_gs, sf);
-            const std::size_t pair = static_cast<std::size_t>(pos) * T + t;
+            const uint2 q                   = quant16(v, layer.a2_gs, sf);
+            const std::size_t pair          = static_cast<std::size_t>(pos) * T + t;
             hq[pair * (I / 8) + 2 * jt]     = q.x;
             hq[pair * (I / 8) + 2 * jt + 1] = q.y;
             hsf[pair * IB + jt]             = sf;
@@ -399,8 +400,10 @@ __global__ void __launch_bounds__(G2_THREADS, G2_MIN_BLOCKS)
         pdl::wait_for_dependencies();
         if (accumulate) return;
         for (int c = blockIdx.x * G2_THREADS + tid; c < T * H; c += gridDim.x * G2_THREADS) {
-            if (out_f32 != nullptr) out_f32[c] = 0.f;
-            else out_bf16[c] = __float2bfloat16(0.f);
+            if (out_f32 != nullptr)
+                out_f32[c] = 0.f;
+            else
+                out_bf16[c] = __float2bfloat16(0.f);
         }
         return;
     }
@@ -428,11 +431,11 @@ __global__ void __launch_bounds__(G2_THREADS, G2_MIN_BLOCKS)
     for (; item < items; item += gridDim.x) {
         const int u = item / G2_TILES, tile = item % G2_TILES;
         const int pos = s_list[u], s = s_slot[pos], e = s_id[pos];
-        const int grow = tile * G2_ROWS + row;
-        const int next = item + static_cast<int>(gridDim.x);
-        const bool more = next < items;
-        const int ns = more ? s_slot[s_list[next / G2_TILES]] : 0;
-        const int ngrow = ((more ? next : item) % G2_TILES) * G2_ROWS + row;
+        const int grow            = tile * G2_ROWS + row;
+        const int next            = item + static_cast<int>(gridDim.x);
+        const bool more           = next < items;
+        const int ns              = more ? s_slot[s_list[next / G2_TILES]] : 0;
+        const int ngrow           = ((more ? next : item) % G2_TILES) * G2_ROWS + row;
         const std::uint8_t* nwrow = pool.w2 + static_cast<long long>(ns) * pool.w2_stride +
                                     static_cast<long long>(ngrow) * (I / 2);
         const std::uint8_t* nsfe = pool.w2_sf + static_cast<long long>(ns) * pool.w2_sf_stride;
@@ -458,7 +461,7 @@ __global__ void __launch_bounds__(G2_THREADS, G2_MIN_BLOCKS)
         const int te        = __popc(mask);
         for (int c = tid; c < te * (I / 8); c += G2_THREADS) {
             const int rk = c / (I / 8), k = c % (I / 8);
-            const int t  = nth_token(mask, rk);
+            const int t            = nth_token(mask, rk);
             const std::size_t pair = static_cast<std::size_t>(pos) * T + t;
             s_h[rk][k]             = fp4x8_to_i8(__ldcg(hq + pair * (I / 8) + k));
         }
@@ -486,7 +489,8 @@ __global__ void __launch_bounds__(G2_THREADS, G2_MIN_BLOCKS)
                 const uint4* p = reinterpret_cast<const uint4*>(nwrow + q * 32);
                 wv[i][0]       = __ldcs(p);
                 wv[i][1]       = __ldcs(p + 1);
-                sv[i] = __ldg(reinterpret_cast<const unsigned int*>(nsfe + sf_quad_offset(ngrow, q, IQ)));
+                sv[i]          = __ldg(
+                    reinterpret_cast<const unsigned int*>(nsfe + sf_quad_offset(ngrow, q, IQ)));
             }
 #pragma unroll
             for (int rk = 0; rk < MAXT; ++rk) {
@@ -527,11 +531,12 @@ __global__ void __launch_bounds__(G2_THREADS, G2_MIN_BLOCKS)
             __threadfence();
             for (int c = tid; c < T * (G2_ROWS / 4); c += G2_THREADS) {
                 const int t = c / (G2_ROWS / 4), r4 = (c % (G2_ROWS / 4)) * 4;
-                float4 v    = make_float4(0.f, 0.f, 0.f, 0.f);
+                float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
                 for (int k = 0; k < TOPK; ++k) {
                     if (!s_row_first[t * TOPK + k]) continue;
                     const float4 a = __ldcg(reinterpret_cast<const float4*>(
-                        part_out + (static_cast<std::size_t>(t) * TOPK + k) * H + tile * G2_ROWS + r4));
+                        part_out + (static_cast<std::size_t>(t) * TOPK + k) * H + tile * G2_ROWS +
+                        r4));
                     v.x += a.x;
                     v.y += a.y;
                     v.z += a.z;
@@ -561,9 +566,9 @@ __global__ void __launch_bounds__(G2_THREADS, G2_MIN_BLOCKS)
 
 // Resident CTAs per SM of each kernel (per T for gemm1's dynamic shared memory), per device.
 struct Capacity {
-    int sms = 0;
+    int sms          = 0;
     int g1[MAXT + 1] = {};
-    int g2 = 0;
+    int g2           = 0;
 };
 
 const Capacity& capacity() {
@@ -572,32 +577,34 @@ const Capacity& capacity() {
     static bool known[kMaxDevices];
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
-    if (device < 0 || device >= kMaxDevices) throw std::runtime_error("moe_slots_nvfp4: device index");
+    if (device < 0 || device >= kMaxDevices)
+        throw std::runtime_error("moe_slots_nvfp4: device index");
     if (!known[device]) {
         Capacity c;
         CUDA_CHECK(cudaDeviceGetAttribute(&c.sms, cudaDevAttrMultiProcessorCount, device));
         for (int t = 1; t <= MAXT; ++t) {
-            const auto smem = static_cast<std::size_t>(t) * ((H / 8) * sizeof(int2) + HB * sizeof(float));
-            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c.g1[t], moe_slots_gemm1_kernel,
-                                                                     G1_THREADS, smem));
+            const auto smem =
+                static_cast<std::size_t>(t) * ((H / 8) * sizeof(int2) + HB * sizeof(float));
+            CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &c.g1[t], moe_slots_gemm1_kernel, G1_THREADS, smem));
         }
-        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c.g2, moe_slots_gemm2_kernel, G2_THREADS, 0));
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&c.g2, moe_slots_gemm2_kernel,
+                                                                 G2_THREADS, 0));
         table[device] = c;
         known[device] = true;
     }
     return table[device];
 }
 
-
 std::size_t align256(std::size_t v) { return (v + 255) / 256 * 256; }
 
 } // namespace
 
 std::size_t moe_slots_workspace_layout(std::int32_t tokens, std::size_t offsets[4]) {
-    const auto t     = static_cast<std::size_t>(tokens);
+    const auto t            = static_cast<std::size_t>(tokens);
     const std::size_t pairs = TOPK * t * t; // (first position, token)
-    std::size_t at   = 0;
-    offsets[0]       = at;
+    std::size_t at          = 0;
+    offsets[0]              = at;
     at += align256(pairs * (I / 8) * sizeof(std::uint32_t));
     offsets[1] = at;
     at += align256(pairs * IB * sizeof(float));
@@ -629,19 +636,20 @@ void moe_slots_launch(const Tensor& x, const Tensor& routed_ids, const Tensor& r
                       layer.down_input_divisor};
     const int* ids  = static_cast<const int*>(routed_ids.data);
     const auto smem = static_cast<std::size_t>(T) * ((H / 8) * sizeof(int2) + HB * sizeof(float));
-    float* out_f32          = out.dtype == DType::FP32 ? static_cast<float*>(out.data) : nullptr;
+    float* out_f32  = out.dtype == DType::FP32 ? static_cast<float*>(out.data) : nullptr;
     __nv_bfloat16* out_bf16 =
         out.dtype == DType::BF16 ? static_cast<__nv_bfloat16*>(out.data) : nullptr;
     const Capacity& cap = capacity();
-    const int g1 = std::min(T * TOPK * G1_BLOCKS_PER_POS, cap.sms * std::min(G1_GRID_PER_SM, cap.g1[T]));
+    const int g1 =
+        std::min(T * TOPK * G1_BLOCKS_PER_POS, cap.sms * std::min(G1_GRID_PER_SM, cap.g1[T]));
     const int g2 = std::min(T * TOPK * G2_TILES, cap.sms * std::min(G2_GRID_PER_SM, cap.g2));
+    CUDA_CHECK(pdl::launch_dependent(pdl::LaunchConfig{dim3(g1), dim3(G1_THREADS), smem, stream},
+                                     moe_slots_gemm1_kernel,
+                                     static_cast<const __nv_bfloat16*>(x.data), T, ids, l, p,
+                                     workspace.h_codes, workspace.h_scales, workspace.tile_done));
     CUDA_CHECK(pdl::launch_dependent(
-        pdl::LaunchConfig{dim3(g1), dim3(G1_THREADS), smem, stream},
-        moe_slots_gemm1_kernel, static_cast<const __nv_bfloat16*>(x.data), T, ids, l, p,
-        workspace.h_codes, workspace.h_scales, workspace.tile_done));
-    CUDA_CHECK(pdl::launch_dependent(
-        pdl::LaunchConfig{dim3(g2), dim3(G2_THREADS), 0, stream},
-        moe_slots_gemm2_kernel, T, ids, static_cast<const float*>(routed_weights.data), l, p,
+        pdl::LaunchConfig{dim3(g2), dim3(G2_THREADS), 0, stream}, moe_slots_gemm2_kernel, T, ids,
+        static_cast<const float*>(routed_weights.data), l, p,
         static_cast<const std::uint32_t*>(workspace.h_codes),
         static_cast<const float*>(workspace.h_scales), workspace.partial, workspace.tile_done,
         out_f32, out_bf16, mode == MoeSlotsOutput::Accumulate ? 1 : 0));

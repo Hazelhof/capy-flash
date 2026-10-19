@@ -70,11 +70,11 @@ struct SplitBuffers {
             candidates[r].emplace(count * ops::kArgmaxSplitCandidateRows * sizeof(std::uint16_t));
             staging[r].emplace(count * ops::kArgmaxSplitCandidateRows * sizeof(std::uint16_t));
             candidates[r]->fill(0x7f);
-            local_t[r] = Tensor(local[r]->data(), DType::I32, {columns});
+            local_t[r]      = Tensor(local[r]->data(), DType::I32, {columns});
             candidates_t[r] = Tensor(candidates[r]->data(), DType::BF16,
                                      {ops::kArgmaxSplitCandidateRows, columns});
-            staging_t[r] = Tensor(staging[r]->data(), DType::BF16,
-                                  {ops::kArgmaxSplitCandidateRows, columns});
+            staging_t[r] =
+                Tensor(staging[r]->data(), DType::BF16, {ops::kArgmaxSplitCandidateRows, columns});
         }
         set_device(ec, 0);
         selected.emplace(count * sizeof(std::int32_t));
@@ -105,16 +105,14 @@ void issue_split(const ExecutionContext& ec, const ops::PeerEvents& events,
         const auto r = static_cast<std::size_t>(rank);
         set_device(ec, rank);
         ops::argmax(logits[r], b.local_t[r], rows, ec.dev[r]->stream);
-        ops::argmax_split_pack(logits[r], b.local_t[r], rank, b.candidates_t[r],
-                               ec.dev[r]->stream);
+        ops::argmax_split_pack(logits[r], b.local_t[r], rank, b.candidates_t[r], ec.dev[r]->stream);
     }
     ops::allreduce_sum(b.candidates_t, b.staging_t, ec, events);
     set_device(ec, 0);
     ops::argmax_split_select(b.candidates_t[0], rows, b.selected_t, ec.dev[0]->stream);
 }
 
-std::vector<int> selected_rows(const ExecutionContext& ec, SplitBuffers& b,
-                               std::int32_t columns) {
+std::vector<int> selected_rows(const ExecutionContext& ec, SplitBuffers& b, std::int32_t columns) {
     set_device(ec, 0);
     return from_device<int>(b.selected->data(), static_cast<std::size_t>(columns));
 }
@@ -132,8 +130,8 @@ int check_selection(const std::string& label, const ExecutionContext& ec,
         retire_staging(ec);
         issue_split(ec, events, logits, b);
         synchronize_both(ec);
-        failures += verify_exact((label + " eager").c_str(), selected_rows(ec, b, columns),
-                                 expected);
+        failures +=
+            verify_exact((label + " eager").c_str(), selected_rows(ec, b, columns), expected);
         failures += b.verify_guards(ec, label + " eager");
     }
     if (mailbox == nullptr) { return failures; }
@@ -185,8 +183,9 @@ int run_head(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
     constexpr std::uint32_t kSeed = 409U;
     int failures                  = 0;
     const qw::PackedWeight parent = make_weight(kQType, kRows, kHidden, kSeed, 0, 0);
-    const std::array<qw::PackedWeight, 2> half{make_weight(kQType, kHalf, kHidden, kSeed, 0, 0),
-                                               make_weight(kQType, kHalf, kHidden, kSeed, kHalf, 0)};
+    const std::array<qw::PackedWeight, 2> half{
+        make_weight(kQType, kHalf, kHidden, kSeed, 0, 0),
+        make_weight(kQType, kHalf, kHidden, kSeed, kHalf, 0)};
     for (const std::int32_t row : {0, 1, 4095, kHalf - 1}) {
         for (const std::int32_t column : {0, 63, 64, kHidden - 1}) {
             for (std::size_t rank = 0; rank < 2; ++rank) {
@@ -230,7 +229,7 @@ int run_head(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
         ops::linear(Tensor(x_device[0].p, DType::BF16, {kHidden, tokens}), parent_weight.weight,
                     whole_t, ops::LinearPolicy::A16Only, whole_arena, ec.dev[0]->stream);
         cuda_check(cudaStreamSynchronize(ec.dev[0]->stream), "cudaStreamSynchronize");
-        const auto whole_bits = from_device<std::uint16_t>(whole.data(), whole_elements);
+        const auto whole_bits           = from_device<std::uint16_t>(whole.data(), whole_elements);
         const std::vector<int> expected = reference_argmax(ec, whole_t, kRows);
 
         std::array<std::optional<GuardedDeviceBuffer>, 2> partial;
@@ -267,8 +266,8 @@ int run_head(const ExecutionContext& ec, ops::PeerMailbox& mailbox) {
         }
         int in_rank1 = 0;
         for (const int row : expected) { in_rank1 += row >= kHalf ? 1 : 0; }
-        std::cout << "  " << label << ": argmax in rank 1's half for " << in_rank1 << "/"
-                  << tokens << " columns\n";
+        std::cout << "  " << label << ": argmax in rank 1's half for " << in_rank1 << "/" << tokens
+                  << " columns\n";
         failures += check_selection(label, ec, logits, expected, &mailbox);
     }
     return failures;
@@ -281,19 +280,21 @@ int run_planted(const ExecutionContext& ec, ops::PeerMailbox& mailbox, std::int3
     const float inf         = std::numeric_limits<float>::infinity();
     const float nan         = std::numeric_limits<float>::quiet_NaN();
     const std::int32_t a = rows / 3, b = rows - 2; // a row in each half: a and rows + b
+
     struct Case {
         std::vector<std::pair<std::int32_t, float>> planted; // complete row, value
         bool all_negative_infinity;
         int expected;
     };
+
     const std::vector<Case> cases{
-        {{{a, 9.0F}, {rows + b, 9.0F}}, false, a},              // tie across the halves
-        {{{a, 8.0F}, {rows + b, 9.0F}}, false, rows + b},       // maximum in rank 1's half
-        {{{a, 9.0F}, {rows + b, 8.5F}}, false, a},              // maximum in rank 0's half
+        {{{a, 9.0F}, {rows + b, 9.0F}}, false, a},               // tie across the halves
+        {{{a, 8.0F}, {rows + b, 9.0F}}, false, rows + b},        // maximum in rank 1's half
+        {{{a, 9.0F}, {rows + b, 8.5F}}, false, a},               // maximum in rank 0's half
         {{{rows + b, 9.0F}, {rows + 1, 9.0F}}, false, rows + 1}, // tie inside rank 1's half
-        {{{rows, 9.0F}, {rows - 1, 9.0F}}, false, rows - 1},    // tie at the boundary
-        {{}, true, 0},                                          // all -inf
-        {{{0, nan}, {rows + b, 9.0F}}, false, 0},               // NaN in row 0
+        {{{rows, 9.0F}, {rows - 1, 9.0F}}, false, rows - 1},     // tie at the boundary
+        {{}, true, 0},                                           // all -inf
+        {{{0, nan}, {rows + b, 9.0F}}, false, 0},                // NaN in row 0
     };
     const auto columns = static_cast<std::int32_t>(cases.size());
     std::vector<float> values(static_cast<std::size_t>(2 * rows) * columns);
@@ -316,8 +317,8 @@ int run_planted(const ExecutionContext& ec, ops::PeerMailbox& mailbox, std::int3
     const DeviceBuffer whole = to_device_bf16(values);
     const std::vector<int> reference =
         reference_argmax(ec, Tensor(whole.p, DType::BF16, {2 * rows, columns}), 2 * rows);
-    int failures = verify_exact((label + " argmax() names the planted rows").c_str(), reference,
-                                expected);
+    int failures =
+        verify_exact((label + " argmax() names the planted rows").c_str(), reference, expected);
     std::array<std::vector<float>, 2> blocks;
     std::array<DeviceBuffer, 2> block_device;
     for (std::size_t rank = 0; rank < 2; ++rank) {
@@ -337,8 +338,8 @@ int run_planted(const ExecutionContext& ec, ops::PeerMailbox& mailbox, std::int3
 
 int verify_registry() {
     try {
-        if (ops::linear_workspace_capacity_bytes(kQType, kHalf, kHidden,
-                                                 ops::LinearPolicy::A16Only, 1, 2048) != 0) {
+        if (ops::linear_workspace_capacity_bytes(kQType, kHalf, kHidden, ops::LinearPolicy::A16Only,
+                                                 1, 2048) != 0) {
             std::cerr << "registry: the Q4 proposal head half reported workspace\n";
             return 1;
         }

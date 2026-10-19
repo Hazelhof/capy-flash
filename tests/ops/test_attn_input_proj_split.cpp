@@ -81,8 +81,8 @@ qw::PackedWeight stack_rows(const std::vector<qw::PackedWeight>& blocks) {
         }
         n += block.weight.n;
     }
-    qw::PackedWeight stacked = blocks.front();
-    stacked.code_plane_bytes = 0;
+    qw::PackedWeight stacked  = blocks.front();
+    stacked.code_plane_bytes  = 0;
     stacked.scale_plane_bytes = 0;
     for (const qw::PackedWeight& block : blocks) {
         stacked.code_plane_bytes += block.code_plane_bytes;
@@ -497,10 +497,10 @@ int main() {
         // crossover (3/4), each A4 MMA tile band and both TMA tiles. The shard keeps the 128-token
         // tile through T=1024 (513, 1024) and the parent does not, so at 1024 the two sides differ
         // in tile; 1025 is the shard's first 256-token tile, against the parent's same tile.
-        failures += run_case(ec, QType::NVFP4, 47U,
-                             {1, 2, 3, 4, 5, 16, 24, 32, 33, 64, 65, 97, 129, 193, 385, 513, 1024,
-                              1025},
-                             {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4});
+        failures +=
+            run_case(ec, QType::NVFP4, 47U,
+                     {1, 2, 3, 4, 5, 16, 24, 32, 33, 64, 65, 97, 129, 193, 385, 513, 1024, 1025},
+                     {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4});
     } catch (const std::exception& error) {
         std::cerr << "attn_input_proj split: " << error.what() << '\n';
         return 1;

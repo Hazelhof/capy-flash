@@ -113,8 +113,9 @@ Use the existing project workflows:
 - [`docs/maintainer/op-development.md`](docs/maintainer/op-development.md) for numerical Op
   development and qualification.
 
-Run `pre-commit install` once: every commit then checks the lines it changes (clang-format) and
-Python errors (ruff), the same hooks CI runs on a pull request. A change that can alter generated
+Run `pre-commit install` once: every commit then formats the files it changes (clang-format for
+C/C++/CUDA, ruff for Python) and checks Python errors and spelling (ruff, typos), the same hooks CI
+runs on a pull request. A change that can alter generated
 tokens also needs the model-level quality check described in [`AGENTS.md`](AGENTS.md)
 (GSM8K and MMLU-Pro, paired per question), unless its output is proven bit-identical.
 

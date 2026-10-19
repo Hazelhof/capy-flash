@@ -1,5 +1,10 @@
 // Hyper-connection Ops against FP64 oracles at the Qwen3.8-Flash-Next geometry (4 streams of
-// 2560, low rank 320, Q8_G32_FP16 Down/Up as in the ninfer-ext NVFP4 recipe).
+// 2560, low rank 320, Q8_G32_FP16 Down/Up as in the ninfer-ext NVFP4 recipe; BF16 Down/Up as in the
+// FP4-Local checkpoint).
+//
+// --bench: us per mixer of combine_mix (Q8, BF16) at T = 1, 2, 4, 8 in one CUDA Graph of 12 mixers
+// over distinct device copies of the weights (they stream from DRAM, as in a forward). Run it again
+// with NINFER_QWEN4_HC_GENERAL=1 to time the general route.
 //
 // The mix oracle evaluates the complete formula of include/ninfer/ops/hyper_connection.h from the
 // represented BF16 inputs and the independently decoded Q8 weights. It ports the fused oracle of
@@ -15,9 +20,12 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <stdexcept>
 #include <iostream>
@@ -42,10 +50,10 @@ constexpr PointwiseCriterion kBf16Output{1.0e-6, 1.0 / 128.0};
 
 // Mixed block input: normwise. Error sources are the BF16 output rounding (RMS ~ 2^-9/sqrt(3)
 // relative), the BF16 (general route) or FP16 (small-T route) staging of the normalized
-// activation (Down input) and of the low-rank activation (Up input), each propagated through one sigmoid gate (slope <= 1/4), and FP32
-// accumulation of K = 10240 / 320 products. A 4 x 10^-3 relative L2 is ~2x the expected
-// staging + rounding total; the gross cap allows two BF16 ulps of the largest value plus the
-// propagated staging error.
+// activation (Down input) and of the low-rank activation (Up input), each propagated through one
+// sigmoid gate (slope <= 1/4), and FP32 accumulation of K = 10240 / 320 products. A 4 x 10^-3
+// relative L2 is ~2x the expected staging + rounding total; the gross cap allows two BF16 ulps of
+// the largest value plus the propagated staging error.
 constexpr ReductionCriterion kMixed{/*relative_l2*/ 4.0e-3, /*gross_absolute*/ 1.0e-4,
                                     /*gross_relative_to_max_reference*/ 1.6e-2};
 // FP32 inject gates 2 sigmoid(p/4), |d gate / dp| <= 1/8. p carries the BF16 staging of the
@@ -164,6 +172,29 @@ quantized_weight::PackedWeight pack_nvfp4(const std::vector<float>& source, std:
     return packed;
 }
 
+// BF16 [n, k] row-major (the checkpoint's mixer weights): the source rounded to BF16.
+quantized_weight::PackedWeight pack_bf16(const std::vector<float>& source, std::int32_t n,
+                                         std::int32_t k) {
+    quantized_weight::PackedWeight packed;
+    packed.dequant = source;
+    round_to_bf16(packed.dequant);
+    packed.payload.resize(source.size() * 2);
+    for (std::size_t i = 0; i < source.size(); ++i) {
+        const std::uint16_t b = f32_to_bf16(source[i]);
+        std::memcpy(packed.payload.data() + 2 * i, &b, 2);
+    }
+    Weight& w  = packed.weight;
+    w.qtype    = QType::BF16;
+    w.layout   = QuantLayout::Contiguous;
+    w.ndim     = 2;
+    w.shape[0] = w.padded_shape[0] = n;
+    w.shape[1] = w.padded_shape[1] = k;
+    w.n                            = n;
+    w.k                            = k;
+    w.payload_bytes                = packed.payload.size();
+    return packed;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Element Ops (ninfer-ext oracles).
 
@@ -247,8 +278,8 @@ int wide_exact_case(std::int32_t tokens, std::uint32_t seed) {
     const auto residual      = random_bf16(wide, seed + 4U, -4.0F, 4.0F);
     std::vector<float> inject(static_cast<std::size_t>(kStreams) * tokens);
     fill_uniform(inject, seed + 5U, 0.0F, 2.0F);
-    DeviceBuffer du = to_device(bits(up)), dn = to_device(bits(normalized)), dy = to_device(bits(y)),
-                 di = to_device(inject);
+    DeviceBuffer du = to_device(bits(up)), dn = to_device(bits(normalized)),
+                 dy = to_device(bits(y)), di = to_device(inject);
     std::array<DeviceBuffer, 2> dr{to_device(bits(residual)), to_device(bits(residual))};
     std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> mixed{
         std::make_unique<GuardedDeviceBuffer>(narrow * 2),
@@ -257,7 +288,7 @@ int wide_exact_case(std::int32_t tokens, std::uint32_t seed) {
         const std::int32_t step = variant == 0 ? tokens : 7;
         for (std::int32_t b = 0; b < tokens; b += step) {
             const std::int32_t n = std::min(step, tokens - b);
-            const auto at = [&](void* p, std::size_t rows, std::size_t bytes) {
+            const auto at        = [&](void* p, std::size_t rows, std::size_t bytes) {
                 return static_cast<std::uint8_t*>(p) + static_cast<std::size_t>(b) * rows * bytes;
             };
             Tensor tu(at(du.p, kWide, 2), DType::BF16, {kWide, n});
@@ -285,11 +316,12 @@ int wide_exact_case(std::int32_t tokens, std::uint32_t seed) {
 // ---------------------------------------------------------------------------------------------
 // Mix and combine-mix against the complete FP64 formula.
 
-enum class Format { Q8, Nvfp4 };
+enum class Format { Q8, Nvfp4, Bf16 };
 
 struct MixFixture {
-    bool inject = true;
-    std::int32_t rows = 0;
+    bool inject          = true;
+    Format weight_format = Format::Q8;
+    std::int32_t rows    = 0;
     std::vector<float> norm;
     std::vector<float> down_source, up_source; // unquantized (for the quantization-effect report)
     quantized_weight::PackedWeight down, up;
@@ -297,7 +329,7 @@ struct MixFixture {
     ops::HyperConnectionWeights weights;
 
     MixFixture(bool with_inject, std::uint32_t seed, Format format = Format::Q8)
-        : inject(with_inject) {
+        : inject(with_inject), weight_format(format) {
         rows = kRank + (inject ? kStreams : 0);
         norm = random_bf16(kWide, seed, -0.125F, 0.125F);
         // NVFP4 stores Down padded to whole 128-row tiles (zero rows past R + I).
@@ -314,16 +346,27 @@ struct MixFixture {
         if (format == Format::Nvfp4) {
             down = pack_nvfp4(down_source, stored_rows, kWide);
             up   = pack_nvfp4(up_source, kWide, kRank);
+        } else if (format == Format::Bf16) {
+            down = pack_bf16(down_source, rows, kWide);
+            up   = pack_bf16(up_source, kWide, kRank);
         } else {
             down = quantized_weight::pack_q8_g32_row_split(down_source, rows, kWide);
             up   = quantized_weight::pack_q8_g32_row_split(up_source, kWide, kRank);
         }
-        d_norm = to_device(bits(norm));
-        d_down = to_device(down.payload);
-        d_up   = to_device(up.payload);
-        weights.norm = Tensor(d_norm.p, DType::BF16, {kWide});
-        weights.down = down.device_weight(d_down.p);
-        weights.up   = up.device_weight(d_up.p);
+        d_norm  = to_device(bits(norm));
+        d_down  = to_device(down.payload);
+        d_up    = to_device(up.payload);
+        weights = bind(d_norm.p, d_down.p, d_up.p);
+    }
+
+    // The mixer weights over device copies of norm / down / up.
+    ops::HyperConnectionWeights bind(void* d_norm_copy, void* d_down_copy, void* d_up_copy) const {
+        ops::HyperConnectionWeights w;
+        w.norm = Tensor(d_norm_copy, DType::BF16, {kWide});
+        w.down = down.device_weight(d_down_copy);
+        w.up   = up.device_weight(d_up_copy);
+        if (weight_format == Format::Bf16) { w.down.scales = w.up.scales = nullptr; }
+        return w;
     }
 
     // FP64 oracle over represented residual values (decoded weights; or the unquantized source
@@ -340,7 +383,8 @@ struct MixFixture {
             const double* x = residual.data() + static_cast<std::size_t>(t) * kWide;
             for (std::int32_t s = 0; s < kStreams; ++s) {
                 double sum = 0.0;
-                for (std::int32_t h = 0; h < kHidden; ++h) sum += x[s * kHidden + h] * x[s * kHidden + h];
+                for (std::int32_t h = 0; h < kHidden; ++h)
+                    sum += x[s * kHidden + h] * x[s * kHidden + h];
                 const double inv = 1.0 / std::sqrt(sum / kHidden + double(kEps));
                 for (std::int32_t h = 0; h < kHidden; ++h)
                     n[s * kHidden + h] = x[s * kHidden + h] * inv * (1.0 + norm[s * kHidden + h]);
@@ -359,7 +403,7 @@ struct MixFixture {
                 for (std::int32_t s = 0; s < kStreams; ++s) {
                     const std::int32_t row = s * kHidden + h;
                     const float* w = up_values.data() + static_cast<std::size_t>(row) * kRank;
-                    double logit           = 0.0;
+                    double logit   = 0.0;
                     for (std::int32_t r = 0; r < kRank; ++r) logit += double(w[r]) * low[r];
                     value += sigmoid(logit) * n[row];
                 }
@@ -372,7 +416,7 @@ struct MixFixture {
 enum class Execution { Eager, Graph };
 
 int mix_case(const MixFixture& f, std::int32_t tokens, bool combine, Execution execution,
-             std::uint32_t seed) {
+             std::uint32_t seed, int device_id = 0) {
     const std::size_t wide   = static_cast<std::size_t>(kWide) * tokens;
     const std::size_t narrow = static_cast<std::size_t>(kHidden) * tokens;
     const auto residual      = random_bf16(wide, seed, -0.75F, 0.75F);
@@ -388,9 +432,9 @@ int mix_case(const MixFixture& f, std::int32_t tokens, bool combine, Execution e
             for (std::int32_t s = 0; s < kStreams; ++s)
                 for (std::int32_t h = 0; h < kHidden; ++h) {
                     const std::size_t i = static_cast<std::size_t>(t) * kWide + s * kHidden + h;
-                    const double exact  = double(residual[i]) +
-                                         double(previous_inject[t * kStreams + s]) *
-                                             double(previous_y[t * kHidden + h]);
+                    const double exact =
+                        double(residual[i]) + double(previous_inject[t * kStreams + s]) *
+                                                  double(previous_y[t * kHidden + h]);
                     represented[i] = bf16_to_f32(f32_to_bf16(static_cast<float>(exact)));
                 }
     }
@@ -411,7 +455,7 @@ int mix_case(const MixFixture& f, std::int32_t tokens, bool combine, Execution e
     Tensor* inject = f.inject ? &t_inject : nullptr;
     WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(tokens, tokens, f.inject));
 
-    DeviceContext device;
+    DeviceContext device(device_id);
     const auto launch = [&] {
         if (combine)
             ops::hyper_connection_combine_mix(t_residual, t_y, t_inj_prev, f.weights, kEps, t_mixed,
@@ -433,13 +477,15 @@ int mix_case(const MixFixture& f, std::int32_t tokens, bool combine, Execution e
 
     const std::string label = std::string(combine ? "combine_mix" : "mix") +
                               (f.inject ? " inject" : " head") + " T=" + std::to_string(tokens) +
-                              (execution == Execution::Graph ? " graph" : "");
+                              (execution == Execution::Graph ? " graph" : "") +
+                              (f.weight_format == Format::Bf16 ? " bf16" : "") +
+                              (device_id != 0 ? " device " + std::to_string(device_id) : "");
     int failures = verify_reduction(label + " mixed", from_device_bf16(d_mixed.data(), narrow),
                                     mixed_ref, kMixed);
     failures += d_mixed.verify_guards(label + " mixed");
     if (f.inject) {
-        failures += verify_pointwise(label + " inject",
-                                     read_f32(d_inject.data(), gates_ref.size()), gates_ref, kInject);
+        failures += verify_pointwise(label + " inject", read_f32(d_inject.data(), gates_ref.size()),
+                                     gates_ref, kInject);
         failures += d_inject.verify_guards(label + " inject");
     }
     if (combine) {
@@ -449,9 +495,8 @@ int mix_case(const MixFixture& f, std::int32_t tokens, bool combine, Execution e
             for (std::int32_t s = 0; s < kStreams; ++s)
                 for (std::int32_t h = 0; h < kHidden; ++h) {
                     const std::size_t i = static_cast<std::size_t>(t) * kWide + s * kHidden + h;
-                    exact[i]            = double(residual[i]) +
-                               double(previous_inject[t * kStreams + s]) *
-                                   double(previous_y[t * kHidden + h]);
+                    exact[i] = double(residual[i]) + double(previous_inject[t * kStreams + s]) *
+                                                         double(previous_y[t * kHidden + h]);
                 }
         failures += verify_pointwise(label + " residual", from_device_bf16(d_residual, wide), exact,
                                      kBf16Output);
@@ -545,6 +590,114 @@ int chain_case(const MixFixture& first, const MixFixture& second, std::int32_t t
     return failures;
 }
 
+// BF16 weights: the small-T route at T against the general route on the same tokens (the general
+// route at T = 9, whose first T columns are the small-T input), with the oracle criteria taking the
+// general route as reference. Both routes are also qualified against the oracle (mix_case).
+int route_parity_case(const MixFixture& f, std::int32_t tokens, bool combine, std::uint32_t seed) {
+    constexpr std::int32_t kGeneral = 9; // first T of the general route
+    const std::size_t wide          = static_cast<std::size_t>(kWide) * kGeneral;
+    const std::size_t narrow        = static_cast<std::size_t>(kHidden) * kGeneral;
+    const std::size_t gates         = static_cast<std::size_t>(kStreams) * kGeneral;
+    const auto residual             = random_bf16(wide, seed, -0.75F, 0.75F);
+    const auto previous_y           = random_bf16(narrow, seed + 1U, -0.5F, 0.5F);
+    std::vector<float> previous_inject(gates);
+    fill_uniform(previous_inject, seed + 2U, 0.0F, 2.0F);
+    DeviceBuffer d_y        = to_device(bits(previous_y));
+    DeviceBuffer d_inj_prev = to_device(previous_inject);
+    DeviceContext device;
+    std::array<DeviceBuffer, 2> d_residual, d_mixed, d_inject;
+    for (int route = 0; route < 2; ++route) { // 0: small-T at T, 1: general at T = 9
+        const std::int32_t n = route == 0 ? tokens : kGeneral;
+        d_residual[route]    = to_device(bits(residual));
+        d_mixed[route]       = DeviceBuffer(narrow * 2);
+        d_inject[route]      = DeviceBuffer(gates * 4);
+        Tensor t_residual(d_residual[route].p, DType::BF16, {kWide, n});
+        Tensor t_y(d_y.p, DType::BF16, {kHidden, n});
+        Tensor t_inj_prev(d_inj_prev.p, DType::FP32, {kStreams, n});
+        Tensor t_mixed(d_mixed[route].p, DType::BF16, {kHidden, n});
+        Tensor t_inject(d_inject[route].p, DType::FP32, {kStreams, n});
+        Tensor* inject = f.inject ? &t_inject : nullptr;
+        WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(n, n, f.inject));
+        if (combine)
+            ops::hyper_connection_combine_mix(t_residual, t_y, t_inj_prev, f.weights, kEps, t_mixed,
+                                              inject, workspace, device.stream);
+        else
+            ops::hyper_connection_mix(t_residual, f.weights, kEps, t_mixed, inject, workspace,
+                                      device.stream);
+        cuda_synchronize(device.stream);
+    }
+    const std::size_t used_narrow = static_cast<std::size_t>(kHidden) * tokens;
+    const std::size_t used_wide   = static_cast<std::size_t>(kWide) * tokens;
+    const std::string label       = std::string("route parity bf16 ") +
+                              (combine ? "combine_mix" : "mix") + (f.inject ? " inject" : " head") +
+                              " T=" + std::to_string(tokens);
+    int failures = verify_reduction(label + " mixed", from_device_bf16(d_mixed[0].p, used_narrow),
+                                    from_device_bf16(d_mixed[1].p, used_narrow), kMixed);
+    if (f.inject) {
+        const std::size_t used_gates = static_cast<std::size_t>(kStreams) * tokens;
+        failures += verify_pointwise(label + " inject", read_f32(d_inject[0].p, used_gates),
+                                     read_f32(d_inject[1].p, used_gates), kInject);
+    }
+    if (combine)
+        failures +=
+            verify_pointwise(label + " residual", from_device_bf16(d_residual[0], used_wide),
+                             from_device_bf16(d_residual[1], used_wide), kBf16Output);
+    return failures;
+}
+
+void bench(const MixFixture& f, const char* name) {
+    constexpr int kMixers = 12, kBatches = 7, kReplays = 20;
+    std::vector<DeviceBuffer> norm, down, up;
+    std::vector<ops::HyperConnectionWeights> weights;
+    for (int m = 0; m < kMixers; ++m) {
+        norm.push_back(to_device(bits(f.norm)));
+        down.push_back(to_device(f.down.payload));
+        up.push_back(to_device(f.up.payload));
+        weights.push_back(f.bind(norm.back().p, down.back().p, up.back().p));
+    }
+    const char* forced = std::getenv("NINFER_QWEN4_HC_GENERAL");
+    for (const std::int32_t T : {1, 2, 4, 8}) {
+        const auto residual =
+            random_bf16(static_cast<std::size_t>(kWide) * T, 0xBE0U, -0.75F, 0.75F);
+        const auto y = random_bf16(static_cast<std::size_t>(kHidden) * T, 0xBE1U, -0.5F, 0.5F);
+        DeviceBuffer d_res  = to_device(bits(residual));
+        DeviceBuffer d_y    = to_device(bits(y));
+        DeviceBuffer d_prev = to_device(std::vector<float>(static_cast<std::size_t>(kStreams) * T));
+        DeviceBuffer d_mixed(static_cast<std::size_t>(kHidden) * T * 2);
+        DeviceBuffer d_inject(static_cast<std::size_t>(kStreams) * T * 4);
+        Tensor tr(d_res.p, DType::BF16, {kWide, T});
+        Tensor ty(d_y.p, DType::BF16, {kHidden, T});
+        Tensor tp(d_prev.p, DType::FP32, {kStreams, T}); // zero gates: replays keep the residual
+        Tensor tm(d_mixed.p, DType::BF16, {kHidden, T});
+        Tensor ti(d_inject.p, DType::FP32, {kStreams, T});
+        WorkspaceArena workspace(ops::hyper_connection_mix_workspace_bytes(T, T, true));
+        DeviceContext device;
+        DecodeGraphDefinition definition;
+        definition.capture(device.stream, [&] {
+            for (const auto& w : weights)
+                ops::hyper_connection_combine_mix(tr, ty, tp, w, kEps, tm, &ti, workspace,
+                                                  device.stream);
+        });
+        DecodeGraphExecutable graph;
+        graph.instantiate(definition);
+        for (int i = 0; i < 5; ++i) graph.launch(device.stream);
+        cuda_synchronize(device.stream);
+        std::vector<double> per_mixer;
+        for (int b = 0; b < kBatches; ++b) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < kReplays; ++i) graph.launch(device.stream);
+            cuda_synchronize(device.stream);
+            const std::chrono::duration<double, std::micro> elapsed =
+                std::chrono::steady_clock::now() - start;
+            per_mixer.push_back(elapsed.count() / (kReplays * kMixers));
+        }
+        std::sort(per_mixer.begin(), per_mixer.end());
+        std::printf("BENCH format=%s T=%d general_forced=%s us_per_mixer=%.2f (min %.2f)\n", name,
+                    T, forced != nullptr ? forced : "0", per_mixer[per_mixer.size() / 2],
+                    per_mixer.front());
+    }
+}
+
 // Quantization effect (informative, no criterion: a weight format is qualified on the real model by
 // teacher forcing, not by an Op test): the FP64 formula on the decoded weights against the same
 // formula on the unquantized source weights, and the kernel against the source formula.
@@ -587,18 +740,25 @@ void quantization_report(const MixFixture& f, const char* name, std::int32_t tok
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
     try {
+        if (argc > 1 && std::string(argv[1]) == "--bench") {
+            bench(MixFixture(true, 0x9000U), "q8");
+            bench(MixFixture(true, 0x9000U, Format::Bf16), "bf16");
+            return 0;
+        }
         int failures = 0;
         for (const std::int32_t tokens : {1, 3, 72, 1024}) {
             failures += grouped_norm_case(tokens, 0x100U + tokens);
             failures += combine_expand_case(tokens, 0x400U + tokens);
         }
-        for (const std::int32_t tokens : {64, 300}) { failures += wide_exact_case(tokens, 0xE00U + tokens); }
+        for (const std::int32_t tokens : {64, 300}) {
+            failures += wide_exact_case(tokens, 0xE00U + tokens);
+        }
         const MixFixture with_inject(true, 0x9000U);
         const MixFixture head(false, 0xA000U);
         // T = 1..8 is the small-T route; 9 is its first boundary past it; 17 and 64 are interior
@@ -641,8 +801,48 @@ int main() {
             std::cerr << "FAIL NVFP4 T=9 accepted (no general route)\n";
             ++failures;
         } catch (const std::invalid_argument&) {}
+        // BF16 weights (FP4-Local): small-T route for T <= 8 (BF16 activation operands, FP32 p),
+        // general route past it; the same criteria against the formula over the BF16 weights.
+        const MixFixture bf16_inject(true, 0x9000U, Format::Bf16);
+        const MixFixture bf16_head(false, 0xA000U, Format::Bf16);
+        for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 17}) {
+            failures += mix_case(bf16_inject, tokens, false, Execution::Eager, 0xF000U + tokens);
+            failures += mix_case(bf16_inject, tokens, true, Execution::Eager, 0xF100U + tokens);
+        }
+        for (const std::int32_t tokens : {1, 8, 9}) {
+            failures += mix_case(bf16_head, tokens, false, Execution::Eager, 0xF200U + tokens);
+            failures += mix_case(bf16_head, tokens, true, Execution::Eager, 0xF300U + tokens);
+        }
+        failures += mix_case(bf16_inject, 4, true, Execution::Graph, 0xF400U);
+        failures += mix_case(bf16_head, 8, false, Execution::Graph, 0xF500U);
+        const MixFixture bf16_second(true, 0x9100U, Format::Bf16);
+        for (const std::int32_t tokens : {1, 4, 8}) {
+            failures +=
+                chain_case(bf16_inject, bf16_second, tokens, Execution::Graph, 0xF600U + tokens);
+        }
+        failures += chain_case(bf16_inject, with_inject, 4, Execution::Eager, 0xF700U);
+        for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8}) {
+            failures += route_parity_case(bf16_inject, tokens, true, 0xF800U + tokens);
+            failures += route_parity_case(bf16_inject, tokens, false, 0xF900U + tokens);
+        }
+        failures += route_parity_case(bf16_head, 8, false, 0xFA00U);
+        // tp 2 replicates the mixers: the same Op on the second device with its own weight copy.
+        int devices = 0;
+        cuda_check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
+        if (devices >= 2) {
+            cuda_check(cudaSetDevice(1), "cudaSetDevice");
+            {
+                const MixFixture peer(true, 0x9000U, Format::Bf16);
+                for (const std::int32_t tokens : {1, 8}) {
+                    failures += mix_case(peer, tokens, true, Execution::Eager, 0xFB00U + tokens, 1);
+                    failures += mix_case(peer, tokens, true, Execution::Graph, 0xFC00U + tokens, 1);
+                }
+            }
+            cuda_check(cudaSetDevice(0), "cudaSetDevice");
+        }
         quantization_report(with_inject, "q8", 4, 0xC000U);
         quantization_report(fp4_inject, "nvfp4", 4, 0xC000U);
+        quantization_report(bf16_inject, "bf16", 4, 0xC000U);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " hyper_connection correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

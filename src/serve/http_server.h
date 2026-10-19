@@ -47,6 +47,7 @@ public:
     void stop();
 
     [[nodiscard]] const std::string& public_model_id() const noexcept { return public_model_id_; }
+
     // True once the engine watch stopped listen() because the Engine reported an Engine-wide
     // failure; the process should then exit non-zero so a supervisor reloads the model.
     [[nodiscard]] bool engine_failed() const noexcept { return engine_failed_.load(); }

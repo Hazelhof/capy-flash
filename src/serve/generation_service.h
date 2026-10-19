@@ -109,6 +109,7 @@ public:
     explicit GenerationService(ServeOptions options, StartupObserver startup_observer = {});
 
     [[nodiscard]] const ServeOptions& options() const noexcept { return options_; }
+
     [[nodiscard]] std::uint32_t turn_anchors() const noexcept { return turn_anchors_; }
 
     // Engine owns the once-normalized startup configuration. Serving diagnostics must use this

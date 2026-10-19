@@ -66,7 +66,9 @@ struct Case {
 };
 
 const char* storage_name(KvCacheStorage storage) {
-    return storage == KvCacheStorage::BFloat16 ? "bf16" : storage == KvCacheStorage::Int8Group64 ? "int8" : "nvfp4";
+    return storage == KvCacheStorage::BFloat16      ? "bf16"
+           : storage == KvCacheStorage::Int8Group64 ? "int8"
+                                                    : "nvfp4";
 }
 
 // Paged K/V planes and one block-table row per sequence, on the current device. Logical page p of
@@ -105,7 +107,7 @@ public:
     [[nodiscard]] PagedKVLayerView row_view(std::int32_t row) const {
         const PagedKVBatchLayerView batch = batch_view();
         auto* table                       = static_cast<std::int32_t*>(tables_.p) +
-                                            static_cast<std::ptrdiff_t>(row) * logical_pages_;
+                      static_cast<std::ptrdiff_t>(row) * logical_pages_;
         return {batch.k_pages,
                 batch.v_pages,
                 batch.k_scale_pages,
@@ -389,8 +391,8 @@ int main() {
     try {
         const ExecutionContext ec({0, 1});
         std::uint32_t seed = 900U;
-        for (const KvCacheStorage storage :
-             {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Nvfp4Group16}) {
+        for (const KvCacheStorage storage : {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64,
+                                             KvCacheStorage::Nvfp4Group16}) {
             // Decode, grouped and parallel-grouped blocks on both sides of the 8-token seam,
             // tiled prompt blocks, long-context decode, and decode/verify batches, each after a
             // history appended through the Op itself.

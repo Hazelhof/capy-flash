@@ -61,6 +61,14 @@ struct DeviceKVPages {
     std::uint32_t backend = 0;
 };
 
+// Program::compact_device_kv (v0.6, idle KV to the Host).
+struct DeviceKVCompaction {
+    bool ran                    = false;
+    std::uint32_t moved_pages   = 0; // Device replicas packed into lower physical pages
+    std::int32_t columns_before = 0; // active elastic expert columns
+    std::int32_t columns_after  = 0;
+};
+
 enum class TextPhase {
     Prefill,
     Verify,
@@ -1012,6 +1020,20 @@ public:
     [[nodiscard]] std::optional<SharedPrefixSummary>
     demote_retained_shared_kv_for_lease(const SharedPrefixHandle& shared,
                                         DeviceKVPages needed) noexcept;
+    // v0.6 (idle KV to the Host): with elastic KV and a Host KV tier the Device keeps only the
+    // KV of active requests. The Engine moves the Device KV of idle retained owners to the Host
+    // (demote_retained_*_for_lease with every page) and then calls compact_device_kv(), which
+    // packs the remaining Device pages into the lowest physical pages and gives the KV backing no
+    // longer needed back to the routed-expert cache at once. Between execution units only, with
+    // no context transaction and no request prefilling; otherwise (or without elastic KV and a
+    // Host KV tier) it does nothing and returns ran = false.
+    [[nodiscard]] bool idle_device_kv_offload() const noexcept;
+    // Host KV bytes that moving every movable Device KV page of this idle continuation would
+    // take (absent when none can move now), and the Host KV tier's free bytes.
+    [[nodiscard]] std::optional<std::size_t>
+    idle_device_kv_host_bytes(const ContinuationHandle& continuation) const noexcept;
+    [[nodiscard]] std::size_t host_kv_free_bytes() const noexcept;
+    DeviceKVCompaction compact_device_kv();
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     // Drops one long anchor of an idle catalogued continuation and keeps the rest of it. Returns
     // the continuation's new summary, or nothing (and no change) when the drop is not possible now.

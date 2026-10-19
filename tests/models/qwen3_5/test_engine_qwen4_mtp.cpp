@@ -1,6 +1,7 @@
 // Qwen4Exp (Qwen3.8-Flash-Next) MTP rounds through the public Engine on a synthetic artifact
 // with an MTP layer (NINFER_TEST_QWEN4_ARTIFACT; the 4-layer synthetic artifact of
-// tools/capy_flash/make_test_artifact.sh is the intended one). Skips (77) without it or without a CUDA device.
+// tools/capy_flash/make_test_artifact.sh is the intended one). Skips (77) without it or without a
+// CUDA device.
 //
 // Oracle: the no-draft route. NINFER_QWEN4_MTP_NO_DRAFTS=1 runs every round with extent 0 (the
 // anchor alone, the same verify / fold / alignment kernels), so with greedy sampling an MTP run
@@ -55,12 +56,11 @@ namespace {
 
 // 160 pg19 tokens (Qwen tokenizer), the first 64 of them.
 const std::vector<ninfer::TokenId> kIds = {
-    987, 17956, 1931, 539, 81249, 28442, 321, 279, 7849, 42500, 198, 30058,
-    5961, 7659, 506, 1696, 1074, 2068, 83846, 9504, 4909, 318, 1919, 999,
-    557, 198, 8293, 1931, 494, 5167, 76409, 1801, 2420, 539, 561, 198,
-    34499, 28732, 10052, 15256, 52682, 5946, 26467, 669, 206717, 4616, 357, 177414,
-    80281, 15810, 13, 14200, 262, 1897, 206717, 4616, 357, 177414, 80281, 15810,
-    271, 262, 7466, 198,
+    987,   17956, 1931,   539,   81249, 28442,  321,   279,   7849,   42500, 198,   30058, 5961,
+    7659,  506,   1696,   1074,  2068,  83846,  9504,  4909,  318,    1919,  999,   557,   198,
+    8293,  1931,  494,    5167,  76409, 1801,   2420,  539,   561,    198,   34499, 28732, 10052,
+    15256, 52682, 5946,   26467, 669,   206717, 4616,  357,   177414, 80281, 15810, 13,    14200,
+    262,   1897,  206717, 4616,  357,   177414, 80281, 15810, 271,    262,   7466,  198,
 };
 constexpr std::uint32_t kDrafts = 3;
 // 1 token from the prefill, then rounds of K+1 = 4 under oracle drafts: 1 + 4 * 10 = 41, so the
@@ -72,7 +72,9 @@ public:
     ScopedEnv(const char* name, const std::string& value) : name_(name) {
         ::setenv(name, value.c_str(), 1);
     }
+
     ~ScopedEnv() { ::unsetenv(name_); }
+
     ScopedEnv(const ScopedEnv&)            = delete;
     ScopedEnv& operator=(const ScopedEnv&) = delete;
 
@@ -84,14 +86,14 @@ enum class Experts { Mapped, Offload };
 
 ninfer::EngineOptions options(const char* artifact, Experts experts, std::uint32_t lanes) {
     ninfer::EngineOptions o;
-    o.artifact_path         = artifact;
-    o.purpose               = ninfer::EnginePurpose::Generation;
-    o.kv_cache              = ninfer::KvCacheStorage::BFloat16;
-    o.prefill_chunk         = 128;
-    o.max_context           = 256;
-    o.kv_capacity           = ninfer::KvCapacityPolicy::explicit_capacity(256 * lanes);
-    o.max_concurrency       = lanes;
-    o.context_cache.enabled = false;
+    o.artifact_path            = artifact;
+    o.purpose                  = ninfer::EnginePurpose::Generation;
+    o.kv_cache                 = ninfer::KvCacheStorage::BFloat16;
+    o.prefill_chunk            = 128;
+    o.max_context              = 256;
+    o.kv_capacity              = ninfer::KvCapacityPolicy::explicit_capacity(256 * lanes);
+    o.max_concurrency          = lanes;
+    o.context_cache.enabled    = false;
     o.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
     o.speculative.draft_tokens = kDrafts;
     if (experts == Experts::Mapped) {
@@ -130,7 +132,7 @@ int g_tp = 1;
 
 ninfer::GenerationResult generate_once(const char* artifact, Experts experts,
                                        const std::vector<ninfer::TokenId>& ids) {
-    auto o = options(artifact, experts, 1);
+    auto o                        = options(artifact, experts, 1);
     o.speculative.draft_shortlist = g_shortlist;
     if (g_tp == 2) {
         o.tp      = 2;
@@ -150,6 +152,7 @@ void print(const char* label, const ninfer::GenerationResult& r) {
 }
 
 int failures = 0;
+
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::cerr << "FAIL: " << what << '\n';
@@ -160,7 +163,7 @@ void check(bool ok, const std::string& what) {
 // MTP, no-draft and oracle-draft runs of one prompt with `experts`.
 void exactness(const char* artifact, Experts experts, const char* label) {
     const std::vector<ninfer::TokenId> ids = prompt(0, 33);
-    const auto mtp     = generate_once(artifact, experts, ids);
+    const auto mtp                         = generate_once(artifact, experts, ids);
     ninfer::GenerationResult no_draft;
     {
         const ScopedEnv none("NINFER_QWEN4_MTP_NO_DRAFTS", "1");
@@ -185,7 +188,8 @@ void exactness(const char* artifact, Experts experts, const char* label) {
     print("no drafts", no_draft);
     print("oracle drafts", oracle);
     check(no_draft.generated_token_ids.size() == kOutput, std::string(label) + ": full budget");
-    check(no_draft.speculative.drafted_tokens == 0, std::string(label) + ": the control drafts nothing");
+    check(no_draft.speculative.drafted_tokens == 0,
+          std::string(label) + ": the control drafts nothing");
     check(mtp.generated_token_ids == no_draft.generated_token_ids,
           std::string(label) + ": MTP tokens equal the no-draft tokens");
     check(oracle.generated_token_ids == no_draft.generated_token_ids,
@@ -200,9 +204,13 @@ void exactness(const char* artifact, Experts experts, const char* label) {
 // Counts the streamed output deltas of one request.
 struct CountingSink final : ninfer::OutputSink {
     std::atomic<int> deltas{0};
+
     void start(ninfer::GenerationStart) override {}
+
     void progress(ninfer::PromptProgress) override {}
+
     void timing(ninfer::GenerationTimingObservation) override {}
+
     void publish(ninfer::OutputDelta) override { ++deltas; }
 };
 
@@ -216,13 +224,14 @@ void cancelled_row(const char* artifact) {
         ninfer::GenerationHandle a =
             engine.submit(engine.prepare_tokens(long_prompt, false), greedy(200),
                           ninfer::OutputConsumerMode::Streaming);
-        ninfer::GenerationHandle b = engine.submit(engine.prepare_tokens(short_prompt, false), greedy(64));
+        ninfer::GenerationHandle b =
+            engine.submit(engine.prepare_tokens(short_prompt, false), greedy(64));
         // Cancelled once it has streamed output for a while, i.e. while both lanes decode (B is
         // admitted right after A; rounds take ~20 ms on the synthetic model).
         CountingSink sink;
         cancelled = a.wait(&sink, ninfer::CancellationView([&] { return sink.deltas >= 6; }));
-        survivor = b.wait();
-        later    = generate(engine, later_prompt, kOutput);
+        survivor  = b.wait();
+        later     = generate(engine, later_prompt, kOutput);
     }
     ninfer::GenerationResult fresh;
     {
@@ -238,7 +247,8 @@ void cancelled_row(const char* artifact) {
               cancelled.generated_token_ids.size() >= 6 &&
               cancelled.generated_token_ids.size() < 200,
           "cancelled row: the request is cancelled mid-decode");
-    check(survivor.generated_token_ids.size() == 64, "cancelled row: the survivor finishes its budget");
+    check(survivor.generated_token_ids.size() == 64,
+          "cancelled row: the survivor finishes its budget");
     check(later.generated_token_ids == fresh.generated_token_ids,
           "cancelled row: a later request equals the same request on a fresh engine");
 }
@@ -310,9 +320,9 @@ void prefix_reuse(const char* artifact, Experts experts, int tp, const char* lab
         const ninfer::PromptInput a =
             chat_prompt("How many crates of pears arrived on the third day?");
         const ninfer::PromptInput b = chat_prompt("Which farm sent the heaviest crate of plums?");
-        const auto both  = run_engine(o, {a, b});
-        const auto first = run_engine(o, {a});
-        const auto fresh = run_engine(o, {b});
+        const auto both             = run_engine(o, {a, b});
+        const auto first            = run_engine(o, {a});
+        const auto fresh            = run_engine(o, {b});
         const ninfer::GenerationResult& resumed = both[1];
         const ninfer::GenerationResult& cold    = fresh[0];
         print("shared prefix: A", both[0]);
@@ -333,7 +343,7 @@ void prefix_reuse(const char* artifact, Experts experts, int tp, const char* lab
     }
     {
         const std::vector<ninfer::TokenId> first_prompt = prompt(0, 33);
-        const auto continuation = [&](bool drafts, bool extend) {
+        const auto continuation                         = [&](bool drafts, bool extend) {
             std::optional<ScopedEnv> none;
             if (!drafts) { none.emplace("NINFER_QWEN4_MTP_NO_DRAFTS", "1"); }
             ninfer::Engine engine(o);
@@ -341,7 +351,7 @@ void prefix_reuse(const char* artifact, Experts experts, int tp, const char* lab
                 engine.generate(engine.prepare_tokens(first_prompt), greedy_reuse(24));
             std::vector<ninfer::TokenId> second = first_prompt;
             second.insert(second.end(), first.generated_token_ids.begin(),
-                          first.generated_token_ids.end());
+                                                  first.generated_token_ids.end());
             if (extend) {
                 const std::vector<ninfer::TokenId> more = prompt(40, 17);
                 second.insert(second.end(), more.begin(), more.end());

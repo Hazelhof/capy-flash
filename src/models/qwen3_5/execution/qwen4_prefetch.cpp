@@ -28,11 +28,12 @@ Qwen4ExpertPrefetch::Qwen4ExpertPrefetch(const Qwen4PrefetchOptions& options,
                                          cudaStream_t stream)
     : options_(options), text_layers_(text_layers), layout_(layout), pool_(pool),
       first_slot_(first_slot), memory_(memory), device_(device) {
-    if (options_.slots_per_layer < 1 || options_.slots_per_layer > 64 ||
-        options_.candidates < 1 || options_.candidates > kCandidates || options_.first_layer < 1 ||
+    if (options_.slots_per_layer < 1 || options_.slots_per_layer > 64 || options_.candidates < 1 ||
+        options_.candidates > kCandidates || options_.first_layer < 1 ||
         !(options_.min_score >= 0.0F) || !(options_.link_gbps > 0.0) || !(options_.lead > 0.0)) {
-        throw std::invalid_argument("Qwen4Exp expert prefetch: invalid options (slots 1..64, "
-                                    "candidates 1..32, first layer >= 1, min score >= 0, rate > 0)");
+        throw std::invalid_argument(
+            "Qwen4Exp expert prefetch: invalid options (slots 1..64, "
+            "candidates 1..32, first layer >= 1, min score >= 0, rate > 0)");
     }
     if (text_layers_ < 2 || text_layers_ > expert_cache::kMaxStagingLayers || first_slot_ < 0 ||
         layout_.planes != 4 ||
@@ -66,15 +67,17 @@ Qwen4ExpertPrefetch::Qwen4ExpertPrefetch(const Qwen4PrefetchOptions& options,
     void* device_view = nullptr;
     CUDA_CHECK(cudaHostGetDevicePointer(&device_view, host_, 0));
     if (device_view != host) {
-        throw std::runtime_error("Qwen4Exp expert prefetch: mapped memory needs unified addressing");
+        throw std::runtime_error(
+            "Qwen4Exp expert prefetch: mapped memory needs unified addressing");
     }
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
-    CUDA_CHECK(cudaMemsetAsync(memory_.tags, 0xFF,
-                               sizeof(std::uint32_t) * static_cast<std::size_t>(staging_slots(options_)),
-                               stream));
+    CUDA_CHECK(cudaMemsetAsync(
+        memory_.tags, 0xFF,
+        sizeof(std::uint32_t) * static_cast<std::size_t>(staging_slots(options_)), stream));
     CUDA_CHECK(cudaMemsetAsync(memory_.epoch, 0, sizeof(std::uint32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(memory_.predict_workspace, 0, ops::moe_predict_workspace_bytes(), stream));
+    CUDA_CHECK(
+        cudaMemsetAsync(memory_.predict_workspace, 0, ops::moe_predict_workspace_bytes(), stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     issued_layer_.assign(L, 0);
 }
@@ -90,7 +93,9 @@ Qwen4ExpertPrefetch::~Qwen4ExpertPrefetch() {
 void Qwen4ExpertPrefetch::predict(std::int32_t layer, const Tensor& wide, const Tensor& norm,
                                   const Tensor& router, float eps, const std::int32_t* resident,
                                   cudaStream_t stream) {
-    if (!predicts(layer)) { throw std::logic_error("Qwen4Exp expert prefetch: layer predicts nothing"); }
+    if (!predicts(layer)) {
+        throw std::logic_error("Qwen4Exp expert prefetch: layer predicts nothing");
+    }
     const auto l = static_cast<std::size_t>(layer);
     ops::moe_predict_ahead(wide, norm, router, eps, resident, options_.min_score,
                            options_.candidates, mapped_.candidates + l * kCandidates,
@@ -167,15 +172,15 @@ void Qwen4ExpertPrefetch::issue(std::int32_t layer, std::int64_t now_ns) {
     // Copies still in flight go first on the stream; the rest of one layer period is this
     // layer's (the copy time scaled by the landing feedback of the previous windows).
     const double copy_us = copy_us_ / rate_scale_;
-    const double avail   = period_us_ * options_.lead -
-                         static_cast<double>(pending_copies()) * copy_us;
-    const auto by_time   = static_cast<std::int32_t>(
+    const double avail =
+        period_us_ * options_.lead - static_cast<double>(pending_copies()) * copy_us;
+    const auto by_time = static_cast<std::int32_t>(
         std::clamp(std::floor(avail / copy_us), 0.0, static_cast<double>(B)));
     const std::int32_t n = std::min(by_time, valid);
     counters_.budget_cut += std::min(valid, B) - n;
     if (n == 0) { return; }
 
-    const std::int32_t set = (target & 1) * B;
+    const std::int32_t set    = (target & 1) * B;
     const std::int32_t planes = layout_.planes;
     cudaMemcpyAttributes attr{};
     attr.srcAccessOrder    = cudaMemcpySrcAccessOrderStream;
@@ -215,7 +220,7 @@ void Qwen4ExpertPrefetch::issue(std::int32_t layer, std::int64_t now_ns) {
 void Qwen4ExpertPrefetch::end_window() {
     ++counters_.windows;
     const std::int64_t issued_before = window_issued_at_, landed_before = counters_.landed;
-    window_issued_at_                = counters_.issued;
+    window_issued_at_ = counters_.issued;
     const auto* stats = reinterpret_cast<const volatile std::uint32_t*>(mapped_.stats);
     for (std::int32_t j = options_.first_layer; j < text_layers_; ++j) {
         const volatile std::uint32_t* s = stats + static_cast<std::size_t>(j) * kStats;
@@ -229,8 +234,8 @@ void Qwen4ExpertPrefetch::end_window() {
     // in time: faster), within [0.25, 2] of link_gbps.
     const std::int64_t issued = counters_.issued - issued_before;
     if (issued >= 8) {
-        const double in_time = static_cast<double>(counters_.landed - landed_before) /
-                               static_cast<double>(issued);
+        const double in_time =
+            static_cast<double>(counters_.landed - landed_before) / static_cast<double>(issued);
         if (in_time < 0.75) { rate_scale_ = std::max(0.25, rate_scale_ * 0.9); }
         if (in_time > 0.92) { rate_scale_ = std::min(2.0, rate_scale_ * 1.05); }
     }

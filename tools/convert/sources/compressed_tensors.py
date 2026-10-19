@@ -14,6 +14,7 @@ import torch
 from tools.artifact.codecs.fp8_row import validate_fp8_row_words
 from tools.artifact.formats import valid_positive_fp32_word
 from .logical import EncodedRows, LogicalSource
+from .modelopt import MXFP8, is_mxfp8, mxfp8_source
 from .safetensors import SafetensorsSource, tensor_source
 
 
@@ -41,9 +42,7 @@ def compressed_matrix_source(
     def signature(name: str, expected: tuple[int, ...], dtype: str) -> None:
         info = store.describe(name)
         if info.shape != expected or info.dtype != dtype:
-            raise ValueError(
-                f"{name}: expected {dtype}{expected}, got {info.dtype}{info.shape}"
-            )
+            raise ValueError(f"{name}: expected {dtype}{expected}, got {info.dtype}{info.shape}")
 
     def divisor(suffix: str) -> bytes:
         return _divisor_word(store, f"{prefix}.{suffix}")
@@ -55,9 +54,7 @@ def compressed_matrix_source(
             packed, scale = f"{prefix}.weight_packed", f"{prefix}.weight_scale"
             signature(packed, (n, k // 2), "U8")
             signature(scale, (n, k // 16), "F8_E4M3")
-            codes = store.read_flat(packed, begin * (k // 2), end * (k // 2)).reshape(
-                end - begin, k // 2
-            )
+            codes = store.read_flat(packed, begin * (k // 2), end * (k // 2)).reshape(end - begin, k // 2)
             scales = (
                 store.read_flat(scale, begin * (k // 16), end * (k // 16))
                 .view(torch.uint8)
@@ -71,11 +68,7 @@ def compressed_matrix_source(
         info = store.describe(scale)
         if info.dtype != "BF16" or prod(info.shape) != n:
             raise ValueError(f"{scale}: expected one BF16 scale per row")
-        codes = (
-            store.read_flat(weight, begin * k, end * k)
-            .view(torch.uint8)
-            .reshape(end - begin, k)
-        )
+        codes = store.read_flat(weight, begin * k, end * k).view(torch.uint8).reshape(end - begin, k)
         scales = store.read_flat(scale, begin, end)
         validate_fp8_row_words(codes, scales)
         return EncodedRows(format, codes, scales)
@@ -86,14 +79,9 @@ def compressed_matrix_source(
         first, last = begin // k, (end + k - 1) // k
         words = encoded(first, last)
         if format == "fp8_e4m3fn_row_bf16":
-            values = (
-                words.codes.view(torch.float8_e4m3fn).float()
-                * words.scales.float()[:, None]
-            )
+            values = words.codes.view(torch.float8_e4m3fn).float() * words.scales.float()[:, None]
         else:
-            codes = torch.stack((words.codes & 15, words.codes >> 4), dim=-1).reshape(
-                last - first, k
-            )
+            codes = torch.stack((words.codes & 15, words.codes >> 4), dim=-1).reshape(last - first, k)
             values_table = torch.tensor(
                 [
                     0.0,
@@ -115,11 +103,7 @@ def compressed_matrix_source(
                 ]
             )
             values = values_table[codes.long()]
-            scales = (
-                words.scales.view(torch.float8_e4m3fn)
-                .float()
-                .repeat_interleave(16, dim=1)
-            )
+            scales = words.scales.view(torch.float8_e4m3fn).float().repeat_interleave(16, dim=1)
             values = values * scales / struct.unpack("<f", words.weight_divisor)[0]
         return values.reshape(-1)[begin - first * k : end - first * k]
 
@@ -139,7 +123,10 @@ def matrix_source(
     shape: tuple[int, int],
     format: str | None = None,
 ) -> LogicalSource:
-    """Resolve the selected matrix's encoding lazily, after recipe source overrides."""
+    """Resolve the selected matrix's encoding lazily, after recipe source overrides.
+
+    An E4M3FN ``weight`` with a U8 ``weight_scale`` per 32 columns is a ModelOpt MXFP8 matrix.
+    """
     prefix = name.removesuffix(".weight")
     resolved: LogicalSource | None = None
 
@@ -149,13 +136,16 @@ def matrix_source(
             actual = format
             if actual is None and store.has(prefix + ".weight_packed"):
                 actual = "nvfp4"
+            if actual is None and is_mxfp8(store, prefix):
+                actual = MXFP8
             if actual is None and store.describe(name).dtype == "F8_E4M3":
                 actual = "fp8_e4m3fn_row_bf16"
-            resolved = (
-                tensor_source(store, name, shape)
-                if actual is None
-                else compressed_matrix_source(store, prefix, shape, actual)
-            )
+            if actual is None:
+                resolved = tensor_source(store, name, shape)
+            elif actual == MXFP8:
+                resolved = mxfp8_source(store, prefix, shape)
+            else:
+                resolved = compressed_matrix_source(store, prefix, shape, actual)
         return resolved
 
     def encoded(begin: int, end: int) -> EncodedRows:

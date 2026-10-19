@@ -52,9 +52,8 @@ std::vector<std::uint16_t> encode_bf16(const std::vector<float>& values) {
 // `ties`: duplicate some router rows so exact logit ties occur (lower id must win).
 // `valid` (empty: no mask): per lane the valid count of its tokens / valid.size() columns;
 // `last_only`: only each lane's last valid column routes (MoeRouteColumns::LastValid).
-int run_route_case(const std::string& label, int tokens, std::uint32_t seed, bool ties,
-                   bool graph, const std::vector<std::int32_t>& valid = {},
-                   bool last_only = false) {
+int run_route_case(const std::string& label, int tokens, std::uint32_t seed, bool ties, bool graph,
+                   const std::vector<std::int32_t>& valid = {}, bool last_only = false) {
     std::vector<float> x(static_cast<std::size_t>(H) * tokens);
     std::vector<float> router(static_cast<std::size_t>(E + 1) * H);
     fill_uniform(x, seed, -2.0f, 2.0f);
@@ -82,7 +81,8 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
     dx.copy_from_host(x_bits.data(), dx.bytes());
     drouter.copy_from_host(router_bits.data(), drouter.bytes());
     GuardedDeviceBuffer dids(static_cast<std::size_t>(K) * tokens * 4),
-        dweights(static_cast<std::size_t>(K) * tokens * 4), dgate(static_cast<std::size_t>(tokens) * 4);
+        dweights(static_cast<std::size_t>(K) * tokens * 4),
+        dgate(static_cast<std::size_t>(tokens) * 4);
     dids.fill(0xff);
     dweights.fill(0xff);
     dgate.fill(0xff);
@@ -98,7 +98,7 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
     if (!valid.empty()) { dvalid.copy_from_host(valid.data(), valid.size() * 4); }
     Tensor tvalid(dvalid.data(), DType::I32, {lanes});
     const Tensor* valid_columns = valid.empty() ? nullptr : &tvalid;
-    const auto routed = [&](int t) {
+    const auto routed           = [&](int t) {
         if (valid.empty()) { return true; }
         const std::int32_t count = valid[static_cast<std::size_t>(t / width)];
         return last_only ? t % width == count - 1 : t % width < count;
@@ -125,11 +125,11 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
         cuda_synchronize();
     }
 
-    const auto ids     = from_device<std::int32_t>(dids.data(), static_cast<std::size_t>(K) * tokens);
+    const auto ids = from_device<std::int32_t>(dids.data(), static_cast<std::size_t>(K) * tokens);
     const auto weights = from_device<float>(dweights.data(), static_cast<std::size_t>(K) * tokens);
     const auto gate    = from_device<float>(dgate.data(), static_cast<std::size_t>(tokens));
 
-    int failures = 0;
+    int failures        = 0;
     double worst_weight = 0, worst_gate = 0, worst_gate_ratio = 0, worst_margin_ratio = 0;
     const char* mma_env      = std::getenv("NINFER_QWEN4_ROUTER_MMA");
     const bool mma           = (mma_env == nullptr || mma_env[0] != '0') && tokens >= 64;
@@ -154,8 +154,8 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
         std::vector<int> order(E);
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return l[a] > l[b]; });
-        const double tenth = l[order[K - 1]];
-        const int* row     = ids.data() + static_cast<std::size_t>(t) * K;
+        const double tenth         = l[order[K - 1]];
+        const int* row             = ids.data() + static_cast<std::size_t>(t) * K;
         const double expected_gate = 1.0 / (1.0 + std::exp(-l[E]));
         const double gate_error    = std::fabs(gate[t] - expected_gate);
         const double gate_limit =
@@ -197,7 +197,8 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
         // Exact ties: equal FP64 logits and equal rows -> the lower id must come first.
         for (int k = 1; k < K; ++k) {
             if (l[row[k]] == l[row[k - 1]] && row[k] < row[k - 1]) {
-                std::cerr << label << ": token " << t << " exact tie not resolved to the lower id\n";
+                std::cerr << label << ": token " << t
+                          << " exact tie not resolved to the lower id\n";
                 ++failures;
             }
         }
@@ -209,8 +210,9 @@ int run_route_case(const std::string& label, int tokens, std::uint32_t seed, boo
                 worst_weight, std::fabs(weights[static_cast<std::size_t>(t) * K + k] - expected));
         }
     }
-    if (masked != static_cast<int>(std::count_if(
-                      ids.begin(), ids.end(), [](std::int32_t e) { return e == -1; })) / K) {
+    if (masked != static_cast<int>(std::count_if(ids.begin(), ids.end(),
+                                                 [](std::int32_t e) { return e == -1; })) /
+                      K) {
         std::cerr << label << ": a valid column routes nothing\n";
         ++failures;
     }
@@ -258,8 +260,8 @@ int run_combine_case(int rows, int tokens, std::uint32_t seed) {
         const std::size_t t = i / static_cast<std::size_t>(rows);
         expected[i]         = f32_to_bf16(std::fma(gate[t], shared[i], partial[i]));
     }
-    int failures = verify_exact("moe_combine_shared", from_device<std::uint16_t>(dy.data(), count),
-                                expected);
+    int failures =
+        verify_exact("moe_combine_shared", from_device<std::uint16_t>(dy.data(), count), expected);
     failures += dp.verify_guards("combine partial") + ds.verify_guards("combine shared") +
                 dg.verify_guards("combine gate") + dy.verify_guards("combine y");
 
@@ -273,8 +275,8 @@ int run_combine_case(int rows, int tokens, std::uint32_t seed) {
     const std::vector<float> accumulated = from_device<float>(da.data(), count);
     std::size_t fp32_mismatches = 0, rounding_mismatches = 0;
     for (std::size_t i = 0; i < count; ++i) {
-        const std::size_t t = i / static_cast<std::size_t>(rows);
-        const float want    = std::fma(gate[t], shared[i], partial[i]);
+        const std::size_t t    = i / static_cast<std::size_t>(rows);
+        const float want       = std::fma(gate[t], shared[i], partial[i]);
         std::uint32_t got_bits = 0, want_bits = 0;
         std::memcpy(&got_bits, &accumulated[i], 4);
         std::memcpy(&want_bits, &want, 4);
@@ -307,14 +309,16 @@ int main() {
         failures += run_route_case("moe_route graph", 4, 91U, false, true);
         // A verify window W = 4 of 3 lanes: extents 3 (all valid), 0 (anchor only), 1.
         failures += run_route_case("moe_route valid columns", 12, 93U, false, false, {4, 1, 2});
-        failures += run_route_case("moe_route valid columns graph", 12, 95U, false, true, {4, 1, 2});
+        failures +=
+            run_route_case("moe_route valid columns graph", 12, 95U, false, true, {4, 1, 2});
         // MTP AR step: one column per lane, lanes past their extent route nothing.
         failures += run_route_case("moe_route valid columns W=1", 3, 97U, false, false, {1, 0, 1});
         // MTP alignment (T52): W = 4 of 4 lanes, only the accepted (last valid) column routes;
         // counts 4, 1, 0 (nothing), 2.
-        failures += run_route_case("moe_route last valid", 16, 99U, false, false, {4, 1, 0, 2}, true);
-        failures += run_route_case("moe_route last valid graph", 16, 101U, false, true, {4, 1, 0, 2},
-                                   true);
+        failures +=
+            run_route_case("moe_route last valid", 16, 99U, false, false, {4, 1, 0, 2}, true);
+        failures +=
+            run_route_case("moe_route last valid graph", 16, 101U, false, true, {4, 1, 0, 2}, true);
         failures += run_combine_case(2560, 1, 5U);
         failures += run_combine_case(2560, 8, 6U);
         failures += run_combine_case(2560, 129, 7U);

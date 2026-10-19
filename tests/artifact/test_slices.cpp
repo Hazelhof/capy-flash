@@ -73,6 +73,28 @@ Bytes build(QType format, QuantLayout layout, const std::vector<std::uint64_t>& 
                     out[g.scale_offset + index * 2 + i] = pattern(row, source, 200 + i);
                 }
             }
+        } else if (layout == QuantLayout::BlockScaleK32) {
+            // MXFP8 from the format definition: N x K codes, then at the next multiple of 256
+            // bytes N x K/32 scale words, both row-major.
+            const auto scale_plane = (rows * columns + 255) / 256 * 256;
+            for (std::uint64_t k = 0; k < columns; ++k) {
+                out[n * columns + k] = pattern(row, column_of(k), 0);
+            }
+            for (std::uint64_t group = 0; group < columns / 32; ++group) {
+                out[scale_plane + n * (columns / 32) + group] =
+                    pattern(row, column_of(group * 32) / 32, 200);
+            }
+        } else if (layout == QuantLayout::RowInterleaved) {
+            // Row-scaled NVFP4 from the format definition: rows of K/2 code bytes then K/16
+            // scale bytes, nothing else.
+            const auto stride = columns / 2 + columns / 16;
+            for (std::uint64_t j = 0; j < columns / 2; ++j) {
+                out[n * stride + j] = pattern(row, column_of(2 * j), 0);
+            }
+            for (std::uint64_t group = 0; group < columns / 16; ++group) {
+                out[n * stride + columns / 2 + group] =
+                    pattern(row, column_of(group * 16) / 16, 200);
+            }
         } else if (layout == QuantLayout::RowScale) {
             for (std::uint64_t k = 0; k < columns; ++k) {
                 out[n * columns + k] = pattern(row, column_of(k), 0);
@@ -259,6 +281,84 @@ void row_scale() {
                     "fp8 multi-range columns");
 }
 
+template <class Fn>
+void expect_invalid(Fn&& fn, const std::string& label) {
+    try {
+        fn();
+    } catch (const std::invalid_argument&) { return; }
+    check(false, label + ": accepted");
+}
+
+// MXFP8 (block_scale_k32_v1): sizes written out from the format definition, both TP2 halves of
+// either axis, row blocks and scale coordinates. N = 48 and 96 are real shapes that are not
+// multiples of 128 (the GDN a|b projection and its TP2 half).
+void block_scale_k32() {
+    constexpr auto mx  = QType::MXFP8_E4M3FN_G32_UE8M0;
+    constexpr auto k32 = QuantLayout::BlockScaleK32;
+    const auto g       = weight_geometry(mx, k32, std::vector<std::uint64_t>{96, 256});
+    check(g.group_size == 32 && g.code_bytes == 96 * 256 && g.scale_offset == 96 * 256 &&
+              g.scale_bytes == 96 * 8 && g.bytes == 96 * 256 + 96 * 8 && g.divisor_offset == 0,
+          "mxfp8 geometry");
+    const auto small = weight_geometry(mx, k32, std::vector<std::uint64_t>{3, 64});
+    check(small.scale_offset == 256 && small.bytes == 256 + 6, "mxfp8 scale plane alignment");
+    expect_rows(mx, k32, {96, 256}, {{0, 48}}, "mxfp8 rows, first TP2 half");
+    expect_rows(mx, k32, {96, 256}, {{48, 48}}, "mxfp8 rows, second TP2 half");
+    expect_rows(mx, k32, {96, 256}, {{1, 7}, {40, 13}}, "mxfp8 multi-range rows");
+    expect_columns(mx, k32, {6, 256}, {{0, 128}}, "mxfp8 columns, first TP2 half");
+    expect_columns(mx, k32, {6, 256}, {{128, 128}}, "mxfp8 columns, second TP2 half");
+    expect_columns(mx, k32, {5, 96}, {{32, 32}}, "mxfp8 middle column group");
+    expect_rejected([&] { (void)tensor_column_slice(g, std::vector<SliceRange>{{16, 32}}); },
+                    "mxfp8 columns off the 32-column group");
+    expect_rejected(
+        [&] { (void)tensor_column_slice(g, std::vector<SliceRange>{{0, 32}, {64, 32}}); },
+        "mxfp8 multi-range columns");
+    expect_invalid([&] { (void)weight_geometry(mx, k32, std::vector<std::uint64_t>{4, 48}); },
+                   "mxfp8 K not a multiple of 32");
+    expect_invalid(
+        [&] { (void)weight_geometry(QType::NVFP4, k32, std::vector<std::uint64_t>{128, 64}); },
+        "BlockScaleK32 with another format");
+    expect_invalid(
+        [&] {
+            (void)weight_geometry(mx, QuantLayout::RowScale, std::vector<std::uint64_t>{4, 64});
+        },
+        "mxfp8 in another layout");
+    const auto spans = weight_row_block_spans(g, 10, 5);
+    check(spans.size() == 2 && spans[0] == ByteSpan{10 * 256, 5 * 256} &&
+              spans[1] == ByteSpan{96 * 256 + 10 * 8, 5 * 8},
+          "mxfp8 row block spans");
+    check(weight_scale_offset(g, 7, 3) == 96 * 256 + 7 * 8 + 3, "mxfp8 scale coordinate");
+}
+
+// Row-scaled NVFP4 (row_interleaved_v1): the n-gram table row of 160 values is 90 bytes.
+void row_interleaved() {
+    constexpr auto fp4  = QType::NVFP4_ROW_E4M3_G16;
+    constexpr auto rows = QuantLayout::RowInterleaved;
+    const auto g        = weight_geometry(fp4, rows, std::vector<std::uint64_t>{10, 160});
+    check(g.group_size == 16 && g.code_bytes_per_row == 90 && g.scale_offset == 80 &&
+              g.scale_bytes_per_row == 10 && g.scale_bytes == 0 && g.code_bytes == 900 &&
+              g.bytes == 900 && g.divisor_offset == 0,
+          "row-scaled nvfp4 geometry");
+    expect_rows(fp4, rows, {10, 160}, {{0, 5}}, "nvfp4 rows, first TP2 half");
+    expect_rows(fp4, rows, {10, 160}, {{5, 5}}, "nvfp4 rows, second TP2 half");
+    expect_rows(fp4, rows, {10, 160}, {{1, 2}, {6, 3}}, "nvfp4 multi-range rows");
+    expect_columns(fp4, rows, {4, 160}, {{0, 80}}, "nvfp4 row columns, first half");
+    expect_columns(fp4, rows, {4, 160}, {{80, 80}}, "nvfp4 row columns, second half");
+    expect_columns(fp4, rows, {3, 64}, {{16, 32}}, "nvfp4 row middle groups");
+    expect_rejected([&] { (void)tensor_column_slice(g, std::vector<SliceRange>{{8, 16}}); },
+                    "nvfp4 row columns off the 16-column group");
+    expect_invalid([&] { (void)weight_geometry(fp4, rows, std::vector<std::uint64_t>{4, 40}); },
+                   "nvfp4 row K not a multiple of 16");
+    expect_invalid(
+        [&] {
+            (void)weight_geometry(QType::FP8_E4M3FN_ROW_BF16, rows,
+                                  std::vector<std::uint64_t>{4, 64});
+        },
+        "RowInterleaved with another format");
+    const auto spans = weight_row_block_spans(g, 3, 4);
+    check(spans.size() == 1 && spans[0] == ByteSpan{270, 360}, "nvfp4 row block span");
+    check(weight_scale_offset(g, 2, 9) == 2 * 90 + 80 + 9, "nvfp4 row scale coordinate");
+}
+
 } // namespace
 
 // A stacked NVFP4 plane (one divisor per source matrix, e.g. a layer's routed experts) and the
@@ -315,12 +415,13 @@ void stacked_row_blocks() {
         (void)tensor_slice(g, ShardAxis::Rows, rows);
     } catch (const ArtifactError&) { rejected = true; }
     check(rejected, "a stacked plane was sliced");
-    const auto q8 = weight_geometry(QType::Q8_G32_FP16, QuantLayout::RowSplit,
-                                    std::vector<std::uint64_t>{4, 200});
+    const auto q8   = weight_geometry(QType::Q8_G32_FP16, QuantLayout::RowSplit,
+                                      std::vector<std::uint64_t>{4, 200});
     const auto rows = weight_row_block_spans(q8, 1, 2);
-    check(rows.size() == 2 && rows[0] == ByteSpan{q8.code_bytes_per_row, 2 * q8.code_bytes_per_row} &&
-              rows[1] == ByteSpan{q8.scale_offset + q8.scale_bytes_per_row,
-                                  2 * q8.scale_bytes_per_row},
+    check(rows.size() == 2 &&
+              rows[0] == ByteSpan{q8.code_bytes_per_row, 2 * q8.code_bytes_per_row} &&
+              rows[1] ==
+                  ByteSpan{q8.scale_offset + q8.scale_bytes_per_row, 2 * q8.scale_bytes_per_row},
           "RowSplit row block spans");
 }
 
@@ -330,6 +431,8 @@ int main() {
         row_split();
         block_scale();
         row_scale();
+        block_scale_k32();
+        row_interleaved();
         stacked_row_blocks();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

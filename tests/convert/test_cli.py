@@ -88,20 +88,14 @@ def configure(model, recipe, sources):
         assert set(artifact.directory.components) == {"text"}
         assert artifact.directory.metadata == {"name": "my-training-run"}
         assert len(artifact.directory.files) > 1
-        resource = artifact.directory.components["text"]["resources"][
-            "chat_template.jinja"
-        ]
+        resource = artifact.directory.components["text"]["resources"]["chat_template.jinja"]
         assert artifact.read_object(resource) == template.read_bytes()
-        embedding = binding_parts(
-            artifact.directory.bindings["text/token_embedding"], artifact.by_id
-        )[0][0]
+        embedding = binding_parts(artifact.directory.bindings["text/token_embedding"], artifact.by_id)[0][0]
         assert artifact.read_object(embedding) == b"\x80\x3f" * (8 * 128)
         parents = []
         for role in ("query", "key", "gate", "value"):
             name = "text/layers/0/attention/" + role
-            parents.append(
-                binding_parts(artifact.directory.bindings[name], artifact.by_id)[0][0]
-            )
+            parents.append(binding_parts(artifact.directory.bindings[name], artifact.by_id)[0][0])
         assert len(set(parents)) == 4
         assert [artifact.object(parent).format for parent in parents] == [
             "q4_g64_fp16",
@@ -109,10 +103,6 @@ def configure(model, recipe, sources):
             "q6_g64_fp16",
             "q8_g32_fp16",
         ]
-        gate = binding_parts(
-            artifact.directory.bindings["text/layers/0/mlp/gate"], artifact.by_id
-        )[0][0]
-        up = binding_parts(
-            artifact.directory.bindings["text/layers/0/mlp/up"], artifact.by_id
-        )[0][0]
+        gate = binding_parts(artifact.directory.bindings["text/layers/0/mlp/gate"], artifact.by_id)[0][0]
+        up = binding_parts(artifact.directory.bindings["text/layers/0/mlp/up"], artifact.by_id)[0][0]
         assert gate != up

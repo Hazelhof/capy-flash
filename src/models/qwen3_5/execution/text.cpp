@@ -201,6 +201,30 @@ void DFlashFeatureSink::capture_layer(int layer, const Tensor& value, cudaStream
     captured_mask |= 1U << index;
 }
 
+void DFlashFeatureSink::capture_layer_columns(int layer, const Tensor& value, std::int32_t first,
+                                              cudaStream_t stream) {
+    const auto it = std::find(layers.begin(), layers.end(), layer);
+    if (it == layers.end()) { return; }
+    const std::size_t index = static_cast<std::size_t>(it - layers.begin());
+    if (layers.size() > 32 || batch_features != nullptr || features == nullptr ||
+        active_tokens <= 0 || active_tokens > features->ne[1] || value.dtype != DType::BF16 ||
+        value.ne[0] * static_cast<std::int32_t>(layers.size()) != features->ne[0] || first < 0 ||
+        value.ne[1] <= 0 || value.ne[1] > active_tokens - first) {
+        throw std::logic_error("DFlash feature column capture shape is invalid");
+    }
+    const std::size_t element_bytes = dtype_size(DType::BF16);
+    const std::size_t width_bytes   = static_cast<std::size_t>(value.ne[0]) * element_bytes;
+    const std::size_t source_pitch  = static_cast<std::size_t>(value.nb[1]);
+    const std::size_t target_pitch  = static_cast<std::size_t>(features->nb[1]);
+    auto* target                    = static_cast<std::byte*>(features->data) +
+                   static_cast<std::size_t>(first) * target_pitch + index * width_bytes;
+    CUDA_CHECK(cudaMemcpy2DAsync(target, target_pitch, value.data, source_pitch, width_bytes,
+                                 static_cast<std::size_t>(value.ne[1]), cudaMemcpyDeviceToDevice,
+                                 stream));
+    // The layer counts as published once the window that closes the chunk is in.
+    if (first + value.ne[1] == active_tokens) { captured_mask |= 1U << index; }
+}
+
 void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t stream) {
     const std::uint32_t complete_mask = layers.size() == 32 ? ~0U : ((1U << layers.size()) - 1U);
     if (captured_mask != complete_mask) {
@@ -217,8 +241,9 @@ void DFlashFeatureSink::capture_positions(const Tensor& source, cudaStream_t str
         positions == nullptr || active_tokens > positions->ne[0]) {
         throw std::logic_error("DFlash feature positions are invalid");
     }
-    CUDA_CHECK(::ninfer::memcpy_device_async(positions->data, source.data,
-                               static_cast<std::size_t>(active_tokens) * sizeof(std::int32_t), stream));
+    CUDA_CHECK(::ninfer::memcpy_device_async(
+        positions->data, source.data,
+        static_cast<std::size_t>(active_tokens) * sizeof(std::int32_t), stream));
 }
 
 void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_checkpoint) {
@@ -236,11 +261,13 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv, const TpExecution* tp)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv, const TpExecution* tp,
+                         std::int32_t rope_delta)
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
       batch_mtp_kv_(batch_mtp_kv), tp_(tp) {
+    rope_delta_ = rope_delta;
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -499,10 +526,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                                 static_cast<std::size_t>(T - 1) * column_bytes;
             const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
                                  static_cast<std::size_t>(T - 1) * column_bytes;
-            CUDA_CHECK(
-                ::ninfer::memcpy_device_async(x_last.data, x_src, column_bytes, s));
-            CUDA_CHECK(
-                ::ninfer::memcpy_device_async(ah_last.data, ah_src, column_bytes, s));
+            CUDA_CHECK(::ninfer::memcpy_device_async(x_last.data, x_src, column_bytes, s));
+            CUDA_CHECK(::ninfer::memcpy_device_async(ah_last.data, ah_src, column_bytes, s));
         }
     }
 
@@ -530,8 +555,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
                 const auto* src = static_cast<const std::int32_t*>(rope_positions.data) +
                                   static_cast<std::size_t>(axis) * T + (T - 1);
                 auto* dst = static_cast<std::int32_t*>(last_rope_position.data) + axis;
-                CUDA_CHECK(
-                    ::ninfer::memcpy_device_async(dst, src, sizeof(std::int32_t), s));
+                CUDA_CHECK(::ninfer::memcpy_device_async(dst, src, sizeof(std::int32_t), s));
             }
         }
         text_rope(last_rope_position, *config_.rope_parameters, qn, s);
@@ -601,8 +625,8 @@ void TextContext::mtp_forward_batch(const Tensor& ids, const Tensor& hidden,
     require_single_device("MTP forward");
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     if (qwen4()) {
-        qwen4_mtp_forward_batch(ids, hidden, positions, envelope, mtp_hidden, logits_column,
-                                logits, draft_token, explicit_rope_positions, input_embeddings);
+        qwen4_mtp_forward_batch(ids, hidden, positions, envelope, mtp_hidden, logits_column, logits,
+                                draft_token, explicit_rope_positions, input_embeddings);
         return;
     }
     const int T = ids.ne[0];
@@ -749,8 +773,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     if constexpr (!Tap::enabled) {
         if (qwen4()) {
             qwen4_target_verify(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                                linear_state_source_slots, envelope, hidden, logits,
-                                target_tokens);
+                                linear_state_source_slots, envelope, hidden, logits, target_tokens);
             return;
         }
     } else {
@@ -1103,12 +1126,11 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_source_slot_);
         Tensor recurrent_state_out =
             state_.recurrent_slot(static_cast<std::uint32_t>(gidx), linear_state_destination_slot_);
-        ops::gated_delta_net(
-            q_recurrent, k_recurrent, vv, g, beta,
-            static_cast<float>(1.0 /
-                               std::sqrt(static_cast<double>(config_.gdn->linear_key_head_dim))),
-            /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o,
-            ctx_.execution_view());
+        ops::gated_delta_net(q_recurrent, k_recurrent, vv, g, beta,
+                             static_cast<float>(1.0 / std::sqrt(static_cast<double>(
+                                                          config_.gdn->linear_key_head_dim))),
+                             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out,
+                             o, ctx_.execution_view());
     }
 
     Tensor on = workspace::gdn_normalized_output(work_, config_, T)
@@ -1188,10 +1210,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
         if constexpr (Tap::enabled) {
             throw std::logic_error("Qwen4Exp prefill publishes no speculative feature taps");
         } else {
-            if (multimodal != nullptr) {
-                throw std::invalid_argument("Qwen4Exp image input is not implemented");
-            }
-            return qwen4_prefill(ids, text_prefill, finalize_at_end);
+            return qwen4_prefill(ids, text_prefill, multimodal, finalize_at_end);
         }
     }
     runtime::ExecutionTimingRecorder timing;
@@ -1380,7 +1399,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                 if (mtp_window.final_column_uses_generated_token) {
                     Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
                     CUDA_CHECK(::ninfer::memcpy_device_async(generated_mtp_id.data, io_.token.data,
-                                               sizeof(std::int32_t), s));
+                                                             sizeof(std::int32_t), s));
                 }
 
                 Tensor mtp_input_embeddings;
@@ -1421,8 +1440,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                                                                 ar_visible};
                         mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
                                             ar_envelope, next_hidden, logits, next_token);
-                        CUDA_CHECK(::ninfer::memcpy_device_async(io_.mtp->ar_hidden.data, next_hidden.data,
-                                                   io_.mtp->ar_hidden.bytes(), s));
+                        CUDA_CHECK(::ninfer::memcpy_device_async(io_.mtp->ar_hidden.data,
+                                                                 next_hidden.data,
+                                                                 io_.mtp->ar_hidden.bytes(), s));
                         ops::increment_i32_scalar(ar_position, s);
                     }
                 } else {
@@ -1439,7 +1459,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                                      "rewrite checkpoint hidden output");
                 const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
                 CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data,
-                                           checkpoint_hidden.data, checkpoint_hidden.bytes(), s));
+                                                         checkpoint_hidden.data,
+                                                         checkpoint_hidden.bytes(), s));
             }
         }
 

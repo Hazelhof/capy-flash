@@ -255,21 +255,26 @@ void add_turn_anchor_markers(ninfer::PromptInput& input, std::uint32_t turn_anch
 GenerationService::GenerationService(ServeOptions options, StartupObserver startup_observer)
     : options_(std::move(options)) {
     ninfer::EngineOptions engine_options;
-    engine_options.artifact_path            = options_.artifact_path;
-    engine_options.chat_template_path       = options_.chat_template_path;
-    engine_options.device                   = options_.device;
-    engine_options.tp                       = options_.tp;
-    engine_options.devices                  = options_.devices;
-    engine_options.max_context              = options_.max_context;
-    engine_options.kv_capacity              = options_.kv_capacity;
-    engine_options.max_concurrency          = options_.max_concurrency;
-    engine_options.max_pending_requests     = options_.max_pending_requests;
-    engine_options.pending_timeout_ms       = options_.pending_timeout_ms;
-    engine_options.prefill_chunk            = options_.prefill_chunk;
-    engine_options.kv_lease_window_tokens   = options_.kv_lease_window_tokens;
-    engine_options.kv_cache                 = options_.kv_cache;
-    engine_options.elastic_kv               = options_.elastic_kv;
-    if (options_.miss_split) { engine_options.routed_experts.miss_split.mode = *options_.miss_split; }
+    engine_options.artifact_path          = options_.artifact_path;
+    engine_options.chat_template_path     = options_.chat_template_path;
+    engine_options.device                 = options_.device;
+    engine_options.tp                     = options_.tp;
+    engine_options.devices                = options_.devices;
+    engine_options.max_context            = options_.max_context;
+    engine_options.kv_capacity            = options_.kv_capacity;
+    engine_options.max_concurrency        = options_.max_concurrency;
+    engine_options.max_pending_requests   = options_.max_pending_requests;
+    engine_options.pending_timeout_ms     = options_.pending_timeout_ms;
+    engine_options.prefill_chunk          = options_.prefill_chunk;
+    engine_options.kv_lease_window_tokens = options_.kv_lease_window_tokens;
+    engine_options.kv_cache               = options_.kv_cache;
+    engine_options.elastic_kv             = options_.elastic_kv;
+    if (options_.miss_split) {
+        engine_options.routed_experts.miss_split.mode = *options_.miss_split;
+    }
+    if (options_.stream_min_tokens) {
+        engine_options.routed_experts.stream_min_tokens = *options_.stream_min_tokens;
+    }
     engine_options.enable_vision            = options_.enable_vision;
     engine_options.vision_device            = options_.vision_device;
     engine_options.max_vision_tokens        = options_.max_vision_tokens;
@@ -283,8 +288,9 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.media_live_bytes         = options_.media_live_bytes;
     engine_options.media_preprocess_threads = options_.media_preprocess_threads;
     engine_options.startup_observer         = std::move(startup_observer);
-    engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
-    turn_anchors_ = resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
+    engine_ = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    turn_anchors_ =
+        resolve_turn_anchors(options_.turn_anchors, engine_->load_summary().architecture);
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     if (!options_.prefill_miss_dump_dir.empty()) {
@@ -467,10 +473,9 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         // A request that ends without a result still leaves its prompt as a context to compare
         // the next one against.
         if (prefill_miss_dump_ != nullptr && !prepared.prompt_token_ids.empty()) {
-            (void)prefill_miss_dump_->observe(prepared.prompt_token_ids, {},
-                                              static_cast<std::uint32_t>(
-                                                  prepared.prompt_token_ids.size()),
-                                              "failed");
+            (void)prefill_miss_dump_->observe(
+                prepared.prompt_token_ids, {},
+                static_cast<std::uint32_t>(prepared.prompt_token_ids.size()), "failed");
         }
         try {
             throw;

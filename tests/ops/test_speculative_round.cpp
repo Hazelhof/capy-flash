@@ -43,13 +43,15 @@ int prepare_verify_case(int k, int batch) {
         lengths[b] = 131072 + 1009 * b;
         for (int j = 0; j < k; ++j) drafts[b * k + j] = 37 + 257 * b + 7919 * j;
     }
-    DeviceBuffer d_anchors = to_device(anchors), d_lengths = to_device(lengths), d_drafts = to_device(drafts);
+    DeviceBuffer d_anchors = to_device(anchors), d_lengths = to_device(lengths),
+                 d_drafts  = to_device(drafts);
     DeviceBuffer d_extents = to_device(extents);
     GuardedDeviceBuffer d_full(width * batch * sizeof(std::int32_t));
     GuardedDeviceBuffer d_ids(d_full.bytes()), d_positions(d_full.bytes());
     Tensor a(d_anchors.p, DType::I32, {batch}), l(d_lengths.p, DType::I32, {batch});
     Tensor d(d_drafts.p, DType::I32, {k, batch}), e(d_extents.p, DType::I32, {batch});
-    Tensor full(d_full.data(), DType::I32, {width, batch}), ids(d_ids.data(), DType::I32, {width, batch});
+    Tensor full(d_full.data(), DType::I32, {width, batch}),
+        ids(d_ids.data(), DType::I32, {width, batch});
     Tensor positions(d_positions.data(), DType::I32, {width, batch});
     DeviceContext context;
     cuda_synchronize();
@@ -59,27 +61,43 @@ int prepare_verify_case(int k, int batch) {
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    if (k == 15 && batch == 8) { definition.capture(context.stream, launch); graph.instantiate(definition); }
+    if (k == 15 && batch == 8) {
+        definition.capture(context.stream, launch);
+        graph.instantiate(definition);
+    }
     int failures = 0;
     for (int phase = 0; phase <= k; ++phase) {
         for (int b = 0; b < batch; ++b) extents[b] = (phase + 3 * b) % width;
-        CUDA_CHECK(cudaMemcpyAsync(d_extents.p, extents.data(), d_extents.bytes, cudaMemcpyHostToDevice, context.stream));
-        if (graph.ready()) graph.launch(context.stream); else launch();
+        CUDA_CHECK(cudaMemcpyAsync(d_extents.p, extents.data(), d_extents.bytes,
+                                   cudaMemcpyHostToDevice, context.stream));
+        if (graph.ready())
+            graph.launch(context.stream);
+        else
+            launch();
         context.synchronize();
         std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
         for (int b = 0; b < batch; ++b)
             for (int j = 0; j < width; ++j) {
-                expected_ids[b * width + j] = j > 0 && j <= extents[b] ? drafts[b * k + j - 1] : anchors[b];
+                expected_ids[b * width + j] =
+                    j > 0 && j <= extents[b] ? drafts[b * k + j - 1] : anchors[b];
                 expected_positions[b * width + j] = lengths[b] + std::min(j, extents[b]);
             }
-        failures += verify_exact("verify ids", read<std::int32_t>(d_ids, expected_ids.size()), expected_ids);
-        failures += verify_exact("verify full ids", read<std::int32_t>(d_full, expected_ids.size()), expected_ids);
-        failures += verify_exact("verify positions", read<std::int32_t>(d_positions, expected_positions.size()), expected_positions);
-        failures += verify_exact("extents unchanged", from_device<std::int32_t>(d_extents, batch), extents);
+        failures += verify_exact("verify ids", read<std::int32_t>(d_ids, expected_ids.size()),
+                                 expected_ids);
+        failures += verify_exact("verify full ids", read<std::int32_t>(d_full, expected_ids.size()),
+                                 expected_ids);
+        failures += verify_exact("verify positions",
+                                 read<std::int32_t>(d_positions, expected_positions.size()),
+                                 expected_positions);
+        failures +=
+            verify_exact("extents unchanged", from_device<std::int32_t>(d_extents, batch), extents);
     }
-    failures += verify_exact("anchors unchanged", from_device<std::int32_t>(d_anchors, batch), anchors);
-    failures += verify_exact("lengths unchanged", from_device<std::int32_t>(d_lengths, batch), lengths);
-    failures += verify_exact("drafts unchanged", from_device<std::int32_t>(d_drafts, drafts.size()), drafts);
+    failures +=
+        verify_exact("anchors unchanged", from_device<std::int32_t>(d_anchors, batch), anchors);
+    failures +=
+        verify_exact("lengths unchanged", from_device<std::int32_t>(d_lengths, batch), lengths);
+    failures += verify_exact("drafts unchanged", from_device<std::int32_t>(d_drafts, drafts.size()),
+                             drafts);
     failures += d_full.verify_guards("verify full ids");
     failures += d_ids.verify_guards("verify ids");
     failures += d_positions.verify_guards("verify positions");
@@ -1111,7 +1129,8 @@ int select_hidden_case(int rows, int columns, int accepted_value) {
 int batched_select_hidden_case(int width, int batch) {
     constexpr int rows = 5120;
     std::vector<std::uint16_t> hidden(static_cast<std::size_t>(rows) * width * batch);
-    for (std::size_t i = 0; i < hidden.size(); ++i) hidden[i] = static_cast<std::uint16_t>(i * 257 + i / rows * 6113);
+    for (std::size_t i = 0; i < hidden.size(); ++i)
+        hidden[i] = static_cast<std::uint16_t>(i * 257 + i / rows * 6113);
     std::vector<std::int32_t> selectors(batch);
     std::vector<std::uint16_t> expected(static_cast<std::size_t>(rows) * batch);
     DeviceBuffer input = to_device(hidden), indices = to_device(selectors);
@@ -1124,22 +1143,32 @@ int batched_select_hidden_case(int width, int batch) {
     const auto launch = [&] { ops::speculative_select_accepted_hidden(h, i, o, context.stream); };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
-    if (width == 16 && batch == 8) { definition.capture(context.stream, launch); graph.instantiate(definition); }
+    if (width == 16 && batch == 8) {
+        definition.capture(context.stream, launch);
+        graph.instantiate(definition);
+    }
     int failures = 0;
     // Final commit N is positive here; a zero commit never issues this gather with selector -1.
     for (int phase = 0; phase < width; ++phase) {
         for (int b = 0; b < batch; ++b) {
             selectors[b] = (phase + 3 * b) % width;
             std::copy_n(hidden.begin() + static_cast<std::size_t>(b * width + selectors[b]) * rows,
-                         rows, expected.begin() + b * rows);
+                        rows, expected.begin() + b * rows);
         }
-        CUDA_CHECK(cudaMemcpyAsync(indices.p, selectors.data(), indices.bytes, cudaMemcpyHostToDevice, context.stream));
-        if (graph.ready()) graph.launch(context.stream); else launch();
+        CUDA_CHECK(cudaMemcpyAsync(indices.p, selectors.data(), indices.bytes,
+                                   cudaMemcpyHostToDevice, context.stream));
+        if (graph.ready())
+            graph.launch(context.stream);
+        else
+            launch();
         context.synchronize();
-        failures += verify_exact("committed hidden N-1", read<std::uint16_t>(output, expected.size()), expected);
-        failures += verify_exact("selectors unchanged", from_device<std::int32_t>(indices, batch), selectors);
+        failures += verify_exact("committed hidden N-1",
+                                 read<std::uint16_t>(output, expected.size()), expected);
+        failures += verify_exact("selectors unchanged", from_device<std::int32_t>(indices, batch),
+                                 selectors);
     }
-    failures += verify_exact("hidden unchanged", from_device<std::uint16_t>(input, hidden.size()), hidden);
+    failures +=
+        verify_exact("hidden unchanged", from_device<std::uint16_t>(input, hidden.size()), hidden);
     failures += output.verify_guards("committed hidden");
     return failures;
 }

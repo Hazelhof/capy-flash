@@ -156,8 +156,7 @@ void hyper_connection_combine_mix(Tensor& residual, const Tensor& previous_y,
  * hyper_connection_mix / hyper_connection_combine_mix call with T in [min_tokens, max_tokens]
  * and the given inject form. Throws for an empty or non-positive interval.
  */
-[[nodiscard]] std::size_t hyper_connection_mix_workspace_bytes(std::int32_t min_tokens,
-                                                               std::int32_t max_tokens,
-                                                               bool inject);
+[[nodiscard]] std::size_t
+hyper_connection_mix_workspace_bytes(std::int32_t min_tokens, std::int32_t max_tokens, bool inject);
 
 } // namespace ninfer::ops

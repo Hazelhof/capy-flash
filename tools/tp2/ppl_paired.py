@@ -59,8 +59,7 @@ def _betainc(a: float, b: float, x: float) -> float:
         return 0.0
     if x >= 1.0:
         return 1.0
-    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-                     + a * math.log(x) + b * math.log1p(-x))
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x))
     if x < (a + 1.0) / (a + b + 2.0):
         return front * _betacf(a, b, x) / a
     return 1.0 - front * _betacf(b, a, 1.0 - x) / b
@@ -90,7 +89,7 @@ def sign_test_p(pos: int, neg: int) -> float:
     if m == 0:
         return 1.0
     k = min(pos, neg)
-    return min(1.0, 2.0 * sum(math.comb(m, j) for j in range(k + 1)) / 2.0 ** m)
+    return min(1.0, 2.0 * sum(math.comb(m, j) for j in range(k + 1)) / 2.0**m)
 
 
 def windows(report: dict) -> dict:
@@ -123,8 +122,8 @@ def main(argv=None) -> int:
     if same == n:
         print(f"PASS identical: {n} windows, perplexity {p_new:.6f}")
         return 0
-    mean = sum(diff) / scored                     # nat per scored token
-    change = 100.0 * math.expm1(mean)             # = 100 (PPL_new / PPL_ref - 1)
+    mean = sum(diff) / scored  # nat per scored token
+    change = 100.0 * math.expm1(mean)  # = 100 (PPL_new / PPL_ref - 1)
     se = math.sqrt(n) * stdev(diff) / scored if n > 1 else float("nan")
     if se == 0.0:
         t, p = math.copysign(math.inf, mean), 0.0
@@ -136,16 +135,28 @@ def main(argv=None) -> int:
     psign = sign_test_p(pos, neg)
     worse = mean > 0.0 and p <= args.alpha
     verdict = "WARN" if worse or abs(change) >= args.max_delta_pct else "PASS"
-    reason = ("significantly worse" if worse else
-              f"|change| >= {args.max_delta_pct} %" if verdict == "WARN" else
-              "not worse at alpha" if mean > 0.0 else "better")
-    print(f"{verdict} paired ({reason}): perplexity {p_ref:.6f} -> {p_new:.6f} ({change:+.3f} %), "
-          f"95 % CI [{low:+.3f}, {high:+.3f}] %, t {t:+.2f} p {p:.3f} (n {n}), "
-          f"signs +{pos}/-{neg}/={same} p {psign:.3f}")
+    reason = (
+        "significantly worse"
+        if worse
+        else f"|change| >= {args.max_delta_pct} %"
+        if verdict == "WARN"
+        else "not worse at alpha"
+        if mean > 0.0
+        else "better"
+    )
+    print(
+        f"{verdict} paired ({reason}): perplexity {p_ref:.6f} -> {p_new:.6f} ({change:+.3f} %), "
+        f"95 % CI [{low:+.3f}, {high:+.3f}] %, t {t:+.2f} p {p:.3f} (n {n}), "
+        f"signs +{pos}/-{neg}/={same} p {psign:.3f}"
+    )
     dr = {d["domain"]: d["perplexity"] for d in ref.get("domains", [])}
     dn = {d["domain"]: d["perplexity"] for d in new.get("domains", [])}
-    print("  " + " · ".join(f"{k} {dr[k]:.4f}->{dn[k]:.4f} ({100 * (dn[k] / dr[k] - 1):+.3f} %)"
-                            for k in sorted(dr) if k in dn))
+    print(
+        "  "
+        + " · ".join(
+            f"{k} {dr[k]:.4f}->{dn[k]:.4f} ({100 * (dn[k] / dr[k] - 1):+.3f} %)" for k in sorted(dr) if k in dn
+        )
+    )
     return 0
 
 

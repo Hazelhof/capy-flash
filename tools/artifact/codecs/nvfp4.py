@@ -18,9 +18,7 @@ from ._tensor_bytes import (
 from .direct import encode_direct
 
 
-def swizzle_nvfp4_scales(
-    natural_scales: torch.Tensor, shape: Sequence[int]
-) -> torch.Tensor:
+def swizzle_nvfp4_scales(natural_scales: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
     """Map natural ``[N,K/16]`` E4M3FN words to the registered scale layout."""
 
     geometry = block_scale_geometry("nvfp4", shape)
@@ -29,17 +27,10 @@ def swizzle_nvfp4_scales(
         (geometry.n, geometry.groups_per_row),
         "NVFP4 scales",
     )
-    return (
-        source.reshape(geometry.n // 128, 4, 32, geometry.k_tiles, 4)
-        .permute(0, 3, 2, 1, 4)
-        .contiguous()
-        .reshape(-1)
-    )
+    return source.reshape(geometry.n // 128, 4, 32, geometry.k_tiles, 4).permute(0, 3, 2, 1, 4).contiguous().reshape(-1)
 
 
-def unswizzle_nvfp4_scales(
-    stored_scales: torch.Tensor, shape: Sequence[int]
-) -> torch.Tensor:
+def unswizzle_nvfp4_scales(stored_scales: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
     """Recover natural ``[N,K/16]`` E4M3FN words from registered layout bytes."""
 
     geometry = block_scale_geometry("nvfp4", shape)
@@ -48,10 +39,7 @@ def unswizzle_nvfp4_scales(
         or stored_scales.dim() != 1
         or stored_scales.numel() != geometry.scale_plane_bytes
     ):
-        raise TypeError(
-            "stored NVFP4 scales must be one-dimensional uint8 with "
-            f"{geometry.scale_plane_bytes} elements"
-        )
+        raise TypeError(f"stored NVFP4 scales must be one-dimensional uint8 with {geometry.scale_plane_bytes} elements")
     source = stored_scales.detach().contiguous().cpu()
     return (
         source.reshape(geometry.n // 128, geometry.k_tiles, 32, 4, 4)
@@ -102,10 +90,9 @@ def encode_nvfp4(
     swizzled = swizzle_nvfp4_scales(scales, shape)
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
-    payload[
-        geometry.scale_plane_offset : geometry.scale_plane_offset
-        + geometry.scale_plane_bytes
-    ] = swizzled.numpy().tobytes()
+    payload[geometry.scale_plane_offset : geometry.scale_plane_offset + geometry.scale_plane_bytes] = (
+        swizzled.numpy().tobytes()
+    )
     payload[geometry.weight_divisor_offset :] = divisor
     return bytes(payload)
 
@@ -118,18 +105,10 @@ def decode_nvfp4_words(
 
     geometry = block_scale_geometry("nvfp4", shape)
     if _payload_length(payload) != geometry.payload_bytes:
-        raise ValueError(
-            f"NVFP4 payload has {_payload_length(payload)} bytes, "
-            f"expected {geometry.payload_bytes}"
-        )
+        raise ValueError(f"NVFP4 payload has {_payload_length(payload)} bytes, expected {geometry.payload_bytes}")
     raw = _payload_tensor(payload, torch.device("cpu"))
-    codes = (
-        raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k // 2)
-    )
-    stored_scales = raw[
-        geometry.scale_plane_offset : geometry.scale_plane_offset
-        + geometry.scale_plane_bytes
-    ]
+    codes = raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k // 2)
+    stored_scales = raw[geometry.scale_plane_offset : geometry.scale_plane_offset + geometry.scale_plane_bytes]
     scales = unswizzle_nvfp4_scales(stored_scales, shape)
     invalid = ((scales & 0x80) != 0) | (scales == 0x7F)
     if bool(invalid.any()):
@@ -138,7 +117,5 @@ def decode_nvfp4_words(
     divisor_word = struct.unpack("<I", divisor_bytes)[0]
     if not valid_positive_fp32_word(divisor_word):
         raise ValueError("NVFP4 weight divisor must be finite and positive")
-    divisor = torch.frombuffer(bytearray(divisor_bytes), dtype=torch.float32).reshape(
-        ()
-    )
+    divisor = torch.frombuffer(bytearray(divisor_bytes), dtype=torch.float32).reshape(())
     return codes, scales, divisor

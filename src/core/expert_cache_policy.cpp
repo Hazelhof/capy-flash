@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -43,18 +44,48 @@ ExpertCachePolicy::ExpertCachePolicy(const PolicyConfig& config) : config_(confi
         throw std::invalid_argument("expert cache policy: elastic columns and gap must be >= 0");
     }
     const std::int32_t P = c.partitions;
+    if (!c.layer_slots.empty()) {
+        if (c.layer_slots.size() != static_cast<std::size_t>(c.layers)) {
+            throw std::invalid_argument(
+                "expert cache policy: layer_slots needs one entry per layer");
+        }
+        for (const std::int32_t k : c.layer_slots) {
+            if (k < P) {
+                throw std::invalid_argument(
+                    "expert cache policy: every partition needs at least one slot in every layer");
+            }
+        }
+    }
     partition_slots_.resize(static_cast<std::size_t>(P));
     partition_base_.resize(static_cast<std::size_t>(P));
+    layer_base_.resize(static_cast<std::size_t>(P * c.layers));
+    base_offset_.resize(static_cast<std::size_t>(P * (c.layers + 1)));
     std::size_t total = 0;
     for (std::int32_t p = 0; p < P; ++p) {
-        const std::int32_t slots = partition_slot_count(c, p);
+        const std::int32_t slots                      = partition_slot_count(c, p);
         partition_slots_[static_cast<std::size_t>(p)] = slots;
         partition_base_[static_cast<std::size_t>(p)]  = total;
+        std::int64_t offset                           = 0;
+        for (std::int32_t l = 0; l < c.layers; ++l) {
+            const std::int32_t base                                 = layer_slot_count(c, l, p);
+            layer_base_[static_cast<std::size_t>(p * c.layers + l)] = base;
+            base_offset_[static_cast<std::size_t>(p * (c.layers + 1) + l)] =
+                static_cast<std::int32_t>(offset);
+            offset += base;
+        }
+        if (offset != static_cast<std::int64_t>(slots) * c.layers) {
+            throw std::invalid_argument(
+                "expert cache policy: layer_slots must give every partition layers * "
+                "partition_slot_count base slots");
+        }
+        base_offset_[static_cast<std::size_t>(p * (c.layers + 1) + c.layers)] =
+            static_cast<std::int32_t>(offset);
         total += static_cast<std::size_t>(slots + c.elastic_columns) *
                  static_cast<std::size_t>(c.layers);
     }
     active_columns_ = c.elastic_columns;
-    const std::size_t cells = static_cast<std::size_t>(c.layers) * static_cast<std::size_t>(c.experts);
+    const std::size_t cells =
+        static_cast<std::size_t>(c.layers) * static_cast<std::size_t>(c.experts);
     slot_of_.assign(cells, -1);
     frequency_.assign(cells, 0.0);
     expert_of_.assign(total, -1);
@@ -73,39 +104,46 @@ void ExpertCachePolicy::set_insert_cap(std::int32_t cap) {
 
 std::int32_t ExpertCachePolicy::pool_slot(std::int32_t partition, std::int32_t layer,
                                           std::int32_t local) const noexcept {
-    const std::int32_t base = partition_slots_[static_cast<std::size_t>(partition)];
-    if (local < base) { return layer * base + local; }
-    return config_.layers * base + config_.elastic_gap + (local - base) * config_.layers + layer;
+    const std::int32_t base = base_slots(partition, layer);
+    if (local < base) { return base_offset(partition, layer) + local; }
+    return base_offset(partition, config_.layers) + config_.elastic_gap +
+           (local - base) * config_.layers + layer;
 }
 
 void ExpertCachePolicy::locate(std::int32_t partition, std::int32_t slot, std::int32_t& layer,
                                std::int32_t& local) const noexcept {
-    const std::int32_t base = partition_slots_[static_cast<std::size_t>(partition)];
-    const std::int32_t L    = config_.layers;
-    if (slot < L * base) {
-        layer = slot / base;
-        local = slot - layer * base;
+    const std::int32_t L = config_.layers;
+    const auto offsets   = base_offset_.begin() + partition * (L + 1);
+    if (slot < offsets[L]) {
+        // The last layer whose base region begins at or before `slot` (layers with one slot or
+        // more, so the region is not empty).
+        layer =
+            static_cast<std::int32_t>(std::upper_bound(offsets, offsets + L, slot) - offsets) - 1;
+        local = slot - offsets[layer];
         return;
     }
-    const std::int32_t e = slot - L * base - config_.elastic_gap;
+    const std::int32_t e = slot - offsets[L] - config_.elastic_gap;
     layer                = e % L;
-    local                = base + e / L;
+    local                = base_slots(partition, layer) + e / L;
 }
 
-std::int32_t ExpertCachePolicy::expert_in(std::int32_t partition, std::int32_t slot) const noexcept {
+std::int32_t ExpertCachePolicy::expert_in(std::int32_t partition,
+                                          std::int32_t slot) const noexcept {
     std::int32_t layer = 0;
     std::int32_t local = 0;
     locate(partition, slot, layer, local);
     return expert_of_[lane_base(layer, partition) + static_cast<std::size_t>(local)];
 }
 
-std::int32_t ExpertCachePolicy::occupied(std::int32_t layer, std::int32_t partition) const noexcept {
+std::int32_t ExpertCachePolicy::occupied(std::int32_t layer,
+                                         std::int32_t partition) const noexcept {
     return lanes_[static_cast<std::size_t>(layer * config_.partitions + partition)].count;
 }
 
-std::int32_t ExpertCachePolicy::capacity(std::int32_t layer, std::int32_t partition) const noexcept {
+std::int32_t ExpertCachePolicy::capacity(std::int32_t layer,
+                                         std::int32_t partition) const noexcept {
     const Lane& ln = lanes_[static_cast<std::size_t>(layer * config_.partitions + partition)];
-    return ln.blocked ? active_columns_ : slots_in_partition(partition);
+    return ln.blocked ? active_columns_ : slots_in_partition(partition, layer);
 }
 
 bool ExpertCachePolicy::full(std::int32_t layer, std::int32_t partition) const noexcept {
@@ -113,7 +151,7 @@ bool ExpertCachePolicy::full(std::int32_t layer, std::int32_t partition) const n
 }
 
 std::int32_t ExpertCachePolicy::take_free(std::int32_t layer, std::int32_t partition) {
-    Lane& ln = lane(layer, partition);
+    Lane& ln           = lane(layer, partition);
     std::int32_t local = 0;
     if (!ln.free.empty()) {
         local = ln.free.back();
@@ -172,7 +210,7 @@ void ExpertCachePolicy::touch(std::int32_t layer, std::int32_t partition,
     std::int32_t located = 0;
     std::int32_t local   = 0;
     locate(partition, slot, located, local);
-    const std::size_t base = lane_base(layer, partition);
+    const std::size_t base                            = lane_base(layer, partition);
     last_use_[base + static_cast<std::size_t>(local)] = window_[static_cast<std::size_t>(layer)];
     if (ln.tail == local) { return; }
     unlink(ln, base, local);
@@ -204,9 +242,9 @@ std::int32_t ExpertCachePolicy::victim_local(std::int32_t layer, std::int32_t pa
 }
 
 Insert ExpertCachePolicy::insert(std::int32_t layer, std::int32_t expert, bool scored) {
-    const std::int32_t p     = partition_of(expert);
-    Lane& ln                 = lane(layer, p);
-    const std::size_t base   = lane_base(layer, p);
+    const std::int32_t p   = partition_of(expert);
+    Lane& ln               = lane(layer, p);
+    const std::size_t base = lane_base(layer, p);
     Insert ins{expert, p, 0, -1};
     std::int32_t local = 0;
     if (ln.count < capacity(layer, p)) {
@@ -217,10 +255,10 @@ Insert ExpertCachePolicy::insert(std::int32_t layer, std::int32_t expert, bool s
         unlink(ln, base, local);
         slot_of_[index(layer, ins.victim)] = -1;
     }
-    ins.slot                                     = pool_slot(p, layer, local);
+    ins.slot                                           = pool_slot(p, layer, local);
     expert_of_[base + static_cast<std::size_t>(local)] = expert;
-    slot_of_[index(layer, expert)]                = ins.slot;
-    last_use_[base + static_cast<std::size_t>(local)] = window_[static_cast<std::size_t>(layer)];
+    slot_of_[index(layer, expert)]                     = ins.slot;
+    last_use_[base + static_cast<std::size_t>(local)]  = window_[static_cast<std::size_t>(layer)];
     push_mru(ln, base, local);
     return ins;
 }
@@ -306,8 +344,9 @@ void ExpertCachePolicy::decide(std::int32_t layer, std::span<const Routed> route
         // Hottest first: decayed frequency with admission, the window count without. Ties keep
         // ascending id order.
         auto count_of = [&](std::int32_t e) {
-            const auto it = std::lower_bound(routed.begin(), routed.end(), e,
-                                             [](const Routed& r, std::int32_t v) { return r.expert < v; });
+            const auto it =
+                std::lower_bound(routed.begin(), routed.end(), e,
+                                 [](const Routed& r, std::int32_t v) { return r.expert < v; });
             return static_cast<double>(it->count);
         };
         auto heat = [&](std::int32_t e) { return config_.admission ? f[e] : count_of(e); };
@@ -325,8 +364,7 @@ void ExpertCachePolicy::decide(std::int32_t layer, std::span<const Routed> route
     }
 }
 
-void ExpertCachePolicy::validate_window(std::span<const Routed> routed,
-                                        std::int32_t tokens) const {
+void ExpertCachePolicy::validate_window(std::span<const Routed> routed, std::int32_t tokens) const {
     if (tokens < 0) { throw std::invalid_argument("expert cache policy: tokens must be >= 0"); }
     for (std::size_t i = 0; i < routed.size(); ++i) {
         const Routed& r = routed[i];
@@ -339,8 +377,8 @@ void ExpertCachePolicy::validate_window(std::span<const Routed> routed,
     }
 }
 
-void ExpertCachePolicy::decide_prompt(std::int32_t layer, std::span<const Routed> routed,
-                                      std::int32_t tokens, LayerDecision& out) {
+void ExpertCachePolicy::classify_prompt(std::int32_t layer, std::span<const Routed> routed,
+                                        std::int32_t tokens, bool frequencies, LayerDecision& out) {
     if (layer < 0 || layer >= config_.layers) {
         throw std::out_of_range("expert cache policy: layer " + std::to_string(layer));
     }
@@ -354,7 +392,7 @@ void ExpertCachePolicy::decide_prompt(std::int32_t layer, std::span<const Routed
     out.missing.clear();
     out.inserts.clear();
     ++window_[static_cast<std::size_t>(layer)];
-    if (tracks_frequency()) {
+    if (frequencies && tracks_frequency()) {
         double weight = 1.0;
         if (config_.recency_weighted_prompts && tokens > 0) {
             const double x = static_cast<double>(tokens) / config_.half_life_tokens;
@@ -370,13 +408,33 @@ void ExpertCachePolicy::decide_prompt(std::int32_t layer, std::span<const Routed
             out.missing.push_back(r.expert);
         }
     }
+}
+
+void ExpertCachePolicy::count_prompt(std::int32_t layer, std::span<const Routed> routed,
+                                     std::int32_t tokens, LayerDecision& out, bool frequencies) {
+    classify_prompt(layer, routed, tokens, frequencies, out);
+}
+
+void ExpertCachePolicy::decide_prompt(std::int32_t layer, std::span<const Routed> routed,
+                                      std::int32_t tokens, LayerDecision& out) {
+    decide_prompt(layer, routed, tokens, std::numeric_limits<std::int32_t>::max(), out);
+}
+
+void ExpertCachePolicy::decide_prompt(std::int32_t layer, std::span<const Routed> routed,
+                                      std::int32_t tokens, std::int32_t target_cap,
+                                      LayerDecision& out) {
+    if (target_cap <= 0) {
+        throw std::invalid_argument("expert cache policy: prompt target cap must be positive");
+    }
+    classify_prompt(layer, routed, tokens, /*frequencies=*/true, out);
     // Targets: per partition its slot count of the most routed experts (count descending, ties
     // to the lower id), coldest first.
     candidates_.clear();
     for (const Routed& r : routed) { candidates_.push_back(r.expert); }
     auto count_of = [&](std::int32_t e) {
-        const auto it = std::lower_bound(routed.begin(), routed.end(), e,
-                                         [](const Routed& r, std::int32_t v) { return r.expert < v; });
+        const auto it =
+            std::lower_bound(routed.begin(), routed.end(), e,
+                             [](const Routed& r, std::int32_t v) { return r.expert < v; });
         return it->count;
     };
     std::stable_sort(candidates_.begin(), candidates_.end(),
@@ -385,7 +443,7 @@ void ExpertCachePolicy::decide_prompt(std::int32_t layer, std::span<const Routed
     std::vector<std::int32_t> targets;
     for (const std::int32_t e : candidates_) {
         auto& n = taken[static_cast<std::size_t>(partition_of(e))];
-        if (n < capacity(layer, partition_of(e))) {
+        if (n < std::min(capacity(layer, partition_of(e)), target_cap)) {
             targets.push_back(e);
             ++n;
         }
@@ -416,16 +474,19 @@ void ExpertCachePolicy::prefill(std::int32_t layer, std::span<const std::int32_t
     std::vector<std::uint8_t> seen(static_cast<std::size_t>(config_.experts), 0);
     for (const std::int32_t e : hottest_first) {
         if (e < 0 || e >= config_.experts || seen[static_cast<std::size_t>(e)] != 0) {
-            throw std::invalid_argument("expert cache policy: profile experts must be distinct and in range");
+            throw std::invalid_argument(
+                "expert cache policy: profile experts must be distinct and in range");
         }
         seen[static_cast<std::size_t>(e)] = 1;
-        auto& list = chosen[static_cast<std::size_t>(partition_of(e))];
+        auto& list                        = chosen[static_cast<std::size_t>(partition_of(e))];
         if (static_cast<std::int32_t>(list.size()) < capacity(layer, partition_of(e))) {
             list.push_back(e);
         }
     }
     for (const auto& list : chosen) {
-        for (auto it = list.rbegin(); it != list.rend(); ++it) { out.push_back(insert(layer, *it)); }
+        for (auto it = list.rbegin(); it != list.rend(); ++it) {
+            out.push_back(insert(layer, *it));
+        }
     }
 }
 
@@ -438,7 +499,8 @@ void ExpertCachePolicy::top_up(std::int32_t layer, std::span<const std::int32_t>
     std::vector<std::uint8_t> seen(static_cast<std::size_t>(config_.experts), 0);
     for (const std::int32_t e : hottest_first) {
         if (e < 0 || e >= config_.experts || seen[static_cast<std::size_t>(e)] != 0) {
-            throw std::invalid_argument("expert cache policy: profile experts must be distinct and in range");
+            throw std::invalid_argument(
+                "expert cache policy: profile experts must be distinct and in range");
         }
         seen[static_cast<std::size_t>(e)] = 1;
         if (slot_of(layer, e) >= 0) { continue; }
@@ -449,7 +511,9 @@ void ExpertCachePolicy::top_up(std::int32_t layer, std::span<const std::int32_t>
         }
     }
     for (const auto& list : chosen) {
-        for (auto it = list.rbegin(); it != list.rend(); ++it) { out.push_back(insert(layer, *it)); }
+        for (auto it = list.rbegin(); it != list.rend(); ++it) {
+            out.push_back(insert(layer, *it));
+        }
     }
 }
 
@@ -458,10 +522,10 @@ void ExpertCachePolicy::block_base(std::int32_t layer, std::vector<SlotEviction>
         throw std::out_of_range("expert cache policy: layer " + std::to_string(layer));
     }
     for (std::int32_t p = 0; p < config_.partitions; ++p) {
-        Lane& ln                 = lane(layer, p);
+        Lane& ln = lane(layer, p);
         if (ln.blocked) { continue; }
         const std::size_t base   = lane_base(layer, p);
-        const std::int32_t slots = partition_slots_[static_cast<std::size_t>(p)];
+        const std::int32_t slots = base_slots(p, layer);
         for (std::int32_t local = 0; local < std::min(ln.used, slots); ++local) {
             const std::size_t i  = base + static_cast<std::size_t>(local);
             const std::int32_t e = expert_of_[i];
@@ -488,8 +552,10 @@ void ExpertCachePolicy::unblock_base(std::int32_t layer) {
         ln.blocked             = false;
         const std::size_t base = lane_base(layer, p);
         // Highest first: take_free hands out the lowest base slot first.
-        for (std::int32_t local = partition_slots_[static_cast<std::size_t>(p)] - 1; local >= 0; --local) {
-            if (expert_of_[base + static_cast<std::size_t>(local)] < 0) { ln.free.push_back(local); }
+        for (std::int32_t local = base_slots(p, layer) - 1; local >= 0; --local) {
+            if (expert_of_[base + static_cast<std::size_t>(local)] < 0) {
+                ln.free.push_back(local);
+            }
         }
     }
 }
@@ -516,8 +582,7 @@ void ExpertCachePolicy::clear_layer(std::int32_t layer, std::vector<std::int32_t
     }
 }
 
-void ExpertCachePolicy::set_active_columns(std::int32_t columns,
-                                           std::vector<SlotEviction>& evicted,
+void ExpertCachePolicy::set_active_columns(std::int32_t columns, std::vector<SlotEviction>& evicted,
                                            std::vector<SlotMove>& moves) {
     if (columns < 0 || columns > config_.elastic_columns) {
         throw std::out_of_range("expert cache policy: active columns out of range");
@@ -529,13 +594,13 @@ void ExpertCachePolicy::set_active_columns(std::int32_t columns,
     std::vector<std::int32_t> order;
     for (std::int32_t layer = 0; layer < config_.layers; ++layer) {
         for (std::int32_t p = 0; p < config_.partitions; ++p) {
-            Lane& ln                = lane(layer, p);
-            const std::int32_t cap  = partition_slots_[static_cast<std::size_t>(p)] + columns;
+            Lane& ln               = lane(layer, p);
+            const std::int32_t cap = base_slots(p, layer) + columns;
             if (ln.used <= cap) { continue; }
-            const std::size_t base  = lane_base(layer, p);
+            const std::size_t base = lane_base(layer, p);
             // T69: a lane may have free slots below `used` and, while its base slots are blocked,
             // keeps only local slots [lo, cap).
-            const std::int32_t lo   = ln.blocked ? partition_slots_[static_cast<std::size_t>(p)] : 0;
+            const std::int32_t lo = ln.blocked ? base_slots(p, layer) : 0;
             // Coldest first: the LRU order, stably re-ranked by decayed frequency with admission.
             order.clear();
             for (std::int32_t s = ln.head; s >= 0; s = next_[base + static_cast<std::size_t>(s)]) {
@@ -571,10 +636,10 @@ void ExpertCachePolicy::set_active_columns(std::int32_t columns,
                 const std::int32_t e   = expert_of_[from];
                 const std::int32_t pv  = prev_[from];
                 const std::int32_t nx  = next_[from];
-                expert_of_[to] = e;
-                prev_[to]      = pv;
-                next_[to]      = nx;
-                last_use_[to]  = last_use_[from];
+                expert_of_[to]         = e;
+                prev_[to]              = pv;
+                next_[to]              = nx;
+                last_use_[to]          = last_use_[from];
                 if (pv >= 0) {
                     next_[base + static_cast<std::size_t>(pv)] = hole;
                 } else {
@@ -585,9 +650,9 @@ void ExpertCachePolicy::set_active_columns(std::int32_t columns,
                 } else {
                     ln.tail = hole;
                 }
-                expert_of_[from] = -1;
-                prev_[from]      = -1;
-                next_[from]      = -1;
+                expert_of_[from]           = -1;
+                prev_[from]                = -1;
+                next_[from]                = -1;
                 const std::int32_t to_slot = pool_slot(p, layer, hole);
                 moves.push_back(SlotMove{layer, e, p, pool_slot(p, layer, local), to_slot});
                 slot_of_[index(layer, e)] = to_slot;
@@ -595,7 +660,9 @@ void ExpertCachePolicy::set_active_columns(std::int32_t columns,
             }
             ln.free.clear();
             for (std::int32_t local = cap - 1; local >= lo; --local) {
-                if (expert_of_[base + static_cast<std::size_t>(local)] < 0) { ln.free.push_back(local); }
+                if (expert_of_[base + static_cast<std::size_t>(local)] < 0) {
+                    ln.free.push_back(local);
+                }
             }
             ln.used = cap;
         }

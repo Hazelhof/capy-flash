@@ -16,17 +16,54 @@
 #include "ninfer/ops/vision_pos_embed.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
+
+// Validation (NINFER_VISION_DUMP=<directory>): each encoded item's patches as the tower received
+// them (BF16 [patches, 1536]) and its merged embeddings (BF16 [merged, H]) with its grid, so the
+// tower can be compared with an independent reference on the same inputs. Synchronizes the
+// encoding device; off unless set.
+void dump_encoded_item(const VisionItemView& item, const Tensor& output,
+                       const DeviceContext& device) {
+    static const char* directory = std::getenv("NINFER_VISION_DUMP");
+    if (directory == nullptr || *directory == '\0' || item.control == nullptr) { return; }
+    static std::atomic<int> sequence{0};
+    const int index = sequence++;
+    device.synchronize();
+    std::vector<std::uint16_t> merged(static_cast<std::size_t>(output.numel()));
+    CUDA_CHECK(cudaMemcpy(merged.data(), output.data, output.bytes(), cudaMemcpyDeviceToHost));
+    const std::string stem = std::string(directory) + "/item" + std::to_string(index);
+    const auto write       = [](const std::string& path, const void* data, std::size_t bytes) {
+        if (FILE* file = std::fopen(path.c_str(), "wb")) {
+            (void)std::fwrite(data, 1, bytes, file);
+            (void)std::fclose(file);
+        }
+    };
+    write(stem + ".patches.bf16", item.patches.data(), item.patches.size_bytes());
+    write(stem + ".merged.bf16", merged.data(), merged.size() * sizeof(std::uint16_t));
+    if (FILE* file = std::fopen((stem + ".json").c_str(), "w")) {
+        const auto& grid = item.control->grid;
+        std::fprintf(file,
+                     "{\"grid_thw\": [%d, %d, %d], \"patches\": %zu, \"merged\": %zu, "
+                     "\"hidden\": %d}\n",
+                     grid.temporal, grid.height, grid.width, item.control->patch_count,
+                     item.control->merged_count, output.ne[0]);
+        (void)std::fclose(file);
+    }
+}
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     if (b != 0 && a > std::numeric_limits<std::size_t>::max() / b) {
@@ -589,11 +626,13 @@ void VisionPrefillSession::encode_on_ranks(const VisionItemView& item, Tensor& r
     timers_.back().start();
     context_.encode(item, encoded, encoder.workspace, *encoder.workspace_plan);
     timers_.back().record_stop();
+    dump_encoded_item(item, encoded, *encoder.device);
     encoded_->record(encoder.device->stream);
 
     ScopedCurrentDevice::select(receiver.device->device);
     encoded_->wait(receiver.device->stream);
-    CUDA_CHECK(::ninfer::memcpy_device_async(received.data, encoded.data, encoded.bytes(), receiver.device->stream));
+    CUDA_CHECK(::ninfer::memcpy_device_async(received.data, encoded.data, encoded.bytes(),
+                                             receiver.device->stream));
     copied_->record(receiver.device->stream);
 
     // The next item's encode overwrites the encoding rank's handoff only after the copy read it.
@@ -636,6 +675,7 @@ VisionChunk VisionPrefillSession::prepare_chunk(std::uint32_t begin, std::uint32
             timers_.back().start();
             context_.encode(item, output, ranks_[0].workspace, *ranks_[0].workspace_plan);
             timers_.back().record_stop();
+            dump_encoded_item(item, output, *ranks_[0].device);
         }
         active_item_          = active->prepared_item_index;
         active_handoff_bytes_ = output.bytes();

@@ -33,12 +33,12 @@ struct ServeOptions {
     std::string api_key;                          // empty => no auth
     std::optional<std::string> model_id_override; // unset => artifact metadata.name
     std::string request_log_jsonl;                // empty => structured request logging disabled
-    std::uint32_t max_context          = 8192;
-    KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
-    std::uint32_t max_concurrency      = 1;
-    std::uint32_t max_pending_requests = 16;
-    std::uint32_t pending_timeout_ms   = 30000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t max_context            = 8192;
+    KvCapacityPolicy kv_capacity         = KvCapacityPolicy::explicit_capacity(8192);
+    std::uint32_t max_concurrency        = 1;
+    std::uint32_t max_pending_requests   = 16;
+    std::uint32_t pending_timeout_ms     = 30000;
+    std::uint32_t prefill_chunk          = 1024;
     std::uint32_t kv_lease_window_tokens = 4096; // --kv-lease-window; 0 = reserve max_tokens
     std::filesystem::path context_cost_presets;
     std::uint32_t log_stats_interval_ms    = 5000; // 0 disables periodic Engine throughput logs
@@ -65,16 +65,19 @@ struct ServeOptions {
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
     // turn branches from the conversation; see to_prompt_input.
     // Unset = the model's default (resolve_turn_anchors): 0 on Qwen4Exp, 1 elsewhere.
-    // capy-flash (T152): on Qwen3.8-Flash-Next every prefill pass reads the non-resident experts from
-    // host RAM (~0.8 s fixed), and the anchor splits one pass more per agentic turn (TTFT 2.67 ->
-    // 1.82 s without it); a cancelled or edited turn then re-prefills the conversation. T161: on
-    // models whose weights are all on the GPU (Qwen3.8-27B) the extra pass costs nothing measurable,
-    // so they keep the anchor.
+    // capy-flash (T152): on Qwen3.8-Flash-Next every prefill pass reads the non-resident experts
+    // from host RAM (~0.8 s fixed), and the anchor splits one pass more per agentic turn (TTFT 2.67
+    // -> 1.82 s without it); a cancelled or edited turn then re-prefills the conversation. T161: on
+    // models whose weights are all on the GPU (Qwen3.8-27B) the extra pass costs nothing
+    // measurable, so they keep the anchor.
     std::optional<std::uint32_t> turn_anchors;
     // T64/T66c Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
-    // (--elastic, --kv-grow, --kv-budget-gib) and the decode miss split (--miss-split auto|off).
+    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split auto|off) and
+    // the prompt-chunk width from which the missing experts stream over PCIe (--stream-min-tokens,
+    // RoutedExpertOptions::stream_min_tokens; 0 = never).
     ElasticKvOptions elastic_kv;
     std::optional<MissSplitMode> miss_split;
+    std::optional<std::uint32_t> stream_min_tokens;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;

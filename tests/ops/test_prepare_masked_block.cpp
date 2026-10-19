@@ -76,11 +76,11 @@ int run_batch_case(int width, int batch, bool dense) {
     for (int b = 0; b < batch; ++b) {
         anchors[b] = 9173 + 111 * b;
         lengths[b] = 37 + 1009 * b;
-        valid[b] = dense ? width : 1 + (3 * b) % width;
+        valid[b]   = dense ? width : 1 + (3 * b) % width;
     }
     DeviceBuffer device_anchors = to_device(anchors);
     DeviceBuffer device_lengths = to_device(lengths);
-    DeviceBuffer device_valid = to_device(valid);
+    DeviceBuffer device_valid   = to_device(valid);
     GuardedDeviceBuffer ids(static_cast<std::size_t>(width * batch) * sizeof(std::int32_t));
     GuardedDeviceBuffer positions(ids.bytes());
     ids.fill(0xcd);
@@ -105,10 +105,17 @@ int run_batch_case(int width, int batch, bool dense) {
         CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        for (int b = 0; b < batch; ++b) { anchors[b] += 11; lengths[b] += 7; valid[b] = 1 + valid[b] % width; }
-        CUDA_CHECK(cudaMemcpyAsync(device_anchors.p, anchors.data(), device_anchors.bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_lengths.p, lengths.data(), device_lengths.bytes, cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid.data(), device_valid.bytes, cudaMemcpyHostToDevice, stream));
+        for (int b = 0; b < batch; ++b) {
+            anchors[b] += 11;
+            lengths[b] += 7;
+            valid[b] = 1 + valid[b] % width;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(device_anchors.p, anchors.data(), device_anchors.bytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_lengths.p, lengths.data(), device_lengths.bytes,
+                                   cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(device_valid.p, valid.data(), device_valid.bytes,
+                                   cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -118,14 +125,21 @@ int run_batch_case(int width, int batch, bool dense) {
     std::vector<std::int32_t> expected_ids(width * batch), expected_positions(width * batch);
     for (int b = 0; b < batch; ++b)
         for (int j = 0; j < width; ++j) {
-            expected_ids[b * width + j] = j == 0 ? anchors[b] : mask;
+            expected_ids[b * width + j]       = j == 0 ? anchors[b] : mask;
             expected_positions[b * width + j] = lengths[b] + std::min(j, valid[b] - 1);
         }
-    int failures = verify_exact("DFlash2 masked ids", from_device<std::int32_t>(ids.data(), expected_ids.size()), expected_ids);
-    failures += verify_exact("DFlash2 masked positions", from_device<std::int32_t>(positions.data(), expected_positions.size()), expected_positions);
-    failures += verify_exact("anchors unchanged", from_device<std::int32_t>(device_anchors, batch), anchors);
-    failures += verify_exact("lengths unchanged", from_device<std::int32_t>(device_lengths, batch), lengths);
-    failures += verify_exact("valid unchanged", from_device<std::int32_t>(device_valid, batch), valid);
+    int failures =
+        verify_exact("DFlash2 masked ids",
+                     from_device<std::int32_t>(ids.data(), expected_ids.size()), expected_ids);
+    failures += verify_exact("DFlash2 masked positions",
+                             from_device<std::int32_t>(positions.data(), expected_positions.size()),
+                             expected_positions);
+    failures += verify_exact("anchors unchanged", from_device<std::int32_t>(device_anchors, batch),
+                             anchors);
+    failures += verify_exact("lengths unchanged", from_device<std::int32_t>(device_lengths, batch),
+                             lengths);
+    failures +=
+        verify_exact("valid unchanged", from_device<std::int32_t>(device_valid, batch), valid);
     failures += ids.verify_guards("masked ids");
     failures += positions.verify_guards("masked positions");
     return failures;

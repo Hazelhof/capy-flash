@@ -81,7 +81,8 @@ int main() {
         // A16 at every positive T. Every band at both ends: decode (1), SIMT (2), the sliced-K
         // capacities 4 (3..4; T=3 stages one masked column), 8 (5..8), 16 (9..16) and 32
         // (17..32), then the token-tiled MMA route (33+, 129 a partial tile).
-        constexpr std::array<std::int32_t, 14> kA16Cases{1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 32, 33, 64, 129};
+        constexpr std::array<std::int32_t, 14> kA16Cases{1,  2,  3,  4,  5,  8,  9,
+                                                         16, 17, 24, 32, 33, 64, 129};
         // Exercise both sides of the native MMA/TMA boundary, including the partial TMA tile.
         constexpr std::array<std::int32_t, 17> kA4Cases{2,   4,   5,   16,  56,  64,  65,  96,  97,
                                                         112, 128, 129, 255, 256, 257, 512, 1024};

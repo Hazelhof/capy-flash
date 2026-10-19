@@ -17,12 +17,16 @@ constexpr std::array kFormats = {
     std::pair{QType::Q8_G32_FP16, std::string_view{"q8_g32_fp16"}},
     std::pair{QType::NVFP4, std::string_view{"nvfp4"}},
     std::pair{QType::FP8_E4M3FN_ROW_BF16, std::string_view{"fp8_e4m3fn_row_bf16"}},
+    std::pair{QType::MXFP8_E4M3FN_G32_UE8M0, std::string_view{"mxfp8_e4m3fn_g32_ue8m0"}},
+    std::pair{QType::NVFP4_ROW_E4M3_G16, std::string_view{"nvfp4_row_e4m3_g16"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},
     std::pair{QuantLayout::RowSplit, std::string_view{"row_split_k128_v1"}},
     std::pair{QuantLayout::RowScale, std::string_view{"row_scale_v1"}},
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
+    std::pair{QuantLayout::BlockScaleK32, std::string_view{"block_scale_k32_v1"}},
+    std::pair{QuantLayout::RowInterleaved, std::string_view{"row_interleaved_v1"}},
 };
 
 } // namespace

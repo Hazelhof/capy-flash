@@ -37,8 +37,8 @@ namespace {
 using namespace ninfer;
 using namespace ninfer::test;
 
-constexpr std::int32_t kRows      = 5120;
-constexpr std::int32_t kMaxTokens = 1025;
+constexpr std::int32_t kRows       = 5120;
+constexpr std::int32_t kMaxTokens  = 1025;
 constexpr double kBf16UnitRoundoff = 1.0 / 256.0;
 // The cancelled rows carry tiny values; the uncancelled ones keep the tensor norm meaningful.
 constexpr ReductionCriterion kA4Tolerance{0.16, kBf16UnitRoundoff, 0.16};
@@ -59,8 +59,8 @@ std::uint32_t mix(std::uint32_t value) {
 std::vector<std::int32_t> widths(std::int32_t first) {
     std::vector<std::int32_t> result;
     for (std::int32_t t = first; t <= 48; ++t) result.push_back(t);
-    for (std::int32_t t : {49, 63, 64, 65, 96, 127, 128, 129, 191, 192, 193, 255, 256, 257, 383,
-                           384, 385, 511, 512, 513, 767, 768, 769, 1023, 1024, 1025}) {
+    for (std::int32_t t : {49,  63,  64,  65,  96,  127, 128, 129, 191, 192, 193,  255,  256,
+                           257, 383, 384, 385, 511, 512, 513, 767, 768, 769, 1023, 1024, 1025}) {
         result.push_back(t);
     }
     return result;
@@ -101,12 +101,12 @@ void broadcast_columns(Problem& problem, const std::vector<std::uint16_t>& colum
 // global weight divisor 0.13 that makes alpha inexact.
 Problem make_nvfp4(std::int32_t k, std::uint32_t seed) {
     Problem problem;
-    problem.name   = "NVFP4 A4 [" + std::to_string(kRows) + "," + std::to_string(k) + "]";
-    problem.qtype  = QType::NVFP4;
-    problem.policy = ops::LinearPolicy::AllowA4;
-    problem.k      = k;
-    problem.first  = k == 6144 || k == 3072 ? ops::detail::kNvfp4OutputFamilyFirstA4Tokens
-                                            : ops::detail::kNvfp4DownFamilyFirstA4Tokens;
+    problem.name      = "NVFP4 A4 [" + std::to_string(kRows) + "," + std::to_string(k) + "]";
+    problem.qtype     = QType::NVFP4;
+    problem.policy    = ops::LinearPolicy::AllowA4;
+    problem.k         = k;
+    problem.first     = k == 6144 || k == 3072 ? ops::detail::kNvfp4OutputFamilyFirstA4Tokens
+                                               : ops::detail::kNvfp4DownFamilyFirstA4Tokens;
     problem.tolerance = kA4Tolerance;
     quantized_weight::PatternedWeightOptions options;
     options.weight_scale_divisor = 0.13F;
@@ -117,11 +117,11 @@ Problem make_nvfp4(std::int32_t k, std::uint32_t seed) {
     std::fill_n(packed.payload.begin() + static_cast<std::ptrdiff_t>(packed.scale_plane_offset),
                 packed.scale_plane_bytes, 0);
     for (std::int32_t row = 0; row < kRows; ++row) {
-        const std::uint32_t h = mix(static_cast<std::uint32_t>(row) ^ seed);
-        const std::size_t codes = static_cast<std::size_t>(row) * k / 2;
+        const std::uint32_t h     = mix(static_cast<std::uint32_t>(row) ^ seed);
+        const std::size_t codes   = static_cast<std::size_t>(row) * k / 2;
         packed.payload[codes]     = static_cast<std::uint8_t>(1 + h % 7);        // column 0
         packed.payload[codes + 8] = static_cast<std::uint8_t>(1 + (h >> 3) % 7); // column 16
-        const std::size_t scales = packed.scale_plane_offset +
+        const std::size_t scales  = packed.scale_plane_offset +
                                    static_cast<std::size_t>(row / 128) * (k / 64) * 512 +
                                    static_cast<std::size_t>(row % 32) * 16 +
                                    static_cast<std::size_t>((row % 128) / 32) * 4;
@@ -147,31 +147,31 @@ Problem make_nvfp4(std::int32_t k, std::uint32_t seed) {
 // activation scale, the row scale and the residual all enter the epilogue.
 Problem make_fp8(std::int32_t k, std::uint32_t seed) {
     Problem problem;
-    problem.name   = "FP8 A8 [" + std::to_string(kRows) + "," + std::to_string(k) + "]";
-    problem.qtype  = QType::FP8_E4M3FN_ROW_BF16;
-    problem.policy = ops::LinearPolicy::AllowA8;
-    problem.k      = k;
-    problem.first  = k == 6144 || k == 3072 ? ops::detail::kFp8OutputFamilyFirstA8Tokens
-                                            : ops::detail::kFp8DownFamilyFirstA8Tokens;
+    problem.name      = "FP8 A8 [" + std::to_string(kRows) + "," + std::to_string(k) + "]";
+    problem.qtype     = QType::FP8_E4M3FN_ROW_BF16;
+    problem.policy    = ops::LinearPolicy::AllowA8;
+    problem.k         = k;
+    problem.first     = k == 6144 || k == 3072 ? ops::detail::kFp8OutputFamilyFirstA8Tokens
+                                               : ops::detail::kFp8DownFamilyFirstA8Tokens;
     problem.tolerance = kA8Tolerance;
     problem.weight =
         quantized_weight::make_patterned_weight(QType::FP8_E4M3FN_ROW_BF16, kRows, k, seed);
     auto& packed = problem.weight;
     std::fill_n(packed.payload.begin(), packed.code_plane_bytes, 0);
     for (std::int32_t row = 0; row < kRows; ++row) {
-        const std::uint32_t h   = mix(static_cast<std::uint32_t>(row) ^ seed);
-        const std::size_t codes = static_cast<std::size_t>(row) * k;
+        const std::uint32_t h     = mix(static_cast<std::uint32_t>(row) ^ seed);
+        const std::size_t codes   = static_cast<std::size_t>(row) * k;
         packed.payload[codes]     = static_cast<std::uint8_t>(0x30 + h % 16);
         packed.payload[codes + 1] = static_cast<std::uint8_t>(0x30 + (h >> 4) % 24);
-        const float scale = std::ldexp(1.0F + static_cast<float>((h >> 9) % 128) / 128.0F,
-                                       -6 - static_cast<int>((h >> 16) % 4));
+        const float scale         = std::ldexp(1.0F + static_cast<float>((h >> 9) % 128) / 128.0F,
+                                               -6 - static_cast<int>((h >> 16) % 4));
         quantized_weight::detail::store_u16_le(
             packed.payload, packed.scale_plane_offset + static_cast<std::size_t>(row) * 2,
             f32_to_bf16(scale));
     }
     std::vector<std::uint16_t> column(k, 0);
-    column[0] = f32_to_bf16(1.0F);
-    column[1] = f32_to_bf16(0.30078125F);
+    column[0]                = f32_to_bf16(1.0F);
+    column[1]                = f32_to_bf16(0.30078125F);
     const double token_scale = static_cast<double>(1.0F / 448.0F);
     std::vector<std::uint16_t> residual(kRows);
     problem.oracle.resize(kRows);
@@ -229,8 +229,8 @@ int run(Problem& problem) {
             const std::size_t row = first % kRows, token = first / kRows;
             std::cerr << label << ": " << differing << " of " << words
                       << " values differ from the T=" << tested.front() << " columns (first: row "
-                      << row << " token " << token << " " << hex(actual[first]) << ", T="
-                      << tested.front() << " gave " << hex(reference[row]) << ")\n";
+                      << row << " token " << token << " " << hex(actual[first])
+                      << ", T=" << tested.front() << " gave " << hex(reference[row]) << ")\n";
             ++changed;
             ++failures;
         }

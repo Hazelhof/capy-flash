@@ -6,7 +6,10 @@ the n-gram PLE embedding and the expert banks are mapped here.
 
 Routed expert sources are resolved per expert. A checkpoint that stores fused BF16
 ``experts.gate_up_proj``/``down_proj`` banks exposes them as row ranges; a ModelOpt NVFP4
-checkpoint exposes one encoded matrix per expert and role; a block-FP8 MTP bank is read as values.
+checkpoint exposes one encoded matrix per expert and role (its block scales possibly CSF-compressed);
+a block-FP8 MTP bank is read as values. The n-gram table is BF16, row-FP8 shards under one multiplier,
+or (FP4-Local) row-NVFP4 shards under one ``weight_scale_2``, which then also becomes the one-element
+FP32 parameter ``ple/table_global_scale``.
 """
 
 from __future__ import annotations
@@ -25,7 +28,13 @@ from .qwen3_5 import (
 )
 from .resources import load_resources
 from .sources.logical import LogicalSource
-from .sources.modelopt import fp8_block_source, fp8_tensor_rows_source, nvfp4_source
+from .sources.modelopt import (
+    fp8_block_source,
+    fp8_tensor_rows_source,
+    nvfp4_row_global_scale,
+    nvfp4_row_table_source,
+    nvfp4_source,
+)
 from .sources.safetensors import SafetensorsSource, tensor_source
 
 ARCHITECTURES = ("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
@@ -57,9 +66,7 @@ def text_config(source: dict, *, mtp: bool) -> dict:
         raise ValueError(f"unsupported Qwen4Exp architecture {architectures!r}")
     raw = source.get("text_config", source)
     # The shared fields follow the Qwen3.5 MoE normalization; its architecture guard is bypassed.
-    shared = qwen3_5_text_config(
-        {"architectures": ["Qwen3_5MoeForCausalLM"], "text_config": raw}, mtp=mtp
-    )
+    shared = qwen3_5_text_config({"architectures": ["Qwen3_5MoeForCausalLM"], "text_config": raw}, mtp=mtp)
     shared["architectures"] = ["Qwen4ExpForCausalLM"]
     shared["model_type"] = "qwen4_exp_text"
     _fixed(raw, "norm_topk_prob", True, "text")
@@ -301,10 +308,16 @@ class _Qwen4Builder(_Builder):
             (rows, width // heads),
             lambda: _table_source(store, table, rows, width // heads),
         )
+        if _row_nvfp4_table(store, table):
+            # Row-NVFP4 tables share one FP32 multiplier G; the engine reads it beside the table.
+            self.value_source(
+                p + "table_global_scale",
+                (1,),
+                lambda: nvfp4_row_global_scale(store, table + ".weight_scale_2"),
+                direct="fp32",
+            )
         self.add(p + "key", store, sp + "key_proj.weight", (wide, width), inputs=(p + "embedding",))
-        self.add(
-            p + "value", store, sp + "value_proj.weight", (h, width), inputs=(p + "embedding",)
-        )
+        self.add(p + "value", store, sp + "value_proj.weight", (h, width), inputs=(p + "embedding",))
         self.group(p + "key", p + "value")
         for role, field in (
             ("key_norm", "norm_key"),
@@ -323,12 +336,8 @@ class _Qwen4Builder(_Builder):
         )
 
     def block(self, prefix, source_prefix, store, config, mixer, *, ple=False):
-        self.hyper_connection(
-            prefix + "attn_hc/", source_prefix + "attn_hyper_connection.", store, config
-        )
-        self.hyper_connection(
-            prefix + "ffn_hc/", source_prefix + "mlp_hyper_connection.", store, config
-        )
+        self.hyper_connection(prefix + "attn_hc/", source_prefix + "attn_hyper_connection.", store, config)
+        self.hyper_connection(prefix + "ffn_hc/", source_prefix + "mlp_hyper_connection.", store, config)
         if mixer == "full_attention":
             self.attention(prefix, source_prefix, store, config)
             self.indexer(prefix, source_prefix, store, config)
@@ -347,6 +356,11 @@ def _expert_source(store: SafetensorsSource, leaf: str, shape) -> LogicalSource:
     return tensor_source(store, leaf + ".weight", shape)
 
 
+def _row_nvfp4_table(store: SafetensorsSource, prefix: str) -> bool:
+    """A sharded n-gram table with per-shard E4M3 row-block scales and one ``weight_scale_2`` (FP4-Local)."""
+    return store.has(prefix + ".weight_scale_2") and store.has(prefix + ".shard_0.weight_scale")
+
+
 def _table_source(store: SafetensorsSource, prefix: str, rows: int, width: int) -> LogicalSource:
     shards = []
     while store.has(f"{prefix}.shard_{len(shards)}.weight"):
@@ -355,6 +369,9 @@ def _table_source(store: SafetensorsSource, prefix: str, rows: int, width: int) 
         return tensor_source(store, prefix + ".weight", (rows, width))
     if store.has(prefix + ".weight_scale"):
         return fp8_tensor_rows_source(store, shards, prefix + ".weight_scale", (rows, width))
+    if _row_nvfp4_table(store, prefix):
+        names = [name.removesuffix(".weight") for name in shards]
+        return nvfp4_row_table_source(store, names, prefix + ".weight_scale_2", (rows, width))
     parts = [tensor_source(store, name, tuple(store.describe(name).shape)) for name in shards]
     counts = [part.shape[0] for part in parts]
     if sum(counts) != rows:
@@ -405,9 +422,7 @@ def build_model(
     builder.add("text/token_embedding", base, text_prefix + "embed_tokens.weight", (r, h))
     head_inputs = ("text/final_hidden",) + (("mtp/final_hidden",) if "mtp" in selected else ())
     builder.add("text/output_head", base, "lm_head.weight", (r, h), inputs=head_inputs)
-    builder.hyper_connection(
-        "text/hc_head/", text_prefix + "hyper_connection_mixer.", base, config, inject=False
-    )
+    builder.hyper_connection("text/hc_head/", text_prefix + "hyper_connection_mixer.", base, config, inject=False)
     ple_block = config["ple_layer_ids"][0] - 1
     for i, kind in enumerate(config["layer_types"]):
         builder.block(
@@ -439,9 +454,7 @@ def build_model(
             (h, h),
             inputs=("mtp/hidden_input",),
         )
-        builder.hyper_connection(
-            "mtp/hc_head/", "mtp.hyper_connection_mixer.", base, config, inject=False
-        )
+        builder.hyper_connection("mtp/hc_head/", "mtp.hyper_connection_mixer.", base, config, inject=False)
         builder.block("mtp/layers/0/", "mtp.layers.0.", base, config, "full_attention")
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)

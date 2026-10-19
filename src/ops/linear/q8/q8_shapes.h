@@ -70,4 +70,9 @@ using Q8N124160K5120 = Q8LinearGeometry<124160, 5120>;
 [[nodiscard]] Q8Launch select_q8_qwen4_n640_k2560(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_qwen4_n96_k2560(std::int32_t tokens);
 
+// Qwen4Exp decode rows on the register-resident warp-row pipeline (shapes/qwen4_warp_row.cpp).
+[[nodiscard]] Q8Launch select_q8_qwen4_rows_k2560(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_qwen4_n2560_k640(std::int32_t tokens);
+[[nodiscard]] Q8Launch select_q8_qwen4_n48_k2560(std::int32_t tokens);
+
 } // namespace ninfer::ops::detail

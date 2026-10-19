@@ -22,10 +22,12 @@ on two 16 GB Blackwell GeForce boards. Source and documentation: https://github.
   `libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libcurl4`). On another distribution
   build from source or use the Dockerfile.
 - An NVIDIA driver that supports CUDA 13.1 (R580 or newer). No CUDA toolkit is needed.
-- Two `sm_120` boards with 16 GB for `--tp 2` (validated on 2x RTX 5070 Ti without P2P).
-- **Qwen3.8-Flash-Next** also needs a CPU with AVX-512 (F/BW/VL, VNNI) and about **70 GiB of free RAM**: the routed
-  experts that stay on the host are one 64.6 GiB page-locked allocation, and the server refuses to start without room
-  for it (`NINFER_RAM_GUARD=0` skips the check).
+- Two `sm_120` boards with 16 GB for `--tp 2` (validated on 2x RTX 5070 Ti without P2P; with P2P, for example through
+  a PCIe switch, the prefill exchanges use the direct copy automatically).
+- **Qwen3.8-Flash-Next** also needs a CPU with AVX-512 (F/BW/VL, VNNI) and about **75 GiB of free RAM**: the routed
+  experts that stay on the host are one 64.6 GiB page-locked allocation, `--profile flash-next` keeps the token
+  embedding and up to 4 GiB of idle conversations' KV in RAM as well, and the server refuses to start without room for
+  the experts (`NINFER_RAM_GUARD=0` skips the check). In practice a 96 GB machine.
 
 ## Run
 
@@ -33,6 +35,7 @@ on two 16 GB Blackwell GeForce boards. Source and documentation: https://github.
 tar -xzf capy-flash-*.tar.gz && cd capy-flash-*/
 sha256sum -c SHA256SUMS
 ./serve-flash-next.sh /path/to/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer          # Qwen3.8-Flash-Next
+./serve-flash-next.sh /path/to/vision-artifact.ninfer --vision                    # Flash-Next with images (opt-in)
 ./serve-tp2.sh /path/to/qwen3_8_27b_quasar_nvfp4.ninfer                           # Qwen3.8-27B
 NINFER_PORT=8099 ./serve-flash-next.sh /path/to/model.ninfer --api-key secret      # extra flags are appended
 ```

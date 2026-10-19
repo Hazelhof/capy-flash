@@ -58,15 +58,24 @@ Options parse(int argc, char** argv) {
         }
         if (++i >= argc) throw std::invalid_argument("missing option value");
         const std::string value = argv[i];
-        if (arg == "--form") o.form = value;
-        else if (arg == "--tokens") o.tokens = list(value);
-        else if (arg == "--cache") o.cache = value;
-        else if (arg == "--format") o.format = value;
-        else if (arg == "--warmup") o.warmup = std::stoi(value);
-        else if (arg == "--repeat") o.repeat = std::stoi(value);
-        else if (arg == "--chain") o.chain = std::stoi(value);
-        else if (arg == "--csv-out") o.csv = value;
-        else throw std::invalid_argument("unknown option: " + arg);
+        if (arg == "--form")
+            o.form = value;
+        else if (arg == "--tokens")
+            o.tokens = list(value);
+        else if (arg == "--cache")
+            o.cache = value;
+        else if (arg == "--format")
+            o.format = value;
+        else if (arg == "--warmup")
+            o.warmup = std::stoi(value);
+        else if (arg == "--repeat")
+            o.repeat = std::stoi(value);
+        else if (arg == "--chain")
+            o.chain = std::stoi(value);
+        else if (arg == "--csv-out")
+            o.csv = value;
+        else
+            throw std::invalid_argument("unknown option: " + arg);
     }
     if ((o.form != "mix" && o.form != "combine_mix" && o.form != "head") ||
         (o.cache != "cold" && o.cache != "warm") || (o.format != "q8" && o.format != "nvfp4"))
@@ -111,8 +120,8 @@ int main(int argc, char** argv) {
             norms.push_back(bench::make_bf16(kWide, 0x73U + 16 * c, -0.1F, 0.1F));
         }
         for (int c = 0; c < o.chain; ++c)
-            weights.push_back({Tensor(norms[c].p, DType::BF16, {kWide}), downs[c].weight,
-                               ups[c].weight});
+            weights.push_back(
+                {Tensor(norms[c].p, DType::BF16, {kWide}), downs[c].weight, ups[c].weight});
         // Bytes the small-T route reads per call: Down rows (codes + scales), the touched K of Up
         // (Q8: 320 of 384 codes, whole 24-byte scale rows), the norm.
         const double weight_bytes = fp4 ? double(rows) * (kWide / 2 + kWide / 16) +
@@ -126,7 +135,7 @@ int main(int argc, char** argv) {
         }
         for (const int t : o.tokens) {
             DeviceBuffer residual = bench::make_bf16(std::size_t(kWide) * t, 0x74U, -0.75F, 0.75F);
-            DeviceBuffer y        = bench::make_bf16(std::size_t(kHidden) * t, 0x75U, -0.01F, 0.01F);
+            DeviceBuffer y = bench::make_bf16(std::size_t(kHidden) * t, 0x75U, -0.01F, 0.01F);
             DeviceBuffer previous = bench::make_f32(std::size_t(kStreams) * t, 0x76U, 0.0F, 0.0F);
             DeviceBuffer mixed(std::size_t(kHidden) * t * 2), gates(std::size_t(kStreams) * t * 4);
             Tensor tr(residual.p, DType::BF16, {kWide, t});
@@ -140,8 +149,8 @@ int main(int argc, char** argv) {
                 for (const auto& w : weights) {
                     if (o.separate) separator_kernel<<<1, 32, 0, stream>>>();
                     if (o.form == "combine_mix")
-                        ops::hyper_connection_combine_mix(tr, ty, tp, w, 1e-6F, tm, &ti,
-                                                          workspace, stream);
+                        ops::hyper_connection_combine_mix(tr, ty, tp, w, 1e-6F, tm, &ti, workspace,
+                                                          stream);
                     else
                         ops::hyper_connection_mix(tr, w, 1e-6F, tm, inject ? &ti : nullptr,
                                                   workspace, stream);

@@ -73,10 +73,25 @@ int main() {
     if (const char* env = std::getenv("NINFER_TEST_PORT"); env != nullptr && *env != '\0') {
         port = env;
     }
-    std::vector<std::string> args = {
-        "ninfer-serve", artifact, "--host", "127.0.0.1", "--port", port, "--tp", "2",
-        "--devices", "0,1", "--max-context", "2048", "--kv-capacity", "2048",
-        "--max-concurrency", "1", "--log-stats-interval-ms", "0", "--greedy"};
+    std::vector<std::string> args = {"ninfer-serve",
+                                     artifact,
+                                     "--host",
+                                     "127.0.0.1",
+                                     "--port",
+                                     port,
+                                     "--tp",
+                                     "2",
+                                     "--devices",
+                                     "0,1",
+                                     "--max-context",
+                                     "2048",
+                                     "--kv-capacity",
+                                     "2048",
+                                     "--max-concurrency",
+                                     "1",
+                                     "--log-stats-interval-ms",
+                                     "0",
+                                     "--greedy"};
     std::vector<char*> argv;
     for (std::string& arg : args) { argv.push_back(arg.data()); }
     ninfer::serve::ServeOptions options =
@@ -99,9 +114,7 @@ int main() {
         server.attach(service);
 
         std::atomic<bool> listened{false};
-        std::thread listener([&] {
-            listened.store(server.listen());
-        });
+        std::thread listener([&] { listened.store(server.listen()); });
         // Safety net: a watch that never fires would otherwise hang the test forever.
         std::atomic<bool> timed_out{false};
         std::atomic<bool> done{false};
@@ -135,7 +148,7 @@ int main() {
         const Json body = {{"model", server.public_model_id()},
                            {"messages", Json::array({{{"role", "user"}, {"content", "Say hi."}}})},
                            {"max_tokens", 16}};
-        auto res = client.Post("/v1/chat/completions", body.dump(), "application/json");
+        auto res        = client.Post("/v1/chat/completions", body.dump(), "application/json");
         // The request is failed by the Engine (5xx), or the connection is torn down by the stop:
         // either way it must not have produced a normal completion.
         failures += check(!res || res->status >= 500,

@@ -212,8 +212,8 @@ int main() {
     failures += check(disabled_cache_capacity_rejected,
                       "root-only server mode accepted context-cache capacity options");
 
-    const ServeOptions auto_headroom =
-        parse({"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "2048"});
+    const ServeOptions auto_headroom = parse(
+        {"ninfer-serve", "model.ninfer", "--kv-capacity", "auto", "--vram-headroom-mib", "2048"});
     failures += check(auto_headroom.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
                           auto_headroom.kv_capacity.automatic_headroom_bytes == (2048ULL << 20),
                       "automatic KV capacity must accept --vram-headroom-mib");
@@ -221,7 +221,8 @@ int main() {
     try {
         (void)parse({"ninfer-serve", "model.ninfer", "--vram-headroom-mib", "2048"});
     } catch (const std::invalid_argument&) { headroom_rejected = true; }
-    failures += check(headroom_rejected, "--vram-headroom-mib without --kv-capacity auto was accepted");
+    failures +=
+        check(headroom_rejected, "--vram-headroom-mib without --kv-capacity auto was accepted");
     const ServeOptions response_store =
         parse({"ninfer-serve", "model.ninfer", "--response-store-max-records", "42",
                "--response-store-max-mib", "8"});
@@ -310,12 +311,11 @@ int main() {
                           ninfer::ReasoningEffort::XHigh,
                       "nested reasoning_effort alias did not fold onto the template's xhigh tier");
     request.chat_template_kwargs_json.clear();
-    failures += check(parse_requested_reasoning_effort("adaptive") ==
-                              RequestedReasoningEffort::Adaptive &&
-                          requested_reasoning_effort_name(RequestedReasoningEffort::Adaptive) ==
-                              "adaptive" &&
-                          !parse_requested_reasoning_effort("ultra"),
-                      "adaptive is not a wire effort value, or an unknown effort was accepted");
+    failures += check(
+        parse_requested_reasoning_effort("adaptive") == RequestedReasoningEffort::Adaptive &&
+            requested_reasoning_effort_name(RequestedReasoningEffort::Adaptive) == "adaptive" &&
+            !parse_requested_reasoning_effort("ultra"),
+        "adaptive is not a wire effort value, or an unknown effort was accepted");
     failures += check(resolve_prompt_semantics(request, configured).preserve_thinking == true,
                       "server preserve-thinking default was not resolved");
     request.preserve_thinking = false;
@@ -325,16 +325,18 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("--no-prefix-reuse") != std::string::npos,
               "serve help omits --no-prefix-reuse");
-    failures += check(!defaults.turn_anchors.has_value(), "turn anchors are not left to the model by default");
+    failures += check(!defaults.turn_anchors.has_value(),
+                      "turn anchors are not left to the model by default");
     failures += check(resolve_turn_anchors(std::nullopt, "Qwen4ExpForCausalLM") == 0 &&
                           resolve_turn_anchors(std::nullopt, "Qwen3_5ForCausalLM") == 1 &&
                           resolve_turn_anchors(std::nullopt, "Qwen3_5MoeForCausalLM") == 1 &&
                           resolve_turn_anchors(2U, "Qwen4ExpForCausalLM") == 2 &&
                           resolve_turn_anchors(0U, "Qwen3_5ForCausalLM") == 0,
                       "turn anchors model default (Qwen4Exp 0 T152, others 1 T161) not resolved");
-    failures += check(parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "0"}).turn_anchors == 0 &&
-                          parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "3"}).turn_anchors == 3,
-                      "--turn-anchors did not reach serving options");
+    failures +=
+        check(parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "0"}).turn_anchors == 0 &&
+                  parse({"ninfer-serve", "model.ninfer", "--turn-anchors", "3"}).turn_anchors == 3,
+              "--turn-anchors did not reach serving options");
     failures += check(serve_usage_text("ninfer-serve").find("--turn-anchors") != std::string::npos,
                       "serve help omits --turn-anchors");
     // T66c: Qwen4Exp product options.
@@ -343,13 +345,15 @@ int main() {
     {
         const auto e = parse({"ninfer-serve", "model.ninfer", "--elastic", "--kv-grow", "4096",
                               "--kv-budget-gib", "2.5", "--miss-split", "auto"});
-        failures += check(e.elastic_kv.enabled && e.elastic_kv.grow_tokens == 4096 &&
-                              e.elastic_kv.kv_budget_bytes == static_cast<std::size_t>(2.5 * 1073741824.0) &&
-                              e.miss_split == ninfer::MissSplitMode::Auto,
-                          "--elastic/--kv-grow/--kv-budget-gib/--miss-split did not reach serving options");
-        failures += check(parse({"ninfer-serve", "model.ninfer", "--miss-split", "off"}).miss_split ==
-                              ninfer::MissSplitMode::Off,
-                          "--miss-split off did not reach serving options");
+        failures += check(
+            e.elastic_kv.enabled && e.elastic_kv.grow_tokens == 4096 &&
+                e.elastic_kv.kv_budget_bytes == static_cast<std::size_t>(2.5 * 1073741824.0) &&
+                e.miss_split == ninfer::MissSplitMode::Auto,
+            "--elastic/--kv-grow/--kv-budget-gib/--miss-split did not reach serving options");
+        failures +=
+            check(parse({"ninfer-serve", "model.ninfer", "--miss-split", "off"}).miss_split ==
+                      ninfer::MissSplitMode::Off,
+                  "--miss-split off did not reach serving options");
         int rejected = 0;
         for (const auto& bad : {std::vector<std::string>{"--miss-split", "0.3"},
                                 std::vector<std::string>{"--kv-grow", "0"},
@@ -362,9 +366,27 @@ int main() {
             } catch (const std::invalid_argument&) { ++rejected; }
         }
         failures += check(rejected == 4, "invalid Qwen4Exp product options were accepted");
-        failures += check(serve_usage_text("ninfer-serve").find("--elastic") != std::string::npos &&
-                              serve_usage_text("ninfer-serve").find("--miss-split") != std::string::npos,
-                          "serve help omits the Qwen4Exp product options");
+        failures += check(
+            serve_usage_text("ninfer-serve").find("--elastic") != std::string::npos &&
+                serve_usage_text("ninfer-serve").find("--miss-split") != std::string::npos &&
+                serve_usage_text("ninfer-serve").find("--stream-min-tokens") != std::string::npos,
+            "serve help omits the Qwen4Exp product options");
+    }
+    // T211: prompt streaming threshold.
+    failures += check(!defaults.stream_min_tokens.has_value(),
+                      "--stream-min-tokens set by default (the engine default applies)");
+    failures += check(
+        parse({"ninfer-serve", "model.ninfer", "--stream-min-tokens", "256"}).stream_min_tokens ==
+                256U &&
+            parse({"ninfer-serve", "model.ninfer", "--stream-min-tokens", "0"}).stream_min_tokens ==
+                0U,
+        "--stream-min-tokens did not reach serving options");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"ninfer-serve", "model.ninfer", "--stream-min-tokens", "-1"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--stream-min-tokens -1 was accepted");
     }
     failures += check(serve_usage_text("ninfer-serve").find("--host-kv-mib") != std::string::npos,
                       "serve help omits context-cache capacities");
@@ -495,8 +517,12 @@ int main() {
     const ServeOptions profile_flash =
         parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next"});
     failures += check(profile_flash.context_cache.host_state_slots == 0 &&
-                          profile_flash.context_cache.host_kv_capacity_bytes == 0,
-                      "--profile flash-next turned the Host tier on");
+                          profile_flash.context_cache.host_kv_capacity_bytes == 4096ULL << 20U,
+                      "--profile flash-next does not set 4 GiB of Host KV (and no Host states)");
+    failures += check(profile_flash.embedding_host,
+                      "--profile flash-next does not keep the token embedding in host memory (T200)");
+    failures += check(profile_27b.prefill_chunk == 2048,
+                      "--profile 27b does not use 2048-token prefill chunks (T205b, T205c)");
     failures += check(
         rejects({"ninfer-serve", "model.ninfer", "--device", "1", "--tp", "2", "--devices", "0,1"}),
         "--device disagreeing with the rank 0 device was accepted");
@@ -509,16 +535,16 @@ int main() {
                                                   "--devices", "0,1", "--no-tp-mailbox"})
                                                .tp_mailbox,
                       "--no-tp-mailbox did not disable the captured mailbox transport");
-    failures += check(!defaults.embedding_host && !split.embedding_host &&
-                          parse({"ninfer-serve", "model.ninfer", "--embedding-host"})
-                              .embedding_host &&
-                          parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
-                                 "--embedding-host"})
-                              .embedding_host,
-                      "--embedding-host was not parsed or is on by default");
-    failures += check(serve_usage_text("ninfer-serve").find("--embedding-host") !=
-                          std::string::npos,
-                      "serve help omits --embedding-host");
+    failures +=
+        check(!defaults.embedding_host && !split.embedding_host &&
+                  parse({"ninfer-serve", "model.ninfer", "--embedding-host"}).embedding_host &&
+                  parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1",
+                         "--embedding-host"})
+                      .embedding_host,
+              "--embedding-host was not parsed or is on by default");
+    failures +=
+        check(serve_usage_text("ninfer-serve").find("--embedding-host") != std::string::npos,
+              "serve help omits --embedding-host");
     const ServeOptions vision =
         parse({"ninfer-serve", "model.ninfer", "--tp", "2", "--devices", "0,1", "--vision",
                "--vision-device", "1", "--max-vision-tokens", "4096"});

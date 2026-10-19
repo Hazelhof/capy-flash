@@ -1,6 +1,7 @@
-// Translation-unit fragment of src/models/qwen3_5/program/speculative/target_verification.cpp, included once at its end (after its
-// closing namespace), so the two-device code below shares that file's private helpers without
-// copying them. Not a header. Our file; see docs/maintainer/upstream-merge.md.
+// Translation-unit fragment of src/models/qwen3_5/program/speculative/target_verification.cpp,
+// included once at its end (after its closing namespace), so the two-device code below shares that
+// file's private helpers without copying them. Not a header. Our file; see
+// docs/maintainer/upstream-merge.md.
 //
 // Two-device (tp 2) overload of target_verify_accept() (declared in program/context.h).
 
@@ -15,16 +16,17 @@ namespace ninfer::models::qwen3_5::execution {
 namespace {
 // T123: process-wide probe state; staging allocated once at Program setup (never inside a capture).
 struct TpRankProbe {
-    std::FILE* log             = nullptr;
-    void* host[2]              = {nullptr, nullptr};
-    std::size_t capacity       = 0;
-    std::size_t bytes          = 0;
-    std::size_t column_bytes   = 0;
-    std::int32_t width         = 0;
-    long long rounds           = 0;
-    long long mismatches       = 0;
-    bool oversize_reported     = false;
+    std::FILE* log           = nullptr;
+    void* host[2]            = {nullptr, nullptr};
+    std::size_t capacity     = 0;
+    std::size_t bytes        = 0;
+    std::size_t column_bytes = 0;
+    std::int32_t width       = 0;
+    long long rounds         = 0;
+    long long mismatches     = 0;
+    bool oversize_reported   = false;
 };
+
 TpRankProbe& tp_rank_probe() {
     static TpRankProbe probe = [] {
         TpRankProbe p;
@@ -33,9 +35,14 @@ TpRankProbe& tp_rank_probe() {
         p.log      = std::fopen(path, "a");
         p.capacity = std::size_t{32} << 20;
         for (void*& h : p.host) {
-            if (cudaHostAlloc(&h, p.capacity, cudaHostAllocPortable) != cudaSuccess) { p.log = nullptr; }
+            if (cudaHostAlloc(&h, p.capacity, cudaHostAllocPortable) != cudaSuccess) {
+                p.log = nullptr;
+            }
         }
-        if (p.log != nullptr) { std::fprintf(p.log, "probe start capacity %zu\n", p.capacity); std::fflush(p.log); }
+        if (p.log != nullptr) {
+            std::fprintf(p.log, "probe start capacity %zu\n", p.capacity);
+            std::fflush(p.log);
+        }
         return p;
     }();
     return probe;
@@ -57,10 +64,15 @@ void tp_rank_probe_check(std::uint32_t frontier, std::int32_t row, std::int32_t 
         if (std::memcmp(a, b, p.column_bytes) == 0) { continue; }
         std::size_t diff = 0, first = p.column_bytes;
         for (std::size_t k = 0; k < p.column_bytes; ++k) {
-            if (a[k] != b[k]) { ++diff; if (first == p.column_bytes) { first = k; } }
+            if (a[k] != b[k]) {
+                ++diff;
+                if (first == p.column_bytes) { first = k; }
+            }
         }
         ++p.mismatches;
-        std::fprintf(p.log, "MISMATCH round %lld frontier %u row %d col %d/%d valid %d bytes_diff %zu first_byte %zu tokens",
+        std::fprintf(p.log,
+                     "MISMATCH round %lld frontier %u row %d col %d/%d valid %d bytes_diff %zu "
+                     "first_byte %zu tokens",
                      p.rounds, frontier, row, j, p.width, count, diff, first);
         for (std::int32_t t = 0; t < count; ++t) { std::fprintf(p.log, " %d", tokens[t]); }
         std::fputc('\n', p.log);
@@ -110,9 +122,9 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     card.set_peer_feature_sink(nullptr);
     if (frame.forced_targets.data != nullptr) {
         // T59 replay: the reference continuation stands in for the computed argmax.
-        CUDA_CHECK(::ninfer::memcpy_device_async(frame.target_tokens.data, frame.forced_targets.data,
-                                   frame.target_tokens.bytes(),
-                                   execution.device.stream));
+        CUDA_CHECK(
+            ::ninfer::memcpy_device_async(frame.target_tokens.data, frame.forced_targets.data,
+                                          frame.target_tokens.bytes(), execution.device.stream));
     }
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
@@ -142,8 +154,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     const ScopedCurrentDevice scope(rank1.device);
     CUDA_CHECK(cudaStreamWaitEvent(rank1.stream, events.inputs_ready(0), 0));
     CUDA_CHECK(::ninfer::memcpy_device_async(peer.accepted_drafts.data, frame.accepted_drafts.data,
-                               frame.accepted_drafts.bytes(),
-                               rank1.stream));
+                                             frame.accepted_drafts.bytes(), rank1.stream));
     ops::speculative_select_accepted_hidden(peer.target_hidden, peer.accepted_drafts,
                                             peer.selected_hidden, rank1.stream);
     ops::scatter(peer.selected_hidden, peer.state_destination_slots, peer_continuation_hidden_store,
@@ -152,15 +163,19 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     // T123: the two ranks' verification hidden must be bit-identical (replicated residual).
     if (TpRankProbe& probe = tp_rank_probe(); probe.log != nullptr) {
         const std::size_t bytes = frame.target_hidden.bytes();
-        if (bytes <= probe.capacity && bytes == peer.target_hidden.bytes() && frame.target_hidden.ne[1] > 0) {
-            probe.bytes        = bytes;
-            probe.width        = frame.target_hidden.ne[1];
-            probe.column_bytes = bytes / (static_cast<std::size_t>(frame.target_hidden.ne[1]) *
-                                          static_cast<std::size_t>(std::max<std::int64_t>(1, frame.target_hidden.ne[2])));
-            CUDA_CHECK(cudaMemcpyAsync(probe.host[1], peer.target_hidden.data, bytes, cudaMemcpyDeviceToHost, rank1.stream));
+        if (bytes <= probe.capacity && bytes == peer.target_hidden.bytes() &&
+            frame.target_hidden.ne[1] > 0) {
+            probe.bytes = bytes;
+            probe.width = frame.target_hidden.ne[1];
+            probe.column_bytes =
+                bytes /
+                (static_cast<std::size_t>(frame.target_hidden.ne[1]) *
+                 static_cast<std::size_t>(std::max<std::int64_t>(1, frame.target_hidden.ne[2])));
+            CUDA_CHECK(cudaMemcpyAsync(probe.host[1], peer.target_hidden.data, bytes,
+                                       cudaMemcpyDeviceToHost, rank1.stream));
             const ScopedCurrentDevice rank0(execution.device.device);
-            CUDA_CHECK(cudaMemcpyAsync(probe.host[0], frame.target_hidden.data, bytes, cudaMemcpyDeviceToHost,
-                                       execution.device.stream));
+            CUDA_CHECK(cudaMemcpyAsync(probe.host[0], frame.target_hidden.data, bytes,
+                                       cudaMemcpyDeviceToHost, execution.device.stream));
         } else if (!probe.oversize_reported) {
             probe.oversize_reported = true;
             std::fprintf(probe.log, "probe skip: hidden bytes %zu peer %zu capacity %zu\n", bytes,

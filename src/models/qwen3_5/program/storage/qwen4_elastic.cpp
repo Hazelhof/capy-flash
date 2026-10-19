@@ -22,7 +22,8 @@ void add_pool(const qwen3_5::PagedKVCacheLayout& pool, std::uint32_t step_pages,
             throw std::logic_error("elastic KV: a KV plane is not page-major");
         }
         const std::size_t page_bytes = r.bytes / pages;
-        out.push_back(ElasticRangeSpec{r.offset, r.bytes, page_bytes * std::min(step_pages, pages)});
+        out.push_back(
+            ElasticRangeSpec{r.offset, r.bytes, page_bytes * std::min(step_pages, pages)});
     }
 }
 
@@ -40,12 +41,15 @@ std::vector<ElasticRangeSpec> qwen4_elastic_ranges(const PersistentLayout& layou
     const Qwen4PersistentLayout& q = *layout.qwen4;
     for (std::int32_t plane = 0; plane < 4; ++plane) {
         const std::int64_t stride = execution::Qwen4OffloadExperts::plane_slot_bytes(plane);
-        const auto first = static_cast<std::size_t>(
-            (static_cast<std::int64_t>(q.cache_layers) * q.expert_slots + q.staging_slots) * stride);
-        const auto bytes = static_cast<std::size_t>(
-            static_cast<std::int64_t>(q.cache_layers) * q.elastic_columns * stride);
+        const auto first          = static_cast<std::size_t>(
+            (static_cast<std::int64_t>(q.cache_layers) * q.expert_slots + q.staging_slots) *
+            stride);
+        const auto bytes      = static_cast<std::size_t>(static_cast<std::int64_t>(q.cache_layers) *
+                                                         q.elastic_columns * stride);
         const LayoutRegion& r = q.cache_pool[static_cast<std::size_t>(plane)];
-        if (first + bytes > r.bytes) { throw std::logic_error("elastic KV: expert pool too small"); }
+        if (first + bytes > r.bytes) {
+            throw std::logic_error("elastic KV: expert pool too small");
+        }
         out.push_back(ElasticRangeSpec{r.offset + first, bytes, bytes});
     }
     return out;
@@ -63,7 +67,7 @@ Qwen4ElasticVram::Qwen4ElasticVram(std::vector<Rank> ranks, execution::Qwen4Offl
             throw std::invalid_argument("elastic KV: incomplete rank");
         }
         RankState r;
-        r.memory = rank;
+        r.memory          = rank;
         std::size_t index = 0;
         const auto planes = [&](const qwen3_5::PagedKVCacheLayout& pool, std::vector<Plane>& out) {
             const std::uint32_t pages = pool.pages.spec.page_group_count;
@@ -99,7 +103,7 @@ Qwen4ElasticVram::Qwen4ElasticVram(std::vector<Rank> ranks, execution::Qwen4Offl
         }
     }
     for (std::size_t i = 0; i < ranks_.size(); ++i) {
-        RankState& r = ranks_[i];
+        RankState& r     = ranks_[i];
         const bool owner = i == 0;
         r.memory.text->set_backing(stats_.text_pages, [this, owner](std::uint32_t pages) {
             if (!owner) { throw std::logic_error("elastic KV: a mirror pool handed out a page"); }
@@ -107,18 +111,22 @@ Qwen4ElasticVram::Qwen4ElasticVram(std::vector<Rank> ranks, execution::Qwen4Offl
         });
         if (r.memory.mtp != nullptr) {
             r.memory.mtp->set_backing(stats_.mtp_pages, [this, owner](std::uint32_t pages) {
-                if (!owner) { throw std::logic_error("elastic KV: a mirror pool handed out a page"); }
+                if (!owner) {
+                    throw std::logic_error("elastic KV: a mirror pool handed out a page");
+                }
                 grow(true, pages);
             });
         }
     }
-    std::fprintf(stderr,
-                 "elastic KV: grow step %u pages, Text pool %u pages, MTP pool %u pages, %d elastic "
-                 "expert columns, budget %zu bytes on rank 0\n",
-                 step_pages_, text_capacity_, mtp_capacity_, stats_.columns, ranks_[0].budget);
+    std::fprintf(
+        stderr,
+        "elastic KV: grow step %u pages, Text pool %u pages, MTP pool %u pages, %d elastic "
+        "expert columns, budget %zu bytes on rank 0\n",
+        step_pages_, text_capacity_, mtp_capacity_, stats_.columns, ranks_[0].budget);
 }
 
-std::uint32_t Qwen4ElasticVram::step_up(std::uint32_t pages, std::uint32_t capacity) const noexcept {
+std::uint32_t Qwen4ElasticVram::step_up(std::uint32_t pages,
+                                        std::uint32_t capacity) const noexcept {
     const std::uint32_t stepped = (pages + step_pages_ - 1U) / step_pages_ * step_pages_;
     return std::min(std::max(stepped, std::min(step_pages_, capacity)), capacity);
 }
@@ -138,9 +146,9 @@ std::vector<std::size_t> Qwen4ElasticVram::targets(const RankState& r, std::uint
 bool Qwen4ElasticVram::fits(std::uint32_t text_pages, std::uint32_t mtp_pages,
                             std::int32_t columns) const {
     for (const RankState& r : ranks_) {
-        const std::int64_t after = static_cast<std::int64_t>(r.memory.arena->physical_bytes()) +
-                                   r.memory.arena->physical_delta(
-                                       targets(r, text_pages, mtp_pages, columns));
+        const std::int64_t after =
+            static_cast<std::int64_t>(r.memory.arena->physical_bytes()) +
+            r.memory.arena->physical_delta(targets(r, text_pages, mtp_pages, columns));
         if (after > static_cast<std::int64_t>(r.budget)) { return false; }
     }
     return true;
@@ -207,29 +215,51 @@ void Qwen4ElasticVram::grow(bool mtp_pool, std::uint32_t pages) {
     apply(text, mtp, columns, "grow");
 }
 
-void Qwen4ElasticVram::rebalance(std::uint32_t text_tokens, std::uint32_t mtp_tokens) {
+Qwen4ElasticVram::Backing Qwen4ElasticVram::plan(std::uint32_t text_tokens,
+                                                 std::uint32_t mtp_tokens) const {
     const RankState& r0 = ranks_[0];
-    std::uint32_t text  = step_up(std::max(r0.memory.text->allocated_extent(), pages_of(text_tokens)),
-                                  text_capacity_);
-    std::uint32_t mtp   = 0;
+    Backing out;
+    out.text = step_up(std::max(r0.memory.text->allocated_extent(), pages_of(text_tokens)),
+                       text_capacity_);
     if (r0.memory.mtp != nullptr) {
-        mtp = step_up(std::max(r0.memory.mtp->allocated_extent(), pages_of(mtp_tokens)),
-                      mtp_capacity_);
+        out.mtp = step_up(std::max(r0.memory.mtp->allocated_extent(), pages_of(mtp_tokens)),
+                          mtp_capacity_);
     }
-    if (kv_budget_ > 0 && kv_bytes(text, mtp) > kv_budget_) {
+    if (kv_budget_ > 0 && kv_bytes(out.text, out.mtp) > kv_budget_) {
         throw std::runtime_error("elastic KV: the prompt needs more KV than kv_budget_bytes");
     }
-    std::int32_t columns = stats_.columns;
-    while (columns > 0 && !fits(text, mtp, columns)) { --columns; }
-    if (!fits(text, mtp, columns)) {
+    out.columns = stats_.columns;
+    while (out.columns > 0 && !fits(out.text, out.mtp, out.columns)) { --out.columns; }
+    if (!fits(out.text, out.mtp, out.columns)) {
         throw std::runtime_error("elastic KV: device memory exhausted at " +
-                                 std::to_string(text * kPagedKVPageSize) + " tokens of KV");
+                                 std::to_string(out.text * kPagedKVPageSize) + " tokens of KV");
     }
-    while (columns < experts_.elastic_columns() && fits(text, mtp, columns + 1)) { ++columns; }
-    if (text == stats_.text_pages && mtp == stats_.mtp_pages && columns == stats_.columns) {
+    while (out.columns < experts_.elastic_columns() && fits(out.text, out.mtp, out.columns + 1)) {
+        ++out.columns;
+    }
+    return out;
+}
+
+void Qwen4ElasticVram::rebalance(std::uint32_t text_tokens, std::uint32_t mtp_tokens) {
+    const Backing next = plan(text_tokens, mtp_tokens);
+    if (next.text == stats_.text_pages && next.mtp == stats_.mtp_pages &&
+        next.columns == stats_.columns) {
         return;
     }
-    apply(text, mtp, columns, "rebalance");
+    apply(next.text, next.mtp, next.columns, "rebalance");
+}
+
+bool Qwen4ElasticVram::shrinkable() const {
+    const Backing next = plan(0, 0);
+    return next.text < stats_.text_pages || next.mtp < stats_.mtp_pages;
+}
+
+void Qwen4ElasticVram::shrink_to_live() {
+    const Backing next = plan(0, 0);
+    if (next.text >= stats_.text_pages && next.mtp >= stats_.mtp_pages) { return; }
+    // Only the KV side shrinks here: a backing that a live page still needs is never released.
+    apply(std::min(next.text, stats_.text_pages), std::min(next.mtp, stats_.mtp_pages),
+          std::max(next.columns, stats_.columns), "idle KV to Host");
 }
 
 } // namespace ninfer::models::qwen3_5::detail

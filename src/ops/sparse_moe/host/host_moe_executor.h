@@ -4,7 +4,8 @@
 //
 // One call computes, for T <= max_tokens token positions (decode windows T <= 8, prefill chunks
 // up to the chunk length),
-//   out[t] = sum over host experts e routed by t of alpha[t,e] * W_down[e] (SiLU(W_gate[e] x_t) * (W_up[e] x_t))
+//   out[t] = sum over host experts e routed by t of alpha[t,e] * W_down[e] (SiLU(W_gate[e] x_t) *
+//   (W_up[e] x_t))
 // with NVFP4 weights read in place from the pinned host banks (block_scale_k16_m128x4_v1, the
 // Qwen4Exp bank layout of models::qwen3_5::routed_expert_spans) and W4A8 activations: x_t and the
 // SwiGLU output are quantized to int8 per 16 elements (host_nvfp4.h). Each expert is read once
@@ -19,9 +20,9 @@
 // Decode-size calls (T <= kHostMaxTokens) use the Static schedule by default (Options::schedule):
 // the same two phases over 16-row slices owned per member, stealing at the end, the input
 // quantized by each member for itself (one barrier per call).
-// The output is deterministic and independent of the thread count, item size and schedule. The dot kernel
-// of a group depends on its number of tokens m: m >= min_multi_token uses the multi-token dot,
-// otherwise the per-token (FreeToken) dot; the two differ in FP32 accumulation order only.
+// The output is deterministic and independent of the thread count, item size and schedule. The dot
+// kernel of a group depends on its number of tokens m: m >= min_multi_token uses the multi-token
+// dot, otherwise the per-token (FreeToken) dot; the two differ in FP32 accumulation order only.
 //
 // Port of ninfer-offload's HostMoeExecutor (src/ops/sparse_moe/host/host_moe.{h,cpp} @1fd5c39,
 // Apache-2.0, 1872183316/ninfer-offload) to NVFP4 W4A8 with a pinned spin pool.
@@ -51,8 +52,8 @@ struct HostExpertLayer {
 };
 
 struct HostMoeJob {
-    std::int32_t tokens = 0;
-    std::int32_t top_k  = 0;
+    std::int32_t tokens     = 0;
+    std::int32_t top_k      = 0;
     const std::uint16_t* x  = nullptr; // [T][H] BF16 bits
     const std::int32_t* ids = nullptr; // [T][top_k] expert id, or negative = computed elsewhere
     const float* alpha      = nullptr; // [T][top_k] routing weight
@@ -114,8 +115,11 @@ public:
     void run(Body body, void* context);
 
     // Barrier among the members of the current run(); `index` counts the barriers already passed
-    // by the calling member in this run, starting at 1.
+    // by the calling member in this run, starting at 1. barrier() = arrive() then spin until
+    // released(index): a member may do useful work between the two (prefetching).
     void barrier(std::int32_t index) noexcept;
+    void arrive() noexcept;
+    [[nodiscard]] bool released(std::int32_t index) const noexcept;
 
 private:
     void worker(std::int32_t member, int cpu);
@@ -123,8 +127,8 @@ private:
     std::int32_t size_ = 1;
     double spin_ms_    = 20.0;
     std::vector<std::thread> threads_;
-    Body body_      = nullptr;
-    void* context_  = nullptr;
+    Body body_     = nullptr;
+    void* context_ = nullptr;
     alignas(64) std::atomic<std::uint32_t> generation_{0};
     alignas(64) std::atomic<std::int32_t> finished_{0};
     alignas(64) std::atomic<std::int32_t> arrived_{0};
@@ -149,7 +153,8 @@ public:
         //            from a counter on its own cache line; at most one slice of imbalance (the
         //            Dynamic items are 4 slices: 20 % at U = 1-2 on 6 threads), long sequential
         //            row streams per member.
-        // Both give bit-identical outputs (T35: per-call cost at 1-3 experts; docs/capy-flash/development-log.md).
+        // Both give bit-identical outputs (T35: per-call cost at 1-3 experts;
+        // docs/capy-flash/development-log.md).
         Schedule schedule = Schedule::Static;
         // Static only: a member that has finished its own range takes single slices from the
         // others' remaining ranges (bit-identical; absorbs per-core bandwidth differences).
@@ -165,12 +170,22 @@ public:
         // (moe_slots_nvfp4: x and h to E2M1 with E4M3 scales per 16 against the layer's input
         // divisors, gate/up and h rounded to BF16) in FP64 sums instead of W4A8. Slow.
         bool emulate_w4a4 = false;
-        // T98 (on by default since capy-flash v0.2.1; NINFER_HOST_MOE_A4=0 restores W4A8): the same
+        // T98 (on by default since capy-flash v0.5.0; NINFER_HOST_MOE_A4=0 restores W4A8): the same
         // fast dots with the GPU's W4A4 activation codec (quantize_*_a4) and its BF16 roundings of
         // gate/up and h, so an expert quantizes its activations the same way whether it runs on the
-        // CPU or on the GPU (the sums still run in a different order). Without it, which experts run
-        // where (a matter of timing) changed the activation precision, and the output with it (T98).
+        // CPU or on the GPU (the sums still run in a different order). Without it, which experts
+        // run where (a matter of timing) changed the activation precision, and the output with it
+        // (T98).
         bool a4 = true;
+        // Static with member_quantize: a member that has finished its gate/up slices and waits
+        // at the barrier for the others software-prefetches (into L2) the down rows and scale
+        // tiles of its own down range, in the order it will read them, until the barrier opens.
+        // The gate/up tail (up to one 16-row slice, ~5 us at T = 4) leaves the RAM bandwidth to
+        // the last members; the waiting ones spend it on their next phase. Results never change.
+        // Budget per member and call in KiB (0 = off): about what one core loads in the tail; a
+        // large budget competes with the last gate/up slices for RAM (graph bench, 48 layers of
+        // 3-5 misses: 32 KiB -1.5 % per window vs off, 384 KiB no better than off).
+        std::int32_t down_prefetch_kib = 32;
     };
 
     // `max_tokens` >= 1 bounds the tokens of one call (any value; buffers scale with it).
@@ -186,6 +201,8 @@ public:
 
 private:
     static void body(void* self, std::int32_t member);
+    // Barrier 1 of a Static member_quantize call, prefetching the member's down range meanwhile.
+    void await_down(std::int32_t member);
     void phase_tokens(std::int32_t member);
     void phase_gate_up();
     void phase_down(std::int32_t member);
@@ -195,10 +212,14 @@ private:
     void emu_call();
     std::int32_t emu_phase_ = 0;
     std::vector<float> emu_xc_, emu_xsf_, emu_h_, emu_hc_, emu_hsf_;
+
     void stamp(std::int32_t member, int index) noexcept {
-        if (options_.record_members) members_[static_cast<std::size_t>(member)].ns[index] = now_rel();
+        if (options_.record_members)
+            members_[static_cast<std::size_t>(member)].ns[index] = now_rel();
     }
+
     [[nodiscard]] std::int64_t now_rel() const noexcept;
+
     [[nodiscard]] DotKernel kernel_for(std::int32_t tokens) const noexcept {
         return tokens >= options_.min_multi_token ? DotKernel::MultiToken : DotKernel::PerToken;
     }
@@ -222,16 +243,18 @@ private:
     W4A8ActivationBuffer x_act_;            // [max_tokens] by token
     W4A8ActivationBuffer h_act_;            // [max_tokens * max_top_k] by pair
     std::vector<std::vector<float>> acc_;   // per pool member: [max_tokens][64] down sums
-    struct alignas(64) Cursor {             // Static: a member's remaining slice range
+
+    struct alignas(64) Cursor { // Static: a member's remaining slice range
         std::atomic<std::int32_t> next{0};
         std::int32_t end = 0;
     };
+
     std::unique_ptr<Cursor[]> gate_cursor_, down_cursor_;
     std::vector<W4A8ActivationBuffer> member_x_; // member_quantize: per member [kHostMaxTokens]
     std::vector<HostMoeMemberTimes> members_;    // record_members
     bool static_ = false;                        // schedule of the current call
 
-    std::int64_t start_ns_ = 0;
+    std::int64_t start_ns_    = 0;
     std::int64_t phase_ns_[3] = {0, 0, 0};
     alignas(64) std::atomic<std::int32_t> next_token_{0};
     alignas(64) std::atomic<std::int32_t> next_gate_{0};

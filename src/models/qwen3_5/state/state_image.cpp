@@ -145,9 +145,9 @@ StateImageHostLayout plan_host_state_image(const StateImageSpec& spec) {
     if (spec.ple) {
         const Tensor ple_slot(nullptr, DType::BF16, {spec.ple->rows});
         host.ple_layer_bytes = ple_slot.bytes();
-        host.ple = builder.add(checked_mul(host.ple_layer_bytes, spec.ple->layers,
-                                           "StateImage host PLE bytes overflow"),
-                               kStateImageAlignment, "StateImage host PLE convolution");
+        host.ple             = builder.add(checked_mul(host.ple_layer_bytes, spec.ple->layers,
+                                                       "StateImage host PLE bytes overflow"),
+                                           kStateImageAlignment, "StateImage host PLE convolution");
     }
     host.image_bytes = builder.finish(kStateImageAlignment, "StateImage host image");
     return host;
@@ -183,10 +183,10 @@ StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
                                  dflash.head_dim, spec.linear.slot_count);
     }
     if (spec.ple) {
-        out.ple = builder.add_tensor(DType::BF16,
-                                     {spec.ple->rows, spec.linear.slot_count,
-                                      static_cast<std::int32_t>(spec.ple->layers)},
-                                     kStateImageAlignment, "StateImage PLE convolution");
+        out.ple = builder.add_tensor(
+            DType::BF16,
+            {spec.ple->rows, spec.linear.slot_count, static_cast<std::int32_t>(spec.ple->layers)},
+            kStateImageAlignment, "StateImage PLE convolution");
     }
 
     out.host = plan_host_state_image(spec);
@@ -379,8 +379,8 @@ void StateImageDevicePool::attach_mirror(StateImageDevicePool& mirror, int devic
     // A mirror holds DFlash local state only for the split DFlash2 drafter (a rank's KV heads),
     // and then with the origin's slots and layers.
     const bool dflash_mismatch =
-        mirror.dflash_local_ && (!dflash_local_ ||
-                                 mirror.dflash_local_->layer_count() != dflash_local_->layer_count());
+        mirror.dflash_local_ &&
+        (!dflash_local_ || mirror.dflash_local_->layer_count() != dflash_local_->layer_count());
     if (&mirror == this || mirror.slot_count() != slot_count() ||
         mirror.linear_.layer_count() != linear_.layer_count() ||
         mirror.host_layout_.spec.hidden != host_layout_.spec.hidden || device < 0 ||
@@ -457,13 +457,12 @@ void StateImageDevicePool::copy_slot_local(std::int32_t source, std::int32_t des
     const Tensor source_hidden      = continuation_hidden_slot(source);
     const Tensor destination_hidden = continuation_hidden_slot(destination);
     CUDA_CHECK(::ninfer::memcpy_device_async(destination_hidden.data, source_hidden.data,
-                               destination_hidden.bytes(), stream));
+                                             destination_hidden.bytes(), stream));
     for (std::uint32_t layer = 0; layer < ple_layers(); ++layer) {
         const Tensor states = ple_states(layer);
         const Tensor from   = states.slice(1, source, 1);
         const Tensor to     = states.slice(1, destination, 1);
-        CUDA_CHECK(
-            ::ninfer::memcpy_device_async(to.data, from.data, to.bytes(), stream));
+        CUDA_CHECK(::ninfer::memcpy_device_async(to.data, from.data, to.bytes(), stream));
     }
 }
 
@@ -481,7 +480,7 @@ void StateImageDevicePool::copy_slot(std::int32_t source, std::int32_t destinati
         mirror_->copy_slot_local(source, destination, mirror_stream_);
         if (mirror_->dflash_local_) {
             mirror_->dflash_local_->copy_slot_from(*mirror_->dflash_local_, source, destination,
-                                                  mirror_stream_);
+                                                   mirror_stream_);
         }
     }
 }
@@ -496,7 +495,7 @@ void StateImageDevicePool::copy_dflash_local(std::int32_t source, std::int32_t d
         if (mirror_ != nullptr && mirror_->dflash_local_) {
             const ScopedCurrentDevice scope(mirror_device_);
             mirror_->dflash_local_->copy_slot_from(*mirror_->dflash_local_, source, destination,
-                                                  mirror_stream_);
+                                                   mirror_stream_);
         }
     }
 }

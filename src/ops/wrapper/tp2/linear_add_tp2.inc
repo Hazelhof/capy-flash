@@ -26,11 +26,15 @@ std::size_t linear_add_row_parallel_workspace_capacity_bytes(QType qtype, std::i
                                                     min_tokens, max_tokens));
 }
 
-void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
-                             const std::array<Tensor, 2>& residual,
-                             const std::array<Tensor, 2>& staging, LinearPolicy policy,
-                             const std::array<WorkspaceArena*, 2>& workspace,
-                             const ExecutionContext& ec, const PeerEvents& events) {
+namespace {
+
+// Both ranks' partials of linear_add_row_parallel(), validated before either rank issues work,
+// so a rejected pair enqueues nothing; the caller then exchanges `residual`.
+void issue_row_parallel_partials(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                                 const std::array<Tensor, 2>& residual,
+                                 const std::array<Tensor, 2>& staging, LinearPolicy policy,
+                                 const std::array<WorkspaceArena*, 2>& workspace,
+                                 const ExecutionContext& ec, const PeerEvents& events) {
     constexpr const char* kOp = "linear_add row-parallel";
     detail::require_split_pair(ec, x, w, detail::SplitAxis::Input, kOp);
     if (!events.live()) {
@@ -67,7 +71,30 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
                                     stream);
         }
     });
+}
+
+} // namespace
+
+void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                             const std::array<Tensor, 2>& residual,
+                             const std::array<Tensor, 2>& staging, LinearPolicy policy,
+                             const std::array<WorkspaceArena*, 2>& workspace,
+                             const ExecutionContext& ec, const PeerEvents& events) {
+    issue_row_parallel_partials(x, w, residual, staging, policy, workspace, ec, events);
     allreduce_sum(residual, staging, ec, events);
+}
+
+void linear_add_row_parallel_begin(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                                   const std::array<Tensor, 2>& residual,
+                                   const std::array<Tensor, 2>& staging, LinearPolicy policy,
+                                   const std::array<WorkspaceArena*, 2>& workspace,
+                                   const ExecutionContext& ec, const PeerEvents& events, int lane) {
+    if (!allreduce_sum_split_available(ec, events)) {
+        throw std::invalid_argument(
+            "linear_add row-parallel begin: the split all-reduce is unavailable");
+    }
+    issue_row_parallel_partials(x, w, residual, staging, policy, workspace, ec, events);
+    allreduce_sum_begin(residual, staging, ec, events, lane);
 }
 
 void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,

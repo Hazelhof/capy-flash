@@ -1,6 +1,7 @@
 #pragma once
 
-// Two-device (tp 2) forms of attn_input_proj. Our file: ninfer/ops/attn_input_proj.h is upstream's and carries no hook.
+// Two-device (tp 2) forms of attn_input_proj. Our file: ninfer/ops/attn_input_proj.h is upstream's
+// and carries no hook.
 
 #include "core/device.h"
 #include "ninfer/ops/attn_input_proj.h"

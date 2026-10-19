@@ -28,9 +28,9 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     }
     if (frame.forced_targets.data != nullptr) {
         // T59 replay: the reference continuation stands in for the computed argmax.
-        CUDA_CHECK(::ninfer::memcpy_device_async(frame.target_tokens.data, frame.forced_targets.data,
-                                   frame.target_tokens.bytes(),
-                                   execution.device.stream));
+        CUDA_CHECK(
+            ::ninfer::memcpy_device_async(frame.target_tokens.data, frame.forced_targets.data,
+                                          frame.target_tokens.bytes(), execution.device.stream));
     }
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(

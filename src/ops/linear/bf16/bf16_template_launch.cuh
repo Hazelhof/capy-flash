@@ -9,6 +9,7 @@
 #include "ops/linear/bf16/bf16_a16_mma.cuh"
 #include "ops/linear/bf16/bf16_a16_sliced_k_mma.cuh"
 #include "ops/linear/bf16/bf16_a16_tma_mma.cuh"
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -101,16 +102,26 @@ template <class Schedule, class Output, class Epilogue>
 void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilogue epilogue,
                                   cudaStream_t stream) {
     validate_bf16_operands<Schedule>(p);
-    if (p.rows % Schedule::kBlockRows || p.k % Schedule::kBlockK)
+    // Row tails only for the plain linear store, whose element-wise epilogue predicates rows.
+    constexpr bool kRowTail = std::is_same_v<Epilogue, LinearIdentityEpilogue>;
+    const bool full_rows    = p.rows % Schedule::kBlockRows == 0;
+    if ((!kRowTail && !full_rows) || p.k % Schedule::kBlockK)
         throw std::invalid_argument("BF16 sliced-K requires complete row/K tiles");
-    constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>;
-    const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
-    for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
-        const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
-                                                            p.k, p.tokens, offset);
-        CUDA_CHECK(cudaGetLastError());
-    });
+    const auto launch = [&]<bool FullRows>() {
+        constexpr auto kernel = bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue, FullRows>;
+        const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
+        for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            const dim3 grid(div_up(p.rows, Schedule::kBlockRows),
+                            div_up(count, Schedule::kBlockTokens));
+            kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue,
+                                                                p.rows, p.k, p.tokens, offset);
+            CUDA_CHECK(cudaGetLastError());
+        });
+    };
+    if constexpr (kRowTail) {
+        if (!full_rows) return launch.template operator()<false>();
+    }
+    launch.template operator()<true>();
 }
 
 } // namespace ninfer::ops::detail

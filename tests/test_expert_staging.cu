@@ -39,13 +39,13 @@ using namespace ninfer::expert_cache;
 
 namespace {
 
-constexpr int kLayers      = 8;
-constexpr int kExperts     = kStagingExperts; // table width
-constexpr int kBank        = 64;              // experts that exist in the bank
-constexpr int kTokens      = 4;
-constexpr int kRoutes      = 10 * kTokens;
-constexpr int kB           = 4;               // staging slots per set
-constexpr int kMainSlots   = 8;               // dummy resident slots (never read here)
+constexpr int kLayers              = 8;
+constexpr int kExperts             = kStagingExperts; // table width
+constexpr int kBank                = 64;              // experts that exist in the bank
+constexpr int kTokens              = 4;
+constexpr int kRoutes              = 10 * kTokens;
+constexpr int kB                   = 4; // staging slots per set
+constexpr int kMainSlots           = 8; // dummy resident slots (never read here)
 constexpr std::size_t kExpertBytes = 2764800;
 constexpr std::size_t kWords       = kExpertBytes / 4;
 
@@ -120,12 +120,14 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
     std::uint32_t* bank = nullptr;
     CUDA_CHECK(cudaMallocHost(&bank, kBank * kExpertBytes));
     for (std::uint32_t e = 0; e < kBank; ++e) {
-        for (std::size_t i = 0; i < kWords; ++i) bank[e * kWords + i] = pattern(e, static_cast<std::uint32_t>(i));
+        for (std::size_t i = 0; i < kWords; ++i)
+            bank[e * kWords + i] = pattern(e, static_cast<std::uint32_t>(i));
     }
-    std::uint32_t *pool = nullptr, *tags = nullptr, *epoch = nullptr, *stats = nullptr, *flags = nullptr;
+    std::uint32_t *pool = nullptr, *tags = nullptr, *epoch = nullptr, *stats = nullptr,
+                  *flags = nullptr;
     std::int32_t *table = nullptr, *rows = nullptr, *ids = nullptr;
-    void* dummy = nullptr;
-    void* dummy_src = nullptr;
+    void* dummy                  = nullptr;
+    void* dummy_src              = nullptr;
     constexpr std::size_t kDummy = 48u << 20;
     CUDA_CHECK(cudaMalloc(&pool, 2 * kB * kExpertBytes));
     CUDA_CHECK(cudaMalloc(&tags, 2 * kB * 4));
@@ -149,7 +151,8 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
     std::mt19937 rng(seed);
     std::vector<std::int32_t> host_table(kLayers * kExperts, -1);
     for (int l = 0; l < kLayers; ++l) {
-        for (int k = 0; k < kMainSlots; ++k) host_table[l * kExperts + static_cast<int>(rng() % kBank)] = k;
+        for (int k = 0; k < kMainSlots; ++k)
+            host_table[l * kExperts + static_cast<int>(rng() % kBank)] = k;
     }
     CUDA_CHECK(cudaMemcpy(table, host_table.data(), host_table.size() * 4, cudaMemcpyHostToDevice));
 
@@ -161,17 +164,19 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
     for (int w = 0; w < windows; ++w) {
         const std::uint32_t ep = static_cast<std::uint32_t>(w + 1);
         for (auto& v : host_ids) v = static_cast<std::int32_t>(rng() % kBank);
-        CUDA_CHECK(cudaMemcpyAsync(ids, host_ids.data(), host_ids.size() * 4, cudaMemcpyHostToDevice, compute));
+        CUDA_CHECK(cudaMemcpyAsync(ids, host_ids.data(), host_ids.size() * 4,
+                                   cudaMemcpyHostToDevice, compute));
         for (int l = 0; l < kLayers; ++l) reinterpret_cast<volatile std::uint32_t*>(flags)[l] = 0;
         write_staging_word(compute, epoch, ep);
         for (int j = 0; j < kLayers; ++j) {
             flag_kernel<<<1, 1, 0, compute>>>(flags + j);
-            staging_overlay(table + j * kExperts, tags + (j & 1) * kB, kB, kMainSlots + (j & 1) * kB,
-                            epoch, j, ids + j * kRoutes, kRoutes, rows + j * kExperts,
-                            stats + j * kStagingStatsWords, compute);
-            reader_kernel<<<64, 256, 0, compute>>>(rows + j * kExperts, ids + j * kRoutes, kRoutes,
-                                                   pool + static_cast<std::size_t>(j & 1) * kB * kWords,
-                                                   kMainSlots + (j & 1) * kB, 1500000ULL, bad, reads);
+            staging_overlay(table + j * kExperts, tags + (j & 1) * kB, kB,
+                            kMainSlots + (j & 1) * kB, epoch, j, ids + j * kRoutes, kRoutes,
+                            rows + j * kExperts, stats + j * kStagingStatsWords, compute);
+            reader_kernel<<<64, 256, 0, compute>>>(
+                rows + j * kExperts, ids + j * kRoutes, kRoutes,
+                pool + static_cast<std::size_t>(j & 1) * kB * kWords, kMainSlots + (j & 1) * kB,
+                1500000ULL, bad, reads);
         }
         CUDA_CHECK(cudaGetLastError());
         // Host: on flag j, copy layer t's experts (t = j+1; the control also copies j+2 early).
@@ -185,19 +190,23 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
             for (const int t : targets) {
                 if (!issued[t].empty()) continue;
                 if (t % 3 == 0) {
-                    CUDA_CHECK(cudaMemcpyAsync(dummy, dummy_src, kDummy, cudaMemcpyHostToDevice, copy));
+                    CUDA_CHECK(
+                        cudaMemcpyAsync(dummy, dummy_src, kDummy, cudaMemcpyHostToDevice, copy));
                 }
-                // Half from the layer's routed non-resident experts, the rest other non-resident ones.
+                // Half from the layer's routed non-resident experts, the rest other non-resident
+                // ones.
                 std::vector<int> pick;
                 for (int i = 0; i < kRoutes && static_cast<int>(pick.size()) < kB / 2; ++i) {
                     const int e = host_ids[t * kRoutes + i];
                     if (host_table[t * kExperts + e] < 0 &&
-                        std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+                        std::find(pick.begin(), pick.end(), e) == pick.end())
+                        pick.push_back(e);
                 }
                 while (static_cast<int>(pick.size()) < kB) {
                     const int e = static_cast<int>(rng() % kBank);
                     if (host_table[t * kExperts + e] < 0 &&
-                        std::find(pick.begin(), pick.end(), e) == pick.end()) pick.push_back(e);
+                        std::find(pick.begin(), pick.end(), e) == pick.end())
+                        pick.push_back(e);
                 }
                 for (int i = 0; i < kB; ++i) {
                     const int local = (t & 1) * kB + i;
@@ -211,26 +220,29 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
             }
         }
         CUDA_CHECK(cudaStreamSynchronize(compute));
-        CUDA_CHECK(cudaMemcpy(host_rows.data(), rows, host_rows.size() * 4, cudaMemcpyDeviceToHost));
+        CUDA_CHECK(
+            cudaMemcpy(host_rows.data(), rows, host_rows.size() * 4, cudaMemcpyDeviceToHost));
         for (int j = 0; j < kLayers; ++j) {
             const std::int32_t* row = host_rows.data() + j * kExperts;
-            const int first = kMainSlots + (j & 1) * kB;
+            const int first         = kMainSlots + (j & 1) * kB;
             int landed = 0, used = 0, used_routes = 0;
             std::set<int> used_set;
             for (int e = 0; e < kExperts; ++e) {
                 const int base = host_table[j * kExperts + e];
                 if (base >= 0) {
                     if (row[e] != base) {
-                        std::cerr << "window " << w << " layer " << j << ": resident " << e << " overridden\n";
+                        std::cerr << "window " << w << " layer " << j << ": resident " << e
+                                  << " overridden\n";
                         ++r.failures;
                     }
                     continue;
                 }
                 if (row[e] < 0) continue;
                 const int i = row[e] - first;
-                if (i < 0 || i >= kB || static_cast<int>(issued[j].size()) <= i || issued[j][i] != e) {
-                    std::cerr << "window " << w << " layer " << j << ": row maps " << e << " to slot "
-                              << row[e] << ", not a copy of this window and layer\n";
+                if (i < 0 || i >= kB || static_cast<int>(issued[j].size()) <= i ||
+                    issued[j][i] != e) {
+                    std::cerr << "window " << w << " layer " << j << ": row maps " << e
+                              << " to slot " << row[e] << ", not a copy of this window and layer\n";
                     ++r.failures;
                     continue;
                 }
@@ -243,13 +255,13 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
                     used_set.insert(e);
                 }
             }
-            used = static_cast<int>(used_set.size());
+            used                   = static_cast<int>(used_set.size());
             const std::uint32_t* s = stats + j * kStagingStatsWords;
             if (s[0] != ep || static_cast<int>(s[1]) != landed || static_cast<int>(s[2]) != used ||
                 static_cast<int>(s[3]) != used_routes) {
                 std::cerr << "window " << w << " layer " << j << ": stats {" << s[0] << "," << s[1]
-                          << "," << s[2] << "," << s[3] << "} vs rows {" << ep << "," << landed << ","
-                          << used << "," << used_routes << "}\n";
+                          << "," << s[2] << "," << s[3] << "} vs rows {" << ep << "," << landed
+                          << "," << used << "," << used_routes << "}\n";
                 ++r.failures;
             }
             r.landed += landed;
@@ -262,9 +274,9 @@ Result run(bool unsafe, std::uint32_t seed, int windows) {
     CUDA_CHECK(cudaMemcpy(&r.bad, bad, 8, cudaMemcpyDeviceToHost));
     unsigned passes = 0;
     CUDA_CHECK(cudaMemcpy(&passes, reads, 4, cudaMemcpyDeviceToHost));
-    std::cout << (unsafe ? "control" : "protocol") << ": windows " << windows << " issued " << r.issued
-              << " landed in time " << r.landed << " late " << r.late << " used " << r.used
-              << " reader passes " << passes << " bad words " << r.bad << '\n';
+    std::cout << (unsafe ? "control" : "protocol") << ": windows " << windows << " issued "
+              << r.issued << " landed in time " << r.landed << " late " << r.late << " used "
+              << r.used << " reader passes " << passes << " bad words " << r.bad << '\n';
     CUDA_CHECK(cudaStreamDestroy(compute));
     CUDA_CHECK(cudaStreamDestroy(copy));
     for (void* p : {static_cast<void*>(pool), static_cast<void*>(tags), static_cast<void*>(epoch),
@@ -289,7 +301,8 @@ int main() {
     }
     int failures = 0;
     // Tag encoding.
-    if (staging_tag(0xFFFE, 127, 511) == kStagingTagEmpty || staging_tag(1, 2, 3) != ((1u << 16) | (2u << 9) | 3u)) {
+    if (staging_tag(0xFFFE, 127, 511) == kStagingTagEmpty ||
+        staging_tag(1, 2, 3) != ((1u << 16) | (2u << 9) | 3u)) {
         std::cerr << "staging_tag encoding\n";
         ++failures;
     }

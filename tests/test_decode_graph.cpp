@@ -102,12 +102,12 @@ int exercise_dual_device_capture() {
     slow_peer.capture(
         origin.stream,
         [&] {
-            CUDA_CHECK(cudaMemsetAsync(origin_storage.base(), 0x22, sizeof(std::uint32_t),
-                                       origin.stream));
+            CUDA_CHECK(
+                cudaMemsetAsync(origin_storage.base(), 0x22, sizeof(std::uint32_t), origin.stream));
             peer.bind_to_current_thread();
             CUDA_CHECK(cudaMemsetAsync(peer_bulk.base(), 0, kBulkBytes, peer.stream));
-            CUDA_CHECK(cudaMemsetAsync(peer_storage.base(), 0x55, sizeof(std::uint32_t),
-                                       peer.stream));
+            CUDA_CHECK(
+                cudaMemsetAsync(peer_storage.base(), 0x55, sizeof(std::uint32_t), peer.stream));
             origin.bind_to_current_thread();
         },
         peer_capture);

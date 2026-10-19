@@ -101,7 +101,9 @@ class ResponsesStreamAdapter:
                         payload=payload,
                         response_id=response_id,
                         error_code=(
-                            error.get("code") if isinstance(error, dict) and isinstance(error.get("code"), str) else None
+                            error.get("code")
+                            if isinstance(error, dict) and isinstance(error.get("code"), str)
+                            else None
                         ),
                         error_message=(
                             error.get("message")

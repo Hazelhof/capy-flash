@@ -38,8 +38,8 @@ namespace {
 
 constexpr int kH = 2560, kI = 640, kK = 10, kE = 512, kRows13 = 2 * kI;
 constexpr int kHB = kH / 16, kIB = kI / 16;
-constexpr std::int64_t kSlotBytes = ops::kMoeSlotsGateUpCodeBytes +
-                                    ops::kMoeSlotsGateUpScaleBytes + ops::kMoeSlotsDownCodeBytes +
+constexpr std::int64_t kSlotBytes = ops::kMoeSlotsGateUpCodeBytes + ops::kMoeSlotsGateUpScaleBytes +
+                                    ops::kMoeSlotsDownCodeBytes +
                                     ops::kMoeSlotsDownScaleBytes; // 2 764 800
 
 // W4A4 vs the unquantized FP64 oracle. Two NVFP4 activation quantizations in series (x before
@@ -63,8 +63,10 @@ const float kE2M1[16] = {0.F,  0.5F,  1.F,  1.5F,  2.F,  3.F,  4.F,  6.F,
 float e4m3_decode(std::uint8_t c) {
     const int sign = c >> 7, e = (c >> 3) & 15, m = c & 7;
     float v = 0.F;
-    if (e == 0) v = static_cast<float>(m) * std::ldexp(1.0F, -9);
-    else v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
+    if (e == 0)
+        v = static_cast<float>(m) * std::ldexp(1.0F, -9);
+    else
+        v = (1.0F + static_cast<float>(m) / 8.0F) * std::ldexp(1.0F, e - 7);
     return sign ? -v : v;
 }
 
@@ -73,8 +75,8 @@ float e4m3_rn(float v) {
     if (!(v > 0.0F)) return 0.0F;
     if (v >= 448.0F) return 448.0F;
     int ex = 0;
-    std::frexp(v, &ex);                                // v = f * 2^ex, f in [0.5,1)
-    const int exponent = std::max(ex - 1, -6);         // subnormal step below 2^-6
+    std::frexp(v, &ex);                        // v = f * 2^ex, f in [0.5,1)
+    const int exponent = std::max(ex - 1, -6); // subnormal step below 2^-6
     const float step   = std::ldexp(1.0F, exponent - 3);
     return std::min(std::nearbyint(v / step) * step, 448.0F);
 }
@@ -82,8 +84,8 @@ float e4m3_rn(float v) {
 // E2M1 round-to-nearest-even (ties to the even code), satfinite.
 float e2m1_rn(float v) {
     static const float grid[8] = {0.F, 0.5F, 1.F, 1.5F, 2.F, 3.F, 4.F, 6.F};
-    const float a = std::fabs(v);
-    float r       = 6.0F;
+    const float a              = std::fabs(v);
+    float r                    = 6.0F;
     for (int i = 0; i < 7; ++i) {
         if (a > grid[i + 1]) continue;
         const float mid = 0.5F * (grid[i] + grid[i + 1]);
@@ -165,8 +167,8 @@ void decode(const std::vector<std::uint8_t>& codes, const std::vector<std::uint8
 }
 
 struct Model {
-    std::vector<int> ids;          // materialized expert ids
-    std::vector<int> index_of;     // [512] -> index in experts or -1
+    std::vector<int> ids;      // materialized expert ids
+    std::vector<int> index_of; // [512] -> index in experts or -1
     std::vector<Expert> experts;
     std::vector<float> div13, div2; // [2E], [E]
 };
@@ -248,7 +250,7 @@ DevicePool make_pool(const Model& m, const std::vector<std::vector<int>>& placem
     DevicePool d;
     d.memory = DeviceBuffer(total);
     d.memory.copy_from_host(host.data(), total);
-    auto* dev = static_cast<std::uint8_t*>(d.memory.p);
+    auto* dev             = static_cast<std::uint8_t*>(d.memory.p);
     d.pool.gate_up_codes  = {dev + base[0], stride[0]};
     d.pool.gate_up_scales = {dev + base[1], stride[1]};
     d.pool.down_codes     = {dev + base[2], stride[2]};
@@ -445,9 +447,11 @@ public:
           div13_(to_device(m.div13)), div2_(to_device(m.div2)), table_(kE * sizeof(int)) {
         cuda_check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "stream");
     }
+
     ~Runner() { cudaStreamDestroy(stream_); }
 
     cudaStream_t stream() const { return stream_; }
+
     WorkspaceArena& workspace() { return workspace_; }
 
     ops::MoeSlotsLayer layer(const Call& c, void* table_device) const {
@@ -474,7 +478,8 @@ public:
         const std::size_t count = static_cast<std::size_t>(T) * kH;
         GuardedDeviceBuffer out(count * elem);
         if (init != nullptr) {
-            if (dtype == DType::FP32) out.copy_from_host(init->data(), count * 4);
+            if (dtype == DType::FP32)
+                out.copy_from_host(init->data(), count * 4);
             else {
                 std::vector<std::uint16_t> h(count);
                 for (std::size_t i = 0; i < count; ++i)
@@ -492,7 +497,8 @@ public:
         cuda_synchronize(stream_);
         failures += out.verify_guards(label);
         std::vector<std::uint32_t> words(count);
-        if (dtype == DType::FP32) out.copy_to_host(words.data(), count * 4);
+        if (dtype == DType::FP32)
+            out.copy_to_host(words.data(), count * 4);
         else {
             std::vector<std::uint16_t> h(count);
             out.copy_to_host(h.data(), count * 2);
@@ -560,9 +566,9 @@ std::vector<std::vector<int>> random_placement(const Model& m, int slots, std::u
 int oracle_cases(const Model& m, Runner& runner, const DevicePool& pool) {
     int failures = 0;
     for (const int T : {1, 2, 3, 4, 8}) {
-        Call c  = make_call(m, T, 100U + T);
-        c.table = table_from(m, identity_placement(m));
-        const Reference ref = reference(m, c, true);
+        Call c                  = make_call(m, T, 100U + T);
+        c.table                 = table_from(m, identity_placement(m));
+        const Reference ref     = reference(m, c, true);
         const std::string label = "oracle T=" + std::to_string(T);
         failures += check_oracles(label, runner.run(c, pool.pool, failures, label), ref);
     }
@@ -579,12 +585,12 @@ int permutation_cases(const Model& m, Runner& runner, const DevicePool& identity
         reference(m, c, true); // calibration only
         const auto base = runner.run(c, identity.pool, failures, "perm base");
         for (int p = 0; p < 4; ++p) {
-            const int slots    = 40 + 7 * p;
-            const auto place   = random_placement(m, slots, 300U + 10U * p + T);
-            const Layout lay   = p % 2 == 0 ? Layout::Contiguous : Layout::Planar;
-            const DevicePool d = make_pool(m, place, slots, lay, 400U + p);
-            Call cp            = c;
-            cp.table           = table_from(m, place);
+            const int slots         = 40 + 7 * p;
+            const auto place        = random_placement(m, slots, 300U + 10U * p + T);
+            const Layout lay        = p % 2 == 0 ? Layout::Contiguous : Layout::Planar;
+            const DevicePool d      = make_pool(m, place, slots, lay, 400U + p);
+            Call cp                 = c;
+            cp.table                = table_from(m, place);
             const std::string label = "permutation T=" + std::to_string(T) + " #" +
                                       std::to_string(p) +
                                       (lay == Layout::Contiguous ? " contiguous" : " planar");
@@ -633,22 +639,22 @@ int missing_cases(const Model& m, Runner& runner, const DevicePool& pool) {
 // (4) A repeated expert in one token row counts with each weight: equals one position with the
 // summed weight (summed in top-k order, as the Op does), and meets the oracles.
 int duplicate_case(const Model& m, Runner& runner, const DevicePool& pool) {
-    int failures = 0;
-    Call c       = make_call(m, 4, 700U);
-    c.table      = table_from(m, identity_placement(m));
-    c.ids[1 * kK + 6] = c.ids[1 * kK + 1]; // token 1: positions 1 and 6
-    c.ids[3 * kK + 9] = c.ids[3 * kK + 0]; // token 3: positions 0 and 9
+    int failures        = 0;
+    Call c              = make_call(m, 4, 700U);
+    c.table             = table_from(m, identity_placement(m));
+    c.ids[1 * kK + 6]   = c.ids[1 * kK + 1]; // token 1: positions 1 and 6
+    c.ids[3 * kK + 9]   = c.ids[3 * kK + 0]; // token 3: positions 0 and 9
     const Reference ref = reference(m, c, true);
     const auto got      = runner.run(c, pool.pool, failures, "duplicate");
     failures += check_oracles("duplicate", got, ref);
-    Call merged = c;
-    merged.w[1 * kK + 1] = (0.0F + c.w[1 * kK + 1]) + c.w[1 * kK + 6];
+    Call merged            = c;
+    merged.w[1 * kK + 1]   = (0.0F + c.w[1 * kK + 1]) + c.w[1 * kK + 6];
     merged.ids[1 * kK + 6] = -1;
-    merged.w[3 * kK + 0] = (0.0F + c.w[3 * kK + 0]) + c.w[3 * kK + 9];
+    merged.w[3 * kK + 0]   = (0.0F + c.w[3 * kK + 0]) + c.w[3 * kK + 9];
     merged.ids[3 * kK + 9] = -1;
-    failures += verify_exact("duplicate == merged weight",
-                             as_float(runner.run(merged, pool.pool, failures, "merged")),
-                             as_float(got));
+    failures +=
+        verify_exact("duplicate == merged weight",
+                     as_float(runner.run(merged, pool.pool, failures, "merged")), as_float(got));
     return failures;
 }
 
@@ -684,12 +690,12 @@ int mode_cases(const Model& m, Runner& runner, const DevicePool& pool) {
     failures += verify_exact("bf16 == rne(store)", b16, expect16);
 
     // no resident expert at all
-    Call empty  = c;
+    Call empty = c;
     empty.table.assign(kE, -1);
     const std::vector<std::uint32_t> zeros(store.size(), 0U);
-    failures += verify_exact("empty store == 0",
-                             as_float(runner.run(empty, pool.pool, failures, "empty")),
-                             std::vector<float>(store.size(), 0.0F));
+    failures +=
+        verify_exact("empty store == 0", as_float(runner.run(empty, pool.pool, failures, "empty")),
+                     std::vector<float>(store.size(), 0.0F));
     failures += verify_exact("empty accumulate keeps out",
                              runner.run(empty, pool.pool, ops::MoeSlotsOutput::Accumulate,
                                         DType::FP32, &init, failures, "empty acc"),
@@ -711,11 +717,11 @@ int mode_cases(const Model& m, Runner& runner, const DevicePool& pool) {
 // (6) CUDA graph: three layer calls captured once (shared workspace, PDL chain); replays after the
 // slot tables, x and routing change reproduce eager calls bit for bit.
 int graph_case(const Model& m, Runner& runner) {
-    int failures     = 0;
-    const int slots  = 2 * static_cast<int>(m.ids.size()) + 5;
-    const auto place = random_placement(m, slots, 900U, 2); // every expert in two slots
-    const DevicePool d = make_pool(m, place, slots, Layout::Contiguous, 901U);
-    constexpr int kLayers = 3;
+    int failures              = 0;
+    const int slots           = 2 * static_cast<int>(m.ids.size()) + 5;
+    const auto place          = random_placement(m, slots, 900U, 2); // every expert in two slots
+    const DevicePool d        = make_pool(m, place, slots, Layout::Contiguous, 901U);
+    constexpr int kLayers     = 3;
     const int tokens[kLayers] = {4, 1, 8};
     std::vector<Call> v1(kLayers), v2(kLayers);
     for (int l = 0; l < kLayers; ++l) {
@@ -760,8 +766,8 @@ int graph_case(const Model& m, Runner& runner) {
         return words;
     };
     upload(v1);
-    cudaStream_t s = runner.stream();
-    cudaGraph_t graph = nullptr;
+    cudaStream_t s       = runner.stream();
+    cudaGraph_t graph    = nullptr;
     cudaGraphExec_t exec = nullptr;
     cuda_check(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "begin capture");
     for (int l = 0; l < kLayers; ++l) {
@@ -850,10 +856,9 @@ int main() {
         }
         const Model m = make_model(24, 11U);
         Runner runner(m);
-        const DevicePool identity =
-            make_pool(m, identity_placement(m), static_cast<int>(m.ids.size()), Layout::Planar,
-                      12U);
-        int failures = 0;
+        const DevicePool identity = make_pool(m, identity_placement(m),
+                                              static_cast<int>(m.ids.size()), Layout::Planar, 12U);
+        int failures              = 0;
         failures += oracle_cases(m, runner, identity);
         failures += permutation_cases(m, runner, identity);
         failures += missing_cases(m, runner, identity);

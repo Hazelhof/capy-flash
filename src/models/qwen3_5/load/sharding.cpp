@@ -257,9 +257,8 @@ bool selector_primary_requested() {
 // over a proposal head that did not split (startup_tp2.inc).
 int selector_rank(const LoadOptions& options) {
     const bool vision_on_rank1 = options.vision && options.vision_rank == 1;
-    return vision_on_rank1 || proposal_head_primary_requested() || selector_primary_requested()
-               ? 0
-               : 1;
+    return vision_on_rank1 || proposal_head_primary_requested() || selector_primary_requested() ? 0
+                                                                                                : 1;
 }
 
 LogicalShard draft_block_shard(std::string_view name, std::string_view leaf,
@@ -293,7 +292,7 @@ LogicalShard draft_block_shard(std::string_view name, std::string_view leaf,
 
 LogicalShard drafter_shard(std::string_view name, const artifact::Shape& shape,
                            const Config& config, const LoadOptions& options) {
-    const int tp = options.tp;
+    const int tp                      = options.tp;
     constexpr std::string_view layers = "dflash2/layers/";
     if (name.starts_with(layers)) {
         const auto slash = name.find('/', layers.size());
@@ -328,7 +327,8 @@ bool routed_expert(std::string_view name) {
     return !block_leaf(name).empty() && name.find("/moe/experts/") != std::string_view::npos;
 }
 
-// ---- Qwen4Exp (Qwen3.8-Flash-Next) ---------------------------------------------------------------
+// ---- Qwen4Exp (Qwen3.8-Flash-Next)
+// ---------------------------------------------------------------
 
 // The decoder block index of a Text or MTP block name: Text block i is i, MTP block i follows the
 // Text blocks (num_hidden_layers + i).
@@ -337,7 +337,8 @@ std::uint32_t qwen4_block_index(std::string_view name, const TextConfig& text) {
          {std::pair<std::string_view, std::uint32_t>{"text/layers/", 0U},
           std::pair<std::string_view, std::uint32_t>{"mtp/layers/", text.num_hidden_layers}}) {
         if (!name.starts_with(prefix)) { continue; }
-        const auto digits = name.substr(prefix.size(), name.find('/', prefix.size()) - prefix.size());
+        const auto digits =
+            name.substr(prefix.size(), name.find('/', prefix.size()) - prefix.size());
         std::uint32_t index = 0;
         for (const char c : digits) {
             if (c < '0' || c > '9') { reject(name, "has a malformed block index"); }
@@ -401,8 +402,10 @@ LogicalShard qwen4_block_shard(std::string_view name, std::string_view leaf,
     if (leaf.starts_with("ple/")) {
         const auto ple_leaf = leaf.substr(4);
         // key|value share one parent, and every rank needs all value rows: replicated in both
-        // modes. The table is a HostFile object read by host code, never placed on a device.
-        if (ple_leaf == "key" || ple_leaf == "value" || ple_leaf == "table") {
+        // modes. The table is a HostFile object read by host code, never placed on a device; the
+        // FP32 multiplier of a row-scaled NVFP4 table is one value every rank's gather uses.
+        if (ple_leaf == "key" || ple_leaf == "value" || ple_leaf == "table" ||
+            ple_leaf == "table_global_scale") {
             return whole(ShardAxis::Replicated);
         }
         return qwen4_stream_shard(name, ple_leaf, shape, text, options);
@@ -415,8 +418,8 @@ LogicalShard qwen4_block_shard(std::string_view name, std::string_view leaf,
     reject(name, "has no Qwen4Exp placement for this parameter");
 }
 
-LogicalShard qwen4_shard(std::string_view name, const artifact::Shape& shape,
-                         const Config& config, const LoadOptions& options) {
+LogicalShard qwen4_shard(std::string_view name, const artifact::Shape& shape, const Config& config,
+                         const LoadOptions& options) {
     const auto& text = config.text;
     if (name == "text/token_embedding" || name == "mtp/embedding_norm" ||
         name == "mtp/embedding_projection" || name == "mtp/hidden_projection") {
@@ -426,7 +429,9 @@ LogicalShard qwen4_shard(std::string_view name, const artifact::Shape& shape,
         const auto rows = leading(name, shape);
         return even(name, ShardAxis::Rows, rows, rows, options.tp);
     }
-    if (name == "mtp/hidden_norm") { return qwen4_stream_shard(name, "hidden_norm", shape, text, options); }
+    if (name == "mtp/hidden_norm") {
+        return qwen4_stream_shard(name, "hidden_norm", shape, text, options);
+    }
     for (const std::string_view head : {"text/hc_head/", "mtp/hc_head/"}) {
         if (name.starts_with(head)) {
             return qwen4_stream_shard(name, name.substr(head.size()), shape, text, options);

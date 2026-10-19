@@ -34,7 +34,7 @@
 namespace ninfer::ops::detail {
 namespace {
 
-constexpr int H = kMoeSlotsHidden;       // 2560
+constexpr int H = kMoeSlotsHidden; // 2560
 constexpr int E = 512;
 constexpr int K = kMoeSlotsTopK;         // 10
 constexpr int I = kMoeSlotsIntermediate; // 640
@@ -88,6 +88,7 @@ struct Activation {
 
 struct IdentityRows {
     static constexpr bool kContiguous = true;
+
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
         return row_begin + local_row;
     }
@@ -95,10 +96,14 @@ struct IdentityRows {
 
 template <class Schedule>
 struct SharedStorage {
-    alignas(16) std::uint8_t a_codes[Schedule::kStages][Schedule::kBlockM * Schedule::kCodeRowBytes];
-    alignas(16) std::uint8_t b_codes[Schedule::kStages][Schedule::kBlockN * Schedule::kCodeRowBytes];
-    alignas(16) std::uint32_t a_scale4[Schedule::kStages][Schedule::kBlockM * Schedule::kK64PerStage];
-    alignas(16) std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
+    alignas(
+        16) std::uint8_t a_codes[Schedule::kStages][Schedule::kBlockM * Schedule::kCodeRowBytes];
+    alignas(
+        16) std::uint8_t b_codes[Schedule::kStages][Schedule::kBlockN * Schedule::kCodeRowBytes];
+    alignas(
+        16) std::uint32_t a_scale4[Schedule::kStages][Schedule::kBlockM * Schedule::kK64PerStage];
+    alignas(16)
+        std::uint8_t b_scales[Schedule::kStages][Schedule::kBlockN * Schedule::kK64PerStage * 4];
 };
 
 template <class Schedule>
@@ -123,20 +128,23 @@ __device__ __forceinline__ void stage_activation(Activation source, SharedStorag
         const int source_token    = valid ? token_policy.source_token(token) : 0;
         const int physical_byte   = swizzled_byte<Schedule>(row, logical_segment * 16);
         auto* destination = shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-        const auto* input = source.codes + static_cast<std::int64_t>(source_token) * G::kCodeBytesPerRow +
+        const auto* input = source.codes +
+                            static_cast<std::int64_t>(source_token) * G::kCodeBytesPerRow +
                             k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
         cp_async_zfill<16, Cache::cg>(destination, input, valid ? 16 : 0);
     }
     static_assert(Schedule::kK64PerStage <= 4);
     constexpr int kScaleBytes = Schedule::kK64PerStage * 4;
-    for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockM; row += Schedule::kThreads) {
+    for (int row = static_cast<int>(threadIdx.x); row < Schedule::kBlockM;
+         row += Schedule::kThreads) {
         const int token        = token_begin + row;
         const bool valid       = token < active_tokens;
         const int source_token = valid ? token_policy.source_token(token) : 0;
         auto* destination      = &shared.a_scale4[stage][row * Schedule::kK64PerStage];
         const auto* input =
-            source.scales +
-            (static_cast<std::int64_t>(source_token) * G::kScaleTilesPerRow + k_tile * Schedule::kK64PerStage) * 4;
+            source.scales + (static_cast<std::int64_t>(source_token) * G::kScaleTilesPerRow +
+                             k_tile * Schedule::kK64PerStage) *
+                                4;
         cp_async_zfill<kScaleBytes>(destination, input, valid ? kScaleBytes : 0);
     }
 }
@@ -163,7 +171,8 @@ __device__ __forceinline__ void stage_weight(const std::uint8_t* __restrict__ co
         constexpr int kQuartilesPerTile  = Schedule::kBlockN >= 128 ? 4 : Schedule::kBlockN / 32;
         constexpr int kScaleBytesPerTask = kQuartilesPerTile * 4;
         constexpr int kScaleTasks        = kScaleRowTiles * Schedule::kK64PerStage * 32;
-        for (int task = static_cast<int>(threadIdx.x); task < kScaleTasks; task += Schedule::kThreads) {
+        for (int task = static_cast<int>(threadIdx.x); task < kScaleTasks;
+             task += Schedule::kThreads) {
             const int row_tile         = task / (Schedule::kK64PerStage * 32);
             const int remainder        = task - row_tile * Schedule::kK64PerStage * 32;
             const int local_k64        = remainder / 32;
@@ -172,18 +181,20 @@ __device__ __forceinline__ void stage_weight(const std::uint8_t* __restrict__ co
             const int global_row_begin = row_begin + row_tile * 128;
             const int persistent_tile  = global_row_begin / 128;
             const int first_quartile   = (global_row_begin & 127) / 32;
-            auto* destination = shared.b_scales[stage] +
+            auto* destination          = shared.b_scales[stage] +
                                 ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + row_mod32) *
                                     kScaleBytesPerTask;
             const auto* input =
                 scales +
-                (static_cast<std::int64_t>(persistent_tile) * G::kScaleTilesPerRow + global_k64) * 512 +
+                (static_cast<std::int64_t>(persistent_tile) * G::kScaleTilesPerRow + global_k64) *
+                    512 +
                 row_mod32 * 16 + first_quartile * 4;
             cp_async<kScaleBytesPerTask>(destination, input);
         }
     } else {
         constexpr int kScaleTasks = Schedule::kBlockN * Schedule::kK64PerStage;
-        for (int task = static_cast<int>(threadIdx.x); task < kScaleTasks; task += Schedule::kThreads) {
+        for (int task = static_cast<int>(threadIdx.x); task < kScaleTasks;
+             task += Schedule::kThreads) {
             const int row             = task / Schedule::kK64PerStage;
             const int local_k64       = task - row * Schedule::kK64PerStage;
             const int weight_row      = row_policy.weight_row(row_begin, row);
@@ -192,10 +203,12 @@ __device__ __forceinline__ void stage_weight(const std::uint8_t* __restrict__ co
             const int row_in_tile     = weight_row & 127;
             const int row_mod32       = row_in_tile & 31;
             const int row_quartile    = row_in_tile >> 5;
-            auto* destination = shared.b_scales[stage] + (row * Schedule::kK64PerStage + local_k64) * 4;
+            auto* destination =
+                shared.b_scales[stage] + (row * Schedule::kK64PerStage + local_k64) * 4;
             const auto* input =
                 scales +
-                (static_cast<std::int64_t>(persistent_tile) * G::kScaleTilesPerRow + global_k64) * 512 +
+                (static_cast<std::int64_t>(persistent_tile) * G::kScaleTilesPerRow + global_k64) *
+                    512 +
                 row_mod32 * 16 + row_quartile * 4;
             cp_async<4>(destination, input);
         }
@@ -212,12 +225,13 @@ union KernelShared {
     float out_f[FloatStage ? Schedule::kBlockM * (Schedule::kBlockN + 4) : 1];
 };
 
-template <class G, class Schedule, class Epilogue, class OutputPolicy, class RowPolicy, bool PairRows,
-          class TokenPolicy, class RasterPolicy, bool FloatStage = false>
+template <class G, class Schedule, class Epilogue, class OutputPolicy, class RowPolicy,
+          bool PairRows, class TokenPolicy, class RasterPolicy, bool FloatStage = false>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void grouped_mma_kernel(
     Activation activation, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales, float alpha, Epilogue epilogue,
-    OutputPolicy output, RowPolicy row_policy, TokenPolicy token_policy, RasterPolicy raster_policy) {
+    OutputPolicy output, RowPolicy row_policy, TokenPolicy token_policy,
+    RasterPolicy raster_policy) {
     static_assert((G::kInputRows % Schedule::kBlockK) == 0);
     static_assert((G::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(!PairRows || ((G::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
@@ -248,10 +262,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 
     float accumulators[Schedule::kMmaM][Schedule::kMmaN][4] = {};
-    const int lane   = static_cast<int>(threadIdx.x) & 31;
-    const int warp   = static_cast<int>(threadIdx.x) >> 5;
-    const int warp_m = warp / Schedule::kWarpsN;
-    const int warp_n = warp - warp_m * Schedule::kWarpsN;
+    const int lane                                          = static_cast<int>(threadIdx.x) & 31;
+    const int warp                                          = static_cast<int>(threadIdx.x) >> 5;
+    const int warp_m                                        = warp / Schedule::kWarpsN;
+    const int warp_n                                        = warp - warp_m * Schedule::kWarpsN;
 
     const int a_matrix      = lane >> 3;
     const int a_row_offset  = (lane & 7) + ((a_matrix & 1) << 3);
@@ -277,34 +291,40 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 const int row           = warp_m * Schedule::kWarpM + mma_m * 16 + a_row_offset;
                 const int logical_byte  = local_k64 * 32 + a_column_byte;
                 const int physical_byte = swizzled_byte<Schedule>(row, logical_byte);
-                const auto* address = shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                const auto* address =
+                    shared.a_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
                 ldmatrix_x4(a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
                             a_fragments[mma_m][3], smem_addr(address));
                 const int scale_row = warp_m * Schedule::kWarpM + mma_m * 16 + sfa_row;
-                a_scales[mma_m] = shared.a_scale4[stage][scale_row * Schedule::kK64PerStage + local_k64];
+                a_scales[mma_m] =
+                    shared.a_scale4[stage][scale_row * Schedule::kK64PerStage + local_k64];
             }
 #pragma unroll
             for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
                 const int row           = warp_n * Schedule::kWarpN + mma_n * 8 + b_row_offset;
                 const int logical_byte  = local_k64 * 32 + b_column_byte;
                 const int physical_byte = swizzled_byte<Schedule>(row, logical_byte);
-                const auto* address = shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
+                const auto* address =
+                    shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
                 ldmatrix_x2(b_fragments[mma_n][0], b_fragments[mma_n][1], smem_addr(address));
                 const int scale_row = warp_n * Schedule::kWarpN + mma_n * 8 + sfb_row;
                 const std::uint8_t* scale_address;
                 if constexpr (RowPolicy::kContiguous) {
-                    constexpr int kQuartilesPerTile  = Schedule::kBlockN >= 128 ? 4 : Schedule::kBlockN / 32;
+                    constexpr int kQuartilesPerTile =
+                        Schedule::kBlockN >= 128 ? 4 : Schedule::kBlockN / 32;
                     constexpr int kScaleBytesPerTask = kQuartilesPerTile * 4;
-                    const int row_tile     = scale_row / 128;
-                    const int row_in_tile  = scale_row & 127;
-                    const int row_mod32    = row_in_tile & 31;
-                    const int row_quartile = row_in_tile >> 5;
-                    scale_address = shared.b_scales[stage] +
-                                    ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + row_mod32) *
-                                        kScaleBytesPerTask +
-                                    row_quartile * 4;
+                    const int row_tile               = scale_row / 128;
+                    const int row_in_tile            = scale_row & 127;
+                    const int row_mod32              = row_in_tile & 31;
+                    const int row_quartile           = row_in_tile >> 5;
+                    scale_address =
+                        shared.b_scales[stage] +
+                        ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + row_mod32) *
+                            kScaleBytesPerTask +
+                        row_quartile * 4;
                 } else {
-                    scale_address = shared.b_scales[stage] + (scale_row * Schedule::kK64PerStage + local_k64) * 4;
+                    scale_address = shared.b_scales[stage] +
+                                    (scale_row * Schedule::kK64PerStage + local_k64) * 4;
                 }
                 b_scales[mma_n] = load_vec<unsigned>(scale_address);
             }
@@ -314,26 +334,27 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 for (int mma_n = 0; mma_n < Schedule::kMmaN; ++mma_n) {
                     mma_nvfp4_e4m3(accumulators[mma_m][mma_n][0], accumulators[mma_m][mma_n][1],
                                    accumulators[mma_m][mma_n][2], accumulators[mma_m][mma_n][3],
-                                   a_fragments[mma_m][0], a_fragments[mma_m][1], a_fragments[mma_m][2],
-                                   a_fragments[mma_m][3], b_fragments[mma_n][0], b_fragments[mma_n][1],
-                                   a_scales[mma_m], b_scales[mma_n]);
+                                   a_fragments[mma_m][0], a_fragments[mma_m][1],
+                                   a_fragments[mma_m][2], a_fragments[mma_m][3],
+                                   b_fragments[mma_n][0], b_fragments[mma_n][1], a_scales[mma_m],
+                                   b_scales[mma_n]);
                 }
             }
         }
         __syncthreads();
         const int next_k_tile = k_tile + Schedule::kStages;
         if (next_k_tile < kKTiles) {
-            stage_activation<G, Schedule>(activation, shared, stage, next_k_tile, token_begin, active,
-                                          token_policy);
+            stage_activation<G, Schedule>(activation, shared, stage, next_k_tile, token_begin,
+                                          active, token_policy);
             stage_weight<G, Schedule>(weight_codes, weight_scales, shared, stage, next_k_tile,
                                       row_begin, row_policy);
         }
         cp_commit();
     }
 
-    const int accumulator_row   = lane >> 2;
-    const int accumulator_col   = 2 * (lane & 3);
-    constexpr int kOutputStride = FloatStage ? Schedule::kBlockN + 4 : Schedule::kBlockN + 8;
+    const int accumulator_row    = lane >> 2;
+    const int accumulator_col    = 2 * (lane & 3);
+    constexpr int kOutputStride  = FloatStage ? Schedule::kBlockN + 4 : Schedule::kBlockN + 8;
     __nv_bfloat16* shared_output = storage.out_h;
     float* shared_output_f       = storage.out_f;
 #pragma unroll
@@ -345,10 +366,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
             const int local_row0  = warp_n * Schedule::kWarpN + mma_n * 8 + accumulator_col;
             const int parent_row0 = row_policy.weight_row(row_begin, local_row0);
             const int parent_row1 = row_policy.weight_row(row_begin, local_row0 + 1);
-            float value00 = accumulators[mma_m][mma_n][0] * alpha;
-            float value01 = accumulators[mma_m][mma_n][1] * alpha;
-            float value10 = accumulators[mma_m][mma_n][2] * alpha;
-            float value11 = accumulators[mma_m][mma_n][3] * alpha;
+            float value00         = accumulators[mma_m][mma_n][0] * alpha;
+            float value01         = accumulators[mma_m][mma_n][1] * alpha;
+            float value10         = accumulators[mma_m][mma_n][2] * alpha;
+            float value11         = accumulators[mma_m][mma_n][3] * alpha;
             if (token0 < active) {
                 value00 = epilogue.apply(parent_row0, value00);
                 value01 = epilogue.apply(parent_row1, value01);
@@ -363,8 +384,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
                 *reinterpret_cast<float2*>(shared_output_f + at0) = make_float2(value00, value01);
                 *reinterpret_cast<float2*>(shared_output_f + at1) = make_float2(value10, value11);
             } else {
-                *reinterpret_cast<__nv_bfloat162*>(shared_output + at0) = __floats2bfloat162_rn(value00, value01);
-                *reinterpret_cast<__nv_bfloat162*>(shared_output + at1) = __floats2bfloat162_rn(value10, value11);
+                *reinterpret_cast<__nv_bfloat162*>(shared_output + at0) =
+                    __floats2bfloat162_rn(value00, value01);
+                *reinterpret_cast<__nv_bfloat162*>(shared_output + at1) =
+                    __floats2bfloat162_rn(value10, value11);
             }
         }
     }
@@ -375,21 +398,25 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     // same token, which holds while a row's vectors come in pairs.
     static_assert((kVectorsPerRow % 2) == 0);
     constexpr int kOutputVectors = Schedule::kBlockM * kVectorsPerRow;
-    for (int task = static_cast<int>(threadIdx.x); task < kOutputVectors; task += Schedule::kThreads) {
+    for (int task = static_cast<int>(threadIdx.x); task < kOutputVectors;
+         task += Schedule::kThreads) {
         const int token_local = task / kVectorsPerRow;
         const int row_vector  = task - token_local * kVectorsPerRow;
         const int token       = token_begin + token_local;
         if (token < active) {
             if constexpr (FloatStage) {
                 const float* row = shared_output_f + token_local * kOutputStride + row_vector * 8;
-                output.store_vector(row_vector * 8, token, load_vec<float4>(row), load_vec<float4>(row + 4));
+                output.store_vector(row_vector * 8, token, load_vec<float4>(row),
+                                    load_vec<float4>(row + 4));
             } else if constexpr (PairRows) {
-                const uint4 values = load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
+                const uint4 values =
+                    load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
                 const uint4 paired = load_vec<uint4>(shared_output + token_local * kOutputStride +
                                                      kStoredRows + row_vector * 8);
                 output.store_pair_vector(row_vector * 8, token, values, paired);
             } else {
-                const uint4 values = load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
+                const uint4 values =
+                    load_vec<uint4>(shared_output + token_local * kOutputStride + row_vector * 8);
                 output.store_vector(row_vector * 8, token, values);
             }
         }
@@ -417,17 +444,22 @@ struct Jobs {
     const std::int32_t* __restrict__ count;
 
     __device__ __forceinline__ int expert() const { return experts[blockIdx.y]; }
+
     __device__ __forceinline__ int slot() const { return slots[blockIdx.y]; }
+
     __device__ __forceinline__ int column_base() const { return columns[blockIdx.y]; }
+
     __device__ __forceinline__ bool live() const { return static_cast<int>(blockIdx.y) < *count; }
 };
 
 struct GateUpRaster {
     Jobs jobs;
+
     __device__ __forceinline__ void blocks(int& block_row, int& block_token) const {
         block_row   = static_cast<int>(blockIdx.x);
         block_token = jobs.column_base() / Schedule::kBlockM;
     }
+
     __device__ __forceinline__ bool live() const { return jobs.live(); }
 };
 
@@ -435,10 +467,12 @@ struct GateUpRaster {
 // identity row policy and the contiguous scale staging address the plane.
 struct DownRaster {
     Jobs jobs;
+
     __device__ __forceinline__ void blocks(int& block_row, int& block_token) const {
         block_row   = jobs.slot() * (H / Schedule::kBlockN) + static_cast<int>(blockIdx.x);
         block_token = jobs.column_base() / Schedule::kBlockM;
     }
+
     __device__ __forceinline__ bool live() const { return jobs.live(); }
 };
 
@@ -446,8 +480,10 @@ struct DownRaster {
 struct GateUpRows {
     static constexpr bool kContiguous = false;
     Jobs jobs;
+
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
-        const int within = row_begin + (local_row & (kPairRows - 1)) + (local_row >= kPairRows ? I : 0);
+        const int within =
+            row_begin + (local_row & (kPairRows - 1)) + (local_row >= kPairRows ? I : 0);
         return jobs.slot() * (2 * I) + within;
     }
 };
@@ -457,9 +493,11 @@ struct GatherTokens {
     const std::int32_t* __restrict__ packed_token;
     const std::int32_t* __restrict__ offsets;
     Jobs jobs;
+
     __device__ __forceinline__ int source_token(int column) const {
         return packed_token[offsets[jobs.expert()] + column];
     }
+
     __device__ __forceinline__ int active_tokens() const {
         const int expert = jobs.expert();
         return offsets[expert + 1] - offsets[expert];
@@ -470,9 +508,11 @@ struct GatherTokens {
 struct PackedTokens {
     const std::int32_t* __restrict__ offsets;
     Jobs jobs;
+
     __device__ __forceinline__ int source_token(int column) const {
         return offsets[jobs.expert()] + column;
     }
+
     __device__ __forceinline__ int active_tokens() const {
         const int expert = jobs.expert();
         return offsets[expert + 1] - offsets[expert];
@@ -484,9 +524,11 @@ struct GatherMiddle {
     const std::int32_t* __restrict__ middle_row;
     const std::int32_t* __restrict__ offsets;
     Jobs jobs;
+
     __device__ __forceinline__ int source_token(int column) const {
         return middle_row[offsets[jobs.expert()] + column];
     }
+
     __device__ __forceinline__ int active_tokens() const {
         const int expert = jobs.expert();
         return offsets[expert + 1] - offsets[expert];
@@ -497,6 +539,7 @@ struct GatherMiddle {
 struct GateUpDivisor {
     const float* __restrict__ divisors;
     Jobs jobs;
+
     __device__ __forceinline__ float apply(int row, float value) const {
         const int within = row % (2 * I);
         return value * __frcp_rn(divisors[2 * jobs.expert() + (within >= I ? 1 : 0)]);
@@ -506,6 +549,7 @@ struct GateUpDivisor {
 struct DownDivisor {
     const float* __restrict__ divisors;
     Jobs jobs;
+
     __device__ __forceinline__ float apply(int, float value) const {
         return value * __frcp_rn(divisors[jobs.expert()]);
     }
@@ -556,9 +600,10 @@ struct GateUpOutput {
     Jobs jobs;
     float divisor;
 
-    __device__ __forceinline__ void store_pair_vector(int local_row, int column, uint4 gate, uint4 up) const {
-        const int row             = static_cast<int>(blockIdx.x) * kPairRows + local_row;
-        const std::int64_t packed = offsets[jobs.expert()] + column;
+    __device__ __forceinline__ void store_pair_vector(int local_row, int column, uint4 gate,
+                                                      uint4 up) const {
+        const int row               = static_cast<int>(blockIdx.x) * kPairRows + local_row;
+        const std::int64_t packed   = offsets[jobs.expert()] + column;
         const std::uint32_t bits[4] = {swiglu_pair(gate.x, up.x), swiglu_pair(gate.y, up.y),
                                        swiglu_pair(gate.z, up.z), swiglu_pair(gate.w, up.w)};
         float2 values[4];
@@ -568,10 +613,11 @@ struct GateUpOutput {
             values[pair] = bf16x2_bits_to_float2(bits[pair]);
             max_abs      = fmaxf(max_abs, fmaxf(fabsf(values[pair].x), fabsf(values[pair].y)));
         }
-        const unsigned pair_mask = 3U << (threadIdx.x & 31U & ~1U);
-        max_abs                  = fmaxf(max_abs, __shfl_xor_sync(pair_mask, max_abs, 1));
+        const unsigned pair_mask    = 3U << (threadIdx.x & 31U & ~1U);
+        max_abs                     = fmaxf(max_abs, __shfl_xor_sync(pair_mask, max_abs, 1));
         const float scale_unencoded = __fdiv_rn(divisor * max_abs, 6.0F);
-        const std::uint8_t scale    = __nv_cvt_float_to_fp8(scale_unencoded, __NV_SATFINITE, __NV_E4M3);
+        const std::uint8_t scale =
+            __nv_cvt_float_to_fp8(scale_unencoded, __NV_SATFINITE, __NV_E4M3);
         std::uint32_t word = 0;
         if (scale != 0) {
             const float reciprocal = __frcp_rn(decode_nvfp4_e4m3(scale));
@@ -594,7 +640,8 @@ struct DownOutput {
     const std::int32_t* __restrict__ offsets;
     Jobs jobs;
 
-    __device__ __forceinline__ void store_vector(int local_row, int column, float4 a, float4 b) const {
+    __device__ __forceinline__ void store_vector(int local_row, int column, float4 a,
+                                                 float4 b) const {
         const int row             = static_cast<int>(blockIdx.x) * Schedule::kBlockN + local_row;
         const std::int64_t packed = offsets[jobs.expert()] + column;
         float* destination        = data + packed * H + row;
@@ -604,9 +651,10 @@ struct DownOutput {
 };
 
 // rank[a] orders assignment a among those of its expert; -1 = the expert has no slot.
-__global__ void count_kernel(const std::int32_t* __restrict__ ids, const std::int32_t* __restrict__ table,
-                             std::int32_t slots, std::int32_t assignments,
-                             std::int32_t* __restrict__ counts, std::int32_t* __restrict__ rank) {
+__global__ void count_kernel(const std::int32_t* __restrict__ ids,
+                             const std::int32_t* __restrict__ table, std::int32_t slots,
+                             std::int32_t assignments, std::int32_t* __restrict__ counts,
+                             std::int32_t* __restrict__ rank) {
     const int a = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (a >= assignments) { return; }
     const std::int32_t e = ids[a];
@@ -655,8 +703,9 @@ __global__ void __launch_bounds__(E)
     }
 }
 
-__global__ void place_kernel(const std::int32_t* __restrict__ ids, const std::int32_t* __restrict__ rank,
-                             std::int32_t assignments, const std::int32_t* __restrict__ offsets,
+__global__ void place_kernel(const std::int32_t* __restrict__ ids,
+                             const std::int32_t* __restrict__ rank, std::int32_t assignments,
+                             const std::int32_t* __restrict__ offsets,
                              std::int32_t* __restrict__ packed_token,
                              std::int32_t* __restrict__ packed_index) {
     const int a = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -692,11 +741,13 @@ __global__ void place_piece_kernel(const std::int32_t* __restrict__ ids,
 }
 
 // x [columns, H] BF16 -> NVFP4 codes [columns, H/2], scales [columns, H/16] (row-major).
-__global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x, std::uint8_t* __restrict__ codes,
-                                std::uint8_t* __restrict__ scales, std::int32_t groups, float divisor) {
+__global__ void quantize_kernel(const __nv_bfloat16* __restrict__ x,
+                                std::uint8_t* __restrict__ codes, std::uint8_t* __restrict__ scales,
+                                std::int32_t groups, float divisor) {
     const int task = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (task >= groups) { return; }
-    const Nvfp4QuantizedK16 q = quantize_nvfp4_k16(x + static_cast<std::int64_t>(task) * 16, divisor);
+    const Nvfp4QuantizedK16 q =
+        quantize_nvfp4_k16(x + static_cast<std::int64_t>(task) * 16, divisor);
     store_vec(codes + static_cast<std::int64_t>(task) * 8, make_uint2(q.codes_lo, q.codes_hi));
     scales[task] = q.scale;
 }
@@ -712,7 +763,7 @@ __global__ void __launch_bounds__(H / 8)
     for (int k = 0; k < K; ++k) {
         const int row = packed_index[column * K + k];
         if (row < 0) { continue; }
-        const float weight = weights[column * K + k];
+        const float weight  = weights[column * K + k];
         const float* source = grouped + static_cast<std::int64_t>(row) * H + feature;
         const float4 a      = load_vec<float4>(source);
         const float4 b      = load_vec<float4>(source + 4);
@@ -732,18 +783,18 @@ namespace {
 // count / scan / place of `columns` tokens' assignments: offsets, the job list, packed_token
 // (grouped position -> token) and packed_index (assignment -> grouped position).
 void group_launch(const std::int32_t* ids, std::int32_t columns, const std::int32_t* table,
-                  std::int32_t slots, std::int32_t* counts, std::int32_t* rank, std::int32_t* offsets,
-                  const Jobs& jobs, std::int32_t* packed_token, std::int32_t* packed_index,
-                  cudaStream_t stream) {
+                  std::int32_t slots, std::int32_t* counts, std::int32_t* rank,
+                  std::int32_t* offsets, const Jobs& jobs, std::int32_t* packed_token,
+                  std::int32_t* packed_index, cudaStream_t stream) {
     const int assignments = columns * K;
     const int blocks      = (assignments + 255) / 256;
     CUDA_CHECK(cudaMemsetAsync(counts, 0, sizeof(std::int32_t) * E, stream));
     count_kernel<<<blocks, 256, 0, stream>>>(ids, table, slots, assignments, counts, rank);
     CUDA_CHECK(cudaGetLastError());
-    scan_kernel<<<1, E, 0, stream>>>(counts, table, offsets, const_cast<std::int32_t*>(jobs.experts),
-                                     const_cast<std::int32_t*>(jobs.columns),
-                                     const_cast<std::int32_t*>(jobs.slots),
-                                     const_cast<std::int32_t*>(jobs.count));
+    scan_kernel<<<1, E, 0, stream>>>(
+        counts, table, offsets, const_cast<std::int32_t*>(jobs.experts),
+        const_cast<std::int32_t*>(jobs.columns), const_cast<std::int32_t*>(jobs.slots),
+        const_cast<std::int32_t*>(jobs.count));
     CUDA_CHECK(cudaGetLastError());
     if (packed_token != nullptr) {
         place_kernel<<<blocks, 256, 0, stream>>>(ids, rank, assignments, offsets, packed_token,
@@ -757,17 +808,17 @@ void gate_up_launch(const MoeGroupedPiece& c, const Jobs& jobs, std::int32_t max
                     cudaStream_t stream) {
     const int groups = c.columns * (H / 16);
     quantize_kernel<<<(groups + 255) / 256, 256, 0, stream>>>(c.x, c.input_codes, c.input_scales,
-                                                             groups, c.gate_up_input_divisor);
+                                                              groups, c.gate_up_input_divisor);
     CUDA_CHECK(cudaGetLastError());
     const Activation input{c.input_codes, c.input_scales};
-    const GateUpOutput output{c.middle_codes, c.middle_scales, c.offsets, jobs, c.down_input_divisor};
+    const GateUpOutput output{c.middle_codes, c.middle_scales, c.offsets, jobs,
+                              c.down_input_divisor};
     const GateUpDivisor epilogue{c.gate_up_divisors, jobs};
     const dim3 grid(I / kPairRows, max_jobs);
     grouped_mma_kernel<GateUpGeometry, Schedule, GateUpDivisor, GateUpOutput, GateUpRows, true,
-                       GatherTokens, GateUpRaster>
-        <<<grid, Schedule::kThreads, 0, stream>>>(
-            input, c.planes[0], c.planes[1], 1.0F / c.gate_up_input_divisor, epilogue, output,
-            GateUpRows{jobs}, GatherTokens{c.packed_token, c.offsets, jobs}, GateUpRaster{jobs});
+                       GatherTokens, GateUpRaster><<<grid, Schedule::kThreads, 0, stream>>>(
+        input, c.planes[0], c.planes[1], 1.0F / c.gate_up_input_divisor, epilogue, output,
+        GateUpRows{jobs}, GatherTokens{c.packed_token, c.offsets, jobs}, GateUpRaster{jobs});
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -785,10 +836,9 @@ void moe_grouped_launch(const MoeGroupedPiece& c, cudaStream_t stream) {
         const DownDivisor epilogue{c.down_divisors, jobs};
         const dim3 grid(H / Schedule::kBlockN, max_jobs);
         grouped_mma_kernel<DownGeometry, Schedule, DownDivisor, DownOutput, IdentityRows, false,
-                           PackedTokens, DownRaster, true>
-            <<<grid, Schedule::kThreads, 0, stream>>>(
-                middle, c.planes[2], c.planes[3], 1.0F / c.down_input_divisor, epilogue, output,
-                IdentityRows{}, PackedTokens{c.offsets, jobs}, DownRaster{jobs});
+                           PackedTokens, DownRaster, true><<<grid, Schedule::kThreads, 0, stream>>>(
+            middle, c.planes[2], c.planes[3], 1.0F / c.down_input_divisor, epilogue, output,
+            IdentityRows{}, PackedTokens{c.offsets, jobs}, DownRaster{jobs});
         CUDA_CHECK(cudaGetLastError());
     }
     merge_kernel<<<c.columns, H / 8, 0, stream>>>(c.grouped, c.packed_index, c.weights, c.out);
@@ -818,11 +868,10 @@ void moe_grouped_wide_launch(const MoeGroupedWide& w, cudaStream_t stream) {
         const DownDivisor epilogue{c.down_divisors, piece_jobs};
         const dim3 grid(H / Schedule::kBlockN, moe_grouped_max_jobs(columns));
         grouped_mma_kernel<DownGeometry, Schedule, DownDivisor, DownOutput, IdentityRows, false,
-                           GatherMiddle, DownRaster, true>
-            <<<grid, Schedule::kThreads, 0, stream>>>(
-                middle, c.planes[2], c.planes[3], 1.0F / c.down_input_divisor, epilogue, output,
-                IdentityRows{}, GatherMiddle{w.piece_middle_row, w.piece_offsets, piece_jobs},
-                DownRaster{piece_jobs});
+                           GatherMiddle, DownRaster, true><<<grid, Schedule::kThreads, 0, stream>>>(
+            middle, c.planes[2], c.planes[3], 1.0F / c.down_input_divisor, epilogue, output,
+            IdentityRows{}, GatherMiddle{w.piece_middle_row, w.piece_offsets, piece_jobs},
+            DownRaster{piece_jobs});
         CUDA_CHECK(cudaGetLastError());
         merge_kernel<<<columns, H / 8, 0, stream>>>(c.grouped, w.piece_index, c.weights + k0,
                                                     c.out + static_cast<std::int64_t>(begin) * H);

@@ -32,11 +32,7 @@ def _bf16_rne_words(values: np.ndarray) -> np.ndarray:
         raise TypeError("BF16 rounding input must be binary32")
     bits = values.view(np.uint32)
     upper = bits >> np.uint32(16)
-    rounded = (
-        bits.astype(np.uint64)
-        + np.uint64(0x7FFF)
-        + (upper & np.uint32(1)).astype(np.uint64)
-    ) >> np.uint64(16)
+    rounded = (bits.astype(np.uint64) + np.uint64(0x7FFF) + (upper & np.uint32(1)).astype(np.uint64)) >> np.uint64(16)
     return rounded.astype(np.uint16)
 
 
@@ -55,16 +51,12 @@ def _round_e4m3fn_rne(values: np.ndarray) -> np.ndarray:
         raise ValueError("E4M3FN rounding input must be finite and bounded")
 
     magnitude = np.abs(values)
-    upper = np.searchsorted(_POSITIVE_E4M3FN_VALUES, magnitude, side="left").astype(
-        np.int16
-    )
+    upper = np.searchsorted(_POSITIVE_E4M3FN_VALUES, magnitude, side="left").astype(np.int16)
     upper = np.minimum(upper, 0x7E)
     lower = np.maximum(upper - 1, 0)
     lower_distance = magnitude - _POSITIVE_E4M3FN_VALUES[lower]
     upper_distance = _POSITIVE_E4M3FN_VALUES[upper] - magnitude
-    choose_upper = (upper_distance < lower_distance) | (
-        (upper_distance == lower_distance) & ((upper & 1) == 0)
-    )
+    choose_upper = (upper_distance < lower_distance) | ((upper_distance == lower_distance) & ((upper & 1) == 0))
     words = np.where(choose_upper, upper, lower).astype(np.uint8)
     words |= np.where(np.signbit(values), 0x80, 0).astype(np.uint8)
     return words
@@ -85,20 +77,14 @@ def _quantize_host_rows(host: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     scale_words[underflow] = _BF16_MIN_SUBNORMAL_WORD
 
     scale32 = _bf16_words_to_float32(scale_words)
-    invalid_scale = (~zero_rows) & (
-        ~np.isfinite(scale32) | (scale32 <= np.float32(0.0))
-    )
+    invalid_scale = (~zero_rows) & (~np.isfinite(scale32) | (scale32 <= np.float32(0.0)))
     if invalid_scale.any():
         raise ValueError("FP8 quantization row scale is not finite and positive")
 
     reciprocal = np.zeros(scale32.shape, dtype=np.float32)
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        reciprocal[~zero_rows] = (1.0 / scale32[~zero_rows].astype(np.float64)).astype(
-            np.float32
-        )
-        normalized = (
-            host.astype(np.float64) * reciprocal[:, None].astype(np.float64)
-        ).astype(np.float32)
+        reciprocal[~zero_rows] = (1.0 / scale32[~zero_rows].astype(np.float64)).astype(np.float32)
+        normalized = (host.astype(np.float64) * reciprocal[:, None].astype(np.float64)).astype(np.float32)
     if not np.isfinite(normalized[~zero_rows]).all():
         raise ValueError("FP8 quantization normalization produced a non-finite value")
     bounded = np.clip(normalized, -_E4M3FN_MAX, _E4M3FN_MAX)

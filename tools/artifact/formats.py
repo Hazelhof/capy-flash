@@ -43,7 +43,26 @@ class Fp8RowFormat:
     name: str
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat
+@dataclass(frozen=True, slots=True)
+class Mxfp8Format:
+    """E4M3FN weights with one UE8M0 power-of-two scale word per K-axis group (OCP MX)."""
+
+    name: str
+    group_size: int
+
+
+@dataclass(frozen=True, slots=True)
+class Nvfp4RowFormat:
+    """E2M1 weights with one E4M3FN scale word per row group of 16 elements.
+
+    The tensor-wide FP32 multiplier is a separate logical parameter, not part of the payload.
+    """
+
+    name: str
+    group_size: int
+
+
+NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Mxfp8Format | Nvfp4RowFormat
 
 
 BF16 = DirectFormat("bf16", 2)
@@ -56,16 +75,25 @@ Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
 Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
+MXFP8_E4M3FN_G32_UE8M0 = Mxfp8Format("mxfp8_e4m3fn_g32_ue8m0", 32)
+NVFP4_ROW_E4M3_G16 = Nvfp4RowFormat("nvfp4_row_e4m3_g16", 16)
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
-QUANT_FORMATS = MappingProxyType(
-    {item.name: item for item in (Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16)}
-)
+QUANT_FORMATS = MappingProxyType({item.name: item for item in (Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16)})
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
+MXFP8_FORMATS = MappingProxyType({MXFP8_E4M3FN_G32_UE8M0.name: MXFP8_E4M3FN_G32_UE8M0})
+NVFP4_ROW_FORMATS = MappingProxyType({NVFP4_ROW_E4M3_G16.name: NVFP4_ROW_E4M3_G16})
 NUMERIC_FORMATS = MappingProxyType(
-    {**DIRECT_FORMATS, **QUANT_FORMATS, **NVFP4_FORMATS, **FP8_ROW_FORMATS}
+    {
+        **DIRECT_FORMATS,
+        **QUANT_FORMATS,
+        **NVFP4_FORMATS,
+        **FP8_ROW_FORMATS,
+        **MXFP8_FORMATS,
+        **NVFP4_ROW_FORMATS,
+    }
 )
 
 
@@ -110,6 +138,20 @@ def valid_fp8_weight_word(word: int) -> bool:
     return type(word) is int and 0 <= word <= 0xFF and (word & 0x7F) != 0x7F
 
 
+def valid_ue8m0_scale_word(word: int) -> bool:
+    """Return whether *word* is a finite UE8M0 power-of-two scale (255 is the MX NaN)."""
+
+    return type(word) is int and 0 <= word <= 0xFE
+
+
+def decode_ue8m0_word(word: int) -> float:
+    """Decode one exact UE8M0 scale word: 2 ** (word - 127)."""
+
+    if not valid_ue8m0_scale_word(word):
+        raise ValueError("UE8M0 word must be an integer in [0, 254]")
+    return 2.0 ** (word - 127)
+
+
 def valid_fp8_row_scale_word(word: int) -> bool:
     """Return whether *word* is a nonnegative finite BF16 multiplier."""
 
@@ -147,21 +189,29 @@ __all__ = [
     "Q8_G32_FP16",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
+    "MXFP8_E4M3FN_G32_UE8M0",
+    "NVFP4_ROW_E4M3_G16",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",
     "FP8_ROW_FORMATS",
+    "MXFP8_FORMATS",
+    "NVFP4_ROW_FORMATS",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
+    "Mxfp8Format",
+    "Nvfp4RowFormat",
     "NumericFormat",
     "get_format",
     "decode_e2m1_word",
     "decode_e4m3fn_word",
+    "decode_ue8m0_word",
     "valid_fp8_row_scale_word",
     "valid_fp8_weight_word",
     "valid_nvfp4_scale_word",
     "valid_positive_fp32_word",
+    "valid_ue8m0_scale_word",
 ]

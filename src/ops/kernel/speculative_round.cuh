@@ -169,7 +169,7 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
             // A proposal lookup miss (qd == 0) would otherwise accept the draft unconditionally
             // and leave the position target-unmatched (upstream issue #349). Rejecting it keeps
             // the residual resample on the unmodified target distribution.
-            reject         = qd <= 0.0f || !(pd >= qd || u * qd < pd);
+            reject = qd <= 0.0f || !(pd >= qd || u * qd < pd);
         }
     }
     const unsigned failures = __ballot_sync(0xffffffffU, reject);

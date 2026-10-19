@@ -133,6 +133,49 @@ void failure_and_host_only(DeviceContext& device) {
     materialization(device);
 }
 
+// Words of the encoded objects of tests/artifact/writer_interop.py, which writes them through the
+// Python codecs; offsets below come from the layout definitions, not from weight_geometry.
+std::byte interop_code(std::uint64_t row, std::uint64_t index) {
+    return std::byte((row * 7 + index * 3) % 0x7E);
+}
+
+std::byte interop_scale(std::uint64_t row, std::uint64_t group) {
+    return std::byte((row * 5 + group * 11 + 100) % 0x7E);
+}
+
+void check_interop_encoded(const std::string& id, const WeightGeometry& geometry,
+                           const std::vector<std::byte>& bytes) {
+    if (id == "mxfp8") {
+        // [48, 64]: 3072 code bytes, scale plane at 3072 (a multiple of 256), 48 x 2 scales.
+        require(geometry.format == QType::MXFP8_E4M3FN_G32_UE8M0 &&
+                    geometry.layout == QuantLayout::BlockScaleK32 && bytes.size() == 3072 + 96,
+                "Python MXFP8 object has another format, layout or size");
+        for (std::uint64_t n = 0; n < 48; ++n) {
+            for (std::uint64_t k = 0; k < 64; ++k) {
+                require(bytes[n * 64 + k] == interop_code(n, k), "Python MXFP8 code word moved");
+            }
+            for (std::uint64_t g = 0; g < 2; ++g) {
+                require(bytes[3072 + n * 2 + g] == interop_scale(n, g),
+                        "Python MXFP8 scale word moved");
+            }
+        }
+    } else if (id == "nvfp4_rows") {
+        // [6, 32]: rows of 16 code bytes then 2 scale bytes.
+        require(geometry.format == QType::NVFP4_ROW_E4M3_G16 &&
+                    geometry.layout == QuantLayout::RowInterleaved && bytes.size() == 6 * 18,
+                "Python row-scaled NVFP4 object has another format, layout or size");
+        for (std::uint64_t n = 0; n < 6; ++n) {
+            for (std::uint64_t j = 0; j < 16; ++j) {
+                require(bytes[n * 18 + j] == interop_code(n, j), "Python NVFP4 row code moved");
+            }
+            for (std::uint64_t g = 0; g < 2; ++g) {
+                require(bytes[n * 18 + 16 + g] == interop_scale(n, g),
+                        "Python NVFP4 row scale moved");
+            }
+        }
+    }
+}
+
 void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bool writer_fixture) {
     std::optional<MaterializedArtifact> storage;
     std::map<std::size_t, std::vector<std::byte>> expected;
@@ -167,6 +210,10 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
                     require(bytes[i] == std::byte((i * 37 + 11) % 251),
                             "C++ reading differs from known Python writer input bytes");
                 }
+            }
+            if (writer_fixture) {
+                check_interop_encoded(reader.directory().tensor(placement.object).id,
+                                      reader.geometry(placement.object), bytes);
             }
             expected.emplace(placement.object.index, std::move(bytes));
         }

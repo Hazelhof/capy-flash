@@ -48,13 +48,13 @@ namespace {
 using namespace ninfer;
 using namespace ninfer::expert_cache;
 
-constexpr std::int32_t kPlanes                 = 4;
+constexpr std::int32_t kPlanes = 4;
 // NVFP4 Qwen4Exp expert planes: gate/up codes, gate/up scales, down codes, down scales.
-constexpr std::int64_t kPlaneBytes[kPlanes]    = {1638400, 204800, 819200, 102400};
-constexpr std::int64_t kSlotBytes              = 2764800;
-constexpr std::int64_t kBankPad                = 256;  // bank stride = plane bytes + pad
-constexpr std::int64_t kPoolGap                = 4096; // guard bytes after every pool plane/slot
-constexpr unsigned char kGuard                 = 0xA5;
+constexpr std::int64_t kPlaneBytes[kPlanes] = {1638400, 204800, 819200, 102400};
+constexpr std::int64_t kSlotBytes           = 2764800;
+constexpr std::int64_t kBankPad             = 256;  // bank stride = plane bytes + pad
+constexpr std::int64_t kPoolGap             = 4096; // guard bytes after every pool plane/slot
+constexpr unsigned char kGuard              = 0xA5;
 
 __host__ __device__ inline std::uint64_t pattern(std::uint32_t layer, std::uint32_t expert,
                                                  std::uint32_t plane, std::uint64_t word) {
@@ -93,9 +93,8 @@ __global__ void verify_kernel(const std::int32_t* ids, const std::int32_t* slot_
         const auto* w = reinterpret_cast<const std::uint64_t*>(pool.base[q] + s * pool.stride[q]);
         const std::int64_t words = pool.bytes[q] / 8;
         for (std::int64_t i = threadIdx.x; i < words; i += blockDim.x) {
-            bad += w[i] != pattern(static_cast<std::uint32_t>(layer),
-                                   static_cast<std::uint32_t>(e), static_cast<std::uint32_t>(q),
-                                   static_cast<std::uint64_t>(i));
+            bad += w[i] != pattern(static_cast<std::uint32_t>(layer), static_cast<std::uint32_t>(e),
+                                   static_cast<std::uint32_t>(q), static_cast<std::uint64_t>(i));
         }
     }
     if (bad != 0) { atomicAdd(&counters[0], bad); }
@@ -103,6 +102,7 @@ __global__ void verify_kernel(const std::int32_t* ids, const std::int32_t* slot_
 }
 
 int failures = 0;
+
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::cerr << "FAIL: " << what << '\n';
@@ -112,9 +112,10 @@ void check(bool ok, const std::string& what) {
 
 // Pinned fake banks: layers x planes x experts, stride = plane bytes + pad.
 struct Banks {
-    std::byte* host = nullptr;
+    std::byte* host     = nullptr;
     std::int32_t layers = 0, experts = 0;
     std::size_t bytes = 0;
+
     Banks(std::int32_t L, std::int32_t E) : layers(L), experts(E) {
         for (int q = 0; q < kPlanes; ++q) {
             bytes += static_cast<std::size_t>(L) * E * (kPlaneBytes[q] + kBankPad);
@@ -126,8 +127,9 @@ struct Banks {
                 for (std::int32_t e = 0; e < E; ++e) {
                     auto* w = reinterpret_cast<std::uint64_t*>(p);
                     for (std::int64_t i = 0; i < kPlaneBytes[q] / 8; ++i) {
-                        w[i] = pattern(static_cast<std::uint32_t>(l), static_cast<std::uint32_t>(e),
-                                       static_cast<std::uint32_t>(q), static_cast<std::uint64_t>(i));
+                        w[i] =
+                            pattern(static_cast<std::uint32_t>(l), static_cast<std::uint32_t>(e),
+                                    static_cast<std::uint32_t>(q), static_cast<std::uint64_t>(i));
                     }
                     std::memset(p + kPlaneBytes[q], 0x5A, kBankPad);
                     p += kPlaneBytes[q] + kBankPad;
@@ -135,7 +137,9 @@ struct Banks {
             }
         }
     }
+
     ~Banks() { (void)cudaFreeHost(host); }
+
     [[nodiscard]] const std::byte* base(std::int32_t l, int q) const {
         std::size_t off = 0;
         for (std::int32_t ll = 0; ll < layers; ++ll) {
@@ -155,7 +159,8 @@ ExpertLayout make_layout(const Banks& banks, bool contiguous_slots) {
         layout.plane_bytes[q] = kPlaneBytes[q];
         layout.bank_stride[q] = kPlaneBytes[q] + kBankPad;
         // Contiguous: ninfer-ext's one-slot-of-all-planes layout; otherwise one array per plane.
-        layout.pool_stride[q] = contiguous_slots ? kSlotBytes + kPoolGap : kPlaneBytes[q] + kPoolGap;
+        layout.pool_stride[q] =
+            contiguous_slots ? kSlotBytes + kPoolGap : kPlaneBytes[q] + kPoolGap;
     }
     for (std::int32_t l = 0; l < banks.layers; ++l) {
         for (int q = 0; q < kPlanes; ++q) { layout.bank_base.push_back(banks.base(l, q)); }
@@ -165,9 +170,9 @@ ExpertLayout make_layout(const Banks& banks, bool contiguous_slots) {
 
 // Device pool + table of one GPU, guard-filled.
 struct GpuPool {
-    int device = 0;
+    int device         = 0;
     std::int64_t slots = 0;
-    bool contiguous = false;
+    bool contiguous    = false;
     std::byte* mem[kPlanes]{};
     std::int64_t mem_bytes[kPlanes]{};
     std::int32_t* table = nullptr;
@@ -208,6 +213,7 @@ struct GpuPool {
         // process they landed after the first fills and overwrote loaded experts: finish them here.
         CUDA_CHECK(cudaDeviceSynchronize());
     }
+
     ~GpuPool() {
         (void)cudaSetDevice(device);
         for (auto* m : mem) {
@@ -218,8 +224,7 @@ struct GpuPool {
 };
 
 // Final state: tables == policy, slot bytes exact, guards intact.
-void check_final_state(const ExpertCache& cache, const Banks& banks,
-                       std::vector<GpuPool*>& pools) {
+void check_final_state(const ExpertCache& cache, const Banks& banks, std::vector<GpuPool*>& pools) {
     const ExpertCachePolicy& pol = cache.policy();
     const PolicyConfig& c        = pol.config();
     for (std::int32_t p = 0; p < cache.gpus(); ++p) {
@@ -241,7 +246,8 @@ void check_final_state(const ExpertCache& cache, const Banks& banks,
         for (int q = 0; q < kPlanes; ++q) {
             if (gp.mem[q] == nullptr) { continue; }
             host[q].resize(static_cast<std::size_t>(gp.mem_bytes[q]));
-            CUDA_CHECK(cudaMemcpy(host[q].data(), gp.mem[q], host[q].size(), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(
+                cudaMemcpy(host[q].data(), gp.mem[q], host[q].size(), cudaMemcpyDeviceToHost));
         }
         std::int64_t bad_slots = 0, bad_guard = 0, occupied = 0;
         const std::int32_t per_layer = pol.base_slots(p);
@@ -250,19 +256,19 @@ void check_final_state(const ExpertCache& cache, const Banks& banks,
             const std::int32_t e = pol.expert_in(p, static_cast<std::int32_t>(s));
             // Base slots layer-major, then (no gap here) the elastic columns column-major.
             const std::int64_t base_end = static_cast<std::int64_t>(c.layers) * per_layer;
-            const std::int32_t l        = static_cast<std::int32_t>(
-                s < base_end ? s / per_layer : (s - base_end) % c.layers);
+            const std::int32_t l =
+                static_cast<std::int32_t>(s < base_end ? s / per_layer : (s - base_end) % c.layers);
             occupied += e >= 0;
             std::int64_t off = 0;
             for (int q = 0; q < kPlanes; ++q) {
                 const int mq = gp.contiguous ? 0 : q;
                 const std::int64_t stride =
                     gp.contiguous ? kSlotBytes + kPoolGap : kPlaneBytes[q] + kPoolGap;
-                const unsigned char* d =
-                    host[mq].data() + s * stride + (gp.contiguous ? off : 0);
+                const unsigned char* d = host[mq].data() + s * stride + (gp.contiguous ? off : 0);
                 if (e >= 0) {
-                    bad_slots += std::memcmp(d, banks.base(l, q) + static_cast<std::int64_t>(e) *
-                                                                       (kPlaneBytes[q] + kBankPad),
+                    bad_slots += std::memcmp(d,
+                                             banks.base(l, q) + static_cast<std::int64_t>(e) *
+                                                                    (kPlaneBytes[q] + kBankPad),
                                              static_cast<std::size_t>(kPlaneBytes[q])) != 0;
                 } else if (!elastic) { // a released elastic slot keeps its last expert's bytes
                     bad_slots += std::any_of(d, d + kPlaneBytes[q],
@@ -274,7 +280,8 @@ void check_final_state(const ExpertCache& cache, const Banks& banks,
             for (int q = 0; q < (gp.contiguous ? 1 : kPlanes); ++q) {
                 const std::int64_t len = gp.contiguous ? kSlotBytes : kPlaneBytes[q];
                 const unsigned char* g = host[q].data() + s * (len + kPoolGap) + len;
-                bad_guard += std::any_of(g, g + kPoolGap, [](unsigned char b) { return b != kGuard; });
+                bad_guard +=
+                    std::any_of(g, g + kPoolGap, [](unsigned char b) { return b != kGuard; });
             }
         }
         check(bad_slots == 0, "GPU " + std::to_string(p) + ": slot bytes (" +
@@ -321,15 +328,17 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
     cache.initialize(order);
 
     const std::int32_t n = tokens * topk; // ids per layer per window
+
     struct Dev {
-        cudaStream_t stream = nullptr;
-        std::int32_t* ids = nullptr;       // [layers, n]
-        std::int32_t* slot_ids = nullptr;  // [layers, n]
+        cudaStream_t stream          = nullptr;
+        std::int32_t* ids            = nullptr; // [layers, n]
+        std::int32_t* slot_ids       = nullptr; // [layers, n]
         unsigned long long* counters = nullptr;
-        std::int32_t* host_ids = nullptr;  // pinned
-        std::int32_t* host_slots = nullptr;
-        cudaGraphExec_t graph = nullptr;
+        std::int32_t* host_ids       = nullptr; // pinned
+        std::int32_t* host_slots     = nullptr;
+        cudaGraphExec_t graph        = nullptr;
     };
+
     std::vector<Dev> dev(static_cast<std::size_t>(P));
     const std::size_t idbytes = static_cast<std::size_t>(pc.layers) * n * 4;
     for (std::int32_t p = 0; p < P; ++p) {
@@ -346,8 +355,9 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
         cudaGraph_t g = nullptr;
         CUDA_CHECK(cudaStreamBeginCapture(d.stream, cudaStreamCaptureModeThreadLocal));
         for (std::int32_t l = 0; l < pc.layers; ++l) {
-            expert_cache_map_slots(d.ids + l * n, n, l, pc.experts, pools[static_cast<std::size_t>(p)]->table,
-                                   d.slot_ids + l * n, d.stream);
+            expert_cache_map_slots(d.ids + l * n, n, l, pc.experts,
+                                   pools[static_cast<std::size_t>(p)]->table, d.slot_ids + l * n,
+                                   d.stream);
             verify_kernel<<<n, 256, 0, d.stream>>>(d.ids + l * n, d.slot_ids + l * n, l,
                                                    pools[static_cast<std::size_t>(p)]->view,
                                                    delay_ns, d.counters);
@@ -372,8 +382,8 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
                 std::vector<std::int32_t> tok;
                 while (static_cast<std::int32_t>(tok.size()) < topk) {
                     const std::int32_t e =
-                        order[static_cast<std::size_t>(l)][static_cast<std::size_t>(
-                            std::min(geo(rng), pc.experts - 1))];
+                        order[static_cast<std::size_t>(l)]
+                             [static_cast<std::size_t>(std::min(geo(rng), pc.experts - 1))];
                     if (std::find(tok.begin(), tok.end(), e) == tok.end()) { tok.push_back(e); }
                 }
                 ids.insert(ids.end(), tok.begin(), tok.end());
@@ -387,7 +397,8 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
                           window_ids[static_cast<std::size_t>(l)].end(), d.host_ids + l * n);
             }
             CUDA_CHECK(cudaSetDevice(pools[static_cast<std::size_t>(p)]->device));
-            CUDA_CHECK(cudaMemcpyAsync(d.ids, d.host_ids, idbytes, cudaMemcpyHostToDevice, d.stream));
+            CUDA_CHECK(
+                cudaMemcpyAsync(d.ids, d.host_ids, idbytes, cudaMemcpyHostToDevice, d.stream));
             CUDA_CHECK(cudaGraphLaunch(d.graph, d.stream));
             CUDA_CHECK(cudaMemcpyAsync(d.host_slots, d.slot_ids, idbytes, cudaMemcpyDeviceToHost,
                                        d.stream));
@@ -397,8 +408,8 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
         std::vector<std::int32_t> expected(static_cast<std::size_t>(pc.layers) * n);
         for (std::int32_t l = 0; l < pc.layers; ++l) {
             for (std::int32_t i = 0; i < n; ++i) {
-                expected[static_cast<std::size_t>(l * n + i)] =
-                    cache.published_slot(l, window_ids[static_cast<std::size_t>(l)][static_cast<std::size_t>(i)]);
+                expected[static_cast<std::size_t>(l * n + i)] = cache.published_slot(
+                    l, window_ids[static_cast<std::size_t>(l)][static_cast<std::size_t>(i)]);
             }
         }
         for (std::int32_t l = 0; l < pc.layers; ++l) {
@@ -415,8 +426,10 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
             CUDA_CHECK(cudaStreamSynchronize(d.stream));
             for (std::int32_t l = 0; l < pc.layers; ++l) {
                 for (std::int32_t i = 0; i < n; ++i) {
-                    const std::int32_t e = window_ids[static_cast<std::size_t>(l)][static_cast<std::size_t>(i)];
-                    const std::int32_t want = (e % P == p) ? expected[static_cast<std::size_t>(l * n + i)] : -1;
+                    const std::int32_t e =
+                        window_ids[static_cast<std::size_t>(l)][static_cast<std::size_t>(i)];
+                    const std::int32_t want =
+                        (e % P == p) ? expected[static_cast<std::size_t>(l * n + i)] : -1;
                     map_wrong += d.host_slots[l * n + i] != want;
                 }
             }
@@ -435,8 +448,10 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
                 GpuPool& gp = *pools[static_cast<std::size_t>(p)];
                 CUDA_CHECK(cudaSetDevice(gp.device));
                 std::vector<std::int32_t> table(static_cast<std::size_t>(pc.layers) * pc.experts);
-                CUDA_CHECK(cudaMemcpy(table.data(), gp.table, table.size() * 4, cudaMemcpyDeviceToHost));
-                const std::int64_t base_end = static_cast<std::int64_t>(pc.layers) * pol.base_slots(p);
+                CUDA_CHECK(
+                    cudaMemcpy(table.data(), gp.table, table.size() * 4, cudaMemcpyDeviceToHost));
+                const std::int64_t base_end =
+                    static_cast<std::int64_t>(pc.layers) * pol.base_slots(p);
                 for (const std::int32_t slot : table) {
                     if (slot < base_end) { continue; }
                     released_named += (slot - base_end) / pc.layers >= columns;
@@ -458,11 +473,12 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
         res.bad_words += static_cast<std::int64_t>(c[0]);
         res.reads += static_cast<std::int64_t>(c[1]);
     }
-    check(map_wrong == 0, "mapped slots == published view (" + std::to_string(map_wrong) + " wrong)");
+    check(map_wrong == 0,
+          "mapped slots == published view (" + std::to_string(map_wrong) + " wrong)");
     if (pc.elastic_columns > 0) {
-        check(resizes > 0 && released_named == 0,
-              "elastic: no table names a released column (" + std::to_string(released_named) +
-                  " after " + std::to_string(resizes) + " resizes)");
+        check(resizes > 0 && released_named == 0, "elastic: no table names a released column (" +
+                                                      std::to_string(released_named) + " after " +
+                                                      std::to_string(resizes) + " resizes)");
         check(cache.counters().moved > 0 && cache.counters().shrink_evicted > 0,
               "elastic: shrinks moved and evicted experts (" +
                   std::to_string(cache.counters().moved) + " moved, " +
@@ -477,11 +493,12 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
                 static_cast<long long>(k.windows), double(k.policy_hits) / double(k.accesses),
                 double(k.device_hits) / double(k.accesses), static_cast<long long>(k.inserts),
                 static_cast<long long>(k.fills_issued), static_cast<long long>(k.fills_dropped),
-                static_cast<long long>(k.published),
-                static_cast<long long>(k.unpublished), static_cast<long long>(k.table_launches),
-                static_cast<long long>(res.reads), static_cast<long long>(res.bad_words));
+                static_cast<long long>(k.published), static_cast<long long>(k.unpublished),
+                static_cast<long long>(k.table_launches), static_cast<long long>(res.reads),
+                static_cast<long long>(res.bad_words));
     check(res.bad_words == 0, "no window ever read a wrong byte");
-    check(res.reads > 0 && k.fills_issued > 0 && k.unpublished > 0, "scenario exercised reads, fills, evictions");
+    check(res.reads > 0 && k.fills_issued > 0 && k.unpublished > 0,
+          "scenario exercised reads, fills, evictions");
     for (auto& d : dev) {
         (void)cudaGraphExecDestroy(d.graph);
         (void)cudaStreamDestroy(d.stream);
@@ -504,7 +521,7 @@ void fence_scenario(int device, const Banks& banks) {
     pc.slots_per_layer = 1;
     for (const bool fenced : {true, false}) {
         GpuPool pool(device, 1, pc.experts, false);
-        GpuBinding binding = pool.binding;
+        GpuBinding binding  = pool.binding;
         ExpertLayout layout = make_layout(banks, false);
         layout.bank_base.resize(kPlanes); // layer 0 only
         ExpertCache cache(pc, layout, std::span<const GpuBinding>(&binding, 1));
@@ -535,18 +552,17 @@ void fence_scenario(int device, const Banks& banks) {
         } else {
             // The same copy of B into A's slot, issued without waiting for the window.
             for (int q = 0; q < kPlanes; ++q) {
-                CUDA_CHECK(cudaMemcpyAsync(pool.binding.pool_base[q],
-                                           banks.base(0, q) + 7 * (kPlaneBytes[q] + kBankPad),
-                                           static_cast<std::size_t>(kPlaneBytes[q]),
-                                           cudaMemcpyHostToDevice, raw));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    pool.binding.pool_base[q], banks.base(0, q) + 7 * (kPlaneBytes[q] + kBankPad),
+                    static_cast<std::size_t>(kPlaneBytes[q]), cudaMemcpyHostToDevice, raw));
             }
         }
         CUDA_CHECK(cudaDeviceSynchronize());
         unsigned long long c[2]{};
         CUDA_CHECK(cudaMemcpy(c, counters, 16, cudaMemcpyDeviceToHost));
         if (fenced) {
-            check(c[1] == 1 && c[0] == 0, "fence: the 20 ms reader saw A intact (bad words " +
-                                              std::to_string(c[0]) + ")");
+            check(c[1] == 1 && c[0] == 0,
+                  "fence: the 20 ms reader saw A intact (bad words " + std::to_string(c[0]) + ")");
             cache.flush();
             cache.begin_window(std::span<const cudaStream_t>(&s, 1));
             cache.end_window(std::span<const cudaStream_t>(&s, 1));
@@ -557,8 +573,8 @@ void fence_scenario(int device, const Banks& banks) {
             check(c[1] == 1 && c[0] > 0, "fence control: an unfenced copy is detected (bad words " +
                                              std::to_string(c[0]) + ")");
         }
-        std::printf("  fence %s: slot reads %llu, bad words %llu\n", fenced ? "on " : "off (raw copy)",
-                    c[1], c[0]);
+        std::printf("  fence %s: slot reads %llu, bad words %llu\n",
+                    fenced ? "on " : "off (raw copy)", c[1], c[0]);
         (void)cudaFree(ids);
         (void)cudaFree(slots);
         (void)cudaFree(counters);
@@ -597,7 +613,7 @@ void unfenced_scenario(int device, const Banks& banks, bool premature) {
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
     std::int32_t *ids = nullptr, *slots = nullptr;
     unsigned long long* counters = nullptr;
-    std::uint32_t* flag = nullptr;
+    std::uint32_t* flag          = nullptr;
     CUDA_CHECK(cudaMalloc(&ids, 8));
     CUDA_CHECK(cudaMalloc(&slots, 8));
     CUDA_CHECK(cudaMalloc(&counters, 16));
@@ -659,8 +675,8 @@ void unfenced_scenario(int device, const Banks& banks, bool premature) {
     CUDA_CHECK(cudaStreamSynchronize(s));
     unsigned long long k[2]{};
     CUDA_CHECK(cudaMemcpy(k, counters, 16, cudaMemcpyDeviceToHost));
-    check(k[1] == 2 && k[0] == 0, "unfenced: window 1 read A and layer 1 intact (bad words " +
-                                      std::to_string(k[0]) + ")");
+    check(k[1] == 2 && k[0] == 0,
+          "unfenced: window 1 read A and layer 1 intact (bad words " + std::to_string(k[0]) + ")");
     // Next window: B is published in A's slot and reads intact.
     const std::int32_t next_ids[2] = {7, 5};
     CUDA_CHECK(cudaMemcpyAsync(ids, next_ids, 8, cudaMemcpyHostToDevice, s)); // T158
@@ -673,10 +689,11 @@ void unfenced_scenario(int device, const Banks& banks, bool premature) {
     cache.end_window(streams);
     CUDA_CHECK(cudaStreamSynchronize(s));
     CUDA_CHECK(cudaMemcpy(k, counters, 16, cudaMemcpyDeviceToHost));
-    check(k[1] == 1 && k[0] == 0, "unfenced: window 2 read B intact (bad words " +
-                                      std::to_string(k[0]) + ")");
+    check(k[1] == 1 && k[0] == 0,
+          "unfenced: window 2 read B intact (bad words " + std::to_string(k[0]) + ")");
     std::printf("  unfenced mid-window fill: landed during the window %d, window 2 B reads %llu "
-                "bad %llu\n", landed_in_window ? 1 : 0, k[1], k[0]);
+                "bad %llu\n",
+                landed_in_window ? 1 : 0, k[1], k[0]);
     (void)cudaFree(ids);
     (void)cudaFree(slots);
     (void)cudaFree(counters);
@@ -688,7 +705,8 @@ void unfenced_scenario(int device, const Banks& banks, bool premature) {
 // fills into them is queued and in flight; the "ring user" overwrites every lent slot after the
 // lend event; reclaim refills them from profiles.
 __global__ void scribble_kernel(std::uint64_t* p, std::int64_t words) {
-    for (std::int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < words; i += gridDim.x * blockDim.x) {
+    for (std::int64_t i = blockIdx.x * blockDim.x + threadIdx.x; i < words;
+         i += gridDim.x * blockDim.x) {
         p[i] = 0xDEADBEEFDEADBEEFULL;
     }
 }
@@ -706,7 +724,9 @@ void lend_scenario(int device, const Banks& banks4) {
     ExpertCache cache(pc, make_layout(banks4, false), bindings, 4 * kSlotBytes); // shallow queue
     std::vector<std::vector<std::int32_t>> profile(4);
     for (std::int32_t l = 0; l < 4; ++l) {
-        for (std::int32_t e = 0; e < 64; ++e) { profile[static_cast<std::size_t>(l)].push_back((e * 7 + l) % 64); }
+        for (std::int32_t e = 0; e < 64; ++e) {
+            profile[static_cast<std::size_t>(l)].push_back((e * 7 + l) % 64);
+        }
     }
     cache.initialize(profile);
     cudaStream_t s = nullptr, ring = nullptr;
@@ -719,19 +739,22 @@ void lend_scenario(int device, const Banks& banks4) {
     for (std::int32_t l = 0; l < 4; ++l) {
         std::vector<Routed> routed;
         for (std::int32_t e = 40; e < 48; ++e) { routed.push_back(Routed{(e + l) % 64, 5}); }
-        std::sort(routed.begin(), routed.end(), [](const Routed& a, const Routed& b) { return a.expert < b.expert; });
+        std::sort(routed.begin(), routed.end(),
+                  [](const Routed& a, const Routed& b) { return a.expert < b.expert; });
         (void)cache.observe_prompt(l, routed, 8);
     }
     cache.submit_fills();
     check(cache.fills_pending() > 0, "lend: a backlog is pending when the layers are lent");
     const auto events = cache.lend_layers(2, 2);
-    check(events.size() == 1 && cache.lent(2) && cache.lent(3) && !cache.lent(1), "lend: layers 2..3 lent");
+    check(events.size() == 1 && cache.lent(2) && cache.lent(3) && !cache.lent(1),
+          "lend: layers 2..3 lent");
     // The ring user overwrites every lent slot after the lend event.
     CUDA_CHECK(cudaStreamWaitEvent(ring, events[0], 0));
     for (int q = 0; q < kPlanes; ++q) {
         for (std::int64_t sl = 2 * 8; sl < 4 * 8; ++sl) {
             scribble_kernel<<<64, 256, 0, ring>>>(
-                reinterpret_cast<std::uint64_t*>(pool.binding.pool_base[q] + sl * (kPlaneBytes[q] + kPoolGap)),
+                reinterpret_cast<std::uint64_t*>(pool.binding.pool_base[q] +
+                                                 sl * (kPlaneBytes[q] + kPoolGap)),
                 kPlaneBytes[q] / 8);
         }
     }
@@ -746,15 +769,19 @@ void lend_scenario(int device, const Banks& banks4) {
         for (std::int32_t e = 10; e < 20; ++e) { routed.push_back(Routed{e, 3}); }
         const LayerView v = cache.observe_prompt(l, routed, 8);
         (l >= 2 ? lent_inserts : other_inserts) += v.fills.size();
-        if (l >= 2) { check(v.resident.empty() && v.missing.size() == 10, "lend: lent layer classifies all missing"); }
+        if (l >= 2) {
+            check(v.resident.empty() && v.missing.size() == 10,
+                  "lend: lent layer classifies all missing");
+        }
     }
-    check(lent_inserts == 0 && other_inserts > 0, "lend: lent layers insert nothing (" +
-                                                       std::to_string(lent_inserts) + ")");
+    check(lent_inserts == 0 && other_inserts > 0,
+          "lend: lent layers insert nothing (" + std::to_string(lent_inserts) + ")");
     cache.submit_fills();
     CUDA_CHECK(cudaStreamSynchronize(ring));
     CUDA_CHECK(cudaStreamSynchronize(s));
     // Reclaim: refill the lent layers from profiles of >= 8 experts each.
-    std::vector<std::vector<std::int32_t>> refill{{1, 2, 3, 4, 5, 6, 7, 8, 9}, {60, 61, 62, 63, 0, 1, 2, 3}};
+    std::vector<std::vector<std::int32_t>> refill{{1, 2, 3, 4, 5, 6, 7, 8, 9},
+                                                  {60, 61, 62, 63, 0, 1, 2, 3}};
     cache.reclaim_layers(refill);
     check(!cache.lending(), "lend: reclaimed");
     cache.flush();
@@ -770,7 +797,6 @@ void lend_scenario(int device, const Banks& banks4) {
     (void)cudaStreamDestroy(s);
     (void)cudaStreamDestroy(ring);
 }
-
 
 // T69 lending of the base slots only (lend_layers keep_elastic): 4 layers x 64 experts, base 8
 // slots per layer + 2 elastic columns (per GPU), on 1 or 2 GPUs. Layers 2..3 are lent while a
@@ -800,7 +826,9 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
     ExpertCache cache(pc, make_layout(banks4, false), bindings, 4 * kSlotBytes); // shallow queue
     std::vector<std::vector<std::int32_t>> profile(4);
     for (std::int32_t l = 0; l < 4; ++l) {
-        for (std::int32_t e = 0; e < 64; ++e) { profile[static_cast<std::size_t>(l)].push_back((e * 7 + l) % 64); }
+        for (std::int32_t e = 0; e < 64; ++e) {
+            profile[static_cast<std::size_t>(l)].push_back((e * 7 + l) % 64);
+        }
     }
     cache.initialize(profile);
     const ExpertCachePolicy& pol = cache.policy();
@@ -822,7 +850,8 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
     for (std::int32_t l = 0; l < 4; ++l) {
         std::vector<Routed> routed;
         for (std::int32_t e = 40; e < 52; ++e) { routed.push_back(Routed{(e + l) % 64, 5}); }
-        std::sort(routed.begin(), routed.end(), [](const Routed& a, const Routed& b) { return a.expert < b.expert; });
+        std::sort(routed.begin(), routed.end(),
+                  [](const Routed& a, const Routed& b) { return a.expert < b.expert; });
         (void)cache.observe_prompt(l, routed, 8);
     }
     cache.submit_fills();
@@ -843,19 +872,22 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
     for (std::int32_t l = 2; l < 4; ++l) {
         for (std::int32_t e = 0; e < 64; ++e) {
             const std::int32_t s = pol.slot_of(l, e);
-            check(s < 0 || !is_base(pol.partition_of(e), s), "keep: no lent layer expert in a base slot");
+            check(s < 0 || !is_base(pol.partition_of(e), s),
+                  "keep: no lent layer expert in a base slot");
         }
     }
     // The ring user overwrites every lent base slot after the lend event.
     for (std::int32_t p = 0; p < P; ++p) {
         CUDA_CHECK(cudaSetDevice(devices[static_cast<std::size_t>(p)]));
-        CUDA_CHECK(cudaStreamWaitEvent(rings[static_cast<std::size_t>(p)], events[static_cast<std::size_t>(p)], 0));
+        CUDA_CHECK(cudaStreamWaitEvent(rings[static_cast<std::size_t>(p)],
+                                       events[static_cast<std::size_t>(p)], 0));
         const std::int32_t base = pol.base_slots(p);
         for (int q = 0; q < kPlanes; ++q) {
             for (std::int64_t sl = 2 * base; sl < 4 * base; ++sl) {
                 scribble_kernel<<<64, 256, 0, rings[static_cast<std::size_t>(p)]>>>(
-                    reinterpret_cast<std::uint64_t*>(pools[static_cast<std::size_t>(p)]->binding.pool_base[q] +
-                                                     sl * (kPlaneBytes[q] + kPoolGap)),
+                    reinterpret_cast<std::uint64_t*>(
+                        pools[static_cast<std::size_t>(p)]->binding.pool_base[q] +
+                        sl * (kPlaneBytes[q] + kPoolGap)),
                     kPlaneBytes[q] / 8);
             }
         }
@@ -874,7 +906,8 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
         }
     }
     check(lent_published > 0 && base_published == 0,
-          "keep: lent layers publish elastic residents only (" + std::to_string(lent_published) + ")");
+          "keep: lent layers publish elastic residents only (" + std::to_string(lent_published) +
+              ")");
     unsigned long long bad_reads = 0, reads = 0;
     for (std::int32_t p = 0; p < P; ++p) {
         CUDA_CHECK(cudaSetDevice(devices[static_cast<std::size_t>(p)]));
@@ -915,7 +948,9 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
         const LayerView v = cache.observe_prompt(l, routed, 8);
         if (l >= 2) {
             lent_inserts += v.fills.size();
-            for (const Insert& i : v.fills) { check(!is_base(i.partition, i.slot), "keep: lent layer inserts into elastic slots"); }
+            for (const Insert& i : v.fills) {
+                check(!is_base(i.partition, i.slot), "keep: lent layer inserts into elastic slots");
+            }
         }
     }
     check(lent_inserts > 0, "keep: lent layers insert into their elastic slots");
@@ -926,17 +961,20 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
     for (std::int32_t l = 2; l < 4; ++l) {
         for (std::int32_t e = 0; e < 64; ++e) {
             const std::int32_t s = pol.slot_of(l, e);
-            check(s < 0 || !is_base(pol.partition_of(e), s), "keep: shrink keeps lent base slots empty");
+            check(s < 0 || !is_base(pol.partition_of(e), s),
+                  "keep: shrink keeps lent base slots empty");
         }
     }
     cache.set_active_columns(2, streams);
     // Reclaim: top up from profiles in rank order.
-    std::vector<std::vector<std::int32_t>> refill{{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20},
-                                                  {60, 61, 62, 63, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
+    std::vector<std::vector<std::int32_t>> refill{
+        {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20},
+        {60, 61, 62, 63, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
     std::vector<std::int32_t> rank(static_cast<std::size_t>(4 * 64), 64);
     for (std::int32_t i = 0; i < 2; ++i) {
         for (std::size_t r = 0; r < refill[static_cast<std::size_t>(i)].size(); ++r) {
-            rank[static_cast<std::size_t>((2 + i) * 64 + refill[static_cast<std::size_t>(i)][r])] = static_cast<std::int32_t>(r);
+            rank[static_cast<std::size_t>((2 + i) * 64 + refill[static_cast<std::size_t>(i)][r])] =
+                static_cast<std::int32_t>(r);
         }
     }
     cache.reclaim_layers(refill, rank);
@@ -958,7 +996,8 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
           "keep: reclaimed layers hold their profile's hottest experts");
     check_final_state(cache, banks4, pools);
     std::printf("  keep-elastic lend/reclaim (%d GPU): kept %zu elastic residents, lent-layer "
-                "inserts %zu, slots read while lent %llu\n", P, kept.size(), lent_inserts, reads);
+                "inserts %zu, slots read while lent %llu\n",
+                P, kept.size(), lent_inserts, reads);
     for (std::int32_t p = 0; p < P; ++p) {
         (void)cudaStreamDestroy(streams[static_cast<std::size_t>(p)]);
         (void)cudaStreamDestroy(rings[static_cast<std::size_t>(p)]);
@@ -968,7 +1007,7 @@ void lend_keep_scenario(const std::vector<int>& devices, const Banks& banks4) {
 // --bench: fill bandwidth. Layer 0 only; each repetition routes a fresh set of experts that
 // misses everywhere, so every slot of every GPU is refilled (`per_gpu` experts per GPU).
 void bench(const std::vector<int>& devices, std::int32_t per_gpu, int reps) {
-    const auto P = static_cast<std::int32_t>(devices.size());
+    const auto P               = static_cast<std::int32_t>(devices.size());
     const std::int32_t experts = 512;
     Banks banks(1, experts);
     PolicyConfig pc;
@@ -999,12 +1038,14 @@ void bench(const std::vector<int>& devices, std::int32_t per_gpu, int reps) {
     for (int r = 0; r < reps + 1; ++r) {
         // Alternate between two disjoint expert sets of n experts each (n <= 256).
         std::vector<Routed> routed;
-        for (std::int32_t e = (r % 2) * n; e < (r % 2) * n + n; ++e) { routed.push_back(Routed{e, 1}); }
+        for (std::int32_t e = (r % 2) * n; e < (r % 2) * n + n; ++e) {
+            routed.push_back(Routed{e, 1});
+        }
         cache.begin_window(streams);
         cache.end_window(streams);
         (void)cache.observe(0, routed, 1);
         const std::int64_t bytes0 = cache.counters().fill_bytes;
-        const auto t0 = std::chrono::steady_clock::now();
+        const auto t0             = std::chrono::steady_clock::now();
         cache.submit_fills();
         const auto t1 = std::chrono::steady_clock::now();
         cache.flush();
@@ -1038,11 +1079,12 @@ void bench(const std::vector<int>& devices, std::int32_t per_gpu, int reps) {
             for (std::int32_t i = 0; i < per_gpu; ++i) {
                 const std::int32_t e = i * P + p;
                 for (int q = 0; q < kPlanes; ++q) {
-                    CUDA_CHECK(cudaMemcpyAsync(pools[static_cast<std::size_t>(p)]->binding.pool_base[q] +
-                                                   i * (kPlaneBytes[q] + kPoolGap),
-                                               banks.base(0, q) + e * (kPlaneBytes[q] + kBankPad),
-                                               static_cast<std::size_t>(kPlaneBytes[q]),
-                                               cudaMemcpyHostToDevice, streams[static_cast<std::size_t>(p)]));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        pools[static_cast<std::size_t>(p)]->binding.pool_base[q] +
+                            i * (kPlaneBytes[q] + kPoolGap),
+                        banks.base(0, q) + e * (kPlaneBytes[q] + kBankPad),
+                        static_cast<std::size_t>(kPlaneBytes[q]), cudaMemcpyHostToDevice,
+                        streams[static_cast<std::size_t>(p)]));
                 }
             }
         }
@@ -1052,7 +1094,8 @@ void bench(const std::vector<int>& devices, std::int32_t per_gpu, int reps) {
             CUDA_CHECK(cudaStreamSynchronize(streams[static_cast<std::size_t>(p)]));
         }
         const auto t2 = std::chrono::steady_clock::now();
-        raw_gbs.push_back(double(n) * kSlotBytes / std::chrono::duration<double>(t2 - t0).count() / 1e9);
+        raw_gbs.push_back(double(n) * kSlotBytes / std::chrono::duration<double>(t2 - t0).count() /
+                          1e9);
         raw_us.push_back(std::chrono::duration<double>(t1 - t0).count() * 1e6 / n);
     }
     std::sort(raw_gbs.begin(), raw_gbs.end());
@@ -1070,9 +1113,10 @@ void bench(const std::vector<int>& devices, std::int32_t per_gpu, int reps) {
 } // namespace
 
 int main(int argc, char** argv) {
-    int count = 0;
+    int count             = 0;
     const cudaError_t err = cudaGetDeviceCount(&count);
-    if (err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver || (err == cudaSuccess && count == 0)) {
+    if (err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver ||
+        (err == cudaSuccess && count == 0)) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
@@ -1088,10 +1132,10 @@ int main(int argc, char** argv) {
             Banks banks(3, 64);
             std::printf("expert cache GPU test: %d device(s)\n", count);
             PolicyConfig lru;
-            lru.layers          = 3;
-            lru.experts         = 64;
-            lru.partitions      = 1;
-            lru.slots_per_layer = 10;
+            lru.layers                 = 3;
+            lru.experts                = 64;
+            lru.partitions             = 1;
+            lru.slots_per_layer        = 10;
             const std::int64_t shallow = 8 * kSlotBytes;
             std::printf(" 1 GPU, LRU, one array per plane, fill depth 8 experts:\n");
             (void)run_windows({0}, lru, false, banks, 60, 4, 6, 200'000, 11, shallow);
@@ -1115,9 +1159,9 @@ int main(int argc, char** argv) {
             } else {
                 std::printf(" (one GPU: the two-GPU scenarios did not run)\n");
             }
-            PolicyConfig ela     = adm;
-            ela.slots_per_layer  = 6;
-            ela.elastic_columns  = 3;
+            PolicyConfig ela    = adm;
+            ela.slots_per_layer = 6;
+            ela.elastic_columns = 3;
             std::printf(" 1 GPU, admission + cap 3, 6 base slots + 3 elastic columns resized every "
                         "6 windows:\n");
             (void)run_windows({0}, ela, false, banks, 90, 4, 6, 100'000, 15,

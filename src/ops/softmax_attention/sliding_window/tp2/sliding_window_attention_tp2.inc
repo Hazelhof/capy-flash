@@ -1,7 +1,8 @@
-// Translation-unit fragment of src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp,
-// included once at its end (after its closing namespace): the two-device 16/4 head block of the
-// Op, declared in ninfer/ops/tp2/sliding_window_attention.h, sharing the file's private checks.
-// Not a header. Our file; see docs/maintainer/upstream-merge.md.
+// Translation-unit fragment of
+// src/ops/softmax_attention/sliding_window/sliding_window_attention.cpp, included once at its end
+// (after its closing namespace): the two-device 16/4 head block of the Op, declared in
+// ninfer/ops/tp2/sliding_window_attention.h, sharing the file's private checks. Not a header. Our
+// file; see docs/maintainer/upstream-merge.md.
 
 #include "ninfer/ops/tp2/sliding_window_attention.h"
 #include "ops/softmax_attention/sliding_window/tp2/launch_tp2.h"
@@ -108,8 +109,8 @@ void sliding_window_attention_head_block(const Tensor& q, const Tensor& query_k,
     require_shape(valid_columns, batch, 1, 1, 1, op, "valid columns");
     require_shape(lanes, batch, 1, 1, 1, op, "lanes");
     require_shape(out, kHeadDim, kBlockQHeads, tokens, batch, op, "out");
-    for (const Tensor* t : std::initializer_list<const Tensor*>{
-             &q, &query_k, &query_v, &positions, &valid_columns, &lanes, &out}) {
+    for (const Tensor* t : std::initializer_list<const Tensor*>{&q, &query_k, &query_v, &positions,
+                                                                &valid_columns, &lanes, &out}) {
         require_contiguous_nonnull(*t, op, "operand");
     }
     validate_block_context(context, window, op);
@@ -128,10 +129,9 @@ void sliding_window_attention_head_block(const Tensor& q, const Tensor& query_k,
     if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
         partial = allocate_block_workspace(workspace, tokens, plan.split_capacity, batch);
     }
-    detail::sliding_window_attention_head_block_launch(q, query_k, query_v, positions,
-                                                       valid_columns, lanes, scale, context, plan,
-                                                       partial.acc, partial.m, partial.l, out,
-                                                       stream);
+    detail::sliding_window_attention_head_block_launch(
+        q, query_k, query_v, positions, valid_columns, lanes, scale, context, plan, partial.acc,
+        partial.m, partial.l, out, stream);
 }
 
 } // namespace ninfer::ops

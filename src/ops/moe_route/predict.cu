@@ -1,8 +1,9 @@
 // Implements: include/ninfer/ops/moe_predict.h
-// Router-ahead window scores for expert prefetch (predictor `post_uni` of T19, prefetch T25; docs/capy-flash/development-log.md): a
-// grouped offset RMSNorm + stream mean of the wide residual, the next layer's 512 router rows
-// (one warp per row, as moe_route's logits kernel), and in the grid's last block the softmax
-// window score and the top non-resident candidates by rank counting (deterministic, no sort).
+// Router-ahead window scores for expert prefetch (predictor `post_uni` of T19, prefetch T25;
+// docs/capy-flash/development-log.md): a grouped offset RMSNorm + stream mean of the wide residual,
+// the next layer's 512 router rows (one warp per row, as moe_route's logits kernel), and in the
+// grid's last block the softmax window score and the top non-resident candidates by rank counting
+// (deterministic, no sort).
 #include "ninfer/ops/moe_predict.h"
 
 #include "core/device.h" // CUDA_CHECK
@@ -18,15 +19,15 @@
 namespace ninfer::ops {
 namespace {
 
-constexpr int H        = kMoePredictHidden;
-constexpr int S        = kMoePredictStreams;
-constexpr int E        = kMoePredictExperts;
-constexpr int MAXT     = kMoePredictMaxTokens;
+constexpr int H            = kMoePredictHidden;
+constexpr int S            = kMoePredictStreams;
+constexpr int E            = kMoePredictExperts;
+constexpr int MAXT         = kMoePredictMaxTokens;
 constexpr int kNormThreads = 256;
 constexpr int kPerThread   = H / kNormThreads; // 10
-constexpr int kWarps       = 4;               // router rows per block
-constexpr int kBlocks      = E / kWarps;      // 128
-constexpr int kVectors     = H / 8 / 32;      // uint4 of 8 BF16 per lane
+constexpr int kWarps       = 4;                // router rows per block
+constexpr int kBlocks      = E / kWarps;       // 128
+constexpr int kVectors     = H / 8 / 32;       // uint4 of 8 BF16 per lane
 
 // Workspace: [0, 256) completion counter, then u BF16 [H, MAXT], then logits FP32 [MAXT, E].
 constexpr std::size_t kUOffset      = 256;
@@ -67,8 +68,8 @@ __global__ void __launch_bounds__(kNormThreads)
         float mean  = 0.0F;
 #pragma unroll
         for (int s = 0; s < S; ++s) {
-            const float n = __bfloat162float(__float2bfloat16_rn(
-                v[s][i] * inv[s] * (1.0F + __bfloat162float(norm[s * H + h]))));
+            const float n = __bfloat162float(
+                __float2bfloat16_rn(v[s][i] * inv[s] * (1.0F + __bfloat162float(norm[s * H + h]))));
             mean += n;
         }
         u[static_cast<std::int64_t>(t) * H + h] = __float2bfloat16_rn(mean / static_cast<float>(S));
@@ -114,17 +115,18 @@ __global__ void __launch_bounds__(kWarps * 32)
     predict_select_kernel(const __nv_bfloat16* __restrict__ u,
                           const __nv_bfloat16* __restrict__ router, int T,
                           const std::int32_t* __restrict__ resident, float min_score, int count,
-                          float* logits, unsigned* counter, std::int32_t* candidates,
-                          float* scores, std::uint32_t* flag) {
+                          float* logits, unsigned* counter, std::int32_t* candidates, float* scores,
+                          std::uint32_t* flag) {
     __shared__ float s_score[E];
     __shared__ float red[kWarps];
     __shared__ int s_last;
     __shared__ int s_eligible;
-    const int tid = static_cast<int>(threadIdx.x);
+    const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5, lane = tid & 31;
     {
-        const int row  = static_cast<int>(blockIdx.x) * kWarps + warp;
-        const auto* w4 = reinterpret_cast<const uint4*>(router + static_cast<std::int64_t>(row) * H);
+        const int row = static_cast<int>(blockIdx.x) * kWarps + warp;
+        const auto* w4 =
+            reinterpret_cast<const uint4*>(router + static_cast<std::int64_t>(row) * H);
         uint4 w[kVectors];
 #pragma unroll
         for (int i = 0; i < kVectors; ++i) { w[i] = __ldg(w4 + i * 32 + lane); }
@@ -171,9 +173,9 @@ __global__ void __launch_bounds__(kWarps * 32)
     int eligible = 0;
 #pragma unroll
     for (int i = 0; i < kPer; ++i) {
-        const int e  = i * kWarps * 32 + tid;
+        const int e   = i * kWarps * 32 + tid;
         const bool ok = resident[e] < 0 && score[i] >= min_score;
-        s_score[e]   = ok ? score[i] : -1.0F; // scores are >= 0: an ineligible one never outranks
+        s_score[e]    = ok ? score[i] : -1.0F; // scores are >= 0: an ineligible one never outranks
         eligible += ok ? 1 : 0;
     }
     if (tid == 0) { s_eligible = 0; }
@@ -202,7 +204,7 @@ __global__ void __launch_bounds__(kWarps * 32)
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
-        *counter = 0;
+        *counter                                         = 0;
         *reinterpret_cast<volatile std::uint32_t*>(flag) = 1;
     }
 }
@@ -219,8 +221,8 @@ void moe_predict_ahead(const Tensor& x, const Tensor& norm, const Tensor& router
                        const std::int32_t* resident, float min_score, std::int32_t count,
                        std::int32_t* candidates, float* scores, std::uint32_t* flag,
                        void* workspace, cudaStream_t stream) {
-    require(x.dtype == DType::BF16 && x.data != nullptr && x.is_contiguous() &&
-                x.ne[0] == S * H && x.ne[1] >= 1 && x.ne[1] <= MAXT && x.ne[2] == 1 && x.ne[3] == 1,
+    require(x.dtype == DType::BF16 && x.data != nullptr && x.is_contiguous() && x.ne[0] == S * H &&
+                x.ne[1] >= 1 && x.ne[1] <= MAXT && x.ne[2] == 1 && x.ne[3] == 1,
             "x must be BF16 [4*2560, T], 1 <= T <= 8");
     require(norm.dtype == DType::BF16 && norm.data != nullptr && norm.is_contiguous() &&
                 norm.numel() == S * H,
@@ -228,12 +230,14 @@ void moe_predict_ahead(const Tensor& x, const Tensor& norm, const Tensor& router
     require(router.dtype == DType::BF16 && router.data != nullptr && router.is_contiguous() &&
                 router.numel() == static_cast<std::int64_t>(E + 1) * H,
             "router must be BF16 [2560,513]");
-    require(reinterpret_cast<std::uintptr_t>(router.data) % 16 == 0, "router must be 16-byte aligned");
+    require(reinterpret_cast<std::uintptr_t>(router.data) % 16 == 0,
+            "router must be 16-byte aligned");
     require(count >= 1 && count <= kMoePredictMaxCandidates, "count must be 1..32");
     require(resident != nullptr && candidates != nullptr && scores != nullptr && flag != nullptr &&
                 workspace != nullptr,
             "null pointer");
-    require(reinterpret_cast<std::uintptr_t>(workspace) % 256 == 0, "workspace must be 256-byte aligned");
+    require(reinterpret_cast<std::uintptr_t>(workspace) % 256 == 0,
+            "workspace must be 256-byte aligned");
     require(min_score >= 0.0F, "min_score must be >= 0");
     const int T   = x.ne[1];
     auto* base    = static_cast<std::byte*>(workspace);
@@ -241,8 +245,8 @@ void moe_predict_ahead(const Tensor& x, const Tensor& norm, const Tensor& router
     auto* u       = reinterpret_cast<__nv_bfloat16*>(base + kUOffset);
     auto* logits  = reinterpret_cast<float*>(base + kLogitsOffset);
     predict_uni_kernel<<<T, kNormThreads, 0, stream>>>(static_cast<const __nv_bfloat16*>(x.data),
-                                                        static_cast<const __nv_bfloat16*>(norm.data),
-                                                        eps, u);
+                                                       static_cast<const __nv_bfloat16*>(norm.data),
+                                                       eps, u);
     CUDA_CHECK(cudaGetLastError());
     predict_select_kernel<<<kBlocks, kWarps * 32, 0, stream>>>(
         u, static_cast<const __nv_bfloat16*>(router.data), T, resident, min_score, count, logits,

@@ -30,9 +30,9 @@ using namespace ninfer::test;
 
 namespace {
 
-constexpr int H = ops::kMoePredictHidden;
-constexpr int S = ops::kMoePredictStreams;
-constexpr int E = ops::kMoePredictExperts;
+constexpr int H            = ops::kMoePredictHidden;
+constexpr int S            = ops::kMoePredictStreams;
+constexpr int E            = ops::kMoePredictExperts;
 constexpr double kScoreTol = 2e-4;
 constexpr float kEps       = 1e-6F;
 
@@ -46,17 +46,19 @@ float bf16_round(double v) { return bf16_to_f32(f32_to_bf16(static_cast<float>(v
 
 struct Mapped {
     std::byte* p = nullptr;
+
     explicit Mapped(std::size_t bytes) {
         CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&p), bytes, cudaHostAllocMapped));
         std::memset(p, 0, bytes);
     }
+
     ~Mapped() { (void)cudaFreeHost(p); }
 };
 
 int run_case(const std::string& label, int T, int count, int residents, float min_score,
              std::uint32_t seed, bool graph, int repeats = 1) {
-    std::vector<float> x(static_cast<std::size_t>(S) * H * T), norm(static_cast<std::size_t>(S) * H),
-        router(static_cast<std::size_t>(E + 1) * H);
+    std::vector<float> x(static_cast<std::size_t>(S) * H * T),
+        norm(static_cast<std::size_t>(S) * H), router(static_cast<std::size_t>(E + 1) * H);
     fill_uniform(x, seed, -1.0F, 1.0F);
     // Streams of very different scales (the RMS normalization must remove them).
     for (int t = 0; t < T; ++t) {
@@ -106,7 +108,8 @@ int run_case(const std::string& label, int T, int count, int residents, float mi
         double m = -1e300;
         for (int e = 0; e < E; ++e) {
             double sum = 0;
-            for (int h = 0; h < H; ++h) sum += double(router[static_cast<std::size_t>(e) * H + h]) * u[h];
+            for (int h = 0; h < H; ++h)
+                sum += double(router[static_cast<std::size_t>(e) * H + h]) * u[h];
             l[e] = sum;
             m    = std::max(m, sum);
         }
@@ -119,7 +122,8 @@ int run_case(const std::string& label, int T, int count, int residents, float mi
     for (int e = 0; e < E; ++e) {
         if (resident[e] < 0 && score[e] >= min_score) eligible.push_back(e);
     }
-    std::stable_sort(eligible.begin(), eligible.end(), [&](int a, int b) { return score[a] > score[b]; });
+    std::stable_sort(eligible.begin(), eligible.end(),
+                     [&](int a, int b) { return score[a] > score[b]; });
 
     // Device.
     const auto xb = encode_bf16(x), nb = encode_bf16(norm), rb = encode_bf16(router);
@@ -176,17 +180,19 @@ int run_case(const std::string& label, int T, int count, int residents, float mi
     CUDA_CHECK(cudaStreamDestroy(stream));
 
     const int expect_valid = std::min<int>(count, static_cast<int>(eligible.size()));
-    const double kth = expect_valid > 0 ? score[eligible[static_cast<std::size_t>(expect_valid - 1)]] : 0.0;
+    const double kth =
+        expect_valid > 0 ? score[eligible[static_cast<std::size_t>(expect_valid - 1)]] : 0.0;
     std::vector<bool> seen(E, false);
     double worst_score = 0;
-    int near_ties = 0;
+    int near_ties      = 0;
     for (int k = 0; k < count; ++k) {
         const int e = cands[k];
         if (k >= expect_valid) {
             // An expert at the min_score edge may be judged either way: accept a valid extra one
             // only if its score is within tol of the gate.
             if (e == -1 && scores[k] == 0.0F) continue;
-            if (e >= 0 && e < E && resident[e] < 0 && std::fabs(score[e] - min_score) <= tol) continue;
+            if (e >= 0 && e < E && resident[e] < 0 && std::fabs(score[e] - min_score) <= tol)
+                continue;
             std::cerr << label << ": slot " << k << " should be empty, holds " << e << '\n';
             ++failures;
             continue;

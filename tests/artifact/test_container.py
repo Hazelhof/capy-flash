@@ -46,9 +46,7 @@ def _small(path: Path) -> dict:
             "auxiliaries": {"activation_input_divisor": {"object": "scale"}},
         }
     ]
-    with ArtifactWriter(
-        path, specs, components=components, bindings=bindings, uses=uses
-    ) as writer:
+    with ArtifactWriter(path, specs, components=components, bindings=bindings, uses=uses) as writer:
         writer.write_object("w", struct.pack("<4H", 0, 0x8000, 0x3F80, 0x7FC1))
         writer.write_object("scale", struct.pack("<f", 2.0))
         writer.write_object("template", b"hello")
@@ -72,9 +70,7 @@ def test_single_file_known_header_payload_and_refs(tmp_path):
     assert magic == b"NINFER\0\3" and len(identity) == 16
     payload_offset = (32 + json_bytes + 4095) // 4096 * 4096
     assert payload_offset == 4096
-    assert raw[payload_offset : payload_offset + 8] == struct.pack(
-        "<4H", 0, 0x8000, 0x3F80, 0x7FC1
-    )
+    assert raw[payload_offset : payload_offset + 8] == struct.pack("<4H", 0, 0x8000, 0x3F80, 0x7FC1)
     assert raw[payload_offset + 8 : payload_offset + 256] == bytes(248)
     assert raw[payload_offset + 256 : payload_offset + 260] == struct.pack("<f", 2)
     assert raw[-5:] == b"hello"
@@ -97,9 +93,7 @@ def test_shards_use_recorded_names_and_open_only_when_needed(tmp_path):
         bindings={},
         max_file_bytes=12288,
     ) as writer:
-        writer.write_object(
-            "data", (payload[:5000], payload[5000:9000], payload[9000:])
-        )
+        writer.write_object("data", (payload[:5000], payload[5000:9000], payload[9000:]))
         directory = writer.directory.to_json()
         identity = writer.artifact_id
     assert [f["path"] for f in directory["files"]] == [
@@ -118,10 +112,7 @@ def test_shards_use_recorded_names_and_open_only_when_needed(tmp_path):
     _rewrite(path, directory)
     with Artifact(path) as reader:
         assert reader.read_object("data") == payload
-        assert (
-            b"".join(reader.iter_range(8120, 17300, chunk_bytes=503))
-            == payload[8120:25420]
-        )
+        assert b"".join(reader.iter_range(8120, 17300, chunk_bytes=503)) == payload[8120:25420]
 
     renamed.unlink()
     with Artifact(path) as reader:
@@ -158,9 +149,7 @@ def test_existing_output_is_preserved(tmp_path):
 @pytest.mark.parametrize(
     "change",
     [
-        pytest.param(
-            lambda d: d["objects"][1].update(offset=1), id="overlapping-objects"
-        ),
+        pytest.param(lambda d: d["objects"][1].update(offset=1), id="overlapping-objects"),
         pytest.param(
             lambda d: d["bindings"]["text/reordered"]["parts"][0].update(range=[0, 5]),
             id="binding-outside-parent",
@@ -206,9 +195,7 @@ def test_default_file_limit_accounts_for_framing():
     assert start + directory.files[0].payload_bytes <= size
     assert 4096 + directory.files[1].payload_bytes <= size
     description["objects"][0]["bytes"] = size - start
-    directory, _, same_start = layout_directory(
-        "small.ninfer", description, size - start
-    )
+    directory, _, same_start = layout_directory("small.ninfer", description, size - start)
     assert same_start == start and len(directory.files) == 1
     with pytest.raises(ArtifactError):
         layout_directory("small.ninfer", description, 1 << 64)

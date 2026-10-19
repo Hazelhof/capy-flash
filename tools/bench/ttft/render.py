@@ -327,9 +327,7 @@ def _issues_markdown(summary: dict[str, Any]) -> list[str]:
         value = entry(row)
         value["states"].append(str(row.get("status") or "not_constructed"))
         details = "; ".join(
-            str(item.get("detail", ""))
-            for item in row.get("failed_conditions", [])
-            if isinstance(item, dict)
+            str(item.get("detail", "")) for item in row.get("failed_conditions", []) if isinstance(item, dict)
         )
         if details:
             value["details"].append(details)
@@ -352,9 +350,7 @@ def _issues_markdown(summary: dict[str, Any]) -> list[str]:
                     _short_error("; ".join(dict.fromkeys(row["details"]))),
                     _diagnostic_links(row),
                 )
-                for _, row in sorted(
-                    merged.items(), key=lambda item: (str(item[0][0]), str(item[0][1]))
-                )
+                for _, row in sorted(merged.items(), key=lambda item: (str(item[0][0]), str(item[0][1])))
             ),
         )
     )
@@ -513,12 +509,8 @@ def render_csv(summary: dict[str, Any]) -> str:
                 "symmetric_order_stat",
                 {
                     **row,
-                    "request_roles": json.dumps(
-                        row["request_roles"], separators=(",", ":")
-                    ),
-                    "role_at_rank_counts": json.dumps(
-                        row["role_at_rank_counts"], separators=(",", ":")
-                    ),
+                    "request_roles": json.dumps(row["request_roles"], separators=(",", ":")),
+                    "role_at_rank_counts": json.dumps(row["role_at_rank_counts"], separators=(",", ":")),
                 },
             )
         )

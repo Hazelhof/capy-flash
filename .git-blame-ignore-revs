@@ -1,0 +1,6 @@
+# Formatting-only commits (git blame --ignore-revs-file .git-blame-ignore-revs, or
+# git config blame.ignoreRevsFile .git-blame-ignore-revs; GitHub applies it automatically).
+# style: clang-format every C/C++/CUDA file with the repository .clang-format
+29de06f2e1629d395aabcc7c33ea89f3cf058cec
+# style: ruff format every Python file (line length 120) and lint statements and imports
+9d0c1175006fcef3effe510b2b8fed2900e83f46

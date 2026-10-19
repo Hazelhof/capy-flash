@@ -12,9 +12,7 @@ from typing import Any
 
 # A one-pixel PNG. The target frontend performs its normal resize/patch expansion.
 _IMAGE_DATA_URI = (
-    "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUB"
-    "AScY42YAAAAASUVORK5CYII="
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
 
 
@@ -29,17 +27,13 @@ class Response:
     body: bytes
 
 
-def request(
-    base_url: str, method: str, path: str, payload: Any | None = None
-) -> Response:
+def request(base_url: str, method: str, path: str, payload: Any | None = None) -> Response:
     body = None
     headers = {"Accept": "application/json", "X-Ninfer-Client": "smoke/serve-contract"}
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(
-        base_url + path, data=body, headers=headers, method=method
-    )
+    req = urllib.request.Request(base_url + path, data=body, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=300) as response:
             return Response(
@@ -49,19 +43,13 @@ def request(
             )
     except urllib.error.HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")
-        raise ContractError(
-            f"{method} {path} returned HTTP {error.code}: {detail}"
-        ) from error
+        raise ContractError(f"{method} {path} returned HTTP {error.code}: {detail}") from error
 
 
-def json_response(
-    base_url: str, method: str, path: str, payload: Any | None = None
-) -> dict[str, Any]:
+def json_response(base_url: str, method: str, path: str, payload: Any | None = None) -> dict[str, Any]:
     response = request(base_url, method, path, payload)
     if response.status != 200 or response.content_type != "application/json":
-        raise ContractError(
-            f"{method} {path} returned status={response.status} content-type={response.content_type}"
-        )
+        raise ContractError(f"{method} {path} returned status={response.status} content-type={response.content_type}")
     try:
         value = json.loads(response.body)
     except json.JSONDecodeError as error:
@@ -81,9 +69,7 @@ def wait_for_health(base_url: str, timeout: float) -> None:
         except (ContractError, urllib.error.URLError) as error:
             last_error = error
         time.sleep(0.25)
-    raise ContractError(
-        f"server did not become healthy within {timeout:g}s: {last_error}"
-    )
+    raise ContractError(f"server did not become healthy within {timeout:g}s: {last_error}")
 
 
 def require_usage(usage: Any, prompt_key: str, completion_key: str) -> tuple[int, int]:
@@ -123,12 +109,8 @@ def openai_nonstream(
     if not isinstance(message, dict) or not isinstance(message.get("content"), str):
         raise ContractError("OpenAI response is missing assistant content")
     if choice.get("finish_reason") not in {"stop", "length", "tool_calls"}:
-        raise ContractError(
-            f"invalid OpenAI finish_reason: {choice.get('finish_reason')!r}"
-        )
-    prompt, completion = require_usage(
-        response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
+        raise ContractError(f"invalid OpenAI finish_reason: {choice.get('finish_reason')!r}")
+    prompt, completion = require_usage(response.get("usage"), "prompt_tokens", "completion_tokens")
     if completion > max_tokens:
         raise ContractError("OpenAI output exceeds the requested token budget")
     usage = response["usage"]
@@ -139,9 +121,7 @@ def openai_nonstream(
 
 def parse_openai_stream(response: Response) -> tuple[str, str, str, dict[str, Any]]:
     if response.status != 200 or response.content_type != "text/event-stream":
-        raise ContractError(
-            f"OpenAI stream returned status={response.status} content-type={response.content_type}"
-        )
+        raise ContractError(f"OpenAI stream returned status={response.status} content-type={response.content_type}")
     content: list[str] = []
     reasoning: list[str] = []
     finish_reason: str | None = None
@@ -175,9 +155,7 @@ def parse_openai_stream(response: Response) -> tuple[str, str, str, dict[str, An
             if usage is not None:
                 raise ContractError("OpenAI stream emitted usage more than once")
             if finish_reason is None:
-                raise ContractError(
-                    "OpenAI stream emitted usage before its finish event"
-                )
+                raise ContractError("OpenAI stream emitted usage before its finish event")
             usage = event_usage
             continue
         if usage is not None:
@@ -209,19 +187,13 @@ def parse_openai_stream(response: Response) -> tuple[str, str, str, dict[str, An
                 "length",
                 "tool_calls",
             }:
-                raise ContractError(
-                    f"invalid or duplicate OpenAI finish reason: {reason!r}"
-                )
+                raise ContractError(f"invalid or duplicate OpenAI finish reason: {reason!r}")
             finish_reason = reason
     if not saw_role or not saw_done or finish_reason is None or usage is None:
-        raise ContractError(
-            "OpenAI stream did not complete its role/finish/usage/[DONE] contract"
-        )
+        raise ContractError("OpenAI stream did not complete its role/finish/usage/[DONE] contract")
     prompt, completion = require_usage(usage, "prompt_tokens", "completion_tokens")
     if usage.get("total_tokens") != prompt + completion:
-        raise ContractError(
-            "OpenAI streamed total_tokens does not equal prompt + completion"
-        )
+        raise ContractError("OpenAI streamed total_tokens does not equal prompt + completion")
     return "".join(content), "".join(reasoning), finish_reason, usage
 
 
@@ -246,9 +218,7 @@ def response_text(response: dict[str, Any]) -> tuple[str, str]:
             elif part.get("type") == "reasoning_text":
                 reasoning.append(part["text"])
             else:
-                raise ContractError(
-                    f"unexpected Responses content type: {part.get('type')!r}"
-                )
+                raise ContractError(f"unexpected Responses content type: {part.get('type')!r}")
     return "".join(content), "".join(reasoning)
 
 
@@ -258,13 +228,9 @@ def require_responses_usage(usage: Any) -> tuple[int, int]:
         raise ContractError("Responses total_tokens does not equal input + output")
     input_details = usage.get("input_tokens_details")
     output_details = usage.get("output_tokens_details")
-    if not isinstance(input_details, dict) or not isinstance(
-        input_details.get("cached_tokens"), int
-    ):
+    if not isinstance(input_details, dict) or not isinstance(input_details.get("cached_tokens"), int):
         raise ContractError("Responses cached-token usage is missing")
-    if not isinstance(output_details, dict) or not isinstance(
-        output_details.get("reasoning_tokens"), int
-    ):
+    if not isinstance(output_details, dict) or not isinstance(output_details.get("reasoning_tokens"), int):
         raise ContractError("Responses reasoning-token usage is missing")
     return prompt, completion
 
@@ -292,9 +258,7 @@ def responses_nonstream(
         "incomplete",
     }:
         raise ContractError("Responses non-streaming envelope has the wrong shape")
-    if not isinstance(response.get("id"), str) or not response["id"].startswith(
-        "resp_"
-    ):
+    if not isinstance(response.get("id"), str) or not response["id"].startswith("resp_"):
         raise ContractError("Responses non-streaming envelope has an invalid id")
     if response.get("model") != model or response.get("store") is not store:
         raise ContractError("Responses non-streaming request fields were not echoed")
@@ -307,10 +271,7 @@ def responses_nonstream(
 
 def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]]:
     if response.status != 200 or response.content_type != "text/event-stream":
-        raise ContractError(
-            "Responses stream returned "
-            f"status={response.status} content-type={response.content_type}"
-        )
+        raise ContractError(f"Responses stream returned status={response.status} content-type={response.content_type}")
     content: list[str] = []
     reasoning: list[str] = []
     terminal: dict[str, Any] | None = None
@@ -318,12 +279,8 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
     for block in response.body.decode("utf-8").replace("\r\n", "\n").split("\n\n"):
         if not block:
             continue
-        event_lines = [
-            line[7:] for line in block.splitlines() if line.startswith("event: ")
-        ]
-        data_lines = [
-            line[6:] for line in block.splitlines() if line.startswith("data: ")
-        ]
+        event_lines = [line[7:] for line in block.splitlines() if line.startswith("event: ")]
+        data_lines = [line[6:] for line in block.splitlines() if line.startswith("data: ")]
         if len(event_lines) != 1 or len(data_lines) != 1 or data_lines[0] == "[DONE]":
             raise ContractError(f"malformed Responses SSE block: {block!r}")
         try:
@@ -337,9 +294,7 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
             raise ContractError("Responses sequence_number is not contiguous")
         expected_sequence += 1
         if terminal is not None:
-            raise ContractError(
-                "Responses stream emitted data after its terminal event"
-            )
+            raise ContractError("Responses stream emitted data after its terminal event")
         if event_type == "response.output_text.delta":
             if not isinstance(event.get("delta"), str):
                 raise ContractError("Responses output_text delta is not a string")
@@ -369,16 +324,10 @@ def parse_responses_stream(response: Response) -> tuple[str, str, dict[str, Any]
 def exercise(base_url: str, model: str) -> dict[str, Any]:
     models = json_response(base_url, "GET", "/v1/models")
     entries = models.get("data")
-    if (
-        models.get("object") != "list"
-        or not isinstance(entries, list)
-        or len(entries) != 1
-    ):
+    if models.get("object") != "list" or not isinstance(entries, list) or len(entries) != 1:
         raise ContractError("model-list response has the wrong shape")
     if entries[0].get("id") != model or entries[0].get("owned_by") != "ninfer":
-        raise ContractError(
-            "model-list response does not identify the configured NInfer model"
-        )
+        raise ContractError("model-list response does not identify the configured NInfer model")
     single_model = json_response(base_url, "GET", f"/v1/models/{model}")
     if single_model.get("id") != model:
         raise ContractError("single-model response has the wrong id")
@@ -388,9 +337,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "max_tokens": 4,
         "messages": [{"role": "user", "content": "Reply briefly."}],
     }
-    counted = json_response(
-        base_url, "POST", "/v1/messages/count_tokens", anthropic_prompt
-    )
+    counted = json_response(base_url, "POST", "/v1/messages/count_tokens", anthropic_prompt)
     input_tokens = counted.get("input_tokens")
     if not isinstance(input_tokens, int) or input_tokens <= 0:
         raise ContractError("count_tokens returned a non-positive input_tokens value")
@@ -416,11 +363,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     content, reasoning, stream_finish, stream_usage = parse_openai_stream(streamed)
     if not content and not reasoning:
         raise ContractError("OpenAI stream completed without publishing output bytes")
-    if (
-        not 0
-        < stream_usage["completion_tokens"]
-        <= stream_payload["max_completion_tokens"]
-    ):
+    if not 0 < stream_usage["completion_tokens"] <= stream_payload["max_completion_tokens"]:
         raise ContractError("OpenAI stream violated its output token budget")
     if stream_usage["prompt_tokens"] != nonstream["usage"]["prompt_tokens"]:
         raise ContractError("OpenAI input token count changed for the same messages")
@@ -437,9 +380,7 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
     ):
         raise ContractError("Responses input_tokens returned the wrong shape")
     response_sync = responses_nonstream(base_url, model, responses_input, store=False)
-    response_prompt_tokens, response_output_tokens = require_responses_usage(
-        response_sync.get("usage")
-    )
+    response_prompt_tokens, response_output_tokens = require_responses_usage(response_sync.get("usage"))
     if response_prompt_tokens != response_count["input_tokens"]:
         raise ContractError("Responses input_tokens differs from generation usage")
     response_stream_payload = {
@@ -450,30 +391,22 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         "store": False,
         "stream": True,
     }
-    response_stream = request(
-        base_url, "POST", "/v1/responses", response_stream_payload
-    )
+    response_stream = request(base_url, "POST", "/v1/responses", response_stream_payload)
     _, _, response_stream_terminal = parse_responses_stream(response_stream)
-    streamed_input_tokens, streamed_output_tokens = require_responses_usage(
-        response_stream_terminal.get("usage")
-    )
+    streamed_input_tokens, streamed_output_tokens = require_responses_usage(response_stream_terminal.get("usage"))
     if streamed_output_tokens > response_stream_payload["max_output_tokens"]:
         raise ContractError("Responses stream violated its output token budget")
     if streamed_input_tokens != response_count["input_tokens"]:
         raise ContractError("Responses stream input count differs from input_tokens")
 
-    stored_response = responses_nonstream(
-        base_url, model, "Remember the code word ORCHID. Reply briefly.", store=True
-    )
+    stored_response = responses_nonstream(base_url, model, "Remember the code word ORCHID. Reply briefly.", store=True)
     stored_id = stored_response.get("id")
     if not isinstance(stored_id, str) or not stored_id.startswith("resp_"):
         raise ContractError("stored Response has an invalid id")
     retrieved = json_response(base_url, "GET", f"/v1/responses/{stored_id}")
     if retrieved != stored_response:
         raise ContractError("retrieved Response differs from the created Response")
-    input_items = json_response(
-        base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc"
-    )
+    input_items = json_response(base_url, "GET", f"/v1/responses/{stored_id}/input_items?order=asc")
     if input_items.get("object") != "list" or len(input_items.get("data", [])) != 1:
         raise ContractError("Responses input_items list has the wrong shape")
     continuation_input = "What code word was given? Reply with only that word."
@@ -515,27 +448,19 @@ def exercise(base_url: str, model: str) -> dict[str, Any]:
         }
     ]
     image_response = openai_nonstream(base_url, model, image_messages, max_tokens=2)
-    image_prompt_tokens, _ = require_usage(
-        image_response.get("usage"), "prompt_tokens", "completion_tokens"
-    )
+    image_prompt_tokens, _ = require_usage(image_response.get("usage"), "prompt_tokens", "completion_tokens")
     if image_prompt_tokens <= input_tokens:
-        raise ContractError(
-            "image request did not expand the prompt through the Vision frontend"
-        )
+        raise ContractError("image request did not expand the prompt through the Vision frontend")
 
     anthropic = json_response(base_url, "POST", "/v1/messages", anthropic_prompt)
     if anthropic.get("type") != "message" or anthropic.get("role") != "assistant":
         raise ContractError("Anthropic response has the wrong envelope")
     if anthropic.get("stop_reason") not in {"end_turn", "max_tokens", "tool_use"}:
-        raise ContractError(
-            f"invalid Anthropic stop_reason: {anthropic.get('stop_reason')!r}"
-        )
+        raise ContractError(f"invalid Anthropic stop_reason: {anthropic.get('stop_reason')!r}")
     blocks = anthropic.get("content")
     if not isinstance(blocks, list) or not blocks:
         raise ContractError("Anthropic response content is empty")
-    anthropic_input_tokens, _ = require_usage(
-        anthropic.get("usage"), "input_tokens", "output_tokens"
-    )
+    anthropic_input_tokens, _ = require_usage(anthropic.get("usage"), "input_tokens", "output_tokens")
     if anthropic_input_tokens != input_tokens:
         raise ContractError("Anthropic usage input_tokens differs from count_tokens")
 

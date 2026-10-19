@@ -351,9 +351,10 @@ Options parse(int argc, char** argv) {
         } else if (a == "--repeat") {
             o.repeat = std::atoi(std::string(next()).c_str());
         } else {
-            std::printf("usage: %s [--depth 0,16384,65536] [--width 1,4] [--storage bf16|fp8|int8|all]\n"
-                        "          [--kv-heads 2|1] [--warmup N] [--repeat N]\n",
-                        argv[0]);
+            std::printf(
+                "usage: %s [--depth 0,16384,65536] [--width 1,4] [--storage bf16|fp8|int8|all]\n"
+                "          [--kv-heads 2|1] [--warmup N] [--repeat N]\n",
+                argv[0]);
             std::exit(a == "-h" || a == "--help" ? 0 : 1);
         }
     }

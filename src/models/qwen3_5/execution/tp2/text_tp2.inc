@@ -7,9 +7,13 @@
 // docs/maintainer/upstream-merge.md.
 
 #include "core/device_scope.h"
+#include "models/qwen3_5/execution/tp2/exchange_prefetch.h"
 #include "models/qwen3_5/execution/tp2/split.h"
 
 #include <array>
+#include <variant>
+#include <cstdlib>
+#include <string_view>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -23,6 +27,64 @@ void for_each_rank(const ExecutionContext& execution, Body&& body) {
         ScopedCurrentDevice::select(execution.dev[static_cast<std::size_t>(rank)]->device);
         body(rank);
     }
+}
+
+using LayerBlocks = std::array<const BlockParameters*, kTensorParallelWidth>;
+
+// L2 prefetch hints of the decode exchanges (tp2/exchange_prefetch.h). The mixer's all-reduce is
+// followed by the post-attention norm and the paired gate|up GEMM of the same layer.
+std::array<ExchangePrefetch, 2> ffn_input_prefetch(const LayerBlocks& block, std::size_t bytes) {
+    std::array<ExchangePrefetch, 2> hint;
+    for (std::size_t r = 0; r < 2; ++r) {
+        if (const auto* dense = std::get_if<DenseParameters>(&block[r]->ffn)) {
+            append_prefetch_paired_prefix(dense->gate_up.weight, bytes, hint[r]);
+        }
+    }
+    return hint;
+}
+
+// The FFN's all-reduce is followed by the next layer's input norm and input projection: Q|K|G|V
+// for attention; for GDN the small BF16 A|B gating projection (whole) and then Q|K|V|Z.
+std::array<ExchangePrefetch, 2> mixer_input_prefetch(const LayerBlocks& block, std::size_t bytes) {
+    std::array<ExchangePrefetch, 2> hint;
+    for (std::size_t r = 0; r < 2; ++r) {
+        if (const auto* attention = std::get_if<AttentionParameters>(&block[r]->mixer)) {
+            if (const Weight* w = single_projection(attention->projection)) {
+                append_prefetch_prefix(*w, bytes, hint[r]);
+            }
+        } else if (const auto* gdn = std::get_if<GdnParameters>(&block[r]->mixer)) {
+            std::size_t left = bytes;
+            if (const Weight* control = single_projection(gdn->control)) {
+                const std::size_t whole =
+                    prefetch_row_bytes(*control) * static_cast<std::size_t>(control->n);
+                if (whole != 0 && whole <= bytes / 2) {
+                    append_prefetch_rows(*control, 0, control->n, hint[r]);
+                    left -= whole;
+                }
+            }
+            if (const Weight* w = single_projection(gdn->projection)) {
+                append_prefetch_prefix(*w, left, hint[r]);
+            }
+        }
+    }
+    return hint;
+}
+
+// Prefill overlap: the width of the first half of a `len`-column text chunk, or 0 to run the
+// chunk as one call. A multiple of 128, so the GDN chunk (16 tokens), the attention query tiles
+// and the activation-scale tiles fall on the same column boundaries as in one call over the
+// chunk; both halves wider than 256 columns, so their causal attention takes the tiled family a
+// whole chunk takes (the grouped family serves widths up to 256). NINFER_TP_PREFILL_OVERLAP=0
+// turns the overlap off.
+int prefill_overlap_split(int len) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_TP_PREFILL_OVERLAP");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    constexpr int kAlign = 128, kMinHalf = 384;
+    if (!enabled) { return 0; }
+    const int split = len / 2 / kAlign * kAlign;
+    return split >= kMinHalf && len - split >= kMinHalf ? split : 0;
 }
 
 } // namespace
@@ -181,6 +243,12 @@ void TextContext::peer_tap_capture_layer(int layer, const Tensor& x1) {
     peer_feature_sink_->capture_layer(layer, x1, rank_stream(1));
 }
 
+void TextContext::peer_tap_capture_layer_columns(int layer, const Tensor& x1, std::int32_t first) {
+    if (peer_feature_sink_ == nullptr) { return; }
+    const ScopedCurrentDevice rank1(tp_->execution->dev[1]->device);
+    peer_feature_sink_->capture_layer_columns(layer, x1, first, rank_stream(1));
+}
+
 void TextContext::peer_tap_capture_positions(const Tensor& positions1) {
     if (peer_feature_sink_ == nullptr) { return; }
     const ScopedCurrentDevice rank1(tp_->execution->dev[1]->device);
@@ -305,7 +373,7 @@ const GdnReplayRecords& TextContext::rank_replay_records(int rank) const {
 }
 
 void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
-                               const RankTensors& staging) {
+                               const RankTensors& staging, int exchange_lane) {
     const ExecutionContext& execution = *tp_->execution;
     const AttentionConfig& shard      = *shard_config_->attention;
     const auto ws                     = workspaces();
@@ -356,13 +424,12 @@ void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
         Tensor k       = k_flat[r].view({head_dim, kv_heads, T});
         Tensor v       = v_flat[r].view({head_dim, kv_heads, T});
         Tensor gate    = gate_flat[r].view({head_dim, q_heads, T});
-        ops::rmsnorm(q, p[r]->query_norm, config_.rms_norm_eps, true, qn[r], s);
-        ops::rmsnorm(k, p[r]->key_norm, config_.rms_norm_eps, true, kn[r], s);
         const Tensor& cache_positions = rank_cache_positions(rank);
         const Tensor& rope_positions  = rank_rope_positions(rank);
         Tensor rope_for_op =
             active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-        text_rope(rope_for_op, *config_.rope_parameters, qn[r], kn[r], s);
+        text_qk_norm_rope(rope_for_op, *config_.rope_parameters, p[r]->query_norm, p[r]->key_norm,
+                          config_.rms_norm_eps, q, k, qn[r], kn[r], s);
 
         const PagedKVBatchLayerView cache = rank_text_cache(rank).batch_layer_view(fidx);
         const Tensor& kv_table_rows       = rank_kv_table_rows(rank);
@@ -391,11 +458,11 @@ void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
     });
 
     attention_output_split({a[0].view({q_width, T}), a[1].view({q_width, T})}, p, x, staging, ws,
-                           execution, *tp_->events);
+                           execution, *tp_->events, exchange_lane);
 }
 
 void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Phase ph,
-                              const RankTensors& staging) {
+                              const RankTensors& staging, int exchange_lane) {
     const ExecutionContext& execution = *tp_->execution;
     const GdnConfig& shard            = *shard_config_->gdn;
     const auto ws                     = workspaces();
@@ -559,10 +626,11 @@ void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Pha
     });
 
     gdn_output_split({on[0].view({value_width, T}), on[1].view({value_width, T})}, p, x, staging,
-                     ws, execution, *tp_->events);
+                     ws, execution, *tp_->events, exchange_lane);
 }
 
-void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTensors& staging) {
+void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTensors& staging,
+                               int exchange_lane) {
     const ExecutionContext& execution = *tp_->execution;
     const auto ws                     = workspaces();
     RankTensors h;
@@ -574,7 +642,7 @@ void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTe
         ops::rmsnorm(x[r], w[r]->post_attention_norm, config_.rms_norm_eps, true, h[r],
                      rank_stream(rank));
     });
-    ffn_split(h, {&w[0]->ffn, &w[1]->ffn}, x, staging, ws, execution, *tp_->events);
+    ffn_split(h, {&w[0]->ffn, &w[1]->ffn}, x, staging, ws, execution, *tp_->events, exchange_lane);
 }
 
 template <class Tap>
@@ -584,7 +652,11 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
     const auto& layers1 = tp_->parameters->text.layers;
     for (std::size_t layer = 0; layer < layers0.size(); ++layer) {
         const RankBlocks block{&layers0[layer], &layers1[layer]};
-        const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+        const bool full = config_.layer_types[layer] == MixerKind::FullAttention;
+        // Captured decode only (null budget otherwise): each of the layer's two all-reduces
+        // prefetches the weights the GEMM after it streams; the last layer's, the output head's.
+        const std::size_t prefetch =
+            exchange_prefetch_budget(*tp_->events, *tp_->execution, x[0].bytes());
         const auto compact = dimension(config_.compact_layer_indices[layer]);
         nvtx::ScopedRange layer_range(
             full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
@@ -598,6 +670,10 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
                 auto scope0 = work_.scope();
                 auto scope1 = tp_->work->scope();
+                if (prefetch != 0) {
+                    stage_exchange_prefetch(*tp_->events, *tp_->execution, x[0].bytes(),
+                                            ffn_input_prefetch(block, prefetch));
+                }
                 if (full) {
                     attn_mix_tp2(block, x, compact, staging);
                 } else {
@@ -610,6 +686,19 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
                                         nvtx::Category::PostMixer, layer);
                 auto scope0 = work_.scope();
                 auto scope1 = tp_->work->scope();
+                if (prefetch != 0) {
+                    std::array<ExchangePrefetch, 2> hint;
+                    if (layer + 1 < layers0.size()) {
+                        hint = mixer_input_prefetch({&layers0[layer + 1], &layers1[layer + 1]},
+                                                    prefetch);
+                    } else {
+                        append_prefetch_prefix(parameters_.text.output_head.weight, prefetch,
+                                               hint[0]);
+                        append_prefetch_prefix(tp_->parameters->text.output_head.weight, prefetch,
+                                               hint[1]);
+                    }
+                    stage_exchange_prefetch(*tp_->events, *tp_->execution, x[0].bytes(), hint);
+                }
                 mlp_tail_tp2(block, x, staging);
             }
             if constexpr (Tap::enabled) {
@@ -621,6 +710,141 @@ void TextContext::run_layers_tp2(RankTensors& x, Phase ph, const RankTensors& st
                 "text/layers/" + std::to_string(layer) + (prefill ? " prefill" : " verify") +
                 " tp2 columns=" + std::to_string(x[0].ne[1]) + ": " + error.what());
         }
+    }
+}
+
+// The two halves are exactly two consecutive prefill chunks of `split` and `len - split` tokens,
+// issued block by block in the order mixer A, mixer B, MLP A, MLP B, next layer's mixer A, ...
+// Every block of a half ends in a row-parallel projection whose all-reduce is only begun, on the
+// half's lane of the split exchange, and finished on the ranks' streams just before that half's
+// next block, so one half's exchange moves while the other half's block computes. Half B's mixers
+// read the KV pages and GDN state that half A wrote in the same layer, earlier on the same
+// streams, as the next chunk would; every other op is column-local. Same ops, operands and
+// arithmetic as two chunks: the bits are those of the one-call schedule (the split keeps every
+// tile boundary, prefill_overlap_split). A tap gets a layer's output per half right after that
+// half's closing exchange of the layer has finished, before its next block rewrites the columns:
+// the bytes run_layers_tp2 hands it for the whole chunk, column window by column window.
+template <class Tap>
+void TextContext::prefill_layers_overlap_tp2(RankTensors& x, const RankTensors& staging,
+                                             const RankTensors& positions,
+                                             const RankTensors& rope_positions, int base, int split,
+                                             Tap& tap) {
+    const ExecutionContext& execution = *tp_->execution;
+    const ops::PeerEvents& events     = *tp_->events;
+    const int len                     = x[0].ne[1];
+    if (split <= 0 || split >= len || active_sequence_batch_ != 0) {
+        throw std::logic_error("prefill overlap: invalid half split");
+    }
+
+    struct Half {
+        RankTensors x, staging, positions, rope;
+        ops::CausalAttentionExecutionEnvelope envelope{};
+        std::int32_t source_slot = 0, destination_slot = 0;
+        std::int32_t first = 0;
+        bool open          = false; // its lane holds a begun all-reduce
+        int tapped_layer   = -1;    // the layer whose output that all-reduce completes
+    };
+
+    std::array<Half, 2> halves;
+    for (std::size_t h = 0; h < 2; ++h) {
+        const int first = h == 0 ? 0 : split;
+        const int count = h == 0 ? split : len - split;
+        Half& half      = halves[h];
+        half.first      = first;
+        for (std::size_t r = 0; r < 2; ++r) {
+            half.x[r]         = x[r].slice(1, first, count);
+            half.staging[r]   = staging[r].slice(1, first, count);
+            half.positions[r] = positions[r].slice(0, first, count);
+            half.rope[r]      = rope_positions[r].slice(0, first, count);
+        }
+        const auto visible = static_cast<std::uint32_t>(base + first + count);
+        half.envelope      = {visible, visible};
+        // Half B continues from the state half A published.
+        half.source_slot      = h == 0 ? linear_state_source_slot_ : linear_state_destination_slot_;
+        half.destination_slot = linear_state_destination_slot_;
+    }
+    const auto finish = [&](Half& half, int lane) {
+        if (!half.open) { return; }
+        half.open              = false;
+        const int tapped_layer = half.tapped_layer;
+        half.tapped_layer      = -1;
+        ops::allreduce_sum_finish(execution, events, lane);
+        if constexpr (Tap::enabled) {
+            if (tapped_layer >= 0) {
+                tap.capture_layer_columns(tapped_layer, half.x[0], half.first, ctx_.stream);
+                peer_tap_capture_layer_columns(tapped_layer, half.x[1], half.first);
+            }
+        }
+    };
+    // Runs one block of half `h`: its previous exchange completes first (the block reads and
+    // rewrites its columns), then the block, whose exchange stays open on lane h. `tapped_layer`
+    // >= 0 marks the block that ends that layer.
+    const auto block_of = [&](int h, auto&& body, int tapped_layer = -1) {
+        Half& half = halves[static_cast<std::size_t>(h)];
+        ScopedValue<const Tensor*> cache0(active_cache_positions_, &half.positions[0]);
+        ScopedValue<const Tensor*> rope0(active_rope_positions_, &half.rope[0]);
+        ScopedValue<const Tensor*> cache1(peer_cache_positions_, &half.positions[1]);
+        ScopedValue<const Tensor*> rope1(peer_rope_positions_, &half.rope[1]);
+        ScopedValue<const ops::CausalAttentionExecutionEnvelope*> envelope(
+            active_causal_attention_envelope_, &half.envelope);
+        ScopedValue<std::int32_t> source(linear_state_source_slot_, half.source_slot);
+        ScopedValue<std::int32_t> destination(linear_state_destination_slot_,
+                                              half.destination_slot);
+        auto scope0 = work_.scope();
+        auto scope1 = tp_->work->scope();
+        finish(half, h);
+        body(half);
+        half.open         = true;
+        half.tapped_layer = tapped_layer;
+    };
+    const auto& layers0 = parameters_.text.layers;
+    const auto& layers1 = tp_->parameters->text.layers;
+    std::size_t layer   = 0;
+    try {
+        for (; layer < layers0.size(); ++layer) {
+            const RankBlocks block{&layers0[layer], &layers1[layer]};
+            const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+            const auto compact = dimension(config_.compact_layer_indices[layer]);
+            nvtx::ScopedRange layer_range(
+                full ? nvtx::Name::PrefillLayerFull : nvtx::Name::PrefillLayerGdn,
+                full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+            {
+                nvtx::ScopedRange mixer_range(
+                    full ? nvtx::Name::PrefillAttention : nvtx::Name::PrefillGdn,
+                    full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+                for (int h = 0; h < 2; ++h) {
+                    block_of(h, [&](Half& half) {
+                        if (full) {
+                            attn_mix_tp2(block, half.x, compact, half.staging, h);
+                        } else {
+                            gdn_mix_tp2(block, half.x, compact, Phase::Prefill, half.staging, h);
+                        }
+                    });
+                }
+            }
+            {
+                nvtx::ScopedRange range(nvtx::Name::PrefillPostMixer, nvtx::Category::PostMixer,
+                                        layer);
+                for (int h = 0; h < 2; ++h) {
+                    block_of(
+                        h, [&](Half& half) { mlp_tail_tp2(block, half.x, half.staging, h); },
+                        static_cast<int>(layer));
+                }
+            }
+        }
+        finish(halves[0], 0);
+        finish(halves[1], 1);
+    } catch (const std::exception& error) {
+        // Leave no lane open for the next call; the request fails either way.
+        for (int h = 0; h < 2; ++h) {
+            halves[static_cast<std::size_t>(h)].tapped_layer = -1;
+            try {
+                finish(halves[static_cast<std::size_t>(h)], h);
+            } catch (...) {}
+        }
+        throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                 " prefill overlap tp2 columns=" + std::to_string(len) + ": " +
+                                 error.what());
     }
 }
 
@@ -650,10 +874,7 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
         if constexpr (Tap::enabled) {
             throw std::logic_error("Qwen4Exp prefill publishes no speculative feature taps");
         } else {
-            if (multimodal != nullptr) {
-                throw std::invalid_argument("Qwen4Exp image input is not implemented");
-            }
-            return qwen4_prefill(ids, text_prefill, finalize_at_end);
+            return qwen4_prefill(ids, text_prefill, multimodal, finalize_at_end);
         }
     }
     runtime::ExecutionTimingRecorder timing;
@@ -824,7 +1045,18 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
             tap.begin(x[0]);
             peer_tap_begin(x[1]);
         }
-        run_layers_tp2(x, Phase::Prefill, staging, tap);
+        // A tapped chunk (DFlash2 prefill features) takes its layer outputs half by half; a
+        // multimodal chunk's three-axis RoPE positions are not column-sliceable.
+        bool column_tap = true;
+        if constexpr (Tap::enabled) { column_tap = tap.batch_features == nullptr; }
+        const int overlap_split =
+            column_tap && multimodal == nullptr ? prefill_overlap_split(len) : 0;
+        if (overlap_split > 0 && ops::allreduce_sum_split_available(execution, *tp_->events)) {
+            prefill_layers_overlap_tp2(x, staging, positions, rope_positions, base_i, overlap_split,
+                                       tap);
+        } else {
+            run_layers_tp2(x, Phase::Prefill, staging, tap);
+        }
         if constexpr (requires { tap.capture_positions(positions[0], s); }) {
             tap.capture_positions(positions[0], s);
             peer_tap_capture_positions(positions[1]);
@@ -890,7 +1122,7 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
             if (mtp_window.final_column_uses_generated_token) {
                 Tensor generated_mtp_id = mtp_ids.slice(0, len - 1, 1);
                 CUDA_CHECK(::ninfer::memcpy_device_async(generated_mtp_id.data, io_.token.data,
-                                           sizeof(std::int32_t), s));
+                                                         sizeof(std::int32_t), s));
             }
             // A multimodal prompt's shifted stream carries visual columns: rank 0 embeds the
             // shifted ids and scatters the item's merged embeddings over the shifted visual
@@ -946,9 +1178,8 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
                     for_each_rank(execution, [&](int rank) {
                         const auto r        = static_cast<std::size_t>(rank);
                         cudaStream_t stream = rank_stream(rank);
-                        CUDA_CHECK(::ninfer::memcpy_device_async(ar_hidden[r].data, next_hidden[r].data,
-                                                   ar_hidden[r].bytes(),
-                                                   stream));
+                        CUDA_CHECK(::ninfer::memcpy_device_async(
+                            ar_hidden[r].data, next_hidden[r].data, ar_hidden[r].bytes(), stream));
                         Tensor position = ar_position[r];
                         ops::increment_i32_scalar(position, stream);
                     });
@@ -966,7 +1197,8 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
                                  "rewrite checkpoint hidden output");
             const Tensor checkpoint_hidden = xf.slice(1, len - 1, 1);
             CUDA_CHECK(::ninfer::memcpy_device_async(rewrite_checkpoint_hidden_output_->data,
-                                       checkpoint_hidden.data, checkpoint_hidden.bytes(), s));
+                                                     checkpoint_hidden.data,
+                                                     checkpoint_hidden.bytes(), s));
             if (peer_rewrite_checkpoint_hidden_output_ != nullptr) {
                 // Rank 1 retains the same column of its own final-normed chunk: the hidden axis is
                 // replicated, so this is a local copy on rank 1, not a transfer.
@@ -1136,8 +1368,7 @@ void TextContext::target_verify_batch(
     const RankTensors& hidden, Tensor& logits, Tensor& target_tokens) {
     if (qwen4()) {
         qwen4_target_verify_tp2(ids, cache_positions, rope_positions, valid_columns, kv_table_rows,
-                                linear_state_source_slots, envelope, hidden, logits,
-                                target_tokens);
+                                linear_state_source_slots, envelope, hidden, logits, target_tokens);
         return;
     }
     NullTap tap;
@@ -1267,11 +1498,10 @@ void TextContext::mtp_forward_tail_tp2(RankTensors& x, const RankTensors& ah,
         Tensor k                 = k_flat[r].view({head_dim, kv_heads, T});
         Tensor v                 = v_flat[r].view({head_dim, kv_heads, T});
         Tensor gate              = gate_flat[r].view({head_dim, q_heads, T});
-        ops::rmsnorm(q, mtp.query_norm, config_.rms_norm_eps, true, qn[r], stream);
-        ops::rmsnorm(k, mtp.key_norm, config_.rms_norm_eps, true, kn[r], stream);
         Tensor rope_for_op =
             active_sequence_batch_ != 0 ? rope_positions[r].view({T}) : rope_positions[r];
-        text_rope(rope_for_op, *config_.rope_parameters, qn[r], kn[r], stream);
+        text_qk_norm_rope(rope_for_op, *config_.rope_parameters, mtp.query_norm, mtp.key_norm,
+                          config_.rms_norm_eps, q, k, qn[r], kn[r], stream);
 
         const PagedKVBatchLayerView cache = rank_mtp_cache(rank).batch_layer_view(0);
         const Tensor& rows                = rank_backend_kv_table_rows(rank);
@@ -1449,12 +1679,14 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const RankTensors& hi
             text_rope(rope_positions[r], *config_.rope_parameters, kn[r], stream);
             ops::kv_cache_append(kn[r], v, positions[r], rank_mtp_kv(rank).layer_view(0), stream);
             if (final_chunk) {
-                const auto* x_src  = static_cast<const unsigned char*>(x[r].data) +
-                                     static_cast<std::size_t>(T - 1) * column_bytes;
+                const auto* x_src = static_cast<const unsigned char*>(x[r].data) +
+                                    static_cast<std::size_t>(T - 1) * column_bytes;
                 const auto* ah_src = static_cast<const unsigned char*>(ah[r].data) +
                                      static_cast<std::size_t>(T - 1) * column_bytes;
-                CUDA_CHECK(::ninfer::memcpy_device_async(x_last[r].data, x_src, column_bytes, stream));
-                CUDA_CHECK(::ninfer::memcpy_device_async(ah_last[r].data, ah_src, column_bytes, stream));
+                CUDA_CHECK(
+                    ::ninfer::memcpy_device_async(x_last[r].data, x_src, column_bytes, stream));
+                CUDA_CHECK(
+                    ::ninfer::memcpy_device_async(ah_last[r].data, ah_src, column_bytes, stream));
             }
         });
     }
@@ -1496,9 +1728,8 @@ void TextContext::mtp_prefill_chunk_tp2(const Tensor& ids, const RankTensors& hi
             for (int axis = 0; axis < 3; ++axis) {
                 const auto* src = static_cast<const std::int32_t*>(rope_positions[r].data) +
                                   static_cast<std::size_t>(axis) * T + (T - 1);
-                auto* dst       = static_cast<std::int32_t*>(last_rope[r].data) + axis;
-                CUDA_CHECK(::ninfer::memcpy_device_async(dst, src, sizeof(std::int32_t),
-                                           stream));
+                auto* dst = static_cast<std::int32_t*>(last_rope[r].data) + axis;
+                CUDA_CHECK(::ninfer::memcpy_device_async(dst, src, sizeof(std::int32_t), stream));
             }
         }
         text_rope(last_rope[r], *config_.rope_parameters, qn[r], stream);
@@ -1564,12 +1795,11 @@ void TextContext::proposal_argmax_tp2(const RankTensors& hidden, Tensor& logits,
         const std::array<workspace::TensorParallelProposalRoots, 2> roots{
             workspace::tp_proposal_argmax(*ws[0], rows, T),
             workspace::tp_proposal_argmax(*ws[1], rows, T)};
-        proposal_argmax_split(hidden, {proposal_head_, &peer->head},
-                              {roots[0].partial, roots[1].partial},
-                              {roots[0].local, roots[1].local},
-                              {roots[0].candidates, roots[1].candidates},
-                              {roots[0].staging, roots[1].staging}, proposal_tokens, ws,
-                              *tp_->execution, *tp_->events);
+        proposal_argmax_split(
+            hidden, {proposal_head_, &peer->head}, {roots[0].partial, roots[1].partial},
+            {roots[0].local, roots[1].local}, {roots[0].candidates, roots[1].candidates},
+            {roots[0].staging, roots[1].staging}, proposal_tokens, ws, *tp_->execution,
+            *tp_->events);
         ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                       ctx_.stream);
         return;
@@ -1630,8 +1860,8 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const RankTensors&
                          nullptr);
 }
 
-void TextContext::mtp_propose_batch(const RankTensors& hidden, Tensor& logits,
-                                    Tensor& draft_tokens, Tensor* draft_logprobs) {
+void TextContext::mtp_propose_batch(const RankTensors& hidden, Tensor& logits, Tensor& draft_tokens,
+                                    Tensor* draft_logprobs) {
     if (!tp2()) {
         throw std::invalid_argument("rank-pair MTP proposal requires tensor parallelism");
     }
@@ -1739,8 +1969,8 @@ void TextContext::mtp_forward_ar_step(const Tensor& token, const RankTensors& pr
             ops::offset_i32_positions(position[r], rank == 0 ? io_.rope_delta : tp_->rope_delta,
                                       rope[r], rank_stream(rank));
         }
-        qwen4_mtp_forward_batch_tp2(token, previous_hidden, position, rope, envelope, mtp_hidden,
-                                    0, &logits, &draft_token, nullptr);
+        qwen4_mtp_forward_batch_tp2(token, previous_hidden, position, rope, envelope, mtp_hidden, 0,
+                                    &logits, &draft_token, nullptr);
         return;
     }
     const std::int32_t H = dimension(config_.hidden_size);
@@ -1789,7 +2019,7 @@ void TextContext::ordinary_decode_batch_tp2(const Tensor& ids, const Tensor& cac
             source.ne[2] != 1 || source.ne[3] != 1 || !source.is_contiguous() ||
             source.data == nullptr) {
             throw std::invalid_argument(std::string("tensor-parallel rank 1 ordinary ") + label +
-                                        " does not cover the batch");
+                                          " does not cover the batch");
         }
         return source.slice(0, 0, batch);
     };

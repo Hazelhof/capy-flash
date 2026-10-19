@@ -42,8 +42,8 @@ struct PrefillMissDumpOptions {
 // One detected miss, reported in the operational log next to the request's done line.
 struct PrefillMissReport {
     std::string directory;
-    std::uint32_t prompt_tokens     = 0;
-    std::uint32_t reused_tokens     = 0;
+    std::uint32_t prompt_tokens      = 0;
+    std::uint32_t reused_tokens      = 0;
     std::uint32_t common_prefix      = 0; // longest common prefix with the closest recent context
     std::uint32_t old_context_tokens = 0;
 };
@@ -74,8 +74,7 @@ private:
     };
 
     std::string write_dump(std::span<const TokenId> prompt, std::uint32_t reused_tokens,
-                           std::string_view label, const Context& old,
-                           std::size_t common_prefix);
+                           std::string_view label, const Context& old, std::size_t common_prefix);
 
     PrefillMissDumpOptions options_;
     Detokenizer detokenize_;

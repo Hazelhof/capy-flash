@@ -26,8 +26,8 @@ __global__ void concat_rows_kernel(const T* __restrict__ first, const T* __restr
          i < total; i += step) {
         const std::int64_t column = i / rows;
         const std::int64_t row    = i - column * rows;
-        destination[i] = row < rows0 ? first[column * rows0 + row]
-                                     : second[column * rows1 + (row - rows0)];
+        destination[i] =
+            row < rows0 ? first[column * rows0 + row] : second[column * rows1 + (row - rows0)];
     }
 }
 
@@ -37,10 +37,9 @@ void launch(const Tensor& first, const Tensor& second, Tensor& destination, std:
     const std::int64_t total = (rows0 + rows1) * columns;
     const int grid           = static_cast<int>(std::max<std::int64_t>(
         1, std::min<std::int64_t>(div_up(total, static_cast<std::int64_t>(kBlock)), kGridCap)));
-    concat_rows_kernel<T><<<grid, kBlock, 0, stream>>>(static_cast<const T*>(first.data),
-                                                         static_cast<const T*>(second.data),
-                                                         static_cast<T*>(destination.data), rows0,
-                                                         rows1, columns);
+    concat_rows_kernel<T><<<grid, kBlock, 0, stream>>>(
+        static_cast<const T*>(first.data), static_cast<const T*>(second.data),
+        static_cast<T*>(destination.data), rows0, rows1, columns);
 }
 
 } // namespace
@@ -60,7 +59,7 @@ void concat_rows_bf16_launch(const Tensor& first, const Tensor& second, Tensor& 
     }
     if (columns == 0 || rows0 + rows1 == 0) { return; }
     constexpr std::int64_t kVector = 8; // BF16 values per 16 bytes
-    const bool aligned = (reinterpret_cast<std::uintptr_t>(first.data) & 0xfu) == 0 &&
+    const bool aligned             = (reinterpret_cast<std::uintptr_t>(first.data) & 0xfu) == 0 &&
                          (reinterpret_cast<std::uintptr_t>(second.data) & 0xfu) == 0 &&
                          (reinterpret_cast<std::uintptr_t>(destination.data) & 0xfu) == 0;
     if (aligned && rows0 % kVector == 0 && rows1 % kVector == 0) {

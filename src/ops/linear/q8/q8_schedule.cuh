@@ -31,7 +31,7 @@ struct Q8A16SimtSchedule {
     static constexpr int kStagingBytes =
         kWarps * Stages * GroupsPerWarpStage *
         (Q8RowSplitStorage::kCodeBytesPerGroup + Q8RowSplitStorage::kScaleBytesPerGroup);
-    static constexpr int kPartialBytes = WarpsPerRow > 1 ? kWarps* BlockTokens * sizeof(float) : 0;
+    static constexpr int kPartialBytes = WarpsPerRow > 1 ? kWarps * BlockTokens * sizeof(float) : 0;
     static constexpr int kSharedBytes =
         ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;
     static_assert(kThreads <= 1024);
@@ -51,6 +51,22 @@ struct Q8A16GemvSchedule {
     static constexpr int kMinBlocksPerSm = MinBlocksPerSm;
     static constexpr int kStaticK        = StaticK;
     static constexpr int kUnroll         = Unroll;
+    static_assert(kThreads <= 1024);
+};
+
+// One output row per warp (or WarpsPerRow warps split at scale pairs), the warp's whole K slice
+// (Phases 256-wide phases) loaded into registers before the contraction; T <= TokenCapacity.
+template <int BlockRows, int TokenCapacity, int WarpsPerRow, int Phases, int MinBlocksPerSm>
+struct Q8A16WarpRowSchedule {
+    static_assert(BlockRows > 0 && TokenCapacity > 0 && TokenCapacity <= 4);
+    static_assert(WarpsPerRow == 1 || WarpsPerRow == 2 || WarpsPerRow == 4 || WarpsPerRow == 8);
+    static_assert(Phases > 0 && Phases <= 16 && MinBlocksPerSm > 0);
+    static constexpr int kBlockRows      = BlockRows;
+    static constexpr int kTokenCapacity  = TokenCapacity;
+    static constexpr int kWarpsPerRow    = WarpsPerRow;
+    static constexpr int kPhases         = Phases;
+    static constexpr int kMinBlocksPerSm = MinBlocksPerSm;
+    static constexpr int kThreads        = BlockRows * WarpsPerRow * 32;
     static_assert(kThreads <= 1024);
 };
 

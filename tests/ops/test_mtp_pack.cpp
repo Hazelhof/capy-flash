@@ -119,7 +119,7 @@ int split_case(std::int32_t tokens, bool shard) {
 
     const std::string label =
         std::string("mtp_split_attn_in ") + (shard ? "shard " : "") + "T=" + std::to_string(tokens);
-    int failures            = 0;
+    int failures = 0;
     failures += verify_exact((label + " query").c_str(),
                              from_device<std::uint16_t>(device_query.data(), expected_query.size()),
                              expected_query);

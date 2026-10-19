@@ -61,7 +61,7 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
     fill_uniform(weight, seed + 1U, 0.25F, 1.75F);
     fill_uniform(gate, seed + 2U, -5.0F, 5.0F);
     gate.front() = 0.0F;
-    gate.back() = -0.0F;
+    gate.back()  = -0.0F;
     round_to_bf16(input);
     round_to_bf16(weight);
     round_to_bf16(gate);
@@ -94,11 +94,11 @@ int run_case(const char* label, const Shape& shape, std::uint32_t seed, float in
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         for (std::size_t i = 0; i < gate.size(); ++i) {
-            gate[i] = -gate[i];
+            gate[i]                                                   = -gate[i];
             device_gate.expected[i + leading / sizeof(std::uint16_t)] = f32_to_bf16(gate[i]);
         }
         CUDA_CHECK(cudaMemcpyAsync(device_gate.storage.p, device_gate.expected.data(),
-            device_gate.storage.bytes, cudaMemcpyHostToDevice, stream));
+                                   device_gate.storage.bytes, cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaGraphLaunch(executable, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaGraphExecDestroy(executable));
@@ -128,8 +128,8 @@ int main() {
     failures += run_case("gated_rmsnorm [128,48,1]", {128, 48}, 1401U);
     for (int columns : {2, 7, 16, 48, 56, 57, 64, 96, 128}) {
         const std::string label = "gated_rmsnorm target [128,48," + std::to_string(columns) + "]";
-        failures += run_case(label.c_str(), {128, 48, columns}, 1420U + columns,
-                             4.0F, false, columns == 56 || columns == 57 || columns == 128);
+        failures += run_case(label.c_str(), {128, 48, columns}, 1420U + columns, 4.0F, false,
+                             columns == 56 || columns == 57 || columns == 128);
     }
     failures += run_case("gated_rmsnorm [128,32,7]", {128, 32, 7}, 1402U);
     failures += run_case("gated_rmsnorm [128,32,128]", {128, 32, 128}, 1403U);

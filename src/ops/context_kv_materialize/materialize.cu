@@ -11,7 +11,7 @@
 // KV heads per layer: 8 here; the two-device shard (tp2/materialize_shard_h4.cu) compiles this
 // source again with 4.
 #ifndef NINFER_CONTEXT_KV_MATERIALIZE_KV_HEADS
-#define NINFER_CONTEXT_KV_MATERIALIZE_KV_HEADS 8
+#    define NINFER_CONTEXT_KV_MATERIALIZE_KV_HEADS 8
 #endif
 
 namespace ninfer::ops::detail {
@@ -55,8 +55,9 @@ __device__ __forceinline__ void store_key_head(const float* input, DeviceLayerVi
     float sin0, cos0, sin1, cos1;
     dflash_rope_sincos(positions, column, j, &sin0, &cos0);
     dflash_rope_sincos(positions, column, j + 1, &sin1, &cos1);
-    const auto dst = 128LL * ((positions[column] & 2047) + (long long)layer.padded_capacity *
-                                                               (head + kKvHeads * slots[column / width]));
+    const auto dst =
+        128LL * ((positions[column] & 2047) +
+                 (long long)layer.padded_capacity * (head + kKvHeads * slots[column / width]));
     auto* out      = reinterpret_cast<__nv_bfloat162*>(layer.cache_k + dst);
     out[lane]      = __floats2bfloat162_rn(x0 * cos0 - y0 * sin0, x1 * cos1 - y1 * sin1);
     out[lane + 32] = __floats2bfloat162_rn(y0 * cos0 + x0 * sin0, y1 * cos1 + x1 * sin1);
@@ -201,8 +202,8 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 cp_commit();
             }
 
-            const auto load_fragments = [&](int k_step, unsigned(&a)[4],
-                                            unsigned(&b)[kTokenMmas][2]) {
+            const auto load_fragments = [&](int k_step, unsigned (&a)[4],
+                                            unsigned (&b)[kTokenMmas][2]) {
                 const int weight_row = warp_row * 16 + a_rowoff;
                 const int weight_col = k_step * 16 + a_coloff;
                 ldmatrix_x4(
@@ -399,8 +400,7 @@ void launch_grouped(const Tensor& x, const Tensor& positions, const Tensor& coun
     constexpr auto kernel = context_kv_grouped_kernel<Columns, KWarps>;
     const int shared = q8_prepare_shared<GroupedSchedule<Columns, KWarps>::kSharedBytes, kernel>();
     kernel<<<dim3(kRows / 16, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10),
-             KWarps * 32,
-             shared, stream>>>(
+             KWarps * 32, shared, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
         static_cast<const int*>(counts.data), static_cast<const int*>(slots.data), layers,
         static_cast<float*>(scratch.data), x.ne[1], x.ne[2], envelope.min_count,

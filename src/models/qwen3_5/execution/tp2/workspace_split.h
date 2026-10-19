@@ -69,8 +69,8 @@ TensorParallelProposalRoots tp_proposal_argmax(Allocator& allocator, std::int32_
 }
 
 // The vocabulary-split DFlash2 candidate ranking over `columns` final drafter hidden columns on one
-// rank (execution::dflash2_candidates_split): with `broadcast`, the hidden rank 1 receives from rank
-// 0 and the all-reduce staging it arrives through (rank 1's `hidden` is its copy, rank 0's is
+// rank (execution::dflash2_candidates_split): with `broadcast`, the hidden rank 1 receives from
+// rank 0 and the all-reduce staging it arrives through (rank 1's `hidden` is its copy, rank 0's is
 // unused); then the rank's top sixteen, its packed candidates and their all-reduce staging.
 struct TensorParallelCandidateRoots {
     Tensor hidden;

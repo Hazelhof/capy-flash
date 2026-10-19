@@ -89,7 +89,8 @@ const std::vector<ServeProfile>& serve_profiles() {
     static const std::vector<ServeProfile> profiles{
         {"flash-next",
          {"--tp", "2", "--devices", "0,1", "--kv-dtype", "int8", "--elastic", "--max-context",
-          "262144", "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3"}},
+          "262144", "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3",
+          "--host-kv-mib", "4096", "--embedding-host"}},
         {"27b",
          {"--tp",
           "2",
@@ -115,7 +116,9 @@ const std::vector<ServeProfile>& serve_profiles() {
           "--host-state-slots",
           "8",
           "--host-kv-mib",
-          "8192"}},
+          "8192",
+          "--prefill-chunk",
+          "2048"}},
     };
     return profiles;
 }
@@ -174,6 +177,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--turn-anchors N] "
            "[--elastic] [--kv-grow N] [--kv-budget-gib G] [--miss-split auto|off] "
+           "[--stream-min-tokens N] "
            "[--request-log-jsonl FILE] [--log-speculation-detail] "
            "[--log-speculation-detail-max-steps N] "
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
@@ -236,7 +240,11 @@ std::string serve_usage_text(const char* argv0) {
            "       Qwen4Exp: --elastic backs the KV on demand and lends unused KV to the expert "
            "slot cache (grow step --kv-grow tokens, default 8192; --kv-budget-gib caps one "
            "request's KV); --miss-split auto lets the GPU read part of each window's missing "
-           "experts (best at one GPU), off keeps them all on the CPU (default)\n"
+           "experts (best at one GPU), off keeps them all on the CPU (default); prompt chunks of "
+           "at least --stream-min-tokens N tokens stream the non-resident experts to the GPU "
+           "over PCIe, shorter ones compute them on the CPU (default " +
+           std::to_string(RoutedExpertOptions{}.stream_min_tokens) +
+           ", 0 = never stream)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --tp 2 --devices A,B splits the dense model across two GPUs (rank 0 on A) for "
@@ -420,7 +428,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-budget-gib") {
             const std::string value = require_value("--kv-budget-gib");
-            double gib = 0.0;
+            double gib              = 0.0;
             try {
                 gib = std::stod(value);
             } catch (const std::exception&) {
@@ -437,6 +445,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--miss-split must be auto or off");
             }
+        } else if (arg == "--stream-min-tokens") {
+            options.stream_min_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--stream-min-tokens"), "stream-min-tokens"));
         } else if (arg == "--turn-anchors") {
             options.turn_anchors = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--turn-anchors"), "turn-anchors"));
@@ -610,7 +621,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // The Host tier holds both ranks' halves of a checkpoint (one pinned record per page and
         // per StateImage), so --host-kv-mib and --host-state-slots work as at tp 1. Unset, they
         // stay 0 at tp 2: on Qwen3.8-Flash-Next the routed experts already pin most of the RAM,
-        // and the PLE table is read through the page cache. --profile 27b turns them on.
+        // and the PLE table is read through the page cache. --profile 27b turns them on;
+        // --profile flash-next sets 4 GiB of Host KV for the idle conversations' KV (v0.6).
         if (!host_state_explicit) { options.context_cache.host_state_slots = 0; }
         if (!host_kv_explicit) { options.context_cache.host_kv_capacity_bytes = 0; }
     }

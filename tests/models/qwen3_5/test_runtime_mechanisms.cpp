@@ -155,7 +155,8 @@ void test_decoder_layout() {
            "QSA index records [136,64,1,pages] and block keys [32,64,1,pages]");
     expect(qsa.text_kv.payload_bytes() ==
                fp8.text_kv.payload_bytes() +
-                   2ULL * 5ULL * 64ULL * (ninfer::ops::kQsaIndexRecordWords + ninfer::ops::kQsaBlockKeyWords) * 2ULL,
+                   2ULL * 5ULL * 64ULL *
+                       (ninfer::ops::kQsaIndexRecordWords + ninfer::ops::kQsaBlockKeyWords) * 2ULL,
            "QSA index planes add 336 B per token per attention layer");
 }
 

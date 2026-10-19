@@ -42,15 +42,15 @@ void dflash2_draft_round_tp2(DFlashBatchContext& state, std::int32_t batch_size,
                              DFlashEnvelopes envelopes);
 
 // Whether a split drafter layer's MLP gate/up runs the fused SwiGLU projection: an NVFP4 gate/up
-// (A16Only, tools/convert/official_recipes.py _dflash2_nvfp4_gate_up) has a fused A16 route at every
-// width, while Q8 keeps the linear projection followed by silu_mul (the drafts of artifacts with a
-// Q8 drafter stay what they were).
+// (A16Only, tools/convert/official_recipes.py _dflash2_nvfp4_gate_up) has a fused A16 route at
+// every width, while Q8 keeps the linear projection followed by silu_mul (the drafts of artifacts
+// with a Q8 drafter stay what they were).
 [[nodiscard]] inline bool dflash2_split_mlp_fused(const LinearParameters& gate_up) {
     return gate_up.weight.qtype == QType::NVFP4;
 }
 
-// The rank that holds the split drafter's candidate selector (load/sharding.cpp), read from rank 0's
-// Parameters: 0 when they hold it, else 1.
+// The rank that holds the split drafter's candidate selector (load/sharding.cpp), read from rank
+// 0's Parameters: 0 when they hold it, else 1.
 [[nodiscard]] std::size_t dflash2_selector_rank(const Parameters& rank0);
 
 // After a DFlash2 round's proposal at tp 2: the selecting rank's draft tokens reach the other rank
@@ -69,8 +69,7 @@ void dflash_append_context_peer(DFlashPeerDrafter& peer, const qwen3_5::DFlashDe
 // Rank 1's DFlash feature sinks of the split drafter: target verification scatters into its pending
 // features, and a prefill chunk into its prefill features, whose consumer appends rank 1's context
 // with the chunk's bindings (`host_ingress`, already filled by rank 0's consumer).
-[[nodiscard]] DFlashFeatureSink dflash_peer_batch_sink(DFlashPeerDrafter& peer,
-                                                       const Tensor& lanes,
+[[nodiscard]] DFlashFeatureSink dflash_peer_batch_sink(DFlashPeerDrafter& peer, const Tensor& lanes,
                                                        const Tensor& valid_columns,
                                                        std::int32_t width, std::int32_t batch);
 [[nodiscard]] DFlashFeatureSink

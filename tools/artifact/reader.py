@@ -45,9 +45,7 @@ class Artifact:
             raw_json = os.pread(fd, json_bytes, HEADER.size)
             if len(raw_json) != json_bytes:
                 raise ArtifactError("truncated directory JSON")
-            self.directory: Directory = decode_directory(
-                raw_json, entry_name=self.path.name
-            )
+            self.directory: Directory = decode_directory(raw_json, entry_name=self.path.name)
             self.payload_offset = integer(
                 align_up(HEADER.size + json_bytes, PAYLOAD_ALIGNMENT),
                 "entry payload offset",
@@ -57,9 +55,7 @@ class Artifact:
                 "entry file bytes",
             )
             if entry_bytes != expected:
-                raise ArtifactError(
-                    f"entry length {entry_bytes} does not match {expected}"
-                )
+                raise ArtifactError(f"entry length {entry_bytes} does not match {expected}")
             self._prefixes = [0]
             for file in self.directory.files:
                 self._prefixes.append(self._prefixes[-1] + file.payload_bytes)
@@ -83,11 +79,7 @@ class Artifact:
     @property
     def file_bytes(self) -> int:
         """Total declared file bytes, including framing in unopened files."""
-        return (
-            self.payload_bytes
-            + self.payload_offset
-            + (len(self.directory.files) - 1) * 4096
-        )
+        return self.payload_bytes + self.payload_offset + (len(self.directory.files) - 1) * 4096
 
     def _file(self, index: int) -> int:
         if 0 not in self._fds:
@@ -102,39 +94,25 @@ class Artifact:
             if len(raw) != HEADER.size:
                 raise ArtifactError(f"{path}: truncated continuation header")
             magic, actual_index, artifact_id = HEADER.unpack(raw)
-            if (
-                magic != PART_MAGIC
-                or actual_index != index
-                or artifact_id != self.artifact_id
-            ):
-                raise ArtifactError(
-                    f"{path}: continuation header does not belong to this entry"
-                )
-            expected = integer(
-                PAYLOAD_ALIGNMENT + file.payload_bytes, "continuation file bytes"
-            )
+            if magic != PART_MAGIC or actual_index != index or artifact_id != self.artifact_id:
+                raise ArtifactError(f"{path}: continuation header does not belong to this entry")
+            expected = integer(PAYLOAD_ALIGNMENT + file.payload_bytes, "continuation file bytes")
             if os.fstat(fd).st_size != expected:
-                raise ArtifactError(
-                    f"{path}: continuation length does not match {expected}"
-                )
+                raise ArtifactError(f"{path}: continuation length does not match {expected}")
         except BaseException:
             os.close(fd)
             raise
         self._fds[index] = fd
         return fd
 
-    def iter_range(
-        self, offset: int, length: int, *, chunk_bytes: int = READ_CHUNK_BYTES
-    ) -> Iterator[bytes]:
+    def iter_range(self, offset: int, length: int, *, chunk_bytes: int = READ_CHUNK_BYTES) -> Iterator[bytes]:
         """Yield exactly a logical payload range with bounded temporary memory."""
         integer(offset, "range offset")
         integer(length, "range length")
         integer(chunk_bytes, "read chunk bytes", positive=True)
         end = integer(offset + length, "range end")
         if end > self.payload_bytes:
-            raise ArtifactError(
-                f"range [{offset},{end}) exceeds payload {self.payload_bytes}"
-            )
+            raise ArtifactError(f"range [{offset},{end}) exceeds payload {self.payload_bytes}")
         if 0 not in self._fds:
             raise ArtifactError("artifact is closed")
         while offset < end:
@@ -145,9 +123,7 @@ class Artifact:
             fd = self._file(index)
             data = os.pread(fd, count, file_offset)
             if len(data) != count:
-                raise ArtifactError(
-                    f"short read at logical offset {offset}: {len(data)} of {count}"
-                )
+                raise ArtifactError(f"short read at logical offset {offset}: {len(data)} of {count}")
             discard_cached_pages(fd, file_offset, count)
             yield data
             offset += count
@@ -165,9 +141,7 @@ class Artifact:
             self._validated.add(object_id)
         return obj
 
-    def iter_object(
-        self, object_id: str, *, chunk_bytes: int = READ_CHUNK_BYTES
-    ) -> Iterator[bytes]:
+    def iter_object(self, object_id: str, *, chunk_bytes: int = READ_CHUNK_BYTES) -> Iterator[bytes]:
         obj = self.object(object_id)
         yield from self.iter_range(obj.offset, obj.bytes, chunk_bytes=chunk_bytes)
 

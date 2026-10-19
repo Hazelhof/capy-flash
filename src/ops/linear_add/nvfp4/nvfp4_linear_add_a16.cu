@@ -17,39 +17,33 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         LinearResidualAddEpilogue{{static_cast<__nv_bfloat16*>(residual.data), weight.n}};
     if constexpr (K == Nvfp4N5120K6144::kInputRows || K == Nvfp4N5120K3072::kInputRows) {
         if (tokens <= 8) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, K>>(p, output, epilogue,
-                                                                        stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 8, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 16) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 8, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 24) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 8, 1>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 8, 1>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 32) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 2>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 48) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 2, 2>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 2, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 64) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 2, 2>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 2, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 128) {
@@ -66,39 +60,33 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         }
     } else {
         if (tokens <= 8) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 4, 2>, K>>(p, output, epilogue,
-                                                                        stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<8, 4, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 16) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 4, 2>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<16, 4, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 24) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 2>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 32) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 1>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 1>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 48) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 1>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<32, 4, 1>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 64) {
-            launch_nvfp4_a16_sliced_k_mma<
-                Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 2, 2>, K>>(p, output, epilogue,
-                                                                         stream);
+            launch_nvfp4_a16_sliced_k_mma<Nvfp4ScheduleInstance<Nvfp4SlicedInstance<64, 2, 2>, K>>(
+                p, output, epilogue, stream);
             return;
         }
         if (tokens <= 128) {

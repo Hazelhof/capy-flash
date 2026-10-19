@@ -1,7 +1,7 @@
 #pragma once
 
-// Two-device (tp 2) forms of linear_add. Our file: ninfer/ops/linear_add.h is upstream's and carries no
-// hook.
+// Two-device (tp 2) forms of linear_add. Our file: ninfer/ops/linear_add.h is upstream's and
+// carries no hook.
 //
 // Shapes registered for the two-device forms: NVFP4 and FP8 register the input-column halves
 // [5120,3072] and [5120,8704] of [5120,6144] and [5120,17408], each keeping the activation-
@@ -70,6 +70,18 @@ void linear_add_row_parallel(const std::array<Tensor, 2>& x, const std::array<We
                              const std::array<Tensor, 2>& staging, LinearPolicy policy,
                              const std::array<WorkspaceArena*, 2>& workspace,
                              const ExecutionContext& ec, const PeerEvents& events);
+
+/**
+ * Split-phase form: the same partials, then only allreduce_sum_begin() of `residual` on `lane`
+ * (ninfer/ops/allreduce.h); the caller completes it with allreduce_sum_finish() before reading
+ * `residual` or reusing `staging`. Same result and bits as linear_add_row_parallel(). Requires
+ * allreduce_sum_split_available(ec, events).
+ */
+void linear_add_row_parallel_begin(const std::array<Tensor, 2>& x, const std::array<Weight, 2>& w,
+                                   const std::array<Tensor, 2>& residual,
+                                   const std::array<Tensor, 2>& staging, LinearPolicy policy,
+                                   const std::array<WorkspaceArena*, 2>& workspace,
+                                   const ExecutionContext& ec, const PeerEvents& events, int lane);
 
 /// A16-only row-parallel form; it requires no transient workspace.
 /// Model execution passes a policy; this form is the A16 entry the op qualification suites use.

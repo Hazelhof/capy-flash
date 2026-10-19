@@ -29,8 +29,8 @@ __global__ void apply_table_updates_kernel(std::int32_t* __restrict__ table,
 }
 
 __global__ void map_slots_kernel(const std::int32_t* __restrict__ ids, std::int32_t count,
-                                 const std::int32_t* __restrict__ layer_table,
-                                 std::int32_t experts, std::int32_t* __restrict__ slot_ids) {
+                                 const std::int32_t* __restrict__ layer_table, std::int32_t experts,
+                                 std::int32_t* __restrict__ slot_ids) {
     const std::int32_t i = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= count) { return; }
     const std::int32_t e = ids[i];
@@ -78,7 +78,8 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
     }
     if (layout_.planes < 1 || layout_.planes > kMaxPlanes ||
         layout_.bank_base.size() != static_cast<std::size_t>(layers_ * layout_.planes)) {
-        throw std::invalid_argument("expert cache: 1..8 planes and one bank base per layer and plane");
+        throw std::invalid_argument(
+            "expert cache: 1..8 planes and one bank base per layer and plane");
     }
     for (std::int32_t q = 0; q < layout_.planes; ++q) {
         if (layout_.plane_bytes[q] <= 0 || layout_.bank_stride[q] < layout_.plane_bytes[q] ||
@@ -96,13 +97,14 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
             throw std::invalid_argument("expert cache: host banks must be pinned host memory");
         }
     }
-    const std::size_t cells = static_cast<std::size_t>(layers_) * static_cast<std::size_t>(experts_);
+    const std::size_t cells =
+        static_cast<std::size_t>(layers_) * static_cast<std::size_t>(experts_);
     published_.assign(cells, -1);
     target_.assign(cells, -1);
     dirty_.assign(cells, 0);
     for (std::int32_t p = 0; p < gpus_; ++p) {
-        Gpu& g     = gpu_[static_cast<std::size_t>(p)];
-        g.binding  = gpus[static_cast<std::size_t>(p)];
+        Gpu& g    = gpu_[static_cast<std::size_t>(p)];
+        g.binding = gpus[static_cast<std::size_t>(p)];
         if (g.binding.table == nullptr) { throw std::invalid_argument("expert cache: null table"); }
         for (std::int32_t q = 0; q < layout_.planes; ++q) {
             if (g.binding.pool_base[q] == nullptr) {
@@ -166,7 +168,9 @@ void ExpertCache::initialize(std::span<const std::vector<std::int32_t>> profile)
 }
 
 void ExpertCache::check_streams(std::span<const cudaStream_t> streams) const {
-    if (!initialized_) { throw std::logic_error("expert cache: initialize before the first window"); }
+    if (!initialized_) {
+        throw std::logic_error("expert cache: initialize before the first window");
+    }
     if (streams.size() != static_cast<std::size_t>(gpus_)) {
         throw std::invalid_argument("expert cache: one compute stream per GPU");
     }
@@ -195,7 +199,7 @@ void ExpertCache::publish_targets(std::span<const cudaStream_t> streams) {
     }
     std::int32_t* const mirror = any_mirror ? gpu_[0].binding.mirror : nullptr;
     for (const std::int32_t c : dirty_list_) {
-        const auto ci = static_cast<std::size_t>(c);
+        const auto ci        = static_cast<std::size_t>(c);
         const std::int32_t v = target_[ci];
         if (v == published_[ci]) { continue; }
         const auto p = static_cast<std::size_t>((c % experts_) % gpus_);
@@ -228,7 +232,7 @@ void ExpertCache::publish_targets(std::span<const cudaStream_t> streams) {
     for (std::int32_t p = 0; p < gpus_; ++p) {
         const auto pi = static_cast<std::size_t>(p);
         for (std::size_t i = 0; i < index[pi].size(); ++i) {
-            const std::int32_t v = value[pi][i];
+            const std::int32_t v                               = value[pi][i];
             published_[static_cast<std::size_t>(index[pi][i])] = v;
             ++(v >= 0 ? counters_.published : counters_.unpublished);
         }
@@ -239,7 +243,9 @@ void ExpertCache::publish_targets(std::span<const cudaStream_t> streams) {
 
 void ExpertCache::end_window(std::span<const cudaStream_t> streams) {
     check_streams(streams);
-    if (launched_ != fenced_ + 1) { throw std::logic_error("expert cache: end_window without begin_window"); }
+    if (launched_ != fenced_ + 1) {
+        throw std::logic_error("expert cache: end_window without begin_window");
+    }
     for (std::int32_t p = 0; p < gpus_; ++p) {
         const auto pi = static_cast<std::size_t>(p);
         ScopedCurrentDevice scope(gpu_[pi].binding.device);
@@ -263,16 +269,39 @@ LayerView ExpertCache::observe(std::int32_t layer, std::span<const Routed> route
 }
 
 LayerView ExpertCache::observe_prompt(std::int32_t layer, std::span<const Routed> routed,
-                                      std::int32_t tokens) {
+                                      std::int32_t tokens, bool insert, std::int32_t target_cap) {
     LayerView view = classify(layer, routed);
     if (lent(layer) && !lent_keep_) {
         lent_decision(routed);
     } else if (frozen_) {
         frozen_decision(routed, view);
+    } else if (!insert) {
+        policy_.count_prompt(layer, routed, tokens, decision_);
+    } else if (target_cap > 0) {
+        policy_.decide_prompt(layer, routed, tokens, target_cap, decision_);
     } else {
         policy_.decide_prompt(layer, routed, tokens, decision_);
     }
     return finish_observe(layer, view);
+}
+
+void ExpertCache::apply_prompt(std::int32_t layer, std::span<const Routed> routed,
+                               std::int32_t tokens, std::int32_t target_cap) {
+    if (!initialized_) { throw std::logic_error("expert cache: initialize before apply_prompt"); }
+    if (fenced_ != launched_) {
+        throw std::logic_error("expert cache: apply_prompt inside a window");
+    }
+    if (frozen_ || lent(layer)) { return; }
+    if (target_cap < 0) {
+        policy_.count_prompt(layer, routed, tokens, decision_, /*frequencies=*/true);
+        return;
+    }
+    policy_.decide_prompt(layer, routed, tokens,
+                          target_cap > 0 ? target_cap : std::numeric_limits<std::int32_t>::max(),
+                          decision_);
+    for (const Insert& ins : decision_.inserts) { stage(ins, layer); }
+    counters_.inserts += static_cast<std::int64_t>(decision_.inserts.size());
+    queue_staged(true, /*issue_now=*/false);
 }
 
 // T59: a frozen cache inserts nothing; the policy's hits are the published residents.
@@ -366,16 +395,17 @@ std::span<const cudaEvent_t> ExpertCache::lend_layers(std::int32_t first, std::i
         }
     }
     for (std::int32_t p = 0; p < gpus_; ++p) {
-        Gpu& g             = gpu_[static_cast<std::size_t>(p)];
-        const std::int64_t slots = policy_.base_slots(p);
+        Gpu& g = gpu_[static_cast<std::size_t>(p)];
         // A new generation drops every staged, queued or in-flight fill of a lent slot (the
         // layers' base slots and, unless kept, their elastic slots).
-        for (std::int64_t s = first * slots; s < (first + count) * slots; ++s) {
+        for (std::int32_t s = policy_.base_offset(p, first);
+             s < policy_.base_offset(p, first + count); ++s) {
             ++g.generation[static_cast<std::size_t>(s)];
         }
         for (std::int32_t c = 0; c < policy_.config().elastic_columns && !keep_elastic; ++c) {
             for (std::int32_t l = first; l < first + count; ++l) {
-                ++g.generation[static_cast<std::size_t>(policy_.pool_slot(p, l, policy_.base_slots(p) + c))];
+                ++g.generation[static_cast<std::size_t>(
+                    policy_.pool_slot(p, l, policy_.base_slots(p, l) + c))];
             }
         }
         ScopedCurrentDevice scope(g.binding.device);
@@ -472,11 +502,13 @@ void ExpertCache::set_active_columns(std::int32_t columns, std::span<const cudaS
         for (const SlotMove& m : moves) {
             if (m.partition != p) { continue; }
             for (std::int32_t q = 0; q < layout_.planes; ++q) {
-                CUDA_CHECK(cudaMemcpyAsync(
-                    g.binding.pool_base[q] + static_cast<std::int64_t>(m.to) * layout_.pool_stride[q],
-                    g.binding.pool_base[q] + static_cast<std::int64_t>(m.from) * layout_.pool_stride[q],
-                    static_cast<std::size_t>(layout_.plane_bytes[q]), cudaMemcpyDeviceToDevice,
-                    g.fill_stream));
+                CUDA_CHECK(
+                    cudaMemcpyAsync(g.binding.pool_base[q] +
+                                        static_cast<std::int64_t>(m.to) * layout_.pool_stride[q],
+                                    g.binding.pool_base[q] +
+                                        static_cast<std::int64_t>(m.from) * layout_.pool_stride[q],
+                                    static_cast<std::size_t>(layout_.plane_bytes[q]),
+                                    cudaMemcpyDeviceToDevice, g.fill_stream));
             }
             ++g.generation[static_cast<std::size_t>(m.from)];
             ++g.generation[static_cast<std::size_t>(m.to)];
@@ -544,7 +576,8 @@ void ExpertCache::stage(const Insert& ins, std::int32_t layer) {
     const auto s = static_cast<std::size_t>(ins.slot);
     // A new owner cancels the publication of any earlier fill of this slot still in flight.
     const std::uint32_t generation = ++g.generation[s];
-    const PendingFill fill{static_cast<std::int32_t>(cell(layer, ins.expert)), ins.slot, generation};
+    const PendingFill fill{static_cast<std::int32_t>(cell(layer, ins.expert)), ins.slot,
+                           generation};
     if (g.staged_at[s] >= 0) {
         // Reassigned twice before submission: copy only the last owner (copies inside one batch
         // are unordered, so two writes of one slot must never share a batch).
@@ -558,7 +591,8 @@ void ExpertCache::stage(const Insert& ins, std::int32_t layer) {
 
 void ExpertCache::submit_fills() {
     if (fenced_ != launched_) {
-        throw std::logic_error("expert cache: submit_fills before end_window of the launched window");
+        throw std::logic_error(
+            "expert cache: submit_fills before end_window of the launched window");
     }
     queue_staged(true);
 }
@@ -596,8 +630,9 @@ void ExpertCache::prioritize_queue(std::span<const std::int32_t> rank) {
     };
     for (std::int32_t p = 0; p < gpus_; ++p) {
         Gpu& g = gpu_[static_cast<std::size_t>(p)];
-        std::stable_sort(g.queue.begin(), g.queue.end(),
-                         [&](const PendingFill& a, const PendingFill& b) { return key(a) < key(b); });
+        std::stable_sort(
+            g.queue.begin(), g.queue.end(),
+            [&](const PendingFill& a, const PendingFill& b) { return key(a) < key(b); });
     }
 }
 
@@ -610,9 +645,9 @@ void ExpertCache::prioritize_queue(std::span<const std::int32_t> rank) {
 void ExpertCache::pump(Gpu& g) {
     retire(g, false);
     std::vector<PendingFill> batch;
-    while (!g.queue.empty() && g.in_flight_bytes + static_cast<std::int64_t>(batch.size() + 1) *
-                                                       expert_bytes_ <=
-                                   max_in_flight_bytes_) {
+    while (!g.queue.empty() &&
+           g.in_flight_bytes + static_cast<std::int64_t>(batch.size() + 1) * expert_bytes_ <=
+               max_in_flight_bytes_) {
         const PendingFill f = g.queue.front();
         g.queue.pop_front();
         if (g.generation[static_cast<std::size_t>(f.slot)] != f.generation) {
@@ -627,13 +662,13 @@ void ExpertCache::pump(Gpu& g) {
 void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
     if (fills.empty()) { return; }
     ScopedCurrentDevice scope(g.binding.device);
-    const bool fenced = std::any_of(fills.begin(), fills.end(),
-                                    [](const PendingFill& f) { return f.fenced; });
+    const bool fenced =
+        std::any_of(fills.begin(), fills.end(), [](const PendingFill& f) { return f.fenced; });
     if (fenced && fenced_ > 0) { CUDA_CHECK(cudaStreamWaitEvent(g.fill_stream, g.fence, 0)); }
     const std::int32_t planes = layout_.planes;
     cudaMemcpyAttributes attr{};
-    attr.srcAccessOrder = cudaMemcpySrcAccessOrderStream;
-    attr.flags          = cudaMemcpyFlagPreferOverlapWithCompute;
+    attr.srcAccessOrder    = cudaMemcpySrcAccessOrderStream;
+    attr.flags             = cudaMemcpyFlagPreferOverlapWithCompute;
     std::size_t attr_index = 0;
     for (std::size_t first = 0; first < fills.size(); first += kFillChunkExperts) {
         const std::size_t n = std::min<std::size_t>(kFillChunkExperts, fills.size() - first);
@@ -642,9 +677,9 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
         copy_bytes_.clear();
         FillBatch batch;
         for (std::size_t i = first; i < first + n; ++i) {
-            const PendingFill& f   = fills[i];
-            const std::int32_t l   = f.cell / experts_;
-            const std::int32_t e   = f.cell % experts_;
+            const PendingFill& f = fills[i];
+            const std::int32_t l = f.cell / experts_;
+            const std::int32_t e = f.cell % experts_;
             for (std::int32_t q = 0; q < planes; ++q) {
                 copy_dst_.push_back(g.binding.pool_base[q] +
                                     static_cast<std::int64_t>(f.slot) * layout_.pool_stride[q]);
@@ -717,8 +752,8 @@ std::int64_t ExpertCache::fills_pending() const noexcept {
 }
 
 void expert_cache_map_slots(const std::int32_t* ids, std::int32_t count, std::int32_t layer,
-                            std::int32_t experts, const std::int32_t* table,
-                            std::int32_t* slot_ids, cudaStream_t stream) {
+                            std::int32_t experts, const std::int32_t* table, std::int32_t* slot_ids,
+                            cudaStream_t stream) {
     if (count <= 0) { return; }
     map_slots_kernel<<<static_cast<unsigned>((count + 127) / 128), 128, 0, stream>>>(
         ids, count, table + static_cast<std::ptrdiff_t>(layer) * experts, experts, slot_ids);

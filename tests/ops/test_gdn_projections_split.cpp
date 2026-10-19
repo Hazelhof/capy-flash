@@ -30,6 +30,7 @@
 #include "core/weight.h"
 #include "core/weight_view.h"
 #include "ops/direct_bf16_weight.h"
+#include "ops/gdn_gating_proj/bf16/bf16_gdn_gating_proj_kernels.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 #include "ops/split_test_support.h"
@@ -57,7 +58,7 @@ namespace {
 
 constexpr ReductionCriterion kSplitCriterion{2.0 * kBf16UnitRoundoff, 0.0, 2.0 * kBf16UnitRoundoff};
 
-constexpr QType kFp8  = QType::FP8_E4M3FN_ROW_BF16;
+constexpr QType kFp8   = QType::FP8_E4M3FN_ROW_BF16;
 constexpr QType kNvfp4 = QType::NVFP4;
 
 const char* format_name(QType qtype) { return qtype == kNvfp4 ? "nvfp4" : "fp8"; }
@@ -237,10 +238,10 @@ Weight prepare_input_shard(const Weight& stored) {
         return WeightView{{count, kHidden},
                           {{&parent, begin * kHidden, (begin + count) * kHidden}}};
     };
-    const WeightView q  = rows(0, kShardKeyRows);
-    const WeightView k  = rows(kShardKeyRows, kShardKeyRows);
-    const WeightView v  = rows(2 * kShardKeyRows, kShardValueRows);
-    const WeightView z  = rows(kShardChannels, kShardValueRows);
+    const WeightView q = rows(0, kShardKeyRows);
+    const WeightView k = rows(kShardKeyRows, kShardKeyRows);
+    const WeightView v = rows(2 * kShardKeyRows, kShardValueRows);
+    const WeightView z = rows(kShardChannels, kShardValueRows);
     const auto policy =
         stored.qtype == kNvfp4 ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only;
     std::optional<float> divisor;
@@ -319,9 +320,9 @@ int run_input_case(const ExecutionContext& ec, const InputWeights& weights, std:
         }
 
         for (const ops::LinearPolicy policy : policies) {
-            const std::string label =
-                std::string(format_name(qtype)) + " gdn_input T=" + std::to_string(tokens) + " " +
-                policy_name(policy);
+            const std::string label = std::string(format_name(qtype)) +
+                                      " gdn_input T=" + std::to_string(tokens) + " " +
+                                      policy_name(policy);
 
             set_device(ec, 0);
             GuardedDeviceBuffer ref_qkv(static_cast<std::size_t>(kChannels) * tokens * 2);
@@ -617,12 +618,12 @@ int compare_conv_rank(const std::string& label, const ConvResult& shard, const C
 int run_conv_case(const ExecutionContext& ec, const InputWeights& weights,
                   const ConvCase& test_case, ops::LinearPolicy policy, bool record,
                   std::uint32_t seed) {
-    const QType qtype = weights.qtype;
-    const std::string label =
-        std::string(format_name(qtype)) + " gdn_input_proj_conv_" +
-        (record ? "record" : "snapshot") +
-        " B=" + std::to_string(test_case.batch) + " W=" + std::to_string(test_case.width) +
-        (test_case.mixed ? " mixed " : " ") + policy_name(policy);
+    const QType qtype       = weights.qtype;
+    const std::string label = std::string(format_name(qtype)) + " gdn_input_proj_conv_" +
+                              (record ? "record" : "snapshot") +
+                              " B=" + std::to_string(test_case.batch) +
+                              " W=" + std::to_string(test_case.width) +
+                              (test_case.mixed ? " mixed " : " ") + policy_name(policy);
     const ConvData data = make_conv_data(test_case, seed);
     int failures        = 0;
 
@@ -832,8 +833,8 @@ int run_gating_case(const ExecutionContext& ec, std::uint32_t seed, bool fused) 
     }
 
     // GEMV at T=1; the reference crosses from small-T into its MMA routes while the shard keeps
-    // the split-10 kernel at every T>=2.
-    for (const std::int32_t tokens : {1, 2, 8, 9, 48, 1024}) {
+    // the split-10 sums at every T>=2 (one fused launch through T=32, two kernels above).
+    for (const std::int32_t tokens : {1, 2, 4, 8, 9, 16, 32, 33, 48, 1024}) {
         const std::string label = head + " T=" + std::to_string(tokens);
         const std::vector<float> x_host =
             activation(static_cast<std::size_t>(kHidden) * tokens,
@@ -913,8 +914,8 @@ int run_gating_case(const ExecutionContext& ec, std::uint32_t seed, bool fused) 
             set_device(ec, rank);
             failures += g_buffer[slot]->verify_guards(prefix + " g");
             failures += beta_buffer[slot]->verify_guards(prefix + " beta");
-            const auto got_g = from_device<float>(g_buffer[slot]->data(),
-                                                  static_cast<std::size_t>(kShardHeads) * tokens);
+            const auto got_g    = from_device<float>(g_buffer[slot]->data(),
+                                                     static_cast<std::size_t>(kShardHeads) * tokens);
             const auto got_beta = from_device<float>(
                 beta_buffer[slot]->data(), static_cast<std::size_t>(kShardHeads) * tokens);
             observed_g[slot] = std::vector<double>(got_g.begin(), got_g.end());
@@ -931,6 +932,55 @@ int run_gating_case(const ExecutionContext& ec, std::uint32_t seed, bool fused) 
             std::cerr << label << ": both ranks wrote the same g\n";
             ++failures;
         }
+    }
+    return failures;
+}
+
+// The fused small-T shard kernel against the two-kernel split-10 form it replaces through T=32:
+// the same slice sums added in the same order, so g and beta must agree bit for bit.
+int run_gating_fused_identity(const ExecutionContext& ec, std::uint32_t seed) {
+    int failures = 0;
+    set_device(ec, 0);
+    const bf16::HostWeight a = bf16::make_patterned(kShardHeads, kHidden, seed);
+    const bf16::HostWeight b = bf16::make_patterned(kShardHeads, kHidden, seed + 1);
+    std::vector<float> a_log(kShardHeads);
+    std::vector<float> dt_bias(kShardHeads);
+    fill_uniform(a_log, seed + 2, -2.0F, 1.0F);
+    fill_uniform(dt_bias, seed + 3, -1.0F, 1.0F);
+    const DeviceBuffer a_device = to_device(a.bits), b_device = to_device(b.bits);
+    const DeviceBuffer a_log_device = to_device_f32(a_log), bias_device = to_device_f32(dt_bias);
+    const Weight a_weight = a.device_weight(a_device.p), b_weight = b.device_weight(b_device.p);
+    const Tensor log_a(a_log_device.p, DType::FP32, {kShardHeads});
+    const Tensor bias(bias_device.p, DType::FP32, {kShardHeads});
+    cudaStream_t stream = ec.dev[0]->stream;
+    for (std::int32_t tokens = 2; tokens <= 32; ++tokens) {
+        const std::string label = "gdn_gating_proj fused == split-10 T=" + std::to_string(tokens);
+        const DeviceBuffer x_device = to_device_bf16(
+            activation(static_cast<std::size_t>(kHidden) * tokens, seed * 7U + tokens));
+        const Tensor x(x_device.p, DType::BF16, {kHidden, tokens});
+        const std::size_t outputs = static_cast<std::size_t>(kShardHeads) * tokens;
+        const DeviceBuffer ref_g(outputs * 4), ref_beta(outputs * 4);
+        GuardedDeviceBuffer got_g(outputs * 4), got_beta(outputs * 4);
+        const std::size_t scratch_bytes =
+            static_cast<std::size_t>(10) * tokens * 2 * kShardHeads * sizeof(float);
+        const DeviceBuffer scratch(scratch_bytes);
+        Tensor g_ref(ref_g.p, DType::FP32, {kShardHeads, tokens});
+        Tensor beta_ref(ref_beta.p, DType::FP32, {kShardHeads, tokens});
+        Tensor g_got(got_g.data(), DType::FP32, {kShardHeads, tokens});
+        Tensor beta_got(got_beta.data(), DType::FP32, {kShardHeads, tokens});
+        ops::detail::bf16_gdn_gating_proj_small_t_split10_shard_launch(
+            x, a_weight, b_weight, log_a, bias, scratch.p, scratch_bytes, g_ref, beta_ref, stream);
+        ops::detail::bf16_gdn_gating_proj_small_t_fused_shard_launch(x, a_weight, b_weight, log_a,
+                                                                     bias, g_got, beta_got, stream);
+        cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+        failures += got_g.verify_guards(label + " g") + got_beta.verify_guards(label + " beta");
+        const auto bits = [](const void* p, std::size_t n) {
+            return from_device<std::uint32_t>(p, n);
+        };
+        failures += verify_exact((label + " g").c_str(), bits(got_g.data(), outputs),
+                                 bits(ref_g.p, outputs));
+        failures += verify_exact((label + " beta").c_str(), bits(got_beta.data(), outputs),
+                                 bits(ref_beta.p, outputs));
     }
     return failures;
 }
@@ -1137,11 +1187,10 @@ int main() {
         // The conv forms fuse A16 at B=1 through W=3 and take A8 from W=17 at B=1 and from B*W=17
         // when batched, as the bare projection does from T=17; W=3..4, W=16..17 and B*W=16..18
         // straddle those frontiers.
-        const std::vector<ConvCase> snapshot_cases{{1, 1, false},  {1, 3, false}, {1, 4, false},
-                                                   {1, 16, false}, {1, 17, false}, {1, 24, false},
-                                                   {2, 4, true},   {3, 3, false}, {3, 4, true},
-                                                   {8, 2, false},  {2, 8, false}, {2, 9, true},
-                                                   {2, 16, true}};
+        const std::vector<ConvCase> snapshot_cases{
+            {1, 1, false},  {1, 3, false}, {1, 4, false}, {1, 16, false}, {1, 17, false},
+            {1, 24, false}, {2, 4, true},  {3, 3, false}, {3, 4, true},   {8, 2, false},
+            {2, 8, false},  {2, 9, true},  {2, 16, true}};
         const std::vector<ConvCase> record_cases{{1, 4, false}, {1, 16, false}, {2, 4, false},
                                                  {3, 5, true},  {2, 9, false},  {2, 16, false}};
         std::uint32_t seed = 61U;
@@ -1161,16 +1210,15 @@ int main() {
     if (failures == 0) {
         // A16: decode, the T=2 SIMT, each sliced-K band (T<=8, 16, 24, 32) and each MMA band. A4:
         // each MMA tile band and the TMA route (from T=512).
-        failures += run_input_case(
-            ec, nvfp4_weights, 47U,
-            {1, 2, 3, 4, 5, 9, 17, 32, 33, 64, 65, 97, 129, 193, 300, 512, 1024},
-            {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4});
+        failures +=
+            run_input_case(ec, nvfp4_weights, 47U,
+                           {1, 2, 3, 4, 5, 9, 17, 32, 33, 64, 65, 97, 129, 193, 300, 512, 1024},
+                           {ops::LinearPolicy::A16Only, ops::LinearPolicy::AllowA4});
         // The NVFP4 conv forms fuse A16 at B=1 through W=3 under AllowA4 (through W=16 under
         // A16Only) and take A4 from W=4, and when batched at every W; W=3..4 straddle it.
-        const std::vector<ConvCase> snapshot_cases{{1, 1, false}, {1, 3, false}, {1, 4, false},
-                                                   {1, 5, false}, {1, 16, false}, {2, 4, true},
-                                                   {3, 3, false}, {3, 4, true},  {8, 2, false},
-                                                   {2, 16, true}};
+        const std::vector<ConvCase> snapshot_cases{
+            {1, 1, false}, {1, 3, false}, {1, 4, false}, {1, 5, false}, {1, 16, false},
+            {2, 4, true},  {3, 3, false}, {3, 4, true},  {8, 2, false}, {2, 16, true}};
         const std::vector<ConvCase> record_cases{{1, 3, false}, {1, 4, false}, {1, 9, false},
                                                  {2, 4, false}, {3, 5, true},  {2, 16, false}};
         std::uint32_t seed = 81U;
@@ -1186,6 +1234,7 @@ int main() {
     }
     failures += run_gating_case(ec, 51U, false);
     failures += run_gating_case(ec, 53U, true);
+    failures += run_gating_fused_identity(ec, 57U);
 
     std::cout << (failures ? "FAIL" : "OK") << " gdn projections split\n";
     return failures ? 1 : 0;

@@ -33,12 +33,12 @@ inline constexpr std::int32_t kHostMaxTokens   = 8;   // tokens per dot call
 // One NVFP4 matrix [rows, k] in block_scale_k16_m128x4_v1. Divisor i serves rows
 // [i * rows_per_divisor, (i + 1) * rows_per_divisor).
 struct Nvfp4Plane {
-    const std::uint8_t* codes      = nullptr;
-    const std::uint8_t* scales     = nullptr;
-    const float* divisors          = nullptr;
-    std::int64_t rows              = 0;
-    std::int32_t k                 = 0;
-    std::int64_t rows_per_divisor  = 0;
+    const std::uint8_t* codes     = nullptr;
+    const std::uint8_t* scales    = nullptr;
+    const float* divisors         = nullptr;
+    std::int64_t rows             = 0;
+    std::int32_t k                = 0;
+    std::int64_t rows_per_divisor = 0;
 
     // Views the stored payload of a [rows, k] plane with `divisor_count` divisor words.
     [[nodiscard]] static Nvfp4Plane from_payload(const void* payload, std::int64_t rows,
@@ -50,12 +50,15 @@ struct Nvfp4Plane {
     [[nodiscard]] const std::uint8_t* row_codes(std::int64_t row) const noexcept {
         return codes + static_cast<std::size_t>(row) * static_cast<std::size_t>(k / 2);
     }
+
     // Scale word of (row, quad 0); quad q of the row is at + q * kScaleQuadStride.
     [[nodiscard]] const std::uint8_t* row_scales(std::int64_t row) const noexcept {
         const std::int64_t quads = k / kNvfp4Quad;
-        return scales + static_cast<std::size_t>((row / kNvfp4RowTile) * quads * kScaleQuadStride +
-                                                 (row % 32) * 16 + ((row % kNvfp4RowTile) / 32) * 4);
+        return scales +
+               static_cast<std::size_t>((row / kNvfp4RowTile) * quads * kScaleQuadStride +
+                                        (row % 32) * 16 + ((row % kNvfp4RowTile) / 32) * 4);
     }
+
     [[nodiscard]] float divisor(std::int64_t row) const noexcept {
         return divisors[row / rows_per_divisor];
     }
@@ -66,11 +69,11 @@ struct Nvfp4Plane {
 // asb[b] = block scale; corr[d] = -12 * (q[4d] + ... + q[4d+3]); sb16[d] = asb[d / 4];
 // qu = q + 128 (u8).
 struct W4A8Activation {
-    std::int8_t* q       = nullptr;
-    float* asb           = nullptr;
-    std::int32_t* corr   = nullptr;
-    float* sb16          = nullptr;
-    std::uint8_t* qu     = nullptr;
+    std::int8_t* q     = nullptr;
+    float* asb         = nullptr;
+    std::int32_t* corr = nullptr;
+    float* sb16        = nullptr;
+    std::uint8_t* qu   = nullptr;
 };
 
 // Owns `count` prepared activations of length k, 64-byte aligned.
@@ -79,21 +82,24 @@ public:
     W4A8ActivationBuffer() = default;
     W4A8ActivationBuffer(std::int32_t k, std::int32_t count);
     [[nodiscard]] W4A8Activation at(std::int32_t i) const noexcept;
+
     [[nodiscard]] std::int32_t k() const noexcept { return k_; }
+
     [[nodiscard]] std::int32_t count() const noexcept { return count_; }
 
 private:
     struct Free {
         void operator()(void* p) const noexcept;
     };
+
     std::unique_ptr<std::byte, Free> storage_;
     std::int32_t k_ = 0, count_ = 0;
     std::size_t q_stride_ = 0, asb_stride_ = 0, d_stride_ = 0;
-    std::byte* q_ = nullptr;
-    std::byte* asb_ = nullptr;
+    std::byte* q_    = nullptr;
+    std::byte* asb_  = nullptr;
     std::byte* corr_ = nullptr;
     std::byte* sb16_ = nullptr;
-    std::byte* qu_ = nullptr;
+    std::byte* qu_   = nullptr;
 };
 
 enum class DotKernel { PerToken, MultiToken };
@@ -105,19 +111,20 @@ enum class DotKernel { PerToken, MultiToken };
 void quantize_blocks(const float* x, std::int32_t block0, std::int32_t blocks, W4A8Activation a);
 // Quantizes a whole BF16 row of length k (raw BF16 bits).
 void quantize_bf16(const std::uint16_t* x, std::int32_t k, W4A8Activation a);
-// T98 (default; NINFER_HOST_MOE_A4=0 turns it off): the GPU's NVFP4 activation codec in the same prepared form, so
-// the W4A8 dots compute W4A4: per 16 values sf = e4m3_rn(gs * amax / 6), code = e2m1_rn(x * gs / sf)
-// (moe_slots_nvfp4 / test_moe_slots quant16), stored as q = 2 * code (|q| <= 12) with block
-// scale sf / (2 gs); `gs` = the layer's input divisor of this activation.
-void quantize_blocks_a4(const float* x, std::int32_t block0, std::int32_t blocks, float gs, W4A8Activation a);
+// T98 (default; NINFER_HOST_MOE_A4=0 turns it off): the GPU's NVFP4 activation codec in the same
+// prepared form, so the W4A8 dots compute W4A4: per 16 values sf = e4m3_rn(gs * amax / 6), code =
+// e2m1_rn(x * gs / sf) (moe_slots_nvfp4 / test_moe_slots quant16), stored as q = 2 * code (|q| <=
+// 12) with block scale sf / (2 gs); `gs` = the layer's input divisor of this activation.
+void quantize_blocks_a4(const float* x, std::int32_t block0, std::int32_t blocks, float gs,
+                        W4A8Activation a);
 void quantize_bf16_a4(const std::uint16_t* x, std::int32_t k, float gs, W4A8Activation a);
 
 // out[t * ldo + i] = sum_k w[r0 + i, k] * a_t[k] for i < n, t < tokens (1..kHostMaxTokens).
 // prefetch_rows > 0 (MultiToken only): while dotting row r, software-prefetch the codes of row
 // r + prefetch_rows (may lie past the range; a prefetch never faults). Results do not change.
-void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n,
-              const W4A8Activation* acts, std::int32_t tokens, float* out, std::size_t ldo,
-              DotKernel kernel, std::int32_t prefetch_rows = 0);
+void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n, const W4A8Activation* acts,
+              std::int32_t tokens, float* out, std::size_t ldo, DotKernel kernel,
+              std::int32_t prefetch_rows = 0);
 
 // Decoded weight w[row, k] (exact; the test oracle uses its own decoder).
 [[nodiscard]] float e4m3_value(std::uint8_t code) noexcept;

@@ -36,12 +36,13 @@ void launch(void* destination, const void* source, std::size_t source_pitch, std
 
 } // namespace
 
-void copy_rows(void* destination, const void* source, std::size_t source_pitch, std::size_t row_bytes,
-               std::size_t columns, cudaStream_t stream) {
+void copy_rows(void* destination, const void* source, std::size_t source_pitch,
+               std::size_t row_bytes, std::size_t columns, cudaStream_t stream) {
     if (row_bytes == 0 || columns == 0) { return; }
     const auto aligned = [&](std::size_t a) {
-        return ((reinterpret_cast<std::uintptr_t>(destination) | reinterpret_cast<std::uintptr_t>(source) |
-                 source_pitch | row_bytes) % a) == 0;
+        return ((reinterpret_cast<std::uintptr_t>(destination) |
+                 reinterpret_cast<std::uintptr_t>(source) | source_pitch | row_bytes) %
+                a) == 0;
     };
     if (aligned(16)) {
         launch<uint4>(destination, source, source_pitch, row_bytes, columns, stream);

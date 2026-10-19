@@ -39,6 +39,11 @@ float e4m3fn(std::uint8_t code) {
     return sign != 0 ? -magnitude : magnitude;
 }
 
+// E2M1 (FP4) values by code: sign bit 3, exponent bits 2-1, mantissa bit 0.
+constexpr std::array<float, 16> kE2m1{0.0F,  0.5F,  1.0F,  1.5F,  2.0F,  3.0F,  4.0F,  6.0F,
+                                      -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F, -4.0F, -6.0F};
+constexpr std::uint32_t kNvfp4Group = 16;
+
 float bf16_to_float(std::uint16_t word) {
     return std::bit_cast<float>(static_cast<std::uint32_t>(word) << 16);
 }
@@ -52,8 +57,7 @@ std::uint16_t float_to_bf16(float value) {
 
 } // namespace
 
-PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency residency,
-                     bool prefetch)
+PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency residency, bool prefetch)
     : table_(std::move(table)), hash_(std::move(hash)), residency_(residency), prefetch_(prefetch) {
     const std::uint32_t heads = hash_.heads();
     if (hash_.ngram_size < 2 || hash_.ngram_size > kMaximumNgram || hash_.heads_per_ngram == 0 ||
@@ -61,9 +65,11 @@ PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency reside
         hash_.head_offsets.size() != heads || heads > 32) {
         throw std::invalid_argument("PLE gather hash configuration is inconsistent");
     }
-    if (table_.row_width == 0 || table_.row_bytes < table_.row_width || table_.rows == 0 ||
-        table_.segments.empty() ||
-        table_.scale_plane < (table_.rows - 1) * table_.row_bytes + table_.row_width) {
+    const bool fp8 = table_.format == PleRowFormat::Fp8RowBf16;
+    if (table_.row_width == 0 || table_.rows == 0 || table_.segments.empty() ||
+        table_.row_bytes < table_.row_record_bytes() ||
+        (fp8 ? table_.scale_plane < (table_.rows - 1) * table_.row_bytes + table_.row_width
+             : table_.row_width % kNvfp4Group != 0 || !std::isfinite(table_.global_scale))) {
         throw std::invalid_argument("PLE table description is inconsistent");
     }
     for (std::size_t i = 1; i < table_.segments.size(); ++i) {
@@ -81,6 +87,16 @@ PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency reside
     for (int code = 0; code < 256; ++code) {
         e4m3_[static_cast<std::size_t>(code)] = e4m3fn(static_cast<std::uint8_t>(code));
     }
+    if (!fp8) {
+        // One table holds every value an NVFP4 row can decode to: the global scale is fixed.
+        nvfp4_values_.resize(256 * kE2m1.size());
+        for (std::size_t scale = 0; scale < 256; ++scale) {
+            for (std::size_t code = 0; code < kE2m1.size(); ++code) {
+                nvfp4_values_[scale * kE2m1.size() + code] =
+                    float_to_bf16((kE2m1[code] * e4m3_[scale]) * table_.global_scale);
+            }
+        }
+    }
     if (residency_ == PleResidency::Stream) {
         reader_ = std::make_unique<PleRowReader>(table_.segments);
     } else {
@@ -90,7 +106,7 @@ PleGather::PleGather(PleTableView table, PleHashConfig hash, PleResidency reside
             }
         }
         const char* resident = std::getenv("NINFER_QWEN4_PLE_RESIDENT_SCALES");
-        if (resident == nullptr || resident[0] != '0') { load_scales(); }
+        if (fp8 && (resident == nullptr || resident[0] != '0')) { load_scales(); }
     }
 }
 
@@ -132,7 +148,8 @@ void PleGather::load_scales() {
 PleGather::~PleGather() = default;
 
 template <class Piece>
-void PleGather::for_each_piece(std::uint64_t object_offset, std::uint64_t bytes, Piece&& piece) const {
+void PleGather::for_each_piece(std::uint64_t object_offset, std::uint64_t bytes,
+                               Piece&& piece) const {
     auto it = std::upper_bound(table_.segments.begin(), table_.segments.end(), object_offset,
                                [](std::uint64_t offset, const PleTableSegment& segment) {
                                    return offset < segment.object_offset;
@@ -150,7 +167,8 @@ void PleGather::for_each_piece(std::uint64_t object_offset, std::uint64_t bytes,
         if (bytes != 0) {
             const auto next = std::next(it);
             // Segments cover the object contiguously; a gap would be a malformed table description.
-            if (next == table_.segments.end() || next->object_offset != it->object_offset + it->bytes) {
+            if (next == table_.segments.end() ||
+                next->object_offset != it->object_offset + it->bytes) {
                 throw std::out_of_range("PLE table range crosses a gap between segments");
             }
             it     = next;
@@ -167,7 +185,9 @@ const std::byte* PleGather::locate(std::uint64_t object_offset, std::uint64_t by
     for_each_piece(object_offset, bytes,
                    [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
                        if (pieces++ == 0) { single = segment.data + within; }
-                       if (take != bytes) { std::memcpy(bounce + copied, segment.data + within, take); }
+                       if (take != bytes) {
+                           std::memcpy(bounce + copied, segment.data + within, take);
+                       }
                        copied += take;
                    });
     return pieces == 1 ? single : bounce;
@@ -208,13 +228,28 @@ void PleGather::column_rows(std::span<const std::int32_t> tokens, std::size_t po
     rows(std::span<const std::int64_t>(context.data(), hash_.ngram_size), rows_out);
 }
 
-void PleGather::decode_row(const std::byte* codes, const std::byte* scale_bytes,
-                           std::uint16_t* out) const {
+void PleGather::decode_fp8_row(const std::byte* codes, const std::byte* scale_bytes,
+                               std::uint16_t* out) const {
     std::uint16_t scale_word;
     std::memcpy(&scale_word, scale_bytes, 2);
     const float scale = bf16_to_float(scale_word);
     for (std::uint32_t i = 0; i < table_.row_width; ++i) {
         out[i] = float_to_bf16(e4m3_[static_cast<std::uint8_t>(codes[i])] * scale);
+    }
+}
+
+void PleGather::decode_nvfp4_row(const std::byte* record, std::uint16_t* out) const {
+    const std::byte* scales = record + table_.row_width / 2;
+    for (std::uint32_t group = 0; group < table_.row_width / kNvfp4Group; ++group) {
+        const std::uint16_t* decoded =
+            nvfp4_values_.data() + static_cast<std::size_t>(scales[group]) * kE2m1.size();
+        const std::byte* codes = record + group * (kNvfp4Group / 2);
+        std::uint16_t* values  = out + group * kNvfp4Group;
+        for (std::uint32_t i = 0; i < kNvfp4Group / 2; ++i) {
+            const auto pair   = static_cast<std::uint8_t>(codes[i]);
+            values[2 * i]     = decoded[pair & 0xFU];
+            values[2 * i + 1] = decoded[pair >> 4];
+        }
     }
 }
 
@@ -224,7 +259,7 @@ void PleGather::decode_row(const std::byte* codes, const std::byte* scale_bytes,
 void PleGather::prefetch_mapped(std::span<const std::uint64_t> rows) const {
     static const std::uintptr_t page = static_cast<std::uintptr_t>(::sysconf(_SC_PAGESIZE));
     std::vector<std::uintptr_t> pages;
-    pages.reserve(rows.size() * (scales_.empty() ? 2 : 1));
+    pages.reserve(rows.size() * 2);
     const auto add_range = [&](std::uint64_t object_offset, std::uint64_t bytes) {
         for_each_piece(
             object_offset, bytes,
@@ -236,8 +271,10 @@ void PleGather::prefetch_mapped(std::span<const std::uint64_t> rows) const {
             });
     };
     for (const std::uint64_t row : rows) {
-        add_range(row * table_.row_bytes, table_.row_width);
-        if (scales_.empty()) { add_range(table_.scale_plane + row * 2U, 2); }
+        add_range(row * table_.row_bytes, table_.row_record_bytes());
+        if (table_.format == PleRowFormat::Fp8RowBf16 && scales_.empty()) {
+            add_range(table_.scale_plane + row * 2U, 2);
+        }
     }
     std::sort(pages.begin(), pages.end());
     pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
@@ -277,20 +314,24 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
     // joined in `joined` (offset `joined_at[k]`); `sub_first[k]` is range k's first sub-range.
     std::vector<std::uint32_t> sub_first, joined_at;
     std::vector<std::byte> joined;
+    const std::size_t per_row = ranges_per_row();
+    const auto record         = static_cast<std::uint32_t>(table_.row_record_bytes());
     if (reader_) {
         std::vector<PleRowReader::Range> ranges;
-        ranges.reserve(2 * rows.size() + 2);
-        sub_first.assign(2 * rows.size(), 0);
-        joined_at.assign(2 * rows.size(), UINT32_MAX);
+        ranges.reserve(per_row * rows.size() + 2);
+        sub_first.assign(per_row * rows.size(), 0);
+        joined_at.assign(per_row * rows.size(), UINT32_MAX);
         std::vector<std::pair<std::size_t, std::uint32_t>> split; // (range k, sub-range count)
         const auto add = [&](std::size_t k, std::uint64_t object_offset, std::uint32_t bytes) {
             sub_first[k]      = static_cast<std::uint32_t>(ranges.size());
             std::uint32_t sub = 0;
-            for_each_piece(object_offset, bytes,
-                           [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
-                               ranges.push_back({segment.object_offset + within, static_cast<std::uint32_t>(take)});
-                               ++sub;
-                           });
+            for_each_piece(
+                object_offset, bytes,
+                [&](const PleTableSegment& segment, std::uint64_t within, std::uint64_t take) {
+                    ranges.push_back(
+                        {segment.object_offset + within, static_cast<std::uint32_t>(take)});
+                    ++sub;
+                });
             if (sub > 1) {
                 split.emplace_back(k, sub);
                 joined_at[k] = static_cast<std::uint32_t>(joined.size());
@@ -298,8 +339,8 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
             }
         };
         for (std::size_t r = 0; r < rows.size(); ++r) {
-            add(2 * r, rows[r] * table_.row_bytes, table_.row_width);
-            add(2 * r + 1, table_.scale_plane + rows[r] * 2U, 2U);
+            add(per_row * r, rows[r] * table_.row_bytes, record);
+            if (per_row == 2) { add(2 * r + 1, table_.scale_plane + rows[r] * 2U, 2U); }
         }
         reader_->read(ranges);
         for (const auto [k, sub] : split) {
@@ -314,24 +355,30 @@ void PleGather::gather(std::span<const std::int32_t> tokens, std::size_t first, 
         prefetch_mapped(rows);
     }
     const auto streamed = [&](std::size_t k) -> const std::byte* {
-        return joined_at[k] != UINT32_MAX ? joined.data() + joined_at[k] : reader_->data(sub_first[k]);
+        return joined_at[k] != UINT32_MAX ? joined.data() + joined_at[k]
+                                          : reader_->data(sub_first[k]);
     };
     const auto decode = [&](std::size_t begin, std::size_t end) {
-        std::vector<std::byte> bounce(table_.row_width); // a straddling row's codes (Mapped)
+        std::vector<std::byte> bounce(record); // a straddling row's record (Mapped)
         std::array<std::byte, 2> scale_bounce{};
         for (std::size_t i = begin; i < end; ++i) {
             for (std::uint32_t head = 0; head < heads; ++head) {
-                const std::size_t r    = i * heads + head;
-                const std::byte* codes = reader_ ? streamed(2 * r)
-                                                 : locate(rows[r] * table_.row_bytes,
-                                                          table_.row_width, bounce.data());
+                const std::size_t r = i * heads + head;
+                std::uint16_t* values =
+                    out.data() + i * width_ + static_cast<std::size_t>(head) * table_.row_width;
+                const std::byte* codes =
+                    reader_ ? streamed(per_row * r)
+                            : locate(rows[r] * table_.row_bytes, record, bounce.data());
+                if (per_row == 1) {
+                    decode_nvfp4_row(codes, values);
+                    continue;
+                }
                 const std::byte* scale =
                     reader_ ? streamed(2 * r + 1)
                     : !scales_.empty()
                         ? scales_.data() + rows[r] * 2U
                         : locate(table_.scale_plane + rows[r] * 2U, 2, scale_bounce.data());
-                decode_row(codes, scale,
-                           out.data() + i * width_ + static_cast<std::size_t>(head) * table_.row_width);
+                decode_fp8_row(codes, scale, values);
             }
         }
     };

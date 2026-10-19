@@ -10,17 +10,23 @@ import torch
 
 from .codecs.direct import encode_direct
 from .codecs.fp8_row import encode_fp8_row_scaled
+from .codecs.mxfp8 import encode_mxfp8
 from .codecs.nvfp4 import encode_nvfp4
+from .codecs.nvfp4_row import encode_nvfp4_rows
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
+    Mxfp8Format,
     Nvfp4Format,
+    Nvfp4RowFormat,
     QuantFormat,
     get_format,
 )
 from .layouts import (
     block_scale_geometry,
+    block_scale_k32_geometry,
+    row_interleaved_geometry,
     row_scale_geometry,
     row_split_geometry,
 )
@@ -44,12 +50,8 @@ class TensorOutput:
 
     def write_values(self, element_begin: int, values: torch.Tensor) -> None:
         if not isinstance(self.format, DirectFormat):
-            raise TypeError(
-                "choose the numerical encoder before writing quantized output"
-            )
-        self.write_bytes(
-            element_begin * self.format.word_bytes, encode_direct(values, self.format)
-        )
+            raise TypeError("choose the numerical encoder before writing quantized output")
+        self.write_bytes(element_begin * self.format.word_bytes, encode_direct(values, self.format))
 
     def _padding(self) -> None:
         if self._padding_initialized:
@@ -66,6 +68,9 @@ class TensorOutput:
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Nvfp4Format):
             g = block_scale_geometry(self.format, obj.shape)
+            gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
+        elif isinstance(self.format, Mxfp8Format):
+            g = block_scale_k32_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         else:
             gaps = ()
@@ -94,22 +99,33 @@ class TensorOutput:
             planes = split_row_planes(block, row_split_geometry(self.format, (rows, k)))
             self.write_bytes(g.base_offset + row_begin * g.base_row_bytes, planes.base)
             self.write_bytes(g.high_offset + row_begin * g.high_row_bytes, planes.high)
-            self.write_bytes(
-                g.scale_offset + row_begin * g.scale_row_bytes, planes.scale
-            )
+            self.write_bytes(g.scale_offset + row_begin * g.scale_row_bytes, planes.scale)
         elif isinstance(self.format, Fp8RowFormat):
             g = row_scale_geometry(self.format, obj.shape)
             local = row_scale_geometry(self.format, (rows, k))
             block = memoryview(encode_fp8_row_scaled(codes, scales, (rows, k)))
             self.write_bytes(row_begin * k, block[: local.code_plane_bytes])
+            self.write_bytes(g.scale_plane_offset + row_begin * 2, block[local.scale_plane_offset :])
+        elif isinstance(self.format, Mxfp8Format):
+            # Verbatim words: E4M3FN codes [rows, K] and UE8M0 scales [rows, K/32].
+            g = block_scale_k32_geometry(self.format, obj.shape)
+            local = block_scale_k32_geometry(self.format, (rows, k))
+            block = memoryview(encode_mxfp8(codes, scales, (rows, k)))
+            self.write_bytes(row_begin * k, block[: local.code_plane_bytes])
             self.write_bytes(
-                g.scale_plane_offset + row_begin * 2, block[local.scale_plane_offset :]
+                g.scale_plane_offset + row_begin * g.groups_per_row,
+                block[local.scale_plane_offset :],
             )
+        elif isinstance(self.format, Nvfp4RowFormat):
+            # Verbatim words: E2M1 code bytes [rows, K/2] and E4M3FN scales [rows, K/16]. The
+            # tensor-wide multiplier is a separate FP32 parameter, so there is no divisor here.
+            if weight_divisor is not None:
+                raise ValueError(f"{obj.id}: row-scaled NVFP4 stores its global scale as a separate parameter")
+            g = row_interleaved_geometry(self.format, obj.shape)
+            self.write_bytes(row_begin * g.row_bytes, encode_nvfp4_rows(codes, scales, (rows, k)))
         elif isinstance(self.format, Nvfp4Format):
             if row_begin % 128 or rows % 128 or weight_divisor is None:
-                raise ValueError(
-                    f"{obj.id}: NVFP4 output needs whole 128-row tiles and weight divisor"
-                )
+                raise ValueError(f"{obj.id}: NVFP4 output needs whole 128-row tiles and weight divisor")
             g = block_scale_geometry(self.format, obj.shape, len(self._divisors))
             local = block_scale_geometry(self.format, (rows, k))
             block = memoryview(encode_nvfp4(codes, scales, weight_divisor, (rows, k)))
@@ -122,9 +138,7 @@ class TensorOutput:
             rows_per_divisor = g.n // len(self._divisors)
             index, offset_in_source = divmod(row_begin, rows_per_divisor)
             if offset_in_source + rows > rows_per_divisor:
-                raise ValueError(
-                    f"{obj.id}: a row block may not span two separately quantised sources"
-                )
+                raise ValueError(f"{obj.id}: a row block may not span two separately quantised sources")
             if self._divisors[index] is None:
                 self.write_bytes(g.weight_divisor_offset + index * 4, weight_divisor)
                 self._divisors[index] = bytes(weight_divisor)

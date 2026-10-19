@@ -31,7 +31,7 @@ struct Q4A16SimtSchedule {
     static constexpr int kStagingBytes =
         kWarps * Stages * GroupsPerWarpStage *
         (Q4RowSplitStorage::kCodeBytesPerGroup + Q4RowSplitStorage::kScaleBytesPerGroup);
-    static constexpr int kPartialBytes = WarpsPerRow > 1 ? kWarps* BlockTokens * sizeof(float) : 0;
+    static constexpr int kPartialBytes = WarpsPerRow > 1 ? kWarps * BlockTokens * sizeof(float) : 0;
     static constexpr int kSharedBytes =
         ((kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes) + 15) / 16 * 16;
     static_assert(kThreads <= 1024);

@@ -24,7 +24,7 @@ capy-flash builds (2026-10-14/15); the first public release with this work is v0
 | d0 / 16k | context depth of the decode measurement |
 | miss, resident | a routed expert that is not / is in the GPU expert cache; misses are computed on the CPU |
 | W4A4 / W4A8 | GPU expert kernel (4-bit weights, 4-bit activations) / CPU expert kernel (4-bit weights, int8 activations) |
-| A4 | CPU expert path using the GPU's W4A4 activation codec (from T98; opt-in via `NINFER_HOST_MOE_A4=1` until v0.2, default since v0.2.1) |
+| A4 | CPU expert path using the GPU's W4A4 activation codec (from T98; opt-in via `NINFER_HOST_MOE_A4=1` before v0.5.0, default since v0.5.0, commit 54256b95) |
 | T27 workload | shared decode bench: one pg19 prompt and four chat prompts at depth 0 and 16k, greedy, 128 tokens, n = 5 |
 | T71 replay | agentic replay: 3 synthetic sessions, 53 turns, contexts up to 81k tokens, 256 tokens generated per turn |
 | NLL 4K | mean negative log-likelihood on 4,096-token pg19 windows (lower is better) |
@@ -405,3 +405,35 @@ first and is bounded only at the edge. Agentic replay (3 sessions, 11 subagents,
 TTFT 2.14 -> 0.98 s, prompt tokens from cache 67 -> 78 %, recomputed prompt tokens -35 %, decode unchanged (two
 concurrent decodes: 220 tok/s each with and without the RAM tier). Guardrails: `--kv-lease-window 0` restores the
 full reservation; the server refuses a RAM tier that would leave less than max(4 GiB, 5 %) of RAM available.
+
+**T211** (v0.6): the decode after a prompt and short-prompt TTFT on Flash-Next (`--tp 2`). After every agentic turn
+the first decode rounds took 45 ms instead of 18 (~250-290 ms lost per turn). Not the copies (device hits = policy
+hits): the residency the prompt left. A prompt window made its chunk's most routed experts resident without a cap
+(a 3k-token chunk replaced ~3.2k of the ~8k slots), its decay erased the decode's frequencies (2^(-3200/256)), and
+the 6 ring + up to 28 workspace layers a wide chunk lends were refilled with the prompt's hottest experts. The decode
+after a prompt routes like the decode before it, not like the prompt: replaying the policy offline on the routing of
+a T71 run, the prompt's targets cost 7.2k extra CPU experts per turn, any share of them hurts (a quarter: 1.8k), and
+keeping the decode's residency, frequencies and lent layers costs none. Now prompt windows change neither residency
+nor frequencies (`ExpertCachePolicy::count_prompt`), lent layers refill with what they held when lent (most recently
+used first), and the T69 post-prompt boost (24 windows at 8 insertions per layer per GPU) is on. T71 replay, old
+rule vs three runs of the new defaults: rounds 22.7 -> 17.9-18.3 ms, decode median 124 -> 157-160 tok/s (2.84 tokens
+per round either way), first round after a prompt 45 -> 23-25 ms, steady rounds 18.3 -> 16.2-16.5 ms, TTFT median
+1.55 -> 1.38-1.43 s; the boost alone is worth 18.4 -> 17.9 ms (two pairs) (`NINFER_QWEN4_PROMPT_KEEP=0`,
+`NINFER_QWEN4_BOOST_WINDOWS=0` restore the old rules). Prompts stream their
+non-resident experts from 256 tokens instead of 512 (`--stream-min-tokens`): streaming costs a flat ~1.0 s warm
+(~1.35 s on a server's first request), the CPU path 0.44 s at 97 tokens and 0.6-1.2 s at 240-380 warm, 1.5 s at 158
+and 1.8-2.9 s at 250-380 cold; 1k/4k prompts 1.69/1.85 -> 1.46/1.73 s cold. Tokens change, as with any residency
+change (W4A4 on the GPU, W4A8 on the CPU): without freezing two runs of one binary already differ (agentic prompts
+0/8 identical, short prompts 6/8); with the residency frozen the old and new rules give 8/8 identical answers.
+
+**T211b** (v0.6): T211 per conversation. The T194 bench (280 independent short chats) lost decode with T211
+(it/off 164.8 -> 156.4 tok/s vs T202): there the previous answer's residency is stale and the prompt predicts its own
+decode. A request now continues a conversation when its first text chunk starts at or past half the prompt (at least
+half restored from the context cache; T71 turns restore 66-99 %, a new chat 0 %): it keeps the decode's residency as
+in T211. A new conversation's routing counts are applied when its first decode window begins, to the frequencies
+only (`NINFER_QWEN4_PROMPT_NEW_CAP`, default -1); lent layers are restored either way. Measured on T194, same
+binary: the T69 rule (copies during the prompt) decode 152.3 -> 156.0 tok/s but TTFT 0.58 -> 0.69 s, and the time
+per generated token worse (7.74 -> 7.79 s per 1k tokens); the prompt's targets copied at the first decode window
+cost decode instead (all 148.9, 32 per layer 151.5); frequencies only 153.9 tok/s, TTFT 0.577 s, 7.65 s per 1k
+tokens. The replayed policy on the T194 routing agrees on the residency (targets 6.66 M CPU experts, frequencies
+only 7.13 M, T211 7.25 M) but not on the price of the copies, which only the GPU shows.

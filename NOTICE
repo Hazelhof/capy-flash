@@ -161,3 +161,9 @@ The capy-flash logo (docs/logo) is part of this tree and under the same license.
 Its wordmark is drawn from glyph outlines of the Outfit typeface, Copyright 2021
 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts), licensed
 under the SIL Open Font License 1.1; no font software is included.
+
+MTP draft refit
+---------------
+tools/mtp_refit/mtp_model.py follows the structure of tools/mtp_refit/mtp_ref.py in
+  * Ciprian Ursu -- https://github.com/ursuciprian/qwen3.8-flash-next-dgx-spark-tp-2
+    Licensed under the Apache License, Version 2.0.

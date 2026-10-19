@@ -256,8 +256,27 @@ public:
      */
     void set_backing(std::uint32_t backed_pages, std::function<void(std::uint32_t)> grow);
     void set_backed_pages(std::uint32_t pages);
+
     [[nodiscard]] std::uint32_t backed_pages() const noexcept { return backed_pages_; }
+
     [[nodiscard]] std::uint32_t allocated_extent() const noexcept;
+
+    /**
+     * Compaction of the Device KV backing (v0.6, idle KV to the Host): moves each lease whose page
+     * lies above the lowest free page to that free page, in the given order (ascending page order
+     * keeps neighbouring pages neighbours), copying the bytes on `stream` and on the mirror's
+     * stream (rank 1 keeps the same physical indices) before the old pages are returned. Every
+     * destination is taken before any source is returned, so no copy of the batch reads a page
+     * another one writes. Allocation and reservation counts are unchanged; only physical indices
+     * move, so the caller republishes every execution row that names a moved page before the next
+     * launch. Returns the number of leases moved.
+     */
+    std::uint32_t relocate_lower(std::span<DeviceKVPageLease* const> leases,
+                                 cudaStream_t stream = nullptr);
+
+    [[nodiscard]] std::int32_t page_index(DeviceKVPageHandle handle) const {
+        return physical_index(handle);
+    }
 
     // Every zero_pages/copy_page issued here is repeated at the same physical indices on `mirror`
     // (another device's pool of identical page capacity) on `where.stream`. Host transfers move
@@ -287,8 +306,8 @@ private:
     [[nodiscard]] bool valid_handle(DeviceKVPageHandle handle) const noexcept;
     [[nodiscard]] std::int32_t physical_index(DeviceKVPageHandle handle) const;
     void zero_run(std::int32_t first, std::int32_t count, cudaStream_t stream) const;
-    void copy_run(std::int32_t source_index, std::int32_t destination_index,
-                  cudaStream_t stream) const;
+    void copy_run(std::int32_t source_index, std::int32_t destination_index, cudaStream_t stream,
+                  std::int32_t count = 1) const;
     void require_no_mirror(const char* what) const;
     void require_host_replicas(const HostKVPageLayout& host) const;
     void order_mirror_transfer() const;
@@ -323,7 +342,7 @@ private:
     std::uint32_t reserved_pages_           = 0;
     const DeviceKVPagePool* mirror_         = nullptr;
     DeviceKVMirror mirror_where_;
-    std::uint32_t backed_pages_             = 0;
+    std::uint32_t backed_pages_ = 0;
     std::function<void(std::uint32_t)> grow_backing_;
 };
 

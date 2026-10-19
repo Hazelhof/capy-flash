@@ -18,6 +18,7 @@ with `labels`); every arm is then compared with the first. Their serve.log `req#
 are cross-checked against the request log, and the client's signal events split the workload
 into its phases.
 """
+
 import json
 import os
 import random
@@ -27,8 +28,7 @@ import sys
 
 # Every arm is compared with the control; `alt` is the treatment build with AB_ALT_EXTRA_FLAGS.
 ARMS = ("control", "treatment", "alt")
-LABEL = {"control": "Upstream + Windows port", "treatment": "This fork",
-         "alt": "This fork, original prefix cache"}
+LABEL = {"control": "Upstream + Windows port", "treatment": "This fork", "alt": "This fork, original prefix cache"}
 SHORT = {"control": "Upstream", "treatment": "Fork", "alt": "Fork original-cache"}
 
 
@@ -151,11 +151,14 @@ def log_check(server_done, log_rows):
         dt = abs(row.get("ttft", 0.0) - ttft)
         # The log prints 3 significant digits (1.2s, 80.2 ms) or tenths of a second.
         ok_ttft = dt <= max(0.051, ttft * 0.01)
-        same = (row.get("prompt") == res.get("prompt_tokens")
-                and row.get("output") == res.get("completion_tokens")
-                and row.get("cache") == res.get("prefix_cache_hit_tokens")
-                and row.get("accepted", 0) == (spec.get("accepted_tokens") or 0)
-                and row.get("drafted", 0) == (spec.get("drafted_tokens") or 0) and ok_ttft)
+        same = (
+            row.get("prompt") == res.get("prompt_tokens")
+            and row.get("output") == res.get("completion_tokens")
+            and row.get("cache") == res.get("prefix_cache_hit_tokens")
+            and row.get("accepted", 0) == (spec.get("accepted_tokens") or 0)
+            and row.get("drafted", 0) == (spec.get("drafted_tokens") or 0)
+            and ok_ttft
+        )
         worst_ttft = max(worst_ttft, dt)
         if same:
             matched += 1
@@ -163,8 +166,14 @@ def log_check(server_done, log_rows):
             mismatched += 1
             if len(examples) < 3:
                 examples.append(rid)
-    return {"log_lines": len(log_rows), "records": len(server_done), "matched": matched,
-            "mismatched": mismatched, "examples": examples, "max_ttft_diff_s": worst_ttft}
+    return {
+        "log_lines": len(log_rows),
+        "records": len(server_done),
+        "matched": matched,
+        "mismatched": mismatched,
+        "examples": examples,
+        "max_ttft_diff_s": worst_ttft,
+    }
 
 
 def load_arm(run_dir, arm):
@@ -201,24 +210,30 @@ def load_arm(run_dir, arm):
         if s:
             res, t = s.get("result") or {}, s.get("timings_seconds") or {}
             spec = s.get("speculative") or {}
-            r.update({
-                "prompt": res.get("prompt_tokens") or 0,
-                "hit": res.get("prefix_cache_hit_tokens") or 0,
-                "computed": res.get("computed_prefill_tokens") or 0,
-                "completion": res.get("completion_tokens") or 0,
-                "thinking": res.get("model_thinking_tokens") or 0,
-                "path": res.get("prefix_reuse_path") or "unknown",
-                "finish_server": res.get("finish_reason"),
-                "ttft": t.get("ttft"), "prefill_s": t.get("prefill") or 0.0,
-                "decode_s": t.get("decode") or 0.0, "total_s": t.get("total") or 0.0,
-                "queue_s": (s.get("engine_timing") or {}).get("queue_wait_seconds") or 0.0,
-                "end": s["timestamp_unix_ms"] / 1000.0,
-                "spec_accepted": spec.get("accepted_tokens") or 0,
-                "spec_drafted": spec.get("drafted_tokens") or 0,
-                "ngram_accepted": spec.get("ngram_accepted_tokens") or 0,
-                "ngram_drafted": spec.get("ngram_drafted_tokens") or 0,
-                "rounds": spec.get("rounds") or 0,
-            })
+            r.update(
+                {
+                    "prompt": res.get("prompt_tokens") or 0,
+                    "hit": res.get("prefix_cache_hit_tokens") or 0,
+                    "computed": res.get("computed_prefill_tokens") or 0,
+                    "completion": res.get("completion_tokens") or 0,
+                    "thinking": res.get("model_thinking_tokens") or 0,
+                    "thinking_observed": res.get("model_thinking_tokens") is not None,
+                    "tool_call_parse": res.get("tool_call_parse"),
+                    "path": res.get("prefix_reuse_path") or "unknown",
+                    "finish_server": res.get("finish_reason"),
+                    "ttft": t.get("ttft"),
+                    "prefill_s": t.get("prefill") or 0.0,
+                    "decode_s": t.get("decode") or 0.0,
+                    "total_s": t.get("total") or 0.0,
+                    "queue_s": (s.get("engine_timing") or {}).get("queue_wait_seconds") or 0.0,
+                    "end": s["timestamp_unix_ms"] / 1000.0,
+                    "spec_accepted": spec.get("accepted_tokens") or 0,
+                    "spec_drafted": spec.get("drafted_tokens") or 0,
+                    "ngram_accepted": spec.get("ngram_accepted_tokens") or 0,
+                    "ngram_drafted": spec.get("ngram_drafted_tokens") or 0,
+                    "rounds": spec.get("rounds") or 0,
+                }
+            )
         reqs.append(r)
     build = "?"
     serve_log = os.path.join(d, "serve.log")
@@ -231,11 +246,18 @@ def load_arm(run_dir, arm):
                     break
     b = meta.get("build") or {}
     if b.get("sha256"):
-        build = "%s (%s, sha256 %s)" % (b.get("describe", "?"), b.get("commit", "?"),
-                                        b["sha256"][:12])
-    return {"arm": arm, "requests": reqs, "events": events, "start": start,
-            "throughput": thr, "meta": meta, "errors": errs, "build": build,
-            "log_check": log_check(all_done, parse_serve_log(serve_log))}
+        build = "%s (%s, sha256 %s)" % (b.get("describe", "?"), b.get("commit", "?"), b["sha256"][:12])
+    return {
+        "arm": arm,
+        "requests": reqs,
+        "events": events,
+        "start": start,
+        "throughput": thr,
+        "meta": meta,
+        "errors": errs,
+        "build": build,
+        "log_check": log_check(all_done, parse_serve_log(serve_log)),
+    }
 
 
 def mean(v):
@@ -273,14 +295,21 @@ def decode_windows(A):
         busy = (work.get("decode_device_wait") or 0.0) + (work.get("decode_host") or 0.0)
         if rounds <= 0 or busy <= 0.0:
             continue
-        out.append({"t": o.get("timestamp_unix_ms", 0) / 1000.0, "rounds": rounds, "rows": rows,
-                    "tokens": (o.get("tokens") or {}).get("committed_decode", 0), "busy": busy})
+        out.append(
+            {
+                "t": o.get("timestamp_unix_ms", 0) / 1000.0,
+                "rounds": rounds,
+                "rows": rows,
+                "tokens": (o.get("tokens") or {}).get("committed_decode", 0),
+                "busy": busy,
+            }
+        )
     return sorted(out, key=lambda w: w["t"])
 
 
-BOOTSTRAP_BLOCK = 6        # consecutive 5 s records resampled together (~30 s of decoding)
+BOOTSTRAP_BLOCK = 6  # consecutive 5 s records resampled together (~30 s of decoding)
 BOOTSTRAP_RESAMPLES = 2000
-BOOTSTRAP_MIN_BLOCKS = 5   # fewer blocks than this give no meaningful interval
+BOOTSTRAP_MIN_BLOCKS = 5  # fewer blocks than this give no meaningful interval
 
 
 def decode_rate(windows):
@@ -294,11 +323,9 @@ def decode_rate(windows):
     decode the same requests, so they are resampled in blocks, and the interval reflects how much
     the ratio moves with which turns happened to decode. With fewer than BOOTSTRAP_MIN_BLOCKS
     blocks an estimate has no interval (`lo`/`hi` are None)."""
-    blocks = [windows[i:i + BOOTSTRAP_BLOCK] for i in range(0, len(windows), BOOTSTRAP_BLOCK)]
-    sums = [{k: sum(w[k] for w in b) for k in ("tokens", "busy", "rounds", "rows")}
-            for b in blocks]
-    ratios = {"tps": ("tokens", "busy"), "rounds_per_s": ("rounds", "busy"),
-              "tokens_per_row_round": ("tokens", "rows")}
+    blocks = [windows[i : i + BOOTSTRAP_BLOCK] for i in range(0, len(windows), BOOTSTRAP_BLOCK)]
+    sums = [{k: sum(w[k] for w in b) for k in ("tokens", "busy", "rounds", "rows")} for b in blocks]
+    ratios = {"tps": ("tokens", "busy"), "rounds_per_s": ("rounds", "busy"), "tokens_per_row_round": ("tokens", "rows")}
     samples = {k: [] for k in ratios}
     rng = random.Random(0)
     for _ in range(BOOTSTRAP_RESAMPLES if len(sums) >= BOOTSTRAP_MIN_BLOCKS else 0):
@@ -308,8 +335,11 @@ def decode_rate(windows):
     out = {"seconds": sum(b["busy"] for b in sums), "records": len(windows)}
     for k, (num, den) in ratios.items():
         total = sum(b[den] for b in sums)
-        out[k] = {"value": sum(b[num] for b in sums) / total if total else None,
-                  "lo": pct(samples[k], 0.025), "hi": pct(samples[k], 0.975)}
+        out[k] = {
+            "value": sum(b[num] for b in sums) / total if total else None,
+            "lo": pct(samples[k], 0.025),
+            "hi": pct(samples[k], 0.975),
+        }
     return out
 
 
@@ -325,13 +355,12 @@ def decode_metrics(A):
         "one": decode_rate([w for w in windows if w["rows"] == w["rounds"]]),
         "two": decode_rate([w for w in windows if w["rows"] == 2 * w["rounds"]]),
         "all": decode_rate(windows),
-        "two_request_rounds": (sum(w["rows"] - w["rounds"] for w in windows) / rounds
-                               if rounds else None),
+        "two_request_rounds": (sum(w["rows"] - w["rounds"] for w in windows) / rounds if rounds else None),
         "mean_decode_batch": sum(w["rows"] for w in windows) / rounds if rounds else None,
     }
 
 
-REQUEST_BLOCK = 10         # consecutive requests resampled together for request-metric intervals
+REQUEST_BLOCK = 10  # consecutive requests resampled together for request-metric intervals
 
 
 def request_intervals(rows):
@@ -342,7 +371,7 @@ def request_intervals(rows):
     a metric moves with which stretches of the run it happened to contain; it cannot show how
     differently another run would interleave, which is what repeated seeds are for."""
     rows = sorted(rows, key=lambda r: r.get("t_send") or 0)
-    blocks = [rows[i:i + REQUEST_BLOCK] for i in range(0, len(rows), REQUEST_BLOCK)]
+    blocks = [rows[i : i + REQUEST_BLOCK] for i in range(0, len(rows), REQUEST_BLOCK)]
     if len(blocks) < BOOTSTRAP_MIN_BLOCKS:
         return {}
     stats = {
@@ -350,12 +379,13 @@ def request_intervals(rows):
         "ttft_median": lambda rs: median([r["ttft"] for r in rs]),
         "ttft_p90": lambda rs: pct([r["ttft"] for r in rs], 0.9),
         "ttft_cont_mean": lambda rs: mean([r["ttft"] for r in rs if r["cls"] in CONTINUING]),
-        "hit_rate": lambda rs: (sum(r["hit"] for r in rs) / sum(r["prompt"] for r in rs)
-                                if sum(r["prompt"] for r in rs) else None),
+        "hit_rate": lambda rs: (
+            sum(r["hit"] for r in rs) / sum(r["prompt"] for r in rs) if sum(r["prompt"] for r in rs) else None
+        ),
         "computed_tokens": lambda rs: sum(r["computed"] for r in rs),
         "cont_full_prefill_main": lambda rs: sum(
-            1 for r in rs if r["cls"] in CONTINUING and r["cls"] != "subagent_loop"
-            and r["hit"] == 0),
+            1 for r in rs if r["cls"] in CONTINUING and r["cls"] != "subagent_loop" and r["hit"] == 0
+        ),
     }
     samples = {k: [] for k in stats}
     rng = random.Random(1)
@@ -371,10 +401,13 @@ def request_intervals(rows):
 # The workload's phases, from the client's timestamped signals (see workload.build_plan).
 PHASES = [
     ("resumes", "workload_start", "C_resumed", "the three cold resumes, one after another"),
-    ("to_restart", "C_resumed", "A_restarted",
-     "interleaved sessions, A's first fan-out, B's subagent pair, A's compaction and restart"),
-    ("to_bc_done", "A_restarted", "BC_done", "interleaved sessions and A's second fan-out, "
-     "until B and C finish"),
+    (
+        "to_restart",
+        "C_resumed",
+        "A_restarted",
+        "interleaved sessions, A's first fan-out, B's subagent pair, A's compaction and restart",
+    ),
+    ("to_bc_done", "A_restarted", "BC_done", "interleaved sessions and A's second fan-out, until B and C finish"),
     ("wrap_up", "BC_done", "workload_end", "A alone: last loop, review subagent, PR write-up"),
 ]
 
@@ -391,6 +424,77 @@ def phases(A):
     return {name: (t[b] - t[a] if a in t and b in t else None) for name, a, b, _ in PHASES}
 
 
+def latency_distribution(values):
+    return {"n": len(values), "median": median(values), "p90": pct(values, 0.9), "max": max(values) if values else None}
+
+
+def agentic_measurements(requests):
+    """Summarize latency and coverage."""
+    rows = [r for r in requests if r["cls"] != "aborted"]
+    observed = [r for r in rows if r.get("client_latency_seconds") is not None]
+    complete = [r for r in observed if r["status"] == "ok" and r["stream_complete"]]
+    diagnostics = [r["tool_call_parse"] for r in rows if r.get("tool_call_parse") is not None]
+    token_rows = [
+        r
+        for r in rows
+        if r.get("server") is not None
+        and r.get("thinking_observed")
+        and r.get("thinking") is not None
+        and r.get("completion") is not None
+    ]
+    completion = sum(r["completion"] for r in token_rows)
+    fallback = {}
+    for d in diagnostics:
+        reason = d["fallback_reason"]
+        if reason != "none":
+            fallback[reason] = fallback.get(reason, 0) + 1
+    latency = {}
+    for key in ("first_output", "first_reasoning", "first_content", "first_tool_delta", "tool_ready", "response_end"):
+        values = [
+            r["client_latency_seconds"][key] for r in complete if r["client_latency_seconds"].get(key) is not None
+        ]
+        latency[key] = latency_distribution(values)
+    return {
+        "requests": len(rows),
+        "instrumented_requests": len(observed),
+        "complete_requests": len(complete),
+        "client_errors": sum(r["status"] == "error" for r in rows),
+        "incomplete_streams": sum(not r["stream_complete"] for r in observed),
+        "tool_ready_requests": latency["tool_ready"]["n"],
+        "without_tool_calls": sum(not r["tool_calls"] for r in complete),
+        "valid_tool_calls": sum(r.get("valid_tool_calls") or 0 for r in complete),
+        "invalid_tool_calls": sum(r.get("invalid_tool_calls") or 0 for r in complete),
+        "terminal_tool_requests": sum(r.get("valid_tool_calls") is not None for r in complete),
+        "parser_observed_requests": len(diagnostics),
+        "parser_marker_requests": sum(d["marker_seen"] for d in diagnostics),
+        "parser_fallbacks": fallback,
+        "parser_fallback_requests": sum(fallback.values()),
+        "schema_mismatch_arguments": sum(d["schema_mismatch_arguments"] for d in diagnostics),
+        "token_observed_requests": len(token_rows),
+        "thinking_fraction": sum(r["thinking"] for r in token_rows) / completion if completion else None,
+        "latency_seconds": latency,
+    }
+
+
+def paired_tool_readiness(arm_requests):
+    """Compare requests ready in every arm."""
+    ready = {
+        arm: {
+            r["seed"]: r["client_latency_seconds"]["tool_ready"]
+            for r in requests
+            if r["cls"] != "aborted"
+            and r["status"] == "ok"
+            and r.get("stream_complete")
+            and (r.get("client_latency_seconds") or {}).get("tool_ready") is not None
+        }
+        for arm, requests in arm_requests.items()
+    }
+    common = set.intersection(*(set(rows) for rows in ready.values())) if ready else set()
+    return sorted(common), {
+        arm: latency_distribution([rows[seed] for seed in sorted(common)]) for arm, rows in ready.items()
+    }
+
+
 def metrics(A, cold_seeds):
     rows = [r for r in A["requests"] if r.get("server") and r["cls"] != "aborted"]
     cont = [r for r in rows if r["cls"] in CONTINUING]
@@ -404,6 +508,7 @@ def metrics(A, cold_seeds):
     th = sum(r["hit"] for r in rows)
     m = {
         "n": len(rows),
+        "agentic": agentic_measurements(A["requests"]),
         "n_failed": sum(1 for r in A["requests"] if r["cls"] != "aborted" and not r.get("server")),
         "ttft_mean": mean([r["ttft"] for r in rows]),
         "ttft_median": median([r["ttft"] for r in rows]),
@@ -413,27 +518,28 @@ def metrics(A, cold_seeds):
         "ttft_cont_mean": mean([r["ttft"] for r in cont]),
         "ttft_cont_median": median([r["ttft"] for r in cont]),
         "ttft_new_mean": mean([r["ttft"] for r in newl]),
-        "n_cont": len(cont), "n_new": len(newl),
-        "prompt_tokens": tp, "hit_tokens": th, "hit_rate": th / tp if tp else None,
+        "n_cont": len(cont),
+        "n_new": len(newl),
+        "prompt_tokens": tp,
+        "hit_tokens": th,
+        "hit_rate": th / tp if tp else None,
         "computed_tokens": sum(r["computed"] for r in rows),
         "cont_full_prefill": sum(1 for r in cont if r["hit"] == 0),
         "cont_full_prefill_main": sum(1 for r in cont if r["hit"] == 0 and r["cls"] != "subagent_loop"),
         "cont_full_prefill_sub": sum(1 for r in cont if r["hit"] == 0 and r["cls"] == "subagent_loop"),
         "n_cont_main": sum(1 for r in cont if r["cls"] != "subagent_loop"),
         "n_cont_sub": sum(1 for r in cont if r["cls"] == "subagent_loop"),
-        "cold_prefill_big": (sum(r["computed"] for r in big) /
-                             sum(r["prefill_s"] for r in big)) if big else None,
+        "cold_prefill_big": (sum(r["computed"] for r in big) / sum(r["prefill_s"] for r in big)) if big else None,
         "n_cold_big": len(big),
         "decode": decode_metrics(A),
         "thinking_budget_hits": sum(1 for r in rows if budget and r["thinking"] >= budget),
-        "budget_hit_ngram": sum(r["ngram_accepted"] for r in rows
-                                if budget and r["thinking"] >= budget),
-        "budget_hit_tokens": sum(r["completion"] for r in rows
-                                 if budget and r["thinking"] >= budget),
+        "budget_hit_ngram": sum(r["ngram_accepted"] for r in rows if budget and r["thinking"] >= budget),
+        "budget_hit_tokens": sum(r["completion"] for r in rows if budget and r["thinking"] >= budget),
         "cont_hit_rate": (sum(r["hit"] for r in cont) / max(1, sum(r["prompt"] for r in cont))),
         "cold_prefill_median": median([r["computed"] / r["prefill_s"] for r in cold if r["prefill_s"]]),
-        "cold_prefill_aggregate": (sum(r["computed"] for r in cold) /
-                                   max(1e-9, sum(r["prefill_s"] for r in cold))) if cold else None,
+        "cold_prefill_aggregate": (sum(r["computed"] for r in cold) / max(1e-9, sum(r["prefill_s"] for r in cold)))
+        if cold
+        else None,
         "n_cold": len(cold),
         "output_tps": (sum(r["completion"] for r in dec) / sum(r["decode_s"] for r in dec)) if dec else None,
         "output_tps_copy": (sum(r["completion"] for r in copy) / sum(r["decode_s"] for r in copy)) if copy else None,
@@ -442,8 +548,7 @@ def metrics(A, cold_seeds):
         "thinking_tokens": sum(r["thinking"] for r in rows),
         "reasoning_chars": sum(r.get("reasoning_chars") or 0 for r in rows),
         "decode_seconds": sum(r["decode_s"] for r in rows),
-        "spec_accept": (sum(r["spec_accepted"] for r in rows) /
-                        max(1, sum(r["spec_drafted"] for r in rows))),
+        "spec_accept": (sum(r["spec_accepted"] for r in rows) / max(1, sum(r["spec_drafted"] for r in rows))),
         "ngram_accepted": sum(r["ngram_accepted"] for r in rows),
         "ngram_drafted": sum(r["ngram_drafted"] for r in rows),
         "wall_seconds": A["meta"].get("wall_seconds"),
@@ -470,9 +575,8 @@ def metrics(A, cold_seeds):
             if isinstance(v, (int, float)):
                 pressure[k] = pressure.get(k, 0) + v
         for kind in ("main_kv_transfers",):
-            for d, t in ((cc.get(kind) or {}).items()):
-                pressure["%s_%s_bytes" % (kind, d)] = pressure.get("%s_%s_bytes" % (kind, d), 0) + \
-                    (t.get("bytes") or 0)
+            for d, t in (cc.get(kind) or {}).items():
+                pressure["%s_%s_bytes" % (kind, d)] = pressure.get("%s_%s_bytes" % (kind, d), 0) + (t.get("bytes") or 0)
     m["pressure"] = pressure
     return m
 
@@ -480,6 +584,7 @@ def metrics(A, cold_seeds):
 # ---------------------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------------------
+
 
 def f1(v):
     return "n/a" if v is None else "%.1f" % v
@@ -503,6 +608,7 @@ def ppct(v):
 
 def with_ci(fmt, seconds_key=None):
     """Formats a decode estimate with its 95 % interval, e.g. `187 (184-190)`."""
+
     def render(d):
         e, seconds = d
         if e["value"] is None:
@@ -510,6 +616,7 @@ def with_ci(fmt, seconds_key=None):
         if e["lo"] is None:
             return "%s (%.0f s, too little for an interval)" % (fmt(e["value"]), seconds)
         return "%s (%s-%s)" % (fmt(e["value"]), fmt(e["lo"]), fmt(e["hi"]))
+
     return render
 
 
@@ -543,42 +650,81 @@ def headline_specs(c):
     return [
         ("Average time to first token (s, lower is better)", ("ttft_mean",), f1, "rel", None),
         ("Median time to first token (s, lower is better)", ("ttft_median",), f2, "rel", None),
-        ("90th-percentile time to first token (s, lower is better)", ("ttft_p90",), f1, "rel",
-         None),
+        ("90th-percentile time to first token (s, lower is better)", ("ttft_p90",), f1, "rel", None),
         ("Average TTFT, continuing-session turns (s)", ("ttft_cont_mean",), f2, "rel", None),
         ("Average TTFT, new long prompts (s)", ("ttft_new_mean",), f1, "rel", None),
         ("Prompt tokens served from cache", ("hit_rate",), ppct, "pp", None),
         ("Prompt tokens prefilled (lower is better)", ("computed_tokens",), ntok, "rel", None),
-        ("Main-session turns that re-prefilled the whole prompt (of %d)" % c["n_cont_main"],
-         ("cont_full_prefill_main",), f0, "abs", None),
-        ("Subagent turns that re-prefilled the whole prompt (of %d)" % c["n_cont_sub"],
-         ("cont_full_prefill_sub",), f0, "abs", None),
-        ("Prefill tok/s, requests with no cache hit (all sizes)", ("cold_prefill_aggregate",),
-         ntok, "rel", None),
-        ("Prefill tok/s, requests with no cache hit, 32K+ tokens", ("cold_prefill_big",), ntok,
-         "rel", None),
+        (
+            "Main-session turns that re-prefilled the whole prompt (of %d)" % c["n_cont_main"],
+            ("cont_full_prefill_main",),
+            f0,
+            "abs",
+            None,
+        ),
+        (
+            "Subagent turns that re-prefilled the whole prompt (of %d)" % c["n_cont_sub"],
+            ("cont_full_prefill_sub",),
+            f0,
+            "abs",
+            None,
+        ),
+        ("Prefill tok/s, requests with no cache hit (all sizes)", ("cold_prefill_aggregate",), ntok, "rel", None),
+        ("Prefill tok/s, requests with no cache hit, 32K+ tokens", ("cold_prefill_big",), ntok, "rel", None),
         ("Output tok/s, one request decoding", ("decode", "one", "tps"), ntok, "rel", None),
-        ("Output tok/s, two requests decoding (combined)", ("decode", "two", "tps"), ntok, "rel",
-         None),
-        ("Output tok/s, all decoding at the run's own batching", ("decode", "all", "tps"), ntok,
-         "rel", None),
-        ("Decode rounds/s, one request decoding (engine speed)",
-         ("decode", "one", "rounds_per_s"), f1, "rel", None),
-        ("Decode rounds/s, two requests decoding (engine speed)",
-         ("decode", "two", "rounds_per_s"), f1, "rel", None),
-        ("Tokens per round, one request decoding (speculative acceptance)",
-         ("decode", "one", "tokens_per_row_round"), f2, "rel", None),
-        ("Decode rounds that ran two requests", ("decode", "two_request_rounds"), ppct, "pp",
-         None),
+        ("Output tok/s, two requests decoding (combined)", ("decode", "two", "tps"), ntok, "rel", None),
+        ("Output tok/s, all decoding at the run's own batching", ("decode", "all", "tps"), ntok, "rel", None),
+        ("Decode rounds/s, one request decoding (engine speed)", ("decode", "one", "rounds_per_s"), f1, "rel", None),
+        ("Decode rounds/s, two requests decoding (engine speed)", ("decode", "two", "rounds_per_s"), f1, "rel", None),
+        (
+            "Tokens per round, one request decoding (speculative acceptance)",
+            ("decode", "one", "tokens_per_row_round"),
+            f2,
+            "rel",
+            None,
+        ),
+        ("Decode rounds that ran two requests", ("decode", "two_request_rounds"), ppct, "pp", None),
         ("Workload wall time (min, lower is better)", ("wall_seconds",), f1, "rel", 60.0),
         ("Phase 1, cold resumes (min)", ("phases", "resumes"), f2, "rel", 60.0),
-        ("Phase 2, sessions to A's restart after compaction (min)", ("phases", "to_restart"),
-         f1, "rel", 60.0),
-        ("Phase 3, sessions until B and C finish (min)", ("phases", "to_bc_done"), f1, "rel",
-         60.0),
+        ("Phase 2, sessions to A's restart after compaction (min)", ("phases", "to_restart"), f1, "rel", 60.0),
+        ("Phase 3, sessions until B and C finish (min)", ("phases", "to_bc_done"), f1, "rel", 60.0),
         ("Phase 4, A wraps up alone (min)", ("phases", "wrap_up"), f1, "rel", 60.0),
         ("Average TTFT without queue wait (s)", ("service_ttft_mean",), f2, "rel", None),
         ("Workload requests without a request_done record", ("n_failed",), f0, "abs", None),
+        ("Client requests with tool readiness observed", ("agentic", "tool_ready_requests"), f0, "abs", None),
+        (
+            "Tool-ready requests common to every arm",
+            ("agentic", "paired_tool_ready_latency_seconds", "n"),
+            f0,
+            "abs",
+            None,
+        ),
+        (
+            "Client time to terminal JSON-object tool, median (s, common requests)",
+            ("agentic", "paired_tool_ready_latency_seconds", "median"),
+            f2,
+            "rel",
+            None,
+        ),
+        (
+            "Client time to terminal JSON-object tool, p90 (s, common requests)",
+            ("agentic", "paired_tool_ready_latency_seconds", "p90"),
+            f2,
+            "rel",
+            None,
+        ),
+        (
+            "Client time to terminal JSON-object tool, maximum (s, common requests)",
+            ("agentic", "paired_tool_ready_latency_seconds", "max"),
+            f2,
+            "rel",
+            None,
+        ),
+        ("Complete measured streams without tool calls", ("agentic", "without_tool_calls"), f0, "abs", None),
+        ("Measured incomplete streams", ("agentic", "incomplete_streams"), f0, "abs", None),
+        ("Parser diagnostics observed (requests)", ("agentic", "parser_observed_requests"), f0, "abs", None),
+        ("Parser fallback requests (inspect coverage)", ("agentic", "parser_fallback_requests"), f0, "abs", None),
+        ("Model thinking / completion tokens (token-weighted)", ("agentic", "thinking_fraction"), ppct, "pp", None),
     ]
 
 
@@ -626,7 +772,7 @@ def cell(m, spec):
     v = m
     for k in path:
         v = v.get(k) if isinstance(v, dict) else None
-    if isinstance(v, dict):   # decode estimate
+    if isinstance(v, dict):  # decode estimate
         seconds = resolve(m, path[:-1] + ("seconds",)) or 0.0
         return with_ci(fmt)((v, seconds))
     value = resolve(m, path, divisor)
@@ -638,10 +784,11 @@ def cell(m, spec):
 
 def table_header(arms, change_label):
     others = arms[1:]
-    return ["| Metric | %s | %s |" % (" | ".join(LABEL[a] for a in arms),
-                                      " | ".join(change_label % (SHORT[a], SHORT[arms[0]])
-                                                 for a in others)),
-            "|---|" + "---|" * (len(arms) + len(others))]
+    return [
+        "| Metric | %s | %s |"
+        % (" | ".join(LABEL[a] for a in arms), " | ".join(change_label % (SHORT[a], SHORT[arms[0]]) for a in others)),
+        "|---|" + "---|" * (len(arms) + len(others)),
+    ]
 
 
 def headline(arms, ms):
@@ -650,10 +797,14 @@ def headline(arms, ms):
     for spec in headline_specs(ms[arms[0]]):
         _, path, _, kind, divisor = spec
         c = resolve(ms[arms[0]], path, divisor)
-        L.append("| %s | %s | %s |" % (
-            spec[0], " | ".join(cell(ms[a], spec) for a in arms),
-            " | ".join(change_text(kind, change_value(kind, c, resolve(ms[a], path, divisor)))
-                       for a in arms[1:])))
+        L.append(
+            "| %s | %s | %s |"
+            % (
+                spec[0],
+                " | ".join(cell(ms[a], spec) for a in arms),
+                " | ".join(change_text(kind, change_value(kind, c, resolve(ms[a], path, divisor))) for a in arms[1:]),
+            )
+        )
     return "\n".join(L)
 
 
@@ -665,38 +816,59 @@ def each(arms, value, fmt=lambda v: v):
 def cold_table(arms, A, cold_seeds):
     served = {a: {r["seed"]: r for r in A[a]["requests"] if r.get("server")} for a in arms}
     others = arms[1:]
-    L = ["| Request | Class | Prompt tokens | %s | %s |"
-         % (" | ".join("%s prefill tok/s" % SHORT[a] for a in arms),
-            " | ".join("%s vs %s" % (SHORT[a], SHORT[arms[0]]) for a in others)),
-         "|---|---|---|" + "---|" * (len(arms) + len(others))]
+    L = [
+        "| Request | Class | Prompt tokens | %s | %s |"
+        % (
+            " | ".join("%s prefill tok/s" % SHORT[a] for a in arms),
+            " | ".join("%s vs %s" % (SHORT[a], SHORT[arms[0]]) for a in others),
+        ),
+        "|---|---|---|" + "---|" * (len(arms) + len(others)),
+    ]
     base = served[arms[0]]
     for s in sorted(cold_seeds, key=lambda s: base[s]["computed"]):
-        rates = [served[a][s]["computed"] / served[a][s]["prefill_s"]
-                 if served[a][s]["prefill_s"] else None for a in arms]
-        L.append("| %s | %s | %s | %s | %s |" % (
-            base[s]["tag"], base[s]["cls"], ntok(base[s]["computed"]),
-            " | ".join(ntok(r) for r in rates), " | ".join(chg(rates[0], r) for r in rates[1:])))
+        rates = [
+            served[a][s]["computed"] / served[a][s]["prefill_s"] if served[a][s]["prefill_s"] else None for a in arms
+        ]
+        L.append(
+            "| %s | %s | %s | %s | %s |"
+            % (
+                base[s]["tag"],
+                base[s]["cls"],
+                ntok(base[s]["computed"]),
+                " | ".join(ntok(r) for r in rates),
+                " | ".join(chg(rates[0], r) for r in rates[1:]),
+            )
+        )
     return "\n".join(L)
 
 
 def class_table(arms, A):
-    L = ["| Class | n | %s | %s |" % (" | ".join("%s avg TTFT (s)" % SHORT[a] for a in arms),
-                                     " | ".join("%s cached" % SHORT[a] for a in arms)),
-         "|---|---|" + "---|" * (2 * len(arms))]
+    L = [
+        "| Class | n | %s | %s |"
+        % (" | ".join("%s avg TTFT (s)" % SHORT[a] for a in arms), " | ".join("%s cached" % SHORT[a] for a in arms)),
+        "|---|---|" + "---|" * (2 * len(arms)),
+    ]
     for cls, _ in CLASS_DOC:
         rs = [[r for r in A[a]["requests"] if r["cls"] == cls and r.get("server")] for a in arms]
         if not any(rs):
             continue
-        L.append("| %s | %d | %s | %s |" % (
-            cls, max(len(r) for r in rs), " | ".join(f2(mean([x["ttft"] for x in r])) for r in rs),
-            " | ".join(ppct(sum(x["hit"] for x in r) / max(1, sum(x["prompt"] for x in r)))
-                       for r in rs)))
+        L.append(
+            "| %s | %d | %s | %s |"
+            % (
+                cls,
+                max(len(r) for r in rs),
+                " | ".join(f2(mean([x["ttft"] for x in r])) for r in rs),
+                " | ".join(ppct(sum(x["hit"] for x in r) / max(1, sum(x["prompt"] for x in r))) for r in rs),
+            )
+        )
     return "\n".join(L)
 
 
 def path_table(arms, ms):
-    L = ["| Reuse path | %s |" % " | ".join("%s (requests / cached tokens)" % SHORT[a] for a in arms),
-         "|---|" + "---|" * len(arms)]
+    L = [
+        "| Reuse path | %s |" % " | ".join("%s (requests / cached tokens)" % SHORT[a] for a in arms),
+        "|---|" + "---|" * len(arms),
+    ]
     for p in sorted(set().union(*(ms[a]["paths"] for a in arms))):
         cells = [ms[a]["paths"].get(p, [0, 0]) for a in arms]
         L.append("| %s | %s |" % (p, " | ".join("%d / %s" % (n, ntok(t)) for n, t in cells)))
@@ -704,33 +876,138 @@ def path_table(arms, ms):
 
 
 def pressure_table(arms, ms):
-    keys = ["private_owners_evicted", "private_owners_degraded", "shared_owners_evicted",
-            "shared_owners_degraded", "checkpoints_dropped", "maximal_fallback_selections",
-            "search_budget_exhaustions", "spill_pages", "main_kv_transfers_d2h_bytes",
-            "main_kv_transfers_h2d_bytes"]
-    L = ["| Engine counter (summed over the run) | %s |" % " | ".join(SHORT[a] for a in arms),
-         "|---|" + "---|" * len(arms)]
+    keys = [
+        "private_owners_evicted",
+        "private_owners_degraded",
+        "shared_owners_evicted",
+        "shared_owners_degraded",
+        "checkpoints_dropped",
+        "maximal_fallback_selections",
+        "search_budget_exhaustions",
+        "spill_pages",
+        "main_kv_transfers_d2h_bytes",
+        "main_kv_transfers_h2d_bytes",
+    ]
+    L = [
+        "| Engine counter (summed over the run) | %s |" % " | ".join(SHORT[a] for a in arms),
+        "|---|" + "---|" * len(arms),
+    ]
     for k in keys:
         v = [ms[a]["pressure"].get(k) for a in arms]
         if all(x is None for x in v):
             continue
-        fmt = (lambda v: "n/a" if v is None else "%.1f GiB" % (v / 2 ** 30)) if k.endswith("bytes") \
+        fmt = (
+            (lambda v: "n/a" if v is None else "%.1f GiB" % (v / 2**30))
+            if k.endswith("bytes")
             else (lambda v: "n/a" if v is None else format(int(v), ",d"))
+        )
         L.append("| %s | %s |" % (k, " | ".join(fmt(x) for x in v)))
     return "\n".join(L)
 
 
+def agentic_table(measured):
+    L = [
+        "Client latencies use monotonic time from sending the request, including queue, "
+        "prefill and transport. Only status=ok streams with a finish reason and [DONE] enter "
+        "the distributions. Tool ready requires terminal tool_calls confirmation, identity "
+        "and JSON-object arguments; it does not validate the tool schema or execution.",
+        "",
+        "Coverage: %d requests; %d instrumented; %d complete; %d client errors; "
+        "%d incomplete streams. %d complete streams had no tool calls. Intentionally aborted "
+        "workload requests are excluded."
+        % (
+            measured["requests"],
+            measured["instrumented_requests"],
+            measured["complete_requests"],
+            measured["client_errors"],
+            measured["incomplete_streams"],
+            measured["without_tool_calls"],
+        ),
+        "",
+        "| Client milestone | n | Median s | p90 s | Maximum s |",
+        "|---|---:|---:|---:|---:|",
+    ]
+    for name, stats in measured["latency_seconds"].items():
+        L.append(
+            "| %s | %d | %s | %s | %s |" % (name, stats["n"], f2(stats["median"]), f2(stats["p90"]), f2(stats["max"]))
+        )
+    L += [
+        "",
+        "Terminal tool requests: %d; JSON-object calls: %d; invalid identity/JSON calls: "
+        "%d. Parser coverage: %d requests; markers: %d; fallback reasons: %s; "
+        "schema-mismatch arguments: %d. Thinking token coverage: %d requests; "
+        "token-weighted thinking fraction: %s."
+        % (
+            measured["terminal_tool_requests"],
+            measured["valid_tool_calls"],
+            measured["invalid_tool_calls"],
+            measured["parser_observed_requests"],
+            measured["parser_marker_requests"],
+            json.dumps(measured["parser_fallbacks"], sort_keys=True),
+            measured["schema_mismatch_arguments"],
+            measured["token_observed_requests"],
+            ppct(measured["thinking_fraction"]),
+        ),
+    ]
+    return "\n".join(L)
+
+
 def per_request(A):
-    L = ["| Tag | Class | Prompt | Cached | Prefilled | Path | Queue s | TTFT s | Out | Decode tok/s | Finish |",
-         "|---|---|---|---|---|---|---|---|---|---|---|"]
+    L = [
+        "| Tag | Class | Prompt | Cached | Prefilled | Path | Queue s | TTFT s | Out | Decode tok/s | Finish |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
+    ]
     for r in sorted(A["requests"], key=lambda r: r.get("t_send") or 0):
         if not r.get("server"):
             L.append("| %s | %s | | | | | | | | | %s |" % (r["tag"], r["cls"], r["status"]))
             continue
-        L.append("| %s | %s%s | %s | %s | %s | %s | %s | %s | %s | %s | %s |" % (
-            r["tag"], r["cls"], " (copy)" if r["copy"] else "", ntok(r["prompt"]), ntok(r["hit"]),
-            ntok(r["computed"]), r["path"], f1(r["queue_s"]), f2(r["ttft"]), ntok(r["completion"]),
-            ntok(r["completion"] / r["decode_s"]) if r["decode_s"] else "n/a", r["finish_server"]))
+        L.append(
+            "| %s | %s%s | %s | %s | %s | %s | %s | %s | %s | %s | %s |"
+            % (
+                r["tag"],
+                r["cls"],
+                " (copy)" if r["copy"] else "",
+                ntok(r["prompt"]),
+                ntok(r["hit"]),
+                ntok(r["computed"]),
+                r["path"],
+                f1(r["queue_s"]),
+                f2(r["ttft"]),
+                ntok(r["completion"]),
+                ntok(r["completion"] / r["decode_s"]) if r["decode_s"] else "n/a",
+                r["finish_server"],
+            )
+        )
+    L += [
+        "",
+        "Client milestones (seconds from send; n/a means unobserved):",
+        "",
+        "| Tag | Status | Complete | First output | Reasoning | Content | Tool delta | Tool ready | End | Parser fallback |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for r in sorted(A["requests"], key=lambda r: r.get("t_send") or 0):
+        latency = r.get("client_latency_seconds") or {}
+        diagnostics = r.get("tool_call_parse") or {}
+        L.append(
+            "| %s | %s | %s | %s | %s |"
+            % (
+                r["tag"],
+                r["status"],
+                r.get("stream_complete", "n/a"),
+                " | ".join(
+                    f2(latency.get(key))
+                    for key in (
+                        "first_output",
+                        "first_reasoning",
+                        "first_content",
+                        "first_tool_delta",
+                        "tool_ready",
+                        "response_end",
+                    )
+                ),
+                diagnostics.get("fallback_reason", "n/a"),
+            )
+        )
     return "\n".join(L)
 
 
@@ -738,19 +1015,27 @@ def server_row(A):
     s = A["start"] or {}
     e, mem = s.get("engine") or {}, s.get("memory") or {}
     cc = e.get("context_cache") or {}
-    return ("KV capacity %s tokens; lanes %s; device state slots %s; host state slots %s; "
-            "host KV %.1f GiB; private continuations %s; long anchors per continuation %s; "
-            "shared prefixes %s; free device memory after startup %.2f GiB; build %s"
-            % (ntok(e.get("kv_capacity")), e.get("max_concurrency"),
-               cc.get("device_state_slots"), cc.get("host_state_slots"),
-               (mem.get("host_kv_capacity_bytes") or 0) / 2 ** 30, cc.get("max_private_continuations"),
-               cc.get("max_long_anchors_per_continuation"), cc.get("max_shared_prefixes"),
-               (mem.get("available_after_startup_bytes") or 0) / 2 ** 30, A["build"]))
+    return (
+        "KV capacity %s tokens; lanes %s; device state slots %s; host state slots %s; "
+        "host KV %.1f GiB; private continuations %s; long anchors per continuation %s; "
+        "shared prefixes %s; free device memory after startup %.2f GiB; build %s"
+        % (
+            ntok(e.get("kv_capacity")),
+            e.get("max_concurrency"),
+            cc.get("device_state_slots"),
+            cc.get("host_state_slots"),
+            (mem.get("host_kv_capacity_bytes") or 0) / 2**30,
+            cc.get("max_private_continuations"),
+            cc.get("max_long_anchors_per_continuation"),
+            cc.get("max_shared_prefixes"),
+            (mem.get("available_after_startup_bytes") or 0) / 2**30,
+            A["build"],
+        )
+    )
 
 
 def flag_str(flags):
-    return " ".join(n + ("" if v is None else " " + (('"%s"' % v) if " " in v else v))
-                    for n, v in flags)
+    return " ".join(n + ("" if v is None else " " + (('"%s"' % v) if " " in v else v)) for n, v in flags)
 
 
 def aggregate(out_dir, run_dirs):
@@ -773,15 +1058,22 @@ def aggregate(out_dir, run_dirs):
         raise SystemExit("aggregate needs a baseline (control) arm and one other arm in every run")
     base = arms[0]
     seeds = [s["config"]["seed"] for _, s in runs]
-    L = ["# Agentic A/B over %d workload seeds: %s\n" % (len(runs), " vs ".join(LABEL[a] for a in arms)),
-         "Runs: %s\n" % ", ".join("seed %d `%s`" % (seed, d) for seed, (d, _) in zip(seeds, runs))]
+    L = [
+        "# Agentic A/B over %d workload seeds: %s\n" % (len(runs), " vs ".join(LABEL[a] for a in arms)),
+        "Runs: %s\n" % ", ".join("seed %d `%s`" % (seed, d) for seed, (d, _) in zip(seeds, runs)),
+    ]
     first = runs[0][1]
-    L.append("- Model: `%s`, `--max-context %s`; %d requests per arm per seed; every arm of a "
-             "seed replays the same observations, and each seed replays different ones.\n"
-             % (os.path.basename(first["config"]["model"]),
-                ntok(first["config"].get("max_context")), first[base]["n"]))
-    problems = ["seed %d %s: %d failed request(s)" % (seed, a, s[a]["n_failed"])
-                for seed, (_, s) in zip(seeds, runs) for a in arms if s[a]["n_failed"]]
+    L.append(
+        "- Model: `%s`, `--max-context %s`; %d requests per arm per seed; every arm of a "
+        "seed replays the same observations, and each seed replays different ones.\n"
+        % (os.path.basename(first["config"]["model"]), ntok(first["config"].get("max_context")), first[base]["n"])
+    )
+    problems = [
+        "seed %d %s: %d failed request(s)" % (seed, a, s[a]["n_failed"])
+        for seed, (_, s) in zip(seeds, runs)
+        for a in arms
+        if s[a]["n_failed"]
+    ]
     if problems:
         L.append("**Validity warnings:** " + "; ".join(problems) + "\n")
     L.append("## Headline (mean over seeds, min-max in brackets)\n")
@@ -792,46 +1084,59 @@ def aggregate(out_dir, run_dirs):
         for a in arms:
             v = [resolve(s[a], path, divisor) for _, s in runs]
             v = [x for x in v if x is not None]
-            cells.append("n/a" if not v else fmt(sum(v) / len(v)) if len(v) == 1 else
-                         "%s (%s-%s)" % (fmt(sum(v) / len(v)), bare(fmt(min(v))),
-                                         bare(fmt(max(v)))))
+            cells.append(
+                "n/a"
+                if not v
+                else fmt(sum(v) / len(v))
+                if len(v) == 1
+                else "%s (%s-%s)" % (fmt(sum(v) / len(v)), bare(fmt(min(v))), bare(fmt(max(v))))
+            )
         changes = []
         for a in arms[1:]:
-            d = [change_value(kind, resolve(s[base], path, divisor),
-                              resolve(s[a], path, divisor)) for _, s in runs]
+            d = [change_value(kind, resolve(s[base], path, divisor), resolve(s[a], path, divisor)) for _, s in runs]
             d = [x for x in d if x is not None]
-            changes.append("n/a" if not d else
-                           change_text(kind, sum(d) / len(d),
-                                       (min(d), max(d)) if len(d) > 1 else None))
+            changes.append(
+                "n/a" if not d else change_text(kind, sum(d) / len(d), (min(d), max(d)) if len(d) > 1 else None)
+            )
         L.append("| %s | %s | %s |" % (label, " | ".join(cells), " | ".join(changes)))
     L.append("")
     L.append("## Per seed\n")
-    keys = [("Prompt tokens served from cache", ("hit_rate",), ppct, None),
-            ("Average TTFT (s)", ("ttft_mean",), f1, None),
-            ("TTFT without queue (s)", ("service_ttft_mean",), f2, None),
-            ("Output tok/s, one request", ("decode", "one", "tps"), ntok, None),
-            ("Decode rounds/s, one request", ("decode", "one", "rounds_per_s"), f1, None),
-            ("Output tok/s, all", ("decode", "all", "tps"), ntok, None),
-            ("Completion tokens", ("completion_tokens",), ntok, None),
-            ("Wall time (min)", ("wall_seconds",), f1, 60.0),
-            ("Failed", ("n_failed",), f0, None)]
+    keys = [
+        ("Prompt tokens served from cache", ("hit_rate",), ppct, None),
+        ("Average TTFT (s)", ("ttft_mean",), f1, None),
+        ("TTFT without queue (s)", ("service_ttft_mean",), f2, None),
+        ("Output tok/s, one request", ("decode", "one", "tps"), ntok, None),
+        ("Decode rounds/s, one request", ("decode", "one", "rounds_per_s"), f1, None),
+        ("Output tok/s, all", ("decode", "all", "tps"), ntok, None),
+        ("Completion tokens", ("completion_tokens",), ntok, None),
+        ("Wall time (min)", ("wall_seconds",), f1, 60.0),
+        ("Failed", ("n_failed",), f0, None),
+    ]
     L.append("| Seed | Arm | Ran | %s |" % " | ".join(k[0] for k in keys))
     L.append("|---|---|---|" + "---|" * len(keys))
     for seed, (_, s) in zip(seeds, runs):
         order = s["config"].get("arm_order") or []
         for a in arms:
             ran = ("%d of %d" % (order.index(a) + 1, len(order))) if a in order else ""
-            L.append("| %d | %s | %s | %s |" % (seed, SHORT[a], ran, " | ".join(
-                fmt(resolve(s[a], path, divisor)) for _, path, fmt, divisor in keys)))
+            L.append(
+                "| %d | %s | %s | %s |"
+                % (seed, SHORT[a], ran, " | ".join(fmt(resolve(s[a], path, divisor)) for _, path, fmt, divisor in keys))
+            )
     L.append("")
     L.append("## Seed-to-seed spread\n")
-    L.append("Spread is (max - min) / mean over the seeds for one arm; the per-seed changes are "
-             "each seed's %s against its own %s. A build difference smaller than the spread of "
-             "the per-seed changes is not resolved by this many seeds.\n"
-             % (" / ".join(SHORT[a] for a in arms[1:]), SHORT[base]))
-    L.append("| Metric | %s | %s |" % (" | ".join("%s spread" % SHORT[a] for a in arms),
-                                      " | ".join("%s vs %s per seed" % (SHORT[a], SHORT[base])
-                                                 for a in arms[1:])))
+    L.append(
+        "Spread is (max - min) / mean over the seeds for one arm; the per-seed changes are "
+        "each seed's %s against its own %s. A build difference smaller than the spread of "
+        "the per-seed changes is not resolved by this many seeds.\n"
+        % (" / ".join(SHORT[a] for a in arms[1:]), SHORT[base])
+    )
+    L.append(
+        "| Metric | %s | %s |"
+        % (
+            " | ".join("%s spread" % SHORT[a] for a in arms),
+            " | ".join("%s vs %s per seed" % (SHORT[a], SHORT[base]) for a in arms[1:]),
+        )
+    )
     L.append("|---|" + "---|" * (2 * len(arms) - 1))
     for label, path, fmt, divisor in keys[:-1]:
         cells = []
@@ -841,13 +1146,14 @@ def aggregate(out_dir, run_dirs):
             m = sum(v) / len(v) if v else None
             cells.append("n/a" if not v or not m else "%.1f %%" % ((max(v) - min(v)) / m * 100))
         for a in arms[1:]:
-            d = [change_value("rel", resolve(s[base], path, divisor),
-                              resolve(s[a], path, divisor)) for _, s in runs]
+            d = [change_value("rel", resolve(s[base], path, divisor), resolve(s[a], path, divisor)) for _, s in runs]
             cells.append(", ".join("n/a" if x is None else "%+.1f %%" % x for x in d))
         L.append("| %s | %s |" % (label, " | ".join(cells)))
     L.append("")
-    L.append("Each seed's own report (`report.md` in its run directory) has the intervals, notes "
-             "and per-request detail for that seed.")
+    L.append(
+        "Each seed's own report (`report.md` in its run directory) has the intervals, notes "
+        "and per-request detail for that seed."
+    )
     text = "\n".join(L) + "\n"
     with open(os.path.join(out_dir, "report.md"), "w", encoding="utf-8") as f:
         f.write(text)
@@ -869,17 +1175,21 @@ def main(argv):
     A = {a: load_arm(run_dir, a) for a in arms}
     # Matched cold set: requests with no cache hit in EVERY arm and a real prefill.
     served = [{r["seed"]: r for r in A[a]["requests"] if r.get("server")} for a in arms]
-    cold = {s for s in served[0] if all(s in d and d[s]["hit"] == 0 and d[s]["computed"] >= 4096
-                                        for d in served)}
+    cold = {s for s in served[0] if all(s in d and d[s]["hit"] == 0 and d[s]["computed"] >= 4096 for d in served)}
     ms = {a: metrics(A[a], cold) for a in arms}
-    summary = dict({"config": cfg, "cold_seeds": sorted(cold)}, **ms)
+    tool_seeds, tool_distributions = paired_tool_readiness({a: A[a]["requests"] for a in arms})
+    for a in arms:
+        ms[a]["agentic"]["paired_tool_ready_latency_seconds"] = tool_distributions[a]
+    summary = dict({"config": cfg, "cold_seeds": sorted(cold), "tool_ready_common_seeds": tool_seeds}, **ms)
     with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=1)
 
     c = ms[arms[0]]
     ctx = cfg.get("max_context")
-    gpu = next((A[a]["start"].get("environment", {}).get("gpu_name")
-                for a in reversed(arms) if A[a]["start"]), None) or "GPU"
+    gpu = (
+        next((A[a]["start"].get("environment", {}).get("gpu_name") for a in reversed(arms) if A[a]["start"]), None)
+        or "GPU"
+    )
     L = []
     L.append("# Agentic A/B: %s\n" % " vs ".join(LABEL[a] for a in arms))
     L.append("Run directory: `%s`\n" % run_dir)
@@ -887,53 +1197,72 @@ def main(argv):
     mt = cfg.get("agent_max_tokens_by_arm") or {}
     if linux and same_flags:
         tp = dict(cfg.get("flags") or []).get("--tp") or "1"
-        L.append("- Model: `%s` on %s x %s, `--max-context %s`, identical flags in every arm "
-                 "(profile `%s`, below); arms ran in the order %s."
-                 % (os.path.basename(cfg["model"]), tp, gpu, ntok(ctx), cfg.get("profile"),
-                    " then ".join(SHORT[a] for a in cfg.get("arm_order") or arms)))
+        L.append(
+            "- Model: `%s` on %s x %s, `--max-context %s`, identical flags in every arm "
+            "(profile `%s`, below); arms ran in the order %s."
+            % (
+                os.path.basename(cfg["model"]),
+                tp,
+                gpu,
+                ntok(ctx),
+                cfg.get("profile"),
+                " then ".join(SHORT[a] for a in cfg.get("arm_order") or arms),
+            )
+        )
     elif linux:
         tp = dict(cfg.get("flags") or []).get("--tp") or "1"
         mc = cfg.get("max_context_by_arm") or {}
-        L.append("- Model: `%s` on %s x %s; **flags differ between arms** (below), "
-                 "`--max-context` %s; arms ran in the order %s."
-                 % (os.path.basename(cfg["model"]), tp, gpu,
-                    ", ".join("%s %s" % (SHORT[a], ntok(mc.get(a, ctx))) for a in arms),
-                    " then ".join(SHORT[a] for a in cfg.get("arm_order") or arms)))
+        L.append(
+            "- Model: `%s` on %s x %s; **flags differ between arms** (below), "
+            "`--max-context` %s; arms ran in the order %s."
+            % (
+                os.path.basename(cfg["model"]),
+                tp,
+                gpu,
+                ", ".join("%s %s" % (SHORT[a], ntok(mc.get(a, ctx))) for a in arms),
+                " then ".join(SHORT[a] for a in cfg.get("arm_order") or arms),
+            )
+        )
     else:
-        L.append("- Model: `%s` on an %s, `--max-context %s` for every arm (launch bat: %s)."
-                 % (os.path.basename(cfg["model"]), gpu, ntok(ctx),
-                    ntok(cfg.get("bat_max_context"))))
+        L.append(
+            "- Model: `%s` on an %s, `--max-context %s` for every arm (launch bat: %s)."
+            % (os.path.basename(cfg["model"]), gpu, ntok(ctx), ntok(cfg.get("bat_max_context")))
+        )
     if len(set(mt.get(a, cfg["agent_max_tokens"]) for a in arms)) > 1:
         mt_text = "`max_tokens` on agent turns %s" % ", ".join(
-            "%s %d" % (SHORT[a], mt.get(a, cfg["agent_max_tokens"])) for a in arms)
+            "%s %d" % (SHORT[a], mt.get(a, cfg["agent_max_tokens"])) for a in arms
+        )
     else:
         mt_text = "`max_tokens: %d` on agent turns" % mt.get(arms[0], cfg["agent_max_tokens"])
-    L.append("- Workload: %d requests per arm (seed %d, scale %.2f, corpus commit `%s`), "
-             "%s, thinking on."
-             % (c["n"], cfg["seed"], cfg["scale"], cfg["corpus_commit"], mt_text))
-    exes = cfg.get("exes") or {"control": cfg["control_exe"], "treatment": cfg["treatment_exe"],
-                               "alt": cfg["treatment_exe"]}
+    L.append(
+        "- Workload: %d requests per arm (seed %d, scale %.2f, corpus commit `%s`), "
+        "%s, thinking on." % (c["n"], cfg["seed"], cfg["scale"], cfg["corpus_commit"], mt_text)
+    )
+    exes = cfg.get("exes") or {
+        "control": cfg["control_exe"],
+        "treatment": cfg["treatment_exe"],
+        "alt": cfg["treatment_exe"],
+    }
     for a in arms:
         extra = (" with `%s`" % " ".join(cfg.get("alt_extra_flags") or [])) if a == "alt" else ""
         L.append("- %s: `%s`%s - %s" % (LABEL[a], exes[a], extra, server_row(A[a])))
-    L.append("- Total benchmark time including model loads: %.1f min.\n"
-             % (cfg.get("total_seconds", 0) / 60))
+    L.append("- Total benchmark time including model loads: %.1f min.\n" % (cfg.get("total_seconds", 0) / 60))
     problems = []
     for a in arms:
         if ms[a]["n_failed"]:
-            problems.append("%s: %d workload request(s) have no request_done record"
-                            % (a, ms[a]["n_failed"]))
+            problems.append("%s: %d workload request(s) have no request_done record" % (a, ms[a]["n_failed"]))
         if ms[a]["context_guards"]:
-            problems.append("%s: the client context guard fired %d time(s)"
-                            % (a, ms[a]["context_guards"]))
+            problems.append("%s: the client context guard fired %d time(s)" % (a, ms[a]["context_guards"]))
         if A[a]["meta"].get("serve_alive_at_end") is False:
             problems.append("%s: the serve had exited before the workload ended" % a)
         if ms[a]["foreign_gpu_processes"]:
-            problems.append("%s: %d foreign GPU process(es) ran during the arm (arm.json)"
-                            % (a, ms[a]["foreign_gpu_processes"]))
+            problems.append(
+                "%s: %d foreign GPU process(es) ran during the arm (arm.json)" % (a, ms[a]["foreign_gpu_processes"])
+            )
         if ms[a]["log_check"]["mismatched"]:
-            problems.append("%s: %d serve.log line(s) disagree with the request log"
-                            % (a, ms[a]["log_check"]["mismatched"]))
+            problems.append(
+                "%s: %d serve.log line(s) disagree with the request log" % (a, ms[a]["log_check"]["mismatched"])
+            )
     if problems:
         L.append("**Validity warnings:** " + "; ".join(problems) + "\n")
 
@@ -943,96 +1272,140 @@ def main(argv):
     L.append("## Headline\n")
     L.append(headline(arms, ms) + "\n")
     L.append("How to read it:\n")
-    L.append("- Every row compares the same logical requests: the client tags each one with a "
-             "seed that is identical in every arm. Observations (tool results, user messages, "
-             "summaries) are byte-identical; assistant turns are each arm's own output fed back, "
-             "as an agent client does, so prompt totals differ slightly (tokens: %s)."
-             % per_arm(lambda m: m["prompt_tokens"], ntok))
-    lanes = (((A[arms[0]]["start"] or {}).get("engine") or {}).get("max_concurrency")
-             if linux else 2)
-    L.append("- TTFT includes queueing behind other sessions (the serve runs %s lane(s) and up to "
-             "8 requests are in flight). Average queue wait (s): %s; average TTFT without queue "
-             "wait (s): %s."
-             % (lanes, per_arm(lambda m: m["queue_mean"], f1),
-                per_arm(lambda m: m["service_ttft_mean"], f2)))
-    L.append("- Continuing-session turns (%d) are tool-loop turns, retries, the post-idle and "
-             "post-history-edit turns: cache retention decides their TTFT. New long prompts (%d) "
-             "are resumed sessions, compaction and loop-check calls: prefill speed decides theirs."
-             % (c["n_cont"], c["n_new"]))
-    L.append("- \"No cache hit\" prefill rates are token-weighted (total prefilled tokens / "
-             "total prefill time) over the %d requests that had no cache hit in *every* arm and "
-             "prefilled at least 4,096 tokens (%d of them 32K+; per-request table below). The "
-             "per-request median (tok/s) is %s: most of those requests are ~11-17K subagent "
-             "prompts, where the prompt-attention kernel matters least."
-             % (c["n_cold"], c["n_cold_big"], per_arm(lambda m: m["cold_prefill_median"], ntok)))
-    L.append("- Output tok/s is decode tokens the server committed per second of the engine's "
-             "own decode time (device wait plus host work of decode rounds, from the serve's "
-             "~5 s throughput records), so prefill chunks and idle time do not dilute it. The "
-             "one- and two-request rows use only the records in which every decode round ran "
-             "that many requests (seconds of decode time, one / two requests: %s), so a build's "
-             "batching mix cannot move them; the *all* row is every decode record at the batching "
-             "the run produced (mean decode batch: %s). Brackets are 95 %% block-bootstrap "
-             "intervals over ~30 s stretches of decoding."
-             % (per_arm(lambda m: "%s / %s" % (f1(m["decode"]["one"]["seconds"]),
-                                               f1(m["decode"]["two"]["seconds"]))),
-                per_arm(lambda m: m["decode"]["mean_decode_batch"], f2)))
-    L.append("- Output tok/s = decode rounds/s x tokens per round. Rounds/s is the engine's own "
-             "speed and barely moves with the text; tokens per round is speculative acceptance, "
-             "which moves with what the model happened to write (file copies accept far more than "
-             "fresh reasoning), so it carries most of the interval on output tok/s. Compare "
-             "rounds/s for kernel and host speed, and tokens per round for drafting; each arm "
-             "samples its own text, so acceptance differs between runs as well as builds. Tokens "
-             "per request-round with two requests decoding: %s. Per-request completion / decode "
-             "wall time (tok/s: %s; file-writing turns: %s) is what one stream saw, including "
-             "other lanes' batching and prefill chunks."
-             % (per_arm(lambda m: m["decode"]["two"]["tokens_per_row_round"]["value"], f2),
-                per_arm(lambda m: m["output_tps"], ntok),
-                per_arm(lambda m: m["output_tps_copy"], ntok)))
-    L.append("- Output volume differs because the sampled text does: completion tokens %s "
-             "(thinking: %s); turns that used the whole thinking budget: %s (ngram copies "
-             "supplied %s of those turns' tokens; a high share signals repetitive thinking). "
-             "Longer outputs hold more KV and add batching, so they also shift cache pressure "
-             "and queueing; compare repeated runs before attributing a thinking-length "
-             "difference to a build."
-             % (per_arm(lambda m: m["completion_tokens"], ntok),
-                per_arm(lambda m: m["thinking_tokens"], ntok)
-                if any(ms[a]["thinking_tokens"] for a in arms) else
-                "not counted by these serves without a thinking budget; reasoning characters "
-                "streamed to the client: " + per_arm(lambda m: m["reasoning_chars"], ntok),
-                per_arm(lambda m: m["thinking_budget_hits"]),
-                per_arm(lambda m: "%s of %s" % (ntok(m["budget_hit_ngram"]),
-                                                ntok(m["budget_hit_tokens"])))))
+    L.append(
+        "- Every row compares the same logical requests: the client tags each one with a "
+        "seed that is identical in every arm. Observations (tool results, user messages, "
+        "summaries) are byte-identical; assistant turns are each arm's own output fed back, "
+        "as an agent client does, so prompt totals differ slightly (tokens: %s)."
+        % per_arm(lambda m: m["prompt_tokens"], ntok)
+    )
+    lanes = ((A[arms[0]]["start"] or {}).get("engine") or {}).get("max_concurrency") if linux else 2
+    L.append(
+        "- TTFT includes queueing behind other sessions (the serve runs %s lane(s) and up to "
+        "8 requests are in flight). Average queue wait (s): %s; average TTFT without queue "
+        "wait (s): %s." % (lanes, per_arm(lambda m: m["queue_mean"], f1), per_arm(lambda m: m["service_ttft_mean"], f2))
+    )
+    L.append(
+        "- Continuing-session turns (%d) are tool-loop turns, retries, the post-idle and "
+        "post-history-edit turns: cache retention decides their TTFT. New long prompts (%d) "
+        "are resumed sessions, compaction and loop-check calls: prefill speed decides theirs."
+        % (c["n_cont"], c["n_new"])
+    )
+    L.append(
+        '- "No cache hit" prefill rates are token-weighted (total prefilled tokens / '
+        "total prefill time) over the %d requests that had no cache hit in *every* arm and "
+        "prefilled at least 4,096 tokens (%d of them 32K+; per-request table below). The "
+        "per-request median (tok/s) is %s: most of those requests are ~11-17K subagent "
+        "prompts, where the prompt-attention kernel matters least."
+        % (c["n_cold"], c["n_cold_big"], per_arm(lambda m: m["cold_prefill_median"], ntok))
+    )
+    L.append(
+        "- Output tok/s is decode tokens the server committed per second of the engine's "
+        "own decode time (device wait plus host work of decode rounds, from the serve's "
+        "~5 s throughput records), so prefill chunks and idle time do not dilute it. The "
+        "one- and two-request rows use only the records in which every decode round ran "
+        "that many requests (seconds of decode time, one / two requests: %s), so a build's "
+        "batching mix cannot move them; the *all* row is every decode record at the batching "
+        "the run produced (mean decode batch: %s). Brackets are 95 %% block-bootstrap "
+        "intervals over ~30 s stretches of decoding."
+        % (
+            per_arm(lambda m: "%s / %s" % (f1(m["decode"]["one"]["seconds"]), f1(m["decode"]["two"]["seconds"]))),
+            per_arm(lambda m: m["decode"]["mean_decode_batch"], f2),
+        )
+    )
+    L.append(
+        "- Output tok/s = decode rounds/s x tokens per round. Rounds/s is the engine's own "
+        "speed and barely moves with the text; tokens per round is speculative acceptance, "
+        "which moves with what the model happened to write (file copies accept far more than "
+        "fresh reasoning), so it carries most of the interval on output tok/s. Compare "
+        "rounds/s for kernel and host speed, and tokens per round for drafting; each arm "
+        "samples its own text, so acceptance differs between runs as well as builds. Tokens "
+        "per request-round with two requests decoding: %s. Per-request completion / decode "
+        "wall time (tok/s: %s; file-writing turns: %s) is what one stream saw, including "
+        "other lanes' batching and prefill chunks."
+        % (
+            per_arm(lambda m: m["decode"]["two"]["tokens_per_row_round"]["value"], f2),
+            per_arm(lambda m: m["output_tps"], ntok),
+            per_arm(lambda m: m["output_tps_copy"], ntok),
+        )
+    )
+    L.append(
+        "- Output volume differs because the sampled text does: completion tokens %s "
+        "(thinking: %s); turns that used the whole thinking budget: %s (ngram copies "
+        "supplied %s of those turns' tokens; a high share signals repetitive thinking). "
+        "Longer outputs hold more KV and add batching, so they also shift cache pressure "
+        "and queueing; compare repeated runs before attributing a thinking-length "
+        "difference to a build."
+        % (
+            per_arm(lambda m: m["completion_tokens"], ntok),
+            per_arm(lambda m: m["thinking_tokens"], ntok)
+            if any(ms[a]["thinking_tokens"] for a in arms)
+            else "not counted by these serves without a thinking budget; reasoning characters "
+            "streamed to the client: " + per_arm(lambda m: m["reasoning_chars"], ntok),
+            per_arm(lambda m: m["thinking_budget_hits"]),
+            per_arm(lambda m: "%s of %s" % (ntok(m["budget_hit_ngram"]), ntok(m["budget_hit_tokens"]))),
+        )
+    )
     if any(ms[a]["ngram_drafted"] for a in arms):
         ngram = "Ngram drafting accepted %s." % per_arm(
             lambda m: "%s of %s drafted tokens (%s of output)"
-            % (ntok(m["ngram_accepted"]), ntok(m["ngram_drafted"]),
-               ppct(m["ngram_accepted"] / max(1, m["completion_tokens"]))))
+            % (
+                ntok(m["ngram_accepted"]),
+                ntok(m["ngram_drafted"]),
+                ppct(m["ngram_accepted"] / max(1, m["completion_tokens"])),
+            )
+        )
     else:
         ngram = "Ngram drafting: not available (no ngram drafter in these builds)."
-    L.append("- Speculative acceptance of drafted tokens: %s. %s"
-             % (per_arm(lambda m: m["spec_accept"], ppct), ngram))
-    L.append("- Scripted retries (the user retry and the retry after the abort): %s; scripted "
-             "aborts: %s; client errors (connection, HTTP): %s; workload requests without a "
-             "request_done record: %s."
-             % (per_arm(lambda m: m["n_retry"]), per_arm(lambda m: m["n_aborted"]),
-                per_arm(lambda m: m["n_client_errors"]), per_arm(lambda m: m["n_failed"])))
-    L.append("- serve.log cross-check (`req#N done` lines against request_done records: prompt, "
-             "output and cached tokens, speculative accepted/drafted, TTFT within the log's "
-             "rounding): %s."
-             % per_arm(lambda m: "%d of %d agree (%d lines, max TTFT gap %.3f s)"
-                       % (m["log_check"]["matched"], m["log_check"]["records"],
-                          m["log_check"]["log_lines"], m["log_check"]["max_ttft_diff_s"])))
+    L.append("- Speculative acceptance of drafted tokens: %s. %s" % (per_arm(lambda m: m["spec_accept"], ppct), ngram))
+    L.append(
+        "- Scripted retries (the user retry and the retry after the abort): %s; scripted "
+        "aborts: %s; client errors (connection, HTTP): %s; workload requests without a "
+        "request_done record: %s."
+        % (
+            per_arm(lambda m: m["n_retry"]),
+            per_arm(lambda m: m["n_aborted"]),
+            per_arm(lambda m: m["n_client_errors"]),
+            per_arm(lambda m: m["n_failed"]),
+        )
+    )
+    L.append(
+        "- serve.log cross-check (`req#N done` lines against request_done records: prompt, "
+        "output and cached tokens, speculative accepted/drafted, TTFT within the log's "
+        "rounding): %s."
+        % per_arm(
+            lambda m: "%d of %d agree (%d lines, max TTFT gap %.3f s)"
+            % (
+                m["log_check"]["matched"],
+                m["log_check"]["records"],
+                m["log_check"]["log_lines"],
+                m["log_check"]["max_ttft_diff_s"],
+            )
+        )
+    )
     if linux:
-        L.append("- Serve load time to /health (s): %s."
-                 % per_arm(lambda m: m["load_seconds"], f1))
+        L.append("- Serve load time to /health (s): %s." % per_arm(lambda m: m["load_seconds"], f1))
     L.append("")
+    L.append("## Agentic output and tool measurements\n")
+    L.append(
+        "Headline tool latency comparisons use only the %d logical requests with tool "
+        "readiness observed in every arm. The tables below keep each arm's full distribution "
+        "and coverage, including requests excluded from that comparison.\n" % len(tool_seeds)
+    )
+    for a in arms:
+        L.append("### %s\n\n%s\n" % (LABEL[a], agentic_table(ms[a]["agentic"])))
     L.append("## Phases\n")
     L.append("| Phase | What runs | %s |" % " | ".join("%s (min)" % SHORT[a] for a in arms))
     L.append("|---|---|" + "---|" * len(arms))
     for name, _, _, doc in PHASES:
-        L.append("| %s | %s | %s |" % (name, doc, " | ".join(
-            f2(None if ms[a]["phases"].get(name) is None else ms[a]["phases"][name] / 60)
-            for a in arms)))
+        L.append(
+            "| %s | %s | %s |"
+            % (
+                name,
+                doc,
+                " | ".join(f2(None if ms[a]["phases"].get(name) is None else ms[a]["phases"][name] / 60) for a in arms),
+            )
+        )
     L.append("")
     L.append("## Prefill on requests with no cache hit\n")
     L.append(cold_table(arms, A, cold) + "\n")
@@ -1046,13 +1419,17 @@ def main(argv):
     L.append("## Launch parameters\n")
     for a in arms:
         if linux:
-            L.append("%s: `%s`\n\n```text\n%s\n```\n"
-                     % (LABEL[a], exes[a], flag_str(cfg.get(a + "_flags", []))))
+            L.append("%s: `%s`\n\n```text\n%s\n```\n" % (LABEL[a], exes[a], flag_str(cfg.get(a + "_flags", []))))
         elif a == "control":
-            L.append("%s (fork-only flags dropped: %s; the fork's `--host-cache-mib` is replaced "
-                     "by the explicit host-cache flags it resolved to):\n\n```text\n%s\n```\n"
-                     % (LABEL[a], ", ".join("`%s`" % d for d in cfg.get("dropped_for_control", [])),
-                        flag_str(cfg.get("control_flags", []))))
+            L.append(
+                "%s (fork-only flags dropped: %s; the fork's `--host-cache-mib` is replaced "
+                "by the explicit host-cache flags it resolved to):\n\n```text\n%s\n```\n"
+                % (
+                    LABEL[a],
+                    ", ".join("`%s`" % d for d in cfg.get("dropped_for_control", [])),
+                    flag_str(cfg.get("control_flags", [])),
+                )
+            )
         else:
             L.append("%s:\n\n```text\n%s\n```\n" % (LABEL[a], flag_str(cfg.get(a + "_flags", []))))
     L.append("## Per-request detail\n")

@@ -32,7 +32,8 @@ std::vector<double> sigmoid_mul_oracle(const std::vector<float>& gate,
     return expected;
 }
 
-int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed, bool graph = false) {
+int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::uint32_t seed,
+             bool graph = false) {
     const std::size_t count = static_cast<std::size_t>(rows) * columns;
     std::vector<float> gate(count), x(count);
     fill_uniform(gate, seed, -12.0f, 12.0f);
@@ -64,7 +65,7 @@ int run_case(const char* label, std::int32_t rows, std::int32_t columns, std::ui
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
             CUDA_CHECK(cudaMemcpyAsync(device_x.data(), x_bits.data(), device_x.bytes(),
-                cudaMemcpyHostToDevice, stream));
+                                       cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }

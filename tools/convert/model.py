@@ -43,14 +43,10 @@ class Model:
         if parameter.name in self.parameters:
             raise ValueError(f"duplicate logical parameter {parameter.name}")
         if parameter.source.shape != parameter.shape:
-            raise ValueError(
-                f"{parameter.name}: source shape differs from logical parameter"
-            )
+            raise ValueError(f"{parameter.name}: source shape differs from logical parameter")
         self.parameters[parameter.name] = parameter
 
-    def source(
-        self, parameter: str, store: SafetensorsSource, format: str | None = None
-    ) -> LogicalSource:
+    def source(self, parameter: str, store: SafetensorsSource, format: str | None = None) -> LogicalSource:
         item = self.parameters[parameter]
         if item.source_factory is None:
             raise ValueError(f"{parameter}: provide an explicit logical source")

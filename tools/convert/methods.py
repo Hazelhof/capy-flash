@@ -68,9 +68,7 @@ class PrepareRequest:
     parameters: Mapping[str, object]
     device: str = "cuda"
     rows_per_chunk: int = 512
-    auxiliary_overrides: Mapping[AuxiliaryKey, AuxiliaryValue] = field(
-        default_factory=dict
-    )
+    auxiliary_overrides: Mapping[AuxiliaryKey, AuxiliaryValue] = field(default_factory=dict)
     source_offsets: tuple[int, ...] = field(init=False)
     # Parent row where each input starts, when every input is a complete row block of the parent;
     # None otherwise, and encoded_rows then names the first input that is not.
@@ -129,9 +127,7 @@ class PrepareRequest:
             for item in self.inputs:
                 shape = item.source.shape
                 if len(shape) != 2 or shape[1] != self.target.shape[1]:
-                    raise ValueError(
-                        f"{item.parameter}: encoded grouping requires complete rows"
-                    )
+                    raise ValueError(f"{item.parameter}: encoded grouping requires complete rows")
         if not 0 <= begin < end <= offsets[-1]:
             raise ValueError("encoded method input range is invalid")
         pieces = []
@@ -148,10 +144,7 @@ class PrepareRequest:
                 pieces.append(item.source.read_encoded(low - cursor, high - cursor))
             index += 1
         first = pieces[0]
-        if any(
-            (p.format, p.weight_divisor) != (first.format, first.weight_divisor)
-            for p in pieces
-        ):
+        if any((p.format, p.weight_divisor) != (first.format, first.weight_divisor) for p in pieces):
             raise ValueError("encoded inputs cannot share one parent format/divisor")
         if len(pieces) == 1:
             return first
@@ -169,15 +162,9 @@ _DIRECT_DTYPES = {"bf16": torch.bfloat16, "fp32": torch.float32, "int32": torch.
 
 def _preflight(request: PrepareRequest, *, values: bool = True) -> None:
     if request.parameters:
-        raise ValueError(
-            f"{request.target.id}: this method accepts no numerical parameters"
-        )
-    if prod(request.target.shape) != sum(
-        prod(item.source.shape) for item in request.inputs
-    ):
-        raise ValueError(
-            f"{request.target.id}: parent and logical source counts differ"
-        )
+        raise ValueError(f"{request.target.id}: this method accepts no numerical parameters")
+    if prod(request.target.shape) != sum(prod(item.source.shape) for item in request.inputs):
+        raise ValueError(f"{request.target.id}: parent and logical source counts differ")
     if type(request.rows_per_chunk) is not int or request.rows_per_chunk <= 0:
         raise ValueError("rows_per_chunk must be positive")
     if values:
@@ -191,21 +178,14 @@ def cast_direct(request: PrepareRequest) -> PreparedMethod:
         raise ValueError("cast_direct requires a direct target format")
     _preflight(request)
     dtype = _DIRECT_DTYPES[request.target.format]
-    chunk = request.rows_per_chunk * (
-        request.target.shape[-1] if len(request.target.shape) > 1 else 1
-    )
+    chunk = request.rows_per_chunk * (request.target.shape[-1] if len(request.target.shape) > 1 else 1)
     elements = prod(request.target.shape)
 
     def produce(output):
         for begin in range(0, elements, chunk):
             values = request.values(begin, min(elements, begin + chunk))
-            if dtype == torch.int32 and (
-                bool((values < -(1 << 31)).any())
-                or bool((values > (1 << 31) - 1).any())
-            ):
-                raise ValueError(
-                    "int32 conversion source is outside the representable range"
-                )
+            if dtype == torch.int32 and (bool((values < -(1 << 31)).any()) or bool((values > (1 << 31) - 1).any())):
+                raise ValueError("int32 conversion source is outside the representable range")
             values = values.to(dtype=dtype)
             output.write_values(begin, values)
 
@@ -214,10 +194,7 @@ def cast_direct(request: PrepareRequest) -> PreparedMethod:
 
 def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
     """Use the existing grouped max-abs, FP16-scale and code-rounding algorithm."""
-    if (
-        not isinstance(get_format(request.target.format), QuantFormat)
-        or len(request.target.shape) != 2
-    ):
+    if not isinstance(get_format(request.target.format), QuantFormat) or len(request.target.shape) != 2:
         raise ValueError("grouped_absmax requires a grouped-integer matrix target")
     _preflight(request)
     n, k = request.target.shape
@@ -227,12 +204,8 @@ def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
             end = min(n, begin + request.rows_per_chunk)
             values = request.values(begin * k, end * k).reshape(end - begin, k)
             if not values.dtype.is_floating_point:
-                raise TypeError(
-                    "grouped_absmax source must provide floating-point values"
-                )
-            encoded = quantize_matrix(
-                values, request.target.format, device=request.device
-            )
+                raise TypeError("grouped_absmax source must provide floating-point values")
+            encoded = quantize_matrix(values, request.target.format, device=request.device)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)
@@ -248,11 +221,7 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
     def produce(output):
         for begin in range(0, n, request.rows_per_chunk):
             end = min(n, begin + request.rows_per_chunk)
-            values = (
-                request.values(begin * k, end * k)
-                .reshape(end - begin, k)
-                .to(torch.bfloat16)
-            )
+            values = request.values(begin * k, end * k).reshape(end - begin, k).to(torch.bfloat16)
             encoded = quantize_bf16_rows(values)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
@@ -269,10 +238,7 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     (``target.divisors`` > 1, one equal row block per source) keeps every source's divisor, and
     every source's activation divisor stays on that source's own Uses.
     """
-    if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16")
-        or len(request.target.shape) != 2
-    ):
+    if request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16") or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
     _preflight(request, values=False)
     stacked = request.target.divisors > 1
@@ -286,30 +252,22 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
             raise ValueError(f"{item.parameter}: encoded rows are unavailable")
         first = source.read_encoded(0, 1)
         if first.format != request.target.format:
-            raise ValueError(
-                f"{item.parameter}: source {first.format} differs from target {request.target.format}"
-            )
+            raise ValueError(f"{item.parameter}: source {first.format} differs from target {request.target.format}")
         if first.format == "nvfp4":
             if stacked:
                 pass
             elif weight_divisor is None:
                 weight_divisor = first.weight_divisor
             elif first.weight_divisor != weight_divisor:
-                raise ValueError(
-                    "NVFP4 weight divisors differ; choose separate parents or a conversion method"
-                )
+                raise ValueError("NVFP4 weight divisors differ; choose separate parents or a conversion method")
             for parameter, input_name in item.uses:
                 key = (parameter, input_name, "activation_input_divisor")
                 if key in request.auxiliary_overrides:
                     auxiliaries[key] = request.auxiliary_overrides[key]
                 elif request.policies[(parameter, input_name)] == "AllowA4":
                     if source.input_divisor is None:
-                        raise ValueError(
-                            f"{parameter}: supply an activation divisor for AllowA4"
-                        )
-                    auxiliaries[key] = AuxiliaryValue.activation_divisor(
-                        source.input_divisor()
-                    )
+                        raise ValueError(f"{parameter}: supply an activation divisor for AllowA4")
+                    auxiliaries[key] = AuxiliaryValue.activation_divisor(source.input_divisor())
     n, k = request.target.shape
     # Imported words are copied, not computed, so the chunk is sized by bytes: rows_per_chunk
     # alone gives the 160-byte rows of an n-gram table tiny chunks and millions of reads. Chunk
@@ -336,16 +294,12 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
 _NVFP4_MSE_TARGETS = (E2M1_MAX, 5.5, 5.0, 4.5, 4.0)
 
 
-def _nvfp4_quantized(
-    request: PrepareRequest, targets: tuple[float, ...], *, stacked: bool = False
-) -> PreparedMethod:
+def _nvfp4_quantized(request: PrepareRequest, targets: tuple[float, ...], *, stacked: bool = False) -> PreparedMethod:
     if request.target.format != "nvfp4" or len(request.target.shape) != 2:
         raise ValueError("NVFP4 quantization requires an nvfp4 matrix target")
     if stacked:
         if request.target.divisors != len(request.inputs) or request.row_offsets is None:
-            raise ValueError(
-                "stacked NVFP4 quantization stores one divisor per complete source matrix"
-            )
+            raise ValueError("stacked NVFP4 quantization stores one divisor per complete source matrix")
     elif request.target.divisors != 1:
         raise ValueError("NVFP4 quantization writes one divisor per parent")
     _preflight(request)
@@ -363,9 +317,7 @@ def _nvfp4_quantized(
                 )
     rows = max(128, request.rows_per_chunk // 128 * 128)
     # Row blocks quantised against one divisor: the whole parent, or each source of a stack.
-    blocks = (
-        list(zip(request.row_offsets[:-1], request.row_offsets[1:])) if stacked else [(0, n)]
-    )
+    blocks = list(zip(request.row_offsets[:-1], request.row_offsets[1:])) if stacked else [(0, n)]
 
     def produce(output):
         for first, last in blocks:

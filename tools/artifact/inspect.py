@@ -35,12 +35,8 @@ def artifact_summary(artifact: Artifact) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
-    parser.add_argument(
-        "--objects", action="store_true", help="include physical object records"
-    )
-    parser.add_argument(
-        "--bindings", action="store_true", help="include logical bindings and Uses"
-    )
+    parser.add_argument("--objects", action="store_true", help="include physical object records")
+    parser.add_argument("--bindings", action="store_true", help="include logical bindings and Uses")
     parser.add_argument("--json", action="store_true", help="emit one JSON object")
     args = parser.parse_args()
 
@@ -59,13 +55,9 @@ def main() -> None:
         if args.objects:
             for obj in artifact.objects:
                 storage = (
-                    f"{obj.format}/{obj.layout} {list(obj.shape)}"
-                    if isinstance(obj, TensorObject)
-                    else obj.encoding
+                    f"{obj.format}/{obj.layout} {list(obj.shape)}" if isinstance(obj, TensorObject) else obj.encoding
                 )
-                print(
-                    f"{obj.offset:>14} {obj.bytes:>14} {obj.kind:<8} {storage:<42} {obj.id}"
-                )
+                print(f"{obj.offset:>14} {obj.bytes:>14} {obj.kind:<8} {storage:<42} {obj.id}")
         if args.bindings:
             print(
                 json.dumps(

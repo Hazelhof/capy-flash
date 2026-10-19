@@ -52,19 +52,13 @@ def _pack_high_bits(codes: torch.Tensor, bits: int) -> torch.Tensor:
     mask = (1 << bits) - 1
     for begin in range(0, groups, chunk):
         end = min(groups, begin + chunk)
-        upper = ((codes[begin:end].to(torch.int32) & mask) >> 4) & (
-            (1 << high_bits) - 1
-        )
-        unpacked = ((upper.unsqueeze(-1) >> shifts) & 1).reshape(
-            end - begin, bytes_per_group, 8
-        )
+        upper = ((codes[begin:end].to(torch.int32) & mask) >> 4) & ((1 << high_bits) - 1)
+        unpacked = ((upper.unsqueeze(-1) >> shifts) & 1).reshape(end - begin, bytes_per_group, 8)
         out[begin:end] = (unpacked * bit_weights).sum(-1).to(torch.uint8)
     return out
 
 
-def _pack_codes(
-    codes: torch.Tensor, spec: QuantFormat
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _pack_codes(codes: torch.Tensor, spec: QuantFormat) -> tuple[torch.Tensor, torch.Tensor]:
     if spec.bits == 8:
         return (
             codes.contiguous().view(torch.uint8),
@@ -133,10 +127,7 @@ def split_row_planes(
     """Return non-owning plane spans for a consecutive row range."""
 
     if _payload_length(payload) != geometry.payload_bytes:
-        raise ValueError(
-            f"row-split payload has {_payload_length(payload)} bytes, "
-            f"expected {geometry.payload_bytes}"
-        )
+        raise ValueError(f"row-split payload has {_payload_length(payload)} bytes, expected {geometry.payload_bytes}")
     count = geometry.n - row_begin if row_count is None else row_count
     if row_begin < 0 or count <= 0 or row_begin + count > geometry.n:
         raise IndexError("row range is outside the row-split tensor")
@@ -196,11 +187,7 @@ def gather_row_planes(
         def gather(plane: torch.Tensor, row_bytes: int) -> torch.Tensor:
             if row_bytes == 0:
                 return plane[:0]
-            return (
-                plane.reshape(geometry.n, row_bytes)
-                .index_select(0, indices)
-                .reshape(-1)
-            )
+            return plane.reshape(geometry.n, row_bytes).index_select(0, indices).reshape(-1)
 
         assert isinstance(full.base, torch.Tensor)
         assert isinstance(full.high, torch.Tensor)
@@ -220,9 +207,7 @@ def gather_row_planes(
     def gather_bytes(plane: Plane, row_bytes: int) -> bytes:
         if row_bytes == 0:
             return b""
-        return b"".join(
-            plane[index * row_bytes : (index + 1) * row_bytes] for index in indices_list
-        )
+        return b"".join(plane[index * row_bytes : (index + 1) * row_bytes] for index in indices_list)
 
     return RowPlanes(
         gather_bytes(full.base, geometry.base_row_bytes),
@@ -235,18 +220,14 @@ def gather_row_planes(
 def _plane_length(plane: Plane) -> int:
     if isinstance(plane, torch.Tensor):
         if plane.dtype != torch.uint8 or plane.dim() != 1 or not plane.is_contiguous():
-            raise TypeError(
-                "row planes must be contiguous one-dimensional uint8 tensors"
-            )
+            raise TypeError("row planes must be contiguous one-dimensional uint8 tensors")
         return plane.numel()
     return memoryview(plane).nbytes
 
 
 def _validate_planes(planes: RowPlanes, geometry: RowSplitGeometry) -> None:
     if planes.rows != geometry.n:
-        raise ValueError(
-            f"row planes contain {planes.rows} rows, expected {geometry.n}"
-        )
+        raise ValueError(f"row planes contain {planes.rows} rows, expected {geometry.n}")
     actual = (
         _plane_length(planes.base),
         _plane_length(planes.high),
@@ -277,33 +258,20 @@ def assemble_row_planes(
         assert isinstance(planes.base, torch.Tensor)
         assert isinstance(planes.high, torch.Tensor)
         assert isinstance(planes.scale, torch.Tensor)
-        if (
-            planes.high.device != planes.base.device
-            or planes.scale.device != planes.base.device
-        ):
+        if planes.high.device != planes.base.device or planes.scale.device != planes.base.device:
             raise ValueError("tensor row planes must be on the same device")
-        payload = torch.zeros(
-            geometry.payload_bytes, dtype=torch.uint8, device=planes.base.device
-        )
+        payload = torch.zeros(geometry.payload_bytes, dtype=torch.uint8, device=planes.base.device)
         payload[: geometry.base_bytes].copy_(planes.base)
         if geometry.high_bytes:
-            payload[
-                geometry.high_offset : geometry.high_offset + geometry.high_bytes
-            ].copy_(planes.high)
-        payload[
-            geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes
-        ].copy_(planes.scale)
+            payload[geometry.high_offset : geometry.high_offset + geometry.high_bytes].copy_(planes.high)
+        payload[geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes].copy_(planes.scale)
         return payload
 
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.base_bytes] = bytes(planes.base)
     if geometry.high_bytes:
-        payload[geometry.high_offset : geometry.high_offset + geometry.high_bytes] = (
-            bytes(planes.high)
-        )
-    payload[geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes] = (
-        bytes(planes.scale)
-    )
+        payload[geometry.high_offset : geometry.high_offset + geometry.high_bytes] = bytes(planes.high)
+    payload[geometry.scale_offset : geometry.scale_offset + geometry.scale_bytes] = bytes(planes.scale)
     return bytes(payload)
 
 
@@ -332,10 +300,7 @@ def _planes_on_device(
             source.rows,
         )
     if _payload_length(source) != geometry.payload_bytes:
-        raise ValueError(
-            f"row-split payload has {_payload_length(source)} bytes, "
-            f"expected {geometry.payload_bytes}"
-        )
+        raise ValueError(f"row-split payload has {_payload_length(source)} bytes, expected {geometry.payload_bytes}")
     resident = _payload_tensor(source, device)
     return split_row_planes(resident, geometry)
 
@@ -347,17 +312,11 @@ def _high_indices(
     bits: int,
     group_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    device = (
-        torch.device(device_type)
-        if device_index is None
-        else torch.device(device_type, device_index)
-    )
+    device = torch.device(device_type) if device_index is None else torch.device(device_type, device_index)
     if bits in (4, 8):
         empty = torch.empty(0, dtype=torch.long, device=device)
         return empty, empty
-    bit_positions = torch.arange(group_size, device=device, dtype=torch.long) * (
-        bits - 4
-    )
+    bit_positions = torch.arange(group_size, device=device, dtype=torch.long) * (bits - 4)
     return bit_positions // 8, bit_positions % 8
 
 
@@ -370,38 +329,26 @@ def _unpack_codes(
     assert isinstance(planes.high, torch.Tensor)
     assert isinstance(planes.scale, torch.Tensor)
     groups = geometry.n * geometry.groups_per_row
-    scales = planes.scale.view(torch.float16).reshape(
-        geometry.n, geometry.groups_per_row
-    )
+    scales = planes.scale.view(torch.float16).reshape(geometry.n, geometry.groups_per_row)
     if spec.bits == 8:
-        codes = planes.base.view(torch.int8).reshape(
-            geometry.n, geometry.groups_per_row, spec.group_size
-        )
+        codes = planes.base.view(torch.int8).reshape(geometry.n, geometry.groups_per_row, spec.group_size)
         return scales, codes
     packed = planes.base.reshape(groups, geometry.base_bytes_per_group).to(torch.int16)
-    low = torch.empty(
-        (groups, spec.group_size), dtype=torch.int16, device=packed.device
-    )
+    low = torch.empty((groups, spec.group_size), dtype=torch.int16, device=packed.device)
     low[:, 0::2] = packed & 0x0F
     low[:, 1::2] = (packed >> 4) & 0x0F
     if spec.bits == 4:
         unsigned = low
     else:
-        byte_indices, shifts = _high_indices(
-            packed.device.type, packed.device.index, spec.bits, spec.group_size
-        )
+        byte_indices, shifts = _high_indices(packed.device.type, packed.device.index, spec.bits, spec.group_size)
         high = (
-            planes.high.reshape(groups, geometry.high_bytes_per_group)
-            .index_select(1, byte_indices)
-            .to(torch.int16)
+            planes.high.reshape(groups, geometry.high_bytes_per_group).index_select(1, byte_indices).to(torch.int16)
             >> shifts
         ) & ((1 << (spec.bits - 4)) - 1)
         unsigned = low | (high << 4)
     sign = 1 << (spec.bits - 1)
     codes = torch.where((unsigned & sign) != 0, unsigned - (1 << spec.bits), unsigned)
-    return scales, codes.to(torch.int8).reshape(
-        geometry.n, geometry.groups_per_row, spec.group_size
-    )
+    return scales, codes.to(torch.int8).reshape(geometry.n, geometry.groups_per_row, spec.group_size)
 
 
 def decode_row_split_codes(
@@ -432,9 +379,7 @@ def _scales(scale: torch.Tensor) -> torch.Tensor:
 
 def _low_g64(base: torch.Tensor, groups: int) -> torch.Tensor:
     packed = base.reshape(groups, 32).to(torch.int16)
-    return torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1).reshape(
-        groups, 64
-    )
+    return torch.stack((packed & 0x0F, (packed >> 4) & 0x0F), dim=-1).reshape(groups, 64)
 
 
 def _dequant4(base, _high, scale, _byte_indices, _shifts):
@@ -447,9 +392,7 @@ def _dequant4(base, _high, scale, _byte_indices, _shifts):
 def _dequant5(base, high, scale, byte_indices, shifts):
     scales = _scales(scale)
     groups = scales.numel()
-    upper = (
-        high.reshape(groups, 8).index_select(1, byte_indices).to(torch.int16) >> shifts
-    ) & 1
+    upper = (high.reshape(groups, 8).index_select(1, byte_indices).to(torch.int16) >> shifts) & 1
     unsigned = _low_g64(base, groups) | (upper << 4)
     codes = torch.where((unsigned & 16) != 0, unsigned - 32, unsigned).float()
     return (codes * scales).to(torch.bfloat16)
@@ -458,9 +401,7 @@ def _dequant5(base, high, scale, byte_indices, shifts):
 def _dequant6(base, high, scale, byte_indices, shifts):
     scales = _scales(scale)
     groups = scales.numel()
-    upper = (
-        high.reshape(groups, 16).index_select(1, byte_indices).to(torch.int16) >> shifts
-    ) & 3
+    upper = (high.reshape(groups, 16).index_select(1, byte_indices).to(torch.int16) >> shifts) & 3
     unsigned = _low_g64(base, groups) | (upper << 4)
     codes = torch.where((unsigned & 32) != 0, unsigned - 64, unsigned).float()
     return (codes * scales).to(torch.bfloat16)
@@ -505,23 +446,17 @@ def dequantize_row_split(
     target = torch.device(device)
     planes = _planes_on_device(source, geometry, target)
     if dtype == torch.bfloat16:
-        byte_indices, shifts = _high_indices(
-            target.type, target.index, spec.bits, spec.group_size
-        )
+        byte_indices, shifts = _high_indices(target.type, target.index, spec.bits, spec.group_size)
         function = (
-            _compiled_dequantizer(spec.bits)
-            if compiled and target.type == "cuda"
-            else _EAGER_DEQUANTIZERS[spec.bits]
+            _compiled_dequantizer(spec.bits) if compiled and target.type == "cuda" else _EAGER_DEQUANTIZERS[spec.bits]
         )
         assert isinstance(planes.base, torch.Tensor)
         assert isinstance(planes.high, torch.Tensor)
         assert isinstance(planes.scale, torch.Tensor)
-        physical = function(
-            planes.base, planes.high, planes.scale, byte_indices, shifts
-        ).reshape(geometry.n, geometry.k_pad)
+        physical = function(planes.base, planes.high, planes.scale, byte_indices, shifts).reshape(
+            geometry.n, geometry.k_pad
+        )
         return physical[:, : geometry.k]
     scales, codes = _unpack_codes(planes, spec, geometry)
-    physical = (codes.float() * scales.float().unsqueeze(-1)).reshape(
-        geometry.n, geometry.k_pad
-    )
+    physical = (codes.float() * scales.float().unsqueeze(-1)).reshape(geometry.n, geometry.k_pad)
     return physical[:, : geometry.k].to(dtype)

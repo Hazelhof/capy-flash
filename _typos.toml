@@ -1,0 +1,31 @@
+# typos (crate-ci/typos): spelling of code, comments and docs. Data that is text on purpose (benchmark corpora,
+# multilingual prompts, recorded sessions) is excluded; short identifiers of the kernels are allowed.
+[files]
+extend-exclude = [
+  "third_party/",
+  "eval/corpora/",
+  "bench/fixtures/",
+  "examples/cli/messages/",
+  "bench/capy_flash/sessions.json",
+  "bench/vllm_tp_partial_sums/scripts/make_texts.py",
+]
+
+[default.extend-words]
+# kernel and test identifiers
+rin = "rin"        # row index
+dout = "dout"      # output gradient / output dimension
+tpos = "tpos"      # token position
+thr = "thr"        # thread
+alog = "alog"      # A_log of the gated delta net
+ot = "ot"          # output tile
+nd = "nd"          # n-dimensional
+ba = "ba"          # B x A product
+ue = "ue"          # upper exponent
+arange = "arange"  # torch/numpy arange
+subtiles = "subtiles"
+ser = "ser"
+mis = "mis"        # mis-sized
+thi = "thi"        # truncated tag in a parser test
+
+[default.extend-identifiers]
+cudaMemcpy3DParms = "cudaMemcpy3DParms"  # CUDA API

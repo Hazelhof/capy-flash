@@ -49,11 +49,7 @@ class StderrProgress:
 
     def _line(self, stage: str, occurred_ns: int, fields: dict[str, Any]) -> None:
         elapsed_seconds = max(0.0, (occurred_ns - self._started_ns) / 1e9)
-        details = " ".join(
-            f"{name}={self._value(value)}"
-            for name, value in fields.items()
-            if value is not None
-        )
+        details = " ".join(f"{name}={self._value(value)}" for name, value in fields.items() if value is not None)
         suffix = f" {details}" if details else ""
         try:
             print(
@@ -74,10 +70,7 @@ class StderrProgress:
                 item = self._events.get(timeout=self._heartbeat_seconds)
             except queue.Empty:
                 now = time.perf_counter_ns()
-                active_text = [
-                    f"{key}:{stage}"
-                    for key, (stage, _) in sorted(active.items())
-                ]
+                active_text = [f"{key}:{stage}" for key, (stage, _) in sorted(active.items())]
                 self._line(
                     "heartbeat",
                     now,

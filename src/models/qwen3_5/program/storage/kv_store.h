@@ -776,6 +776,35 @@ public:
         return release_reference(handle, page.writer_references != 0);
     }
 
+    // v0.6 (idle KV to the Host): packs the Device replicas into the lowest physical pages, so
+    // an elastic backing can shrink to the pages still in use. Content, epochs and references
+    // are unchanged; replicas pinned by an open transfer stay where they are. The caller
+    // republishes the execution rows of every active address before the next launch
+    // (KVAddressSpaceStore::republish_active). Returns the number of replicas moved.
+    std::uint32_t compact_device_replicas(cudaStream_t stream) {
+        DeviceKVPagePool& pool        = *physical_;
+        const std::uint32_t allocated = pool.allocated_pages();
+        std::vector<std::pair<std::int32_t, DeviceKVPageLease*>> movable;
+        for (Page& page : pages_) {
+            if (!page.occupied || !page.device_replica || page.pending_device_replica ||
+                page.destination_pinned) {
+                continue;
+            }
+            const std::int32_t index = pool.page_index(page.device_replica->handle());
+            if (index >= static_cast<std::int32_t>(allocated)) {
+                movable.emplace_back(index, &*page.device_replica);
+            }
+        }
+        if (movable.empty()) { return 0; }
+        // Ascending: the pages above the packed extent fill the holes below it in order.
+        std::sort(movable.begin(), movable.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<DeviceKVPageLease*> leases;
+        leases.reserve(movable.size());
+        for (const auto& entry : movable) { leases.push_back(entry.second); }
+        return pool.relocate_lower(leases, stream);
+    }
+
 private:
     struct Page {
         std::uint32_t generation        = 1;
@@ -1842,6 +1871,18 @@ private:
         return memberships_[index * page_capacity_ + page];
     }
 
+public:
+    // Republishes the execution row of every active address (after
+    // LogicalKVPageStore::compact_device_replicas moved physical pages).
+    void republish_active(cudaStream_t stream) {
+        for (const Address& address : addresses_) {
+            if (address.occupied && address.active && address.row) {
+                publish_membership(address, stream);
+            }
+        }
+    }
+
+private:
     void publish_membership(const Address& address, cudaStream_t stream) {
         if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
         publish_scratch_.clear();

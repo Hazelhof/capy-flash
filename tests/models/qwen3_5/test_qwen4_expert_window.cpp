@@ -24,22 +24,26 @@ public:
 
     void run(std::int32_t, const Qwen4ExpertBank&, const Tensor&, const Tensor&, const Tensor&,
              Tensor&, WorkspaceArena&, cudaStream_t) override {}
+
     [[nodiscard]] bool graph_capturable() const noexcept override { return true; }
 
     void begin_window(cudaStream_t, Qwen4Window) override {
         if (open) { throw std::logic_error("window already open"); }
         open = true;
     }
+
     void observe_window(cudaStream_t) override {
         if (!open) { throw std::logic_error("no open window"); }
         if (fail == Step::Observe) { throw std::runtime_error("observe failed"); }
     }
+
     void end_window(cudaStream_t) override {
         if (!open) { throw std::logic_error("no open window"); }
         open = false; // as Qwen4OffloadExperts: closed first, then a failure is reported
         ++ends;
         if (fail == Step::End) { throw std::runtime_error("end failed"); }
     }
+
     void abandon_window(cudaStream_t) noexcept override {
         if (open) { ++abandons; }
         open = false;
@@ -47,6 +51,7 @@ public:
 };
 
 int failures = 0;
+
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::cerr << "FAIL: " << what << '\n';

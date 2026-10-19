@@ -78,14 +78,22 @@ Options parse(int argc, char** argv) {
         }
         if (++i >= argc) throw std::invalid_argument("missing option value");
         const std::string value = argv[i];
-        if (arg == "--tokens") o.tokens = int_list(value);
-        else if (arg == "--resident") o.resident = int_list(value);
-        else if (arg == "--fill") o.fills = str_list(value);
-        else if (arg == "--pool") o.pool = std::stoi(value);
-        else if (arg == "--calls") o.calls = std::stoi(value);
-        else if (arg == "--warmup") o.warmup = std::stoi(value);
-        else if (arg == "--repeat") o.repeat = std::stoi(value);
-        else throw std::invalid_argument("unknown option: " + arg);
+        if (arg == "--tokens")
+            o.tokens = int_list(value);
+        else if (arg == "--resident")
+            o.resident = int_list(value);
+        else if (arg == "--fill")
+            o.fills = str_list(value);
+        else if (arg == "--pool")
+            o.pool = std::stoi(value);
+        else if (arg == "--calls")
+            o.calls = std::stoi(value);
+        else if (arg == "--warmup")
+            o.warmup = std::stoi(value);
+        else if (arg == "--repeat")
+            o.repeat = std::stoi(value);
+        else
+            throw std::invalid_argument("unknown option: " + arg);
     }
     return o;
 }
@@ -110,7 +118,7 @@ CallData make_call(int tokens, int resident, bool reuse, int pool, std::mt19937&
     c.ids.assign(static_cast<std::size_t>(tokens) * kK, -1);
     std::vector<int> fill(tokens, 0);
     for (int j = 0; j < resident; ++j) {
-        const int t                 = j % tokens;
+        const int t               = j % tokens;
         c.ids[t * kK + fill[t]++] = ids[j];
     }
     int next_missing = resident;
@@ -142,13 +150,14 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
         // slot pool, one array per plane: random codes, scale words 0x38 (1.0)
-        const std::int64_t plane[4] = {
-            ops::kMoeSlotsGateUpCodeBytes, ops::kMoeSlotsGateUpScaleBytes,
-            ops::kMoeSlotsDownCodeBytes, ops::kMoeSlotsDownScaleBytes};
+        const std::int64_t plane[4] = {ops::kMoeSlotsGateUpCodeBytes,
+                                       ops::kMoeSlotsGateUpScaleBytes, ops::kMoeSlotsDownCodeBytes,
+                                       ops::kMoeSlotsDownScaleBytes};
         std::vector<DeviceBuffer> planes;
         for (int q = 0; q < 4; ++q) {
             const std::size_t bytes = static_cast<std::size_t>(plane[q]) * o.pool;
-            if (q % 2 == 0) planes.push_back(bench::make_bf16(bytes / 2, 31U + q, -3.0F, 3.0F));
+            if (q % 2 == 0)
+                planes.push_back(bench::make_bf16(bytes / 2, 31U + q, -3.0F, 3.0F));
             else {
                 planes.emplace_back(bytes);
                 planes.back().fill(0x38);
@@ -160,10 +169,10 @@ int main(int argc, char** argv) {
         pool.down_codes     = {planes[2].p, plane[2]};
         pool.down_scales    = {planes[3].p, plane[3]};
         pool.slots          = o.pool;
-        DeviceBuffer div13 = bench::make_f32(2 * kE, 41U, 400.0F, 600.0F);
-        DeviceBuffer div2  = bench::make_f32(kE, 42U, 400.0F, 600.0F);
-        DeviceBuffer x     = bench::make_bf16(
-            static_cast<std::size_t>(ops::kMoeSlotsMaxTokens) * kH, 43U, -2.0F, 2.0F);
+        DeviceBuffer div13  = bench::make_f32(2 * kE, 41U, 400.0F, 600.0F);
+        DeviceBuffer div2   = bench::make_f32(kE, 42U, 400.0F, 600.0F);
+        DeviceBuffer x = bench::make_bf16(static_cast<std::size_t>(ops::kMoeSlotsMaxTokens) * kH,
+                                          43U, -2.0F, 2.0F);
         DeviceBuffer out(static_cast<std::size_t>(ops::kMoeSlotsMaxTokens) * kH * sizeof(float));
         WorkspaceArena workspace(ops::moe_slots_nvfp4_workspace_bytes(ops::kMoeSlotsMaxTokens));
         std::vector<float> weights(static_cast<std::size_t>(ops::kMoeSlotsMaxTokens) * kK, 0.1F);
@@ -179,6 +188,7 @@ int main(int argc, char** argv) {
             std::string fill;
             int tokens, resident;
         };
+
         std::vector<Point> points;
         if (o.anchors) {
             points = {{"reuse", 1, 10}, {"reuse", 2, 17}, {"reuse", 4, 28}, {"reuse", 8, 42}};

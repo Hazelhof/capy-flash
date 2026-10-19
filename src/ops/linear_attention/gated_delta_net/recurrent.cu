@@ -98,7 +98,8 @@ void launch_recurrent_record_fixed(const Tensor& q, const Tensor& k, const Tenso
         state_slot_stride,
         scale,
     };
-    CUDA_CHECK(pdl::launch_dependent({grid, block, 0, stream}, recurrent_record_kernel<Masked>, access));
+    CUDA_CHECK(
+        pdl::launch_dependent({grid, block, 0, stream}, recurrent_record_kernel<Masked>, access));
 }
 
 template <class Geometry>
@@ -214,8 +215,7 @@ void launch_replay_fold(const GdnReplayRecords& records, LinearAttentionStateAll
                         cudaStream_t stream) {
     if (launch_registered_fold<FoldGeometry48x48, FoldGeometry30x32, FoldGeometry48x24,
                                FoldGeometry36x48, FoldGeometry36x24, FoldGeometry3x48,
-                               FoldGeometry3x24>(
-            records, states, rows, active_rows, stream)) {
+                               FoldGeometry3x24>(records, states, rows, active_rows, stream)) {
         return;
     }
     throw std::invalid_argument("GDN replay fold launcher received an unregistered geometry");

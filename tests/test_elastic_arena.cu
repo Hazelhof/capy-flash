@@ -28,6 +28,7 @@ namespace {
 using namespace ninfer;
 
 int failures = 0;
+
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::cerr << "FAIL: " << what << '\n';
@@ -60,7 +61,7 @@ void test_arena() {
     // 11 granules: fixed head [0, g/2+100), range A [g/2+100, 3.5g+100) (granules 1, 2 wholly
     // inside; 0 and 3 shared with fixed bytes), fixed [3.5g+100, 5g), range B [5g, 8g) (granules
     // 5..7), fixed tail [8g, 10g+100).
-    const std::size_t bytes = 10 * g + 100;
+    const std::size_t bytes          = 10 * g + 100;
     const ElasticRangeSpec ranges[2] = {
         {g / 2 + 100, 3 * g, 0},
         {5 * g, 3 * g, g},
@@ -69,9 +70,9 @@ void test_arena() {
     std::byte* base = static_cast<std::byte*>(a.span().data);
     check(a.physical_bytes() == 7 * g, "initial backing: 6 fixed granules + B's first (" +
                                            std::to_string(a.physical_bytes() / g) + ")");
-    CUDA_CHECK(cudaMemset(base, 0x11, g / 2 + 100));              // fixed head
-    CUDA_CHECK(cudaMemset(base + 5 * g, 0x22, g));                // B's backed granule
-    CUDA_CHECK(cudaMemset(base + 8 * g, 0x33, 2 * g + 100));      // fixed tail
+    CUDA_CHECK(cudaMemset(base, 0x11, g / 2 + 100));         // fixed head
+    CUDA_CHECK(cudaMemset(base + 5 * g, 0x22, g));           // B's backed granule
+    CUDA_CHECK(cudaMemset(base + 8 * g, 0x33, 2 * g + 100)); // fixed tail
     CUDA_CHECK(cudaDeviceSynchronize());
     cudaStream_t s = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
@@ -94,7 +95,8 @@ void test_arena() {
     a.set_mapped(small, s);
     check(a.physical_bytes() == 9 * g, "A's whole granules released, B's 3 backed");
     check(all(read(base + 5 * g, 2 * g + 1), 0), "B's re-backed granule reads zero again");
-    check(all(read(base + 3 * g, g / 2 + 100), 0x44), "A's bytes in the shared fixed granule survive");
+    check(all(read(base + 3 * g, g / 2 + 100), 0x44),
+          "A's bytes in the shared fixed granule survive");
     std::size_t again[2] = {3 * g, 0};
     a.set_mapped(again, s);
     check(all(read(base + g, 2 * g), 0), "A's released granules come back zeroed");
@@ -107,9 +109,8 @@ void test_pool_backing() {
     LayoutBuilder builder;
     KVPageGeometry geometry;
     geometry.planes.push_back({DType::BF16, 256, 1, 256});
-    const DeviceKVPagePoolLayout layout =
-        plan_device_kv_page_pool(builder, DeviceKVPagePoolSpec{.page_group_count = 64,
-                                                               .geometry = geometry});
+    const DeviceKVPagePoolLayout layout = plan_device_kv_page_pool(
+        builder, DeviceKVPagePoolSpec{.page_group_count = 64, .geometry = geometry});
     const std::size_t bytes = builder.finish(256);
     DeviceArena arena(bytes);
     DeviceKVPagePool pool(arena.alloc_bytes(bytes), layout);
@@ -129,14 +130,14 @@ void test_pool_backing() {
     check(asked.empty() && pool.allocated_extent() == 3, "3 pages inside the backing: no call");
     pool.materialize(*reservation, 6, leases);
     check(asked.size() == 1 && asked[0] == 6 && pool.backed_pages() == 8,
-          "page 5 needs 6 backed pages (asked " + std::to_string(asked.empty() ? 0 : asked[0]) + ")");
-    fail = true;
+          "page 5 needs 6 backed pages (asked " + std::to_string(asked.empty() ? 0 : asked[0]) +
+              ")");
+    fail       = true;
     bool threw = false;
     try {
         pool.materialize(*reservation, 12, leases);
     } catch (const std::runtime_error&) { threw = true; }
-    check(threw && leases.size() == 6 && pool.allocated_extent() == 6 &&
-              reservation->pages() == 14,
+    check(threw && leases.size() == 6 && pool.allocated_extent() == 6 && reservation->pages() == 14,
           "a failing backing leaves the pool unchanged");
     fail = false;
     pool.materialize(*reservation, 12, leases);
@@ -158,11 +159,11 @@ void test_pool_backing() {
 // device 0, eagerly, on either device's stream. Without P2P a plain UVA copy cannot read VMM memory
 // of a device other than the stream's (cudaErrorInvalidValue); the helper takes the peer copy.
 void test_cross_device_copy() {
-    const std::size_t n = (1u << 20) + 77;
+    const std::size_t n            = (1u << 20) + 77;
     const ElasticRangeSpec none[1] = {};
     CUDA_CHECK(cudaSetDevice(1));
     ElasticArena a(1, n, std::span<const ElasticRangeSpec>(none, 0));
-    std::byte* vmm = static_cast<std::byte*>(a.span().data);
+    std::byte* vmm  = static_cast<std::byte*>(a.span().data);
     cudaStream_t s1 = nullptr;
     CUDA_CHECK(cudaStreamCreate(&s1));
     CUDA_CHECK(cudaSetDevice(0));
@@ -172,9 +173,11 @@ void test_cross_device_copy() {
     CUDA_CHECK(cudaStreamCreate(&s0));
     std::vector<unsigned char> ref(n), back(n);
     for (int round = 0; round < 4; ++round) {
-        const bool to_d0  = round % 2 == 0;            // VMM(1) -> d0, else d0 -> VMM(1)
-        const bool on_s0  = round / 2 == 0;            // issued on device 0's stream, else device 1's
-        for (std::size_t i = 0; i < n; ++i) { ref[i] = static_cast<unsigned char>(i * 13 + round * 5 + 1); }
+        const bool to_d0 = round % 2 == 0; // VMM(1) -> d0, else d0 -> VMM(1)
+        const bool on_s0 = round / 2 == 0; // issued on device 0's stream, else device 1's
+        for (std::size_t i = 0; i < n; ++i) {
+            ref[i] = static_cast<unsigned char>(i * 13 + round * 5 + 1);
+        }
         void* src = to_d0 ? static_cast<void*>(vmm) : d0;
         void* dst = to_d0 ? d0 : static_cast<void*>(vmm);
         CUDA_CHECK(cudaSetDevice(to_d0 ? 1 : 0));
@@ -187,7 +190,8 @@ void test_cross_device_copy() {
         CUDA_CHECK(cudaStreamSynchronize(on_s0 ? s0 : s1));
         CUDA_CHECK(cudaSetDevice(to_d0 ? 0 : 1));
         CUDA_CHECK(cudaMemcpy(back.data(), dst, n, cudaMemcpyDeviceToHost));
-        check(back == ref, std::string("cross-device copy ") + (to_d0 ? "VMM(1)->dev0" : "dev0->VMM(1)") +
+        check(back == ref, std::string("cross-device copy ") +
+                               (to_d0 ? "VMM(1)->dev0" : "dev0->VMM(1)") +
                                (on_s0 ? " on dev0 stream" : " on dev1 stream"));
     }
     CUDA_CHECK(cudaStreamDestroy(s0));
@@ -198,7 +202,7 @@ void test_cross_device_copy() {
 }
 
 int main() {
-    int count = 0;
+    int count             = 0;
     const cudaError_t err = cudaGetDeviceCount(&count);
     if (err == cudaErrorNoDevice || err == cudaErrorInsufficientDriver ||
         (err == cudaSuccess && count == 0)) {

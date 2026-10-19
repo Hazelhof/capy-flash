@@ -251,8 +251,9 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
     if (lane_width != 0) {
         for (int axis = 0; axis < geometry.axes; ++axis)
             for (int t = 0; t < geometry.tokens; ++t)
-                positions[axis * geometry.tokens + t] = first_position +
-                    1009 * (t / lane_width) + 97 * axis + (2 * axis + 1) * (t % lane_width);
+                positions[axis * geometry.tokens + t] = first_position + 1009 * (t / lane_width) +
+                                                        97 * axis +
+                                                        (2 * axis + 1) * (t % lane_width);
     }
     const auto q_expected = rope_oracle(q, positions, geometry, q_heads);
     const auto k_expected = rope_oracle(k, positions, geometry, k_heads);
@@ -284,9 +285,9 @@ int run_pair_case(const Geometry& geometry, int q_heads, int k_heads, int first_
         CUDA_CHECK(cudaGraphInstantiate(&executable, captured, nullptr, nullptr, 0));
         for (int replay = 0; replay < 2; ++replay) {
             CUDA_CHECK(cudaMemcpyAsync(q_device.data(), q_storage.data(), q_device.bytes(),
-                cudaMemcpyHostToDevice, stream));
+                                       cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaMemcpyAsync(k_device.data(), k_storage.data(), k_device.bytes(),
-                cudaMemcpyHostToDevice, stream));
+                                       cudaMemcpyHostToDevice, stream));
             CUDA_CHECK(cudaGraphLaunch(executable, stream));
             CUDA_CHECK(cudaStreamSynchronize(stream));
         }
@@ -453,9 +454,9 @@ int main() {
     for (int axes : {1, 3}) {
         for (int width : {2, 7, 16}) {
             for (int batch : {1, 8}) {
-                failures += run_pair_case({"27b dflash2 lanes", 256, 64, axes, width * batch, kTextTheta},
-                    24, 4, 131072, batch == 8 ? 16 : 0, batch == 8 ? 8 : 0,
-                    width, width == 16 && batch == 8);
+                failures += run_pair_case(
+                    {"27b dflash2 lanes", 256, 64, axes, width * batch, kTextTheta}, 24, 4, 131072,
+                    batch == 8 ? 16 : 0, batch == 8 ? 8 : 0, width, width == 16 && batch == 8);
             }
         }
     }

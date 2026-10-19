@@ -17,7 +17,9 @@ from typing import Sequence
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
+    Mxfp8Format,
     Nvfp4Format,
+    Nvfp4RowFormat,
     NumericFormat,
     QuantFormat,
     get_format,
@@ -78,6 +80,32 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class BlockScaleK32Geometry:
+    """Row-major N x K E4M3FN code plane, then (256-aligned) row-major N x K/32 UE8M0 scales."""
+
+    n: int
+    k: int
+    groups_per_row: int
+    code_plane_bytes: int
+    scale_plane_offset: int
+    scale_plane_bytes: int
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class RowInterleavedGeometry:
+    """N rows of ``row_bytes``: K/2 E2M1 code bytes (low nibble first) then K/16 E4M3FN scales."""
+
+    n: int
+    k: int
+    groups_per_row: int
+    code_row_bytes: int
+    scale_row_bytes: int
+    row_bytes: int
+    payload_bytes: int
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
@@ -95,6 +123,17 @@ ROW_SCALE_V1 = Layout(
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
 
+BLOCK_SCALE_K32_V1 = Layout(
+    "block_scale_k32_v1",
+    256,
+    frozenset(("mxfp8_e4m3fn_g32_ue8m0",)),
+)
+ROW_INTERLEAVED_V1 = Layout(
+    "row_interleaved_v1",
+    256,
+    frozenset(("nvfp4_row_e4m3_g16",)),
+)
+
 LAYOUTS = MappingProxyType(
     {
         layout.name: layout
@@ -103,6 +142,8 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            BLOCK_SCALE_K32_V1,
+            ROW_INTERLEAVED_V1,
         )
     }
 )
@@ -157,9 +198,7 @@ def _shape(value: Sequence[int], *, rank: int | None = None) -> tuple[int, ...]:
     return result
 
 
-def row_split_geometry(
-    format: str | QuantFormat, shape: Sequence[int]
-) -> RowSplitGeometry:
+def row_split_geometry(format: str | QuantFormat, shape: Sequence[int]) -> RowSplitGeometry:
     spec = _format(format)
     if not isinstance(spec, QuantFormat):
         raise ValueError("row_split_k128_v1 requires a grouped quantized format")
@@ -167,9 +206,7 @@ def row_split_geometry(
     k_pad = align_up(k, K_ALIGNMENT)
     groups_per_row = k_pad // spec.group_size
     base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
-    high_bytes_per_group = (
-        0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
-    )
+    high_bytes_per_group = 0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
     scale_row_bytes = groups_per_row * 2
@@ -198,9 +235,7 @@ def row_split_geometry(
     )
 
 
-def block_scale_geometry(
-    format: str | Nvfp4Format, shape: Sequence[int], divisors: int = 1
-) -> BlockScaleGeometry:
+def block_scale_geometry(format: str | Nvfp4Format, shape: Sequence[int], divisors: int = 1) -> BlockScaleGeometry:
     """Planes of one NVFP4 parent; ``divisors`` FP32 words close it, one per equal row block.
 
     A stacked parent (a layer's routed experts, each quantised against its own divisor) keeps one
@@ -213,16 +248,11 @@ def block_scale_geometry(
         raise ValueError("block_scale_k16_m128x4_v1 requires NVFP4")
     n, k = _shape(shape, rank=2)
     if n % 128 != 0 or k % 64 != 0:
-        raise ValueError(
-            "block_scale_k16_m128x4_v1 requires N divisible by 128 "
-            "and K divisible by 64"
-        )
+        raise ValueError("block_scale_k16_m128x4_v1 requires N divisible by 128 and K divisible by 64")
     if isinstance(divisors, bool) or not isinstance(divisors, int) or divisors < 1 or n % divisors:
         raise ValueError("NVFP4 divisor count must divide the plane's rows")
     if divisors > 1 and (n // divisors) % 128:
-        raise ValueError(
-            "each NVFP4 divisor must cover a whole number of 128-row scale tiles"
-        )
+        raise ValueError("each NVFP4 divisor must cover a whole number of 128-row scale tiles")
     code_plane_bytes = n * k // 2
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
     scale_plane_bytes = n * k // spec.group_size
@@ -241,9 +271,7 @@ def block_scale_geometry(
     )
 
 
-def row_scale_geometry(
-    format: str | Fp8RowFormat, shape: Sequence[int]
-) -> RowScaleGeometry:
+def row_scale_geometry(format: str | Fp8RowFormat, shape: Sequence[int]) -> RowScaleGeometry:
     spec = _format(format)
     if not isinstance(spec, Fp8RowFormat):
         raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
@@ -261,6 +289,48 @@ def row_scale_geometry(
     )
 
 
+def block_scale_k32_geometry(format: str | Mxfp8Format, shape: Sequence[int]) -> BlockScaleK32Geometry:
+    spec = _format(format)
+    if not isinstance(spec, Mxfp8Format):
+        raise ValueError("block_scale_k32_v1 requires MXFP8")
+    n, k = _shape(shape, rank=2)
+    if k % spec.group_size:
+        raise ValueError(f"block_scale_k32_v1 requires K divisible by {spec.group_size}")
+    code_plane_bytes = n * k
+    scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
+    scale_plane_bytes = n * (k // spec.group_size)
+    return BlockScaleK32Geometry(
+        n=n,
+        k=k,
+        groups_per_row=k // spec.group_size,
+        code_plane_bytes=code_plane_bytes,
+        scale_plane_offset=scale_plane_offset,
+        scale_plane_bytes=scale_plane_bytes,
+        payload_bytes=scale_plane_offset + scale_plane_bytes,
+    )
+
+
+def row_interleaved_geometry(format: str | Nvfp4RowFormat, shape: Sequence[int]) -> RowInterleavedGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Nvfp4RowFormat):
+        raise ValueError("row_interleaved_v1 requires row-scaled NVFP4")
+    n, k = _shape(shape, rank=2)
+    if k % spec.group_size:
+        raise ValueError(f"row_interleaved_v1 requires K divisible by {spec.group_size}")
+    code_row_bytes = k // 2
+    scale_row_bytes = k // spec.group_size
+    row_bytes = code_row_bytes + scale_row_bytes
+    return RowInterleavedGeometry(
+        n=n,
+        k=k,
+        groups_per_row=k // spec.group_size,
+        code_row_bytes=code_row_bytes,
+        scale_row_bytes=scale_row_bytes,
+        row_bytes=row_bytes,
+        payload_bytes=n * row_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -272,9 +342,7 @@ def encoded_size(
     if divisors != 1 and layout_spec is not BLOCK_SCALE_K16_M128X4_V1:
         raise ValueError(f"layout {layout_spec.name!r} stores one divisor, not {divisors}")
     if numeric_spec.name not in layout_spec.formats:
-        raise ValueError(
-            f"layout {layout_spec.name!r} does not accept format {numeric_spec.name!r}"
-        )
+        raise ValueError(f"layout {layout_spec.name!r} does not accept format {numeric_spec.name!r}")
     if layout_spec is CONTIGUOUS_LE_V1:
         if not isinstance(numeric_spec, DirectFormat):
             raise ValueError("contiguous_le_v1 requires a direct format")
@@ -294,4 +362,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is BLOCK_SCALE_K32_V1:
+        return block_scale_k32_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is ROW_INTERLEAVED_V1:
+        return row_interleaved_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

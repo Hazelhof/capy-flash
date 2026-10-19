@@ -17,11 +17,12 @@
 //     ops::moe_slots_nvfp4 over the experts resident in a device slot cache (T14 ExpertCache,
 //     slot table read in the kernel) while the CPU computes the routed experts the table does not
 //     hold (HostMoeExecutor, NVFP4 W4A8 AVX-512); the CPU partial is added in FP32 before the
-//     single rounding. A prefill chunk hands all its columns over in one call per layer. The cache policy runs on the host, overlapped with the round: the
-//     execution thread reads each layer's routing from the mailbox's routing log while the GPU
-//     works, decides insertions (LRU, optional decayed-frequency admission, insertion cap per
-//     layer per window) and issues their copies on a separate stream as soon as the GPU has left
-//     the layer; a copied expert is published at the first window that begins after its copy.
+//     single rounding. A prefill chunk hands all its columns over in one call per layer. The cache
+//     policy runs on the host, overlapped with the round: the execution thread reads each layer's
+//     routing from the mailbox's routing log while the GPU works, decides insertions (LRU, optional
+//     decayed-frequency admission, insertion cap per layer per window) and issues their copies on a
+//     separate stream as soon as the GPU has left the layer; a copied expert is published at the
+//     first window that begins after its copy.
 //   * Qwen4MappedExperts - every expert read in place from its host-mapped bank over PCIe
 //     (zero-copy, slot table = identity, all W4A4 on the GPU): the reference route of M1, slow.
 //
@@ -29,8 +30,8 @@
 // window: begin_window(stream, kind) before anything of it is enqueued, observe_window(stream)
 // once it is enqueued (returns when the device is done or, for decode rounds, when every layer's
 // routing has been observed: overlaps the policy and the fills with the GPU), end_window(stream)
-// after the device completed it. Executions outside a window (CUDA Graph preparation at startup) are
-// allowed only while no fill is in flight. Once the offload backend's host executor has failed
+// after the device completed it. Executions outside a window (CUDA Graph preparation at startup)
+// are allowed only while no fill is in flight. Once the offload backend's host executor has failed
 // (an exception on its service thread; its doorbells are then answered without a partial), the
 // end_window of the window that saw it throws (the window is closed first) and so does every later
 // begin_window: the execution fails instead of returning logits without the CPU experts.
@@ -73,6 +74,7 @@ struct Qwen4ColumnGroups {
     std::int32_t done          = 0;
     std::function<void(std::int32_t first, std::int32_t count)> ready;
 };
+
 inline thread_local Qwen4ColumnGroups* qwen4_column_groups = nullptr;
 
 enum class Qwen4Window : std::uint8_t {
@@ -138,11 +140,18 @@ public:
     // (T42: the offload backend lends slot-pool memory for the duration of the prompt). Before
     // begin_window of a prompt chunk the caller announces its width; inside the window,
     // prompt_workspace() returns each GPU's lent span (rank 0, then rank 1 at tp 2) and orders the
-    // given compute streams (one per GPU) after the lend.
-    virtual void prepare_prompt(std::int32_t columns) { (void)columns; }
+    // given compute streams (one per GPU) after the lend. `begin` is the chunk's first position
+    // (the KV already holds [0, begin): the prefix restored from the context cache and the
+    // prompt's earlier chunks) and `prompt_tokens` the whole prompt's length (T211b).
+    virtual void prepare_prompt(std::int32_t columns, std::int64_t begin,
+                                std::int64_t prompt_tokens) {
+        (void)columns, (void)begin, (void)prompt_tokens;
+    }
+
     [[nodiscard]] virtual std::int32_t prompt_arena_columns() const noexcept {
         return std::numeric_limits<std::int32_t>::max();
     }
+
     [[nodiscard]] virtual std::array<DeviceSpan, 2>
     prompt_workspace(std::span<const cudaStream_t> streams) {
         (void)streams;
@@ -155,8 +164,11 @@ public:
 
     // Window hooks (header comment), on the execution thread.
     virtual void begin_window(cudaStream_t stream, Qwen4Window kind) { (void)stream, (void)kind; }
+
     virtual void observe_window(cudaStream_t stream) { (void)stream; }
+
     virtual void end_window(cudaStream_t stream) { (void)stream; }
+
     // Closes an open window after a failed execution (the device is idle), ignoring errors.
     virtual void abandon_window(cudaStream_t stream) noexcept { (void)stream; }
 
@@ -209,7 +221,7 @@ private:
 };
 
 struct Qwen4OffloadOptions {
-    std::int32_t slots_per_layer = 0;   // device slots per layer (>= 10)
+    std::int32_t slots_per_layer = 0; // device slots per layer (>= 10)
     // Elastic columns (T64): per GPU this many more slots per layer, after the base slots (and
     // the prefetch staging slots) in column-major order, which set_active_columns() shrinks and
     // grows at runtime (ExpertCachePolicy::set_active_columns). 0 = none.
@@ -224,7 +236,7 @@ struct Qwen4OffloadOptions {
     // after them (the MTP layer) may run several times per window (an MTP round's alignment and
     // draft calls): their calls append to the layer's routing log and the policy observes the
     // whole log once the window has completed. 0 = every layer is a Text layer.
-    std::int32_t text_layers     = 0;
+    std::int32_t text_layers = 0;
     // Split of every decode call's missing experts (<= 8 columns) between the CPU and the GPU,
     // which reads its share of the expert weights from the host bank over PCIe on a second stream
     // while the CPU computes the rest (T18). The publish kernel decides it per layer call from the
@@ -242,10 +254,10 @@ struct Qwen4OffloadOptions {
     std::int32_t stream_min_tokens = 0;
     std::int32_t stream_ring_slots = 576; // rounded up to whole cache layers
     // CPU tail of a streamed chunk (RoutedExpertOptions::stream_cpu_tail and its cost model).
-    bool stream_cpu_tail         = true;
-    double stream_cpu_expert_us  = 45.0;
-    double stream_cpu_token_us   = 9.0;
-    double stream_link_us        = 105.0;
+    bool stream_cpu_tail               = true;
+    double stream_cpu_expert_us        = 45.0;
+    double stream_cpu_token_us         = 9.0;
+    double stream_link_us              = 105.0;
     std::int32_t stream_cpu_max_tokens = 2047;
     // T42 borrowed prompt workspace: prompt chunks of more than `base_chunk` columns run on
     // `prompt_workspace_bytes` per GPU lent from the gate/up code plane of the cache layers just
@@ -263,7 +275,9 @@ struct Qwen4OffloadOptions {
     // decode's routing poorly (agentic turns: 10-30 % hits at the first window), and the
     // capped insertions refill it at <= 2 experts per layer per window
     // (NINFER_QWEN4_BOOST_WINDOWS, NINFER_QWEN4_BOOST_CAP; 0 windows = off, cap 0 = no cap).
-    std::int32_t boost_windows = 0; // T69: not measured on the GPU yet: off by default
+    // T211: on by default; with keep_decode_residency the T71 replay rounds go 18.4 -> 17.9 ms
+    // (two A/B pairs, decode median 155 -> 159 tok/s, TTFT median -0.05 s).
+    std::int32_t boost_windows = 24;
     std::int32_t boost_cap     = 8;
     // Validation aid (NINFER_QWEN4_EXPERT_FREEZE=1): residency is decided by the prompt windows
     // alone and settles before the first decode window (each prompt window waits for its fills),
@@ -275,14 +289,14 @@ struct Qwen4OffloadOptions {
     // windows included; residency stays what initialization (or `snapshot_load`) made it.
     bool freeze_all = false;
     // T59 fast bench (NINFER_QWEN4_EXPERT_SYNC=1): every window waits at its end until its fills
-    // landed (Qwen4OffloadWindowStats::fill_wait_us), so the residency each window sees depends on the
-    // routing alone, not on copy timing; the policy runs as usual.
+    // landed (Qwen4OffloadWindowStats::fill_wait_us), so the residency each window sees depends on
+    // the routing alone, not on copy timing; the policy runs as usual.
     bool sync_fills = false;
     // T59: residency snapshots (NINFER_QWEN4_EXPERT_SNAPSHOT / NINFER_QWEN4_EXPERT_SNAPSHOT_SAVE).
-    // File: blocks "snap <i>" followed by one line per cache layer, "<layer> <expert ids...>" (a file
-    // without "snap" lines is one block). Save: one block per request, the residency the policy
-    // holds when the request's first decode window begins. Load: request r (counted by its first
-    // prompt window) starts from block r mod blocks, restored before its prefill.
+    // File: blocks "snap <i>" followed by one line per cache layer, "<layer> <expert ids...>" (a
+    // file without "snap" lines is one block). Save: one block per request, the residency the
+    // policy holds when the request's first decode window begins. Load: request r (counted by its
+    // first prompt window) starts from block r mod blocks, restored before its prefill.
     std::string snapshot_load;
     std::string snapshot_save;
     // Decode windows: the expert-cache copies of the layers before layer l are submitted once the
@@ -306,9 +320,35 @@ struct Qwen4OffloadOptions {
     // after a prompt's wide chunks): 1 = the refill overlaps the chunk, 2 = the chunk waits for
     // the refill (and finds the layers filled), 0 = off (NINFER_QWEN4_EARLY_RECLAIM).
     std::int32_t early_reclaim = 1;
+    // T211: prompt windows change neither the residency nor the frequencies
+    // (ExpertCachePolicy::count_prompt; their routing still feeds the streaming CPU tail and the
+    // counters), and the layers a prompt lends refill afterwards with the experts they held when
+    // lent, most recently used first, instead of the prompt's hottest: on the T71 agentic replay
+    // the decode after a prompt routes like the decode before it, not like the prompt (a 3k-token
+    // chunk replaced ~3.2k experts and its decay erased the decode's frequencies). Replay, same
+    // binary: post-prompt round 0 45 -> 23 ms, post-prompt excess ~250 -> ~30 ms per turn,
+    // steady rounds 18.3 -> 17.1 ms, decode 124 -> 155 tok/s. The T98 validation aid
+    // (freeze_after_prompt) keeps the old rule.
+    // NINFER_QWEN4_PROMPT_KEEP=0: prompt targets and prompt-profile refill, as before.
+    // T211b: only for a prompt that continues a cached conversation: a request whose first text
+    // chunk starts at position begin < keep_min_cached * prompt tokens (less than that share of
+    // the prompt restored from the context cache; T71 agentic turns restore 66-99 %, a new chat
+    // 0 %) is a new conversation. Its routing counts, summed over its prompt windows, are applied
+    // once when its first decode window begins (ExpertCache::apply_prompt): by default
+    // (new_prompt_cap -1) to the frequencies only, so the post-prompt boost inserts the prompt's
+    // hottest experts first; new_prompt_cap > 0 also makes that many targets per layer and GPU
+    // resident (decide_prompt, 0 = the slot count). T194 bench (280 new chats): the T69 rule
+    // (copies during the prompt) decode +2.4 % but TTFT 0.58 -> 0.69 s; copies at the first
+    // decode window cost decode (all targets -2 %, 32 targets +-0); frequencies only decode +1 %,
+    // TTFT unchanged, the lowest time per generated token. Lent layers are restored either way.
+    // NINFER_QWEN4_PROMPT_KEEP_MIN_CACHED (fraction), NINFER_QWEN4_PROMPT_NEW_CAP.
+    bool keep_decode_residency  = true;
+    double keep_min_cached      = 0.5;
+    std::int32_t new_prompt_cap = -1;
     // T69: a prompt lends only the base slots of its layers; with elastic columns the lent layers
-    // keep their elastic slots and the prompt fills them with its hottest experts, so the decode
-    // after it starts with those resident; NINFER_QWEN4_LEND_KEEP_ELASTIC=0 = off.
+    // keep their elastic slots (and their residents: T211; without keep_decode_residency the
+    // prompt fills them with its hottest experts), so the decode after it starts with those
+    // resident; NINFER_QWEN4_LEND_KEEP_ELASTIC=0 = off.
     bool lend_keep_elastic = true;
     // Validation / measurement aid: one JSON line per window and a summary at destruction.
     std::string trace_path;
@@ -319,22 +359,22 @@ struct Qwen4OffloadOptions {
 
 // Per-window statistics of Qwen4OffloadExperts (sums over the window's layers).
 struct Qwen4OffloadWindowStats {
-    Qwen4Window kind       = Qwen4Window::Decode;
-    std::int32_t tokens    = 0;
-    std::int32_t layers    = 0; // layers whose routing was observed
-    std::int64_t accesses  = 0; // (token, top-k) routes
-    std::int64_t device_hits = 0; // routes served from a published slot
-    std::int64_t policy_hits = 0; // routes the policy counted resident (incl. fills in flight)
-    std::int64_t missing   = 0; // distinct experts per layer computed on the CPU
-    std::int64_t inserts   = 0;
-    std::int64_t fills_issued = 0;
-    std::int64_t fill_bytes   = 0;
+    Qwen4Window kind           = Qwen4Window::Decode;
+    std::int32_t tokens        = 0;
+    std::int32_t layers        = 0; // layers whose routing was observed
+    std::int64_t accesses      = 0; // (token, top-k) routes
+    std::int64_t device_hits   = 0; // routes served from a published slot
+    std::int64_t policy_hits   = 0; // routes the policy counted resident (incl. fills in flight)
+    std::int64_t missing       = 0; // distinct experts per layer computed on the CPU
+    std::int64_t inserts       = 0;
+    std::int64_t fills_issued  = 0;
+    std::int64_t fill_bytes    = 0;
     std::int64_t fills_pending = 0; // at the end of the window
-    double wall_us         = 0;   // begin_window -> end_window
-    double observe_us      = 0;   // host policy work inside observe_window
-    double fill_wait_us    = 0;   // T59 sync_fills: end_window waiting for the window's fills
-    double cpu_us          = 0;   // host executor busy (doorbell seen -> done), all layers
-    std::int64_t cpu_experts = 0;
+    double wall_us             = 0; // begin_window -> end_window
+    double observe_us          = 0; // host policy work inside observe_window
+    double fill_wait_us        = 0; // T59 sync_fills: end_window waiting for the window's fills
+    double cpu_us              = 0; // host executor busy (doorbell seen -> done), all layers
+    std::int64_t cpu_experts   = 0;
     // Device stamps (trace only), all layers: publish -> after the resident experts, -> wait
     // released, and doorbell latency (publish -> host saw it).
     double gpu_resident_us = 0;
@@ -381,7 +421,7 @@ public:
         std::int32_t* identity = nullptr; // I32 [512] = 0..511 (device reads of the host bank)
         std::int32_t* reads    = nullptr; // I32 [10 * 8]: ids the device reads itself
         // tp 2: I32 [layers * 512] residency of both GPUs' slots (ExpertCache mirror).
-        std::int32_t* mirror   = nullptr;
+        std::int32_t* mirror = nullptr;
         // T25 prefetch (options.prefetch.slots_per_layer > 0): the pool arrays hold
         // Qwen4ExpertPrefetch::staging_slots() more slots after the cache's, and these.
         Qwen4ExpertPrefetch::DeviceMemory prefetch;
@@ -392,13 +432,14 @@ public:
         std::int32_t* stage_table = nullptr;
         std::int32_t* picks       = nullptr;
     };
+
     // tp 2: rank 1's device, compute stream and slot memory (pool, table, divisor copy).
     struct Peer {
         int device          = 1;
         cudaStream_t stream = nullptr;
         std::array<std::byte*, 4> pool{};
-        std::int32_t* table = nullptr;
-        float* divisors     = nullptr;
+        std::int32_t* table         = nullptr;
+        float* divisors             = nullptr;
         std::int32_t* stream_tables = nullptr; // rank 1's prefill streaming tables
         // Miss-split share on rank 1 (split_on_peer): its residency mirror, reads, staged scratch.
         std::int32_t* mirror      = nullptr;
@@ -417,12 +458,12 @@ public:
     Qwen4OffloadExperts(const Qwen4OffloadExperts&)            = delete;
     Qwen4OffloadExperts& operator=(const Qwen4OffloadExperts&) = delete;
 
-    void routed(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
-                const Tensor& ids, const Tensor& weights, WorkspaceArena& work,
-                cudaStream_t stream) override;
+    void routed(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x, const Tensor& ids,
+                const Tensor& weights, WorkspaceArena& work, cudaStream_t stream) override;
     void run(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x, const Tensor& ids,
              const Tensor& weights, Tensor& partial, WorkspaceArena& work,
              cudaStream_t stream) override;
+
     [[nodiscard]] bool graph_capturable() const noexcept override { return true; }
 
     void ahead(std::int32_t layer, const Tensor& wide, const Tensor& next_norm,
@@ -433,7 +474,8 @@ public:
     void end_window(cudaStream_t stream) override;
     void abandon_window(cudaStream_t stream) noexcept override;
 
-    void prepare_prompt(std::int32_t columns) override;
+    void prepare_prompt(std::int32_t columns, std::int64_t begin,
+                        std::int64_t prompt_tokens) override;
     void exchanged(std::int32_t layer, cudaStream_t stream) override;
     // Rank 1's exchanged() (Qwen4OffloadPeerExperts): rank 1's streamer.
     void exchanged_peer(std::int32_t layer, cudaStream_t stream);
@@ -447,9 +489,11 @@ public:
     void run_peer_streamed(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
                            const Tensor& ids, const Tensor& weights, Tensor& partial,
                            WorkspaceArena& work, cudaStream_t stream);
+
     // tp 2, split_on_peer: rank 1 adds the miss-split share of a decode call of `layer` (<= 8
     // columns) to its FP32 partial, picked from its mirror by the rule rank 0's publish used.
     [[nodiscard]] bool peer_shares() const noexcept { return split_on_peer_; }
+
     void run_peer_share(std::int32_t layer, const Tensor& x, const Tensor& ids,
                         const Tensor& weights, Tensor& partial, WorkspaceArena& work,
                         cudaStream_t stream);
@@ -457,27 +501,35 @@ public:
     [[nodiscard]] const expert_cache::CacheCounters& counters() const noexcept {
         return cache_->counters();
     }
+
     // Elastic columns (T64): ExpertCache::set_active_columns on every GPU of the cache, between
     // windows with the device idle. The bytes of column c of plane q are the contiguous pool
     // range elastic_column_offset(q, c) .. + elastic_column_bytes(q) of every GPU's plane q.
     void set_active_columns(std::int32_t columns);
+
     [[nodiscard]] std::int32_t active_columns() const noexcept { return cache_->active_columns(); }
+
     [[nodiscard]] std::int32_t elastic_columns() const noexcept { return options_.elastic_columns; }
+
     [[nodiscard]] std::int32_t base_slots() const noexcept { return options_.slots_per_layer; }
+
     [[nodiscard]] std::int64_t elastic_column_offset(std::int32_t plane, std::int32_t column) const;
     [[nodiscard]] std::int64_t elastic_column_bytes(std::int32_t plane) const;
+
     [[nodiscard]] const Qwen4OffloadWindowStats& last_window() const noexcept { return window_; }
+
     // T59 snapshot state (snapshot_load / snapshot_save).
 private:
     std::vector<std::vector<std::vector<std::int32_t>>> snapshot_blocks_;
-    std::int64_t snapshot_request_ = 0;
-    std::int64_t snapshot_saved_   = 0;
-    bool snapshot_any_window_      = false;
+    std::int64_t snapshot_request_  = 0;
+    std::int64_t snapshot_saved_    = 0;
+    bool snapshot_any_window_       = false;
     Qwen4Window snapshot_last_kind_ = Qwen4Window::Decode;
     void snapshot_save_block();
 public:
     // Null when prefetch is off.
     [[nodiscard]] const Qwen4ExpertPrefetch* prefetch() const noexcept { return prefetch_.get(); }
+
     [[nodiscard]] Qwen4OffloadSplitCounters split_counters() const noexcept;
 
     static constexpr std::int32_t kDivisorsPerLayer = 1536;
@@ -491,12 +543,40 @@ public:
     // Device bytes of one slot of every layer (the four planes).
     [[nodiscard]] static std::int64_t slot_bytes(std::int32_t layers);
     // T42 borrowed prompt workspace: the lent layers' slots of the gate/up code plane (the largest
-    // plane, one contiguous region of the planar pool) hold it; at most this many Text layers
-    // (ring + workspace) are lent during a prompt.
+    // plane, one contiguous region of the planar pool) hold it.
     static constexpr std::int64_t kLendPlaneBytes = ops::kMoeSlotsGateUpCodeBytes;
-    [[nodiscard]] static constexpr std::int32_t max_lent_layers(std::int32_t text_layers) {
-        return text_layers * 3 / 4;
-    }
+
+    // Whether a prompt may lend the last `layers` Text layers (ring + workspace): they hold at most
+    // three quarters of the Text layers' base slots (`layer_base`, layer_slot_profile), so the
+    // other layers keep at least a quarter of the residents (36 of 48 uniform layers).
+    [[nodiscard]] static bool may_lend(std::span<const std::int32_t> layer_base,
+                                       std::int32_t text_layers, std::int32_t layers);
+
+    // Base slots of each cache layer on one GPU (prod/cache): `slots_per_layer` for every layer,
+    // or, for Flash-Next at tp 2 (48 Text layers, with or without the MTP layer), the same total
+    // divided by a fitted per-layer profile (the first layers and the MTP layer miss most), scaled
+    // to slots_per_layer and capped at the partition's experts minus the elastic columns.
+    // NINFER_QWEN4_SLOT_PROFILE=0 keeps every layer at slots_per_layer. The pool size is the same
+    // either way (the elastic columns stay one per layer).
+    [[nodiscard]] static std::vector<std::int32_t>
+    layer_slot_profile(std::int32_t layers, std::int32_t text_layers, std::int32_t slots_per_layer,
+                       std::int32_t elastic_columns, std::int32_t partitions);
+    // Slots of the prefill streaming ring of one GPU: `ring_slots` (stream_ring_slots), halved at
+    // tp 2 (`partitions` 2), where a GPU streams only its expert partition (T56;
+    // NINFER_QWEN4_TP2_HALF_RING=0 keeps the 1-GPU size). The startup planner sizes the prompt
+    // chunk with the same count, so the workspace it plans always fits next to the ring.
+    [[nodiscard]] static std::int32_t ring_slots_for(std::int32_t ring_slots,
+                                                     std::int32_t partitions);
+    // Whole cache layers the ring borrows: the last Text layers (`layer_base`, one GPU's base
+    // slots per layer, layer_slot_profile) holding at least the ring's slots.
+    [[nodiscard]] static std::int32_t ring_layers(std::int32_t ring_slots,
+                                                  std::span<const std::int32_t> layer_base,
+                                                  std::int32_t text_layers,
+                                                  std::int32_t partitions);
+    // The fewest layers just below layer `end` whose base slots hold `slots` (end + 1 when even
+    // layers [0, end) do not).
+    [[nodiscard]] static std::int32_t layers_below(std::span<const std::int32_t> layer_base,
+                                                   std::int32_t end, std::int64_t slots);
 
 private:
     [[nodiscard]] Tensor layer_table(std::int32_t layer) const;
@@ -508,9 +588,11 @@ private:
     void fork_device_reads(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
                            const Tensor& weights, const Tensor& out, WorkspaceArena& work,
                            cudaStream_t stream);
+
     [[nodiscard]] bool splitting() const noexcept {
         return options_.split.mode != ops::host::HostMoeSplit::Mode::Off;
     }
+
     void observe_layer(std::int32_t layer);
     // Throws when the host expert executor has failed (HostMoeMailbox::failed).
     void require_executor() const;
@@ -526,9 +608,14 @@ private:
     // Lends layers [first, text_layers_) (ring + borrowed workspace) for a prompt, growing an
     // existing smaller lending; between windows only.
     void lend_prompt_layers(std::int32_t first);
-    // Ends the lending (between windows): the lent layers refill from lent_profile_ (T69: in
-    // profile-rank order across layers unless refill_order is off).
+    // Ends the lending (between windows) of the first `count` lent layers: they refill from
+    // lent_profile_ (T69: in profile-rank order across layers unless refill_order is off).
     void reclaim_lent(std::int32_t count);
+    void refill_lent(std::int32_t count);
+    // T211 (keep_decode_residency): saves the residency of layers [first, first + count) as their
+    // refill profile (lent_profile_), most recently used first, before they are lent; a layer
+    // that already holds a saved profile (lent earlier in the same prompt) keeps it.
+    void save_lent_residency(std::int32_t first, std::int32_t count);
     // T69: lent workspace layers a prompt chunk of `columns` needs.
     [[nodiscard]] std::int32_t workspace_layers_for(std::int32_t columns) const noexcept;
     // Chooses, per Text layer, the non-resident experts left to the CPU while streaming a chunk
@@ -539,40 +626,47 @@ private:
     std::int32_t log_offset(std::int32_t layer, std::int32_t tokens);
     void finish_trace();
 
-    std::int32_t layers_          = 0;
-    std::int32_t partitions_      = 1; // GPUs the cache spans
+    // First base slot of each layer in one GPU's pool ([layers_ + 1], layer_slot_profile prefix).
+    [[nodiscard]] std::int64_t base_offset(std::int32_t layer) const noexcept {
+        return layer_offset_[static_cast<std::size_t>(layer)];
+    }
+
+    std::int32_t layers_     = 0;
+    std::int32_t partitions_ = 1;            // GPUs the cache spans
+    std::vector<std::int32_t> layer_base_;   // [layers_] base slots per layer on each GPU
+    std::vector<std::int64_t> layer_offset_; // [layers_ + 1] prefix of layer_base_
     std::array<cudaStream_t, 2> streams_{};
-    cudaStream_t peer_stream_     = nullptr;
-    std::int32_t text_layers_     = 0;
-    std::int32_t log_tokens_      = 0; // routing log length per layer
+    cudaStream_t peer_stream_ = nullptr;
+    std::int32_t text_layers_ = 0;
+    std::int32_t log_tokens_  = 0;           // routing log length per layer
     std::vector<std::int32_t> extra_offset_; // [layers_ - text_layers_] next log offset
     Qwen4OffloadOptions options_;
     DeviceMemory memory_;
     std::vector<Qwen4ExpertBank> device_banks_; // divisors on the device, pool as slots
     std::unique_ptr<expert_cache::ExpertCache> cache_;
     std::unique_ptr<Qwen4ExpertPrefetch> prefetch_;
-    std::int32_t staging_slots_ = 0;
-    std::int32_t overlay_layer_ = -1;            // routed() staged this layer's row, run() uses it
+    std::int32_t staging_slots_      = 0;
+    std::int32_t overlay_layer_      = -1; // routed() staged this layer's row, run() uses it
     const std::int32_t* overlay_row_ = nullptr;
     Qwen4PrefetchCounters prefetch_at_begin_{};
-    std::vector<std::int32_t> prompt_rank_;      // warm start: [layers * 512] rank in the targets
+    std::vector<std::int32_t> prompt_rank_; // warm start: [layers * 512] rank in the targets
     std::unique_ptr<ops::host::HostMoeMailbox> mailbox_;
     std::vector<expert_cache::Routed> routed_;
 
     // Window state.
-    bool open_                 = false;
-    Qwen4Window kind_          = Qwen4Window::Decode;
-    std::int32_t observed_     = 0; // layers observed in this window (in order)
-    std::int64_t begin_ns_     = 0;
+    bool open_                         = false;
+    Qwen4Window kind_                  = Qwen4Window::Decode;
+    std::int32_t observed_             = 0; // layers observed in this window (in order)
+    std::int64_t begin_ns_             = 0;
     std::int64_t host_served_at_begin_ = 0;
-    cudaEvent_t enqueued_      = nullptr;
+    cudaEvent_t enqueued_              = nullptr;
     expert_cache::CacheCounters at_begin_{};
     Qwen4OffloadWindowStats window_;
-    std::int32_t published_layer_ = -1; // routed() published this layer, run() consumes it
-    cudaStream_t side_    = nullptr;   // device reads of host experts
-    cudaEvent_t fork_     = nullptr;
-    cudaEvent_t join_     = nullptr;
-    Tensor side_partial_;              // routed() -> run(): FP32 [2560,T] of the device reads
+    std::int32_t published_layer_ = -1;      // routed() published this layer, run() consumes it
+    cudaStream_t side_            = nullptr; // device reads of host experts
+    cudaEvent_t fork_             = nullptr;
+    cudaEvent_t join_             = nullptr;
+    Tensor side_partial_; // routed() -> run(): FP32 [2560,T] of the device reads
 
     // Prefill streaming (null when off): the ring is the slots of the cache layers
     // [lend_first_, lend_first_ + lend_count_), lent while prompts stream.
@@ -588,18 +682,31 @@ private:
     std::int32_t prompt_columns_   = 0;
     std::array<bool, 2> lend_waited_{};
     std::array<std::byte*, 4> peer_pool_{};
-    float* peer_divisors_          = nullptr;
+    float* peer_divisors_ = nullptr;
     std::array<int, 2> device_ids_{};
     bool split_on_peer_ = false;
-    Peer peer_{};                                 // rank 1's memory (tp 2)
-    std::vector<Qwen4ExpertBank> banks_;          // host banks (input divisors, planes)
-    // Hottest-first routing of each Text layer in the last prompt window ([layer]; the refill
-    // profile of the lent layers).
+    Peer peer_{};                        // rank 1's memory (tp 2)
+    std::vector<Qwen4ExpertBank> banks_; // host banks (input divisors, planes)
+    // The refill profile of each lent Text layer ([layer]): the last prompt window's routing,
+    // hottest first, or (T211) the residency the layer held when lent, most recently used first.
     std::vector<std::vector<std::int32_t>> lent_profile_;
-    std::vector<std::int32_t> refill_rank_; // T69: [layers * 512] queue order of the refill
+    std::vector<std::int32_t> refill_rank_;   // T69: [layers * 512] queue order of the refill
     std::int32_t chunk_workspace_layers_ = 0; // T69: workspace layers of the open prompt chunk
     std::int32_t boost_left_             = 0; // T69: decode windows left at the boosted cap
-    bool after_prompt_                   = false; // T69: the last window was a prompt window
+    // T211b: the request's first text chunk has been announced (prepare_prompt) since the last
+    // decode window, and whether that request is a new conversation (its prompt windows update
+    // the residency).
+    bool text_prompt_seen_          = false;
+    bool prompt_new_                = false;
+    std::int64_t prompt_next_begin_ = 0; // the position the request's next chunk starts at
+    // The new conversation's routing counts summed over its prompt windows ([layer][expert]),
+    // their tokens ([layer]), the first layer it lent (layers [from, text_layers_) were lent).
+    std::vector<std::vector<std::int32_t>> pending_counts_;
+    std::vector<std::int32_t> pending_tokens_;
+    bool pending_prompt_           = false;
+    std::int32_t prompt_lent_from_ = std::numeric_limits<std::int32_t>::max();
+    void apply_pending_prompt();
+    bool after_prompt_ = false; // T69: the last window was a prompt window
     // Routing counts of every Text layer in the last prompt window ([layer][expert]) and its
     // width; the streamed chunk's CPU selection ([layer][expert], 1 = stream).
     std::vector<std::vector<std::int32_t>> prompt_counts_;
@@ -611,7 +718,7 @@ private:
     std::FILE* routing_        = nullptr;
     std::int64_t clock_offset_ = 0;
     std::int64_t windows_      = 0;
-    std::vector<std::int64_t> flag_seen_ns_; // [layers] routing flag seen (observe_window)
+    std::vector<std::int64_t> flag_seen_ns_;     // [layers] routing flag seen (observe_window)
     std::vector<std::uint32_t> served_at_begin_; // [layers] mailbox served counts at begin_window
     std::int64_t routing_windows_ = 0;
     Qwen4OffloadWindowStats decode_sum_;
@@ -639,7 +746,9 @@ public:
     void run(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x, const Tensor& ids,
              const Tensor& weights, Tensor& partial, WorkspaceArena& work,
              cudaStream_t stream) override;
+
     [[nodiscard]] bool graph_capturable() const noexcept override { return true; }
+
     void exchanged(std::int32_t layer, cudaStream_t stream) override {
         if (owner_ != nullptr) { owner_->exchanged_peer(layer, stream); }
     }
@@ -648,7 +757,7 @@ private:
     std::int32_t layers_          = 0;
     std::int32_t slots_per_layer_ = 0;
     Qwen4OffloadExperts::Peer memory_;
-    Qwen4OffloadExperts* owner_   = nullptr;
+    Qwen4OffloadExperts* owner_ = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

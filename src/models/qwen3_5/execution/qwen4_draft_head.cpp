@@ -8,6 +8,7 @@
 #include "ninfer/ops/target_logprobs.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <stdexcept>
@@ -61,7 +62,7 @@ std::vector<std::int32_t> read_draft_shortlist(const char* path, std::uint32_t r
     std::vector<std::int32_t> ids;
     long long value = 0;
     bool number = false, comment = false;
-    int c = 0;
+    int c            = 0;
     const auto flush = [&] {
         if (number) {
             if (value > std::numeric_limits<std::int32_t>::max()) {
@@ -99,32 +100,50 @@ std::vector<std::int32_t> read_draft_shortlist(const char* path, std::uint32_t r
     return ids;
 }
 
-bool draft_head_supported(const Weight& head) noexcept {
+namespace {
+
+bool q6_head(const Weight& head) noexcept {
     return head.qtype == QType::Q6_G64_FP16 && head.layout == QuantLayout::RowSplit &&
-           head.qdata != nullptr && head.qhigh != nullptr && head.scales != nullptr &&
-           head.n > 0 && head.k > 0 && head.padded_shape[1] >= head.k &&
-           head.padded_shape[1] % 128 == 0;
+           head.qdata != nullptr && head.qhigh != nullptr && head.scales != nullptr && head.n > 0 &&
+           head.k > 0 && head.padded_shape[1] >= head.k && head.padded_shape[1] % 128 == 0;
 }
 
-std::array<std::size_t, 3> q6_row_plane_bytes(const Weight& head) {
-    if (!draft_head_supported(head)) {
-        throw std::invalid_argument("draft head: the output head is not a Q6 RowSplit weight");
+// Row-major [N, K] BF16 with 16-byte aligned rows: every row view and gathered block keeps the
+// alignment the BF16 linear routes need.
+bool bf16_head(const Weight& head) noexcept {
+    return head.qtype == QType::BF16 && head.layout == QuantLayout::Contiguous &&
+           head.qdata != nullptr && reinterpret_cast<std::uintptr_t>(head.qdata) % 16 == 0 &&
+           head.n > 0 && head.k > 0 && head.k % 8 == 0 && head.padded_shape[1] == head.k;
+}
+
+} // namespace
+
+bool draft_head_supported(const Weight& head) noexcept { return q6_head(head) || bf16_head(head); }
+
+std::array<std::size_t, 3> draft_row_plane_bytes(const Weight& head) {
+    if (q6_head(head)) {
+        const auto groups = static_cast<std::size_t>(head.padded_shape[1] / 64);
+        return {groups * 32, groups * 16, groups * 2};
     }
-    const auto groups = static_cast<std::size_t>(head.padded_shape[1] / 64);
-    return {groups * 32, groups * 16, groups * 2};
+    if (bf16_head(head)) { return {static_cast<std::size_t>(head.k) * 2, 0, 0}; }
+    throw std::invalid_argument(
+        "draft head: the output head is neither Q6 RowSplit nor BF16 with aligned rows");
 }
 
-LinearParameters q6_row_view(const LinearParameters& head, std::int32_t first, std::int32_t rows) {
-    const auto bytes = q6_row_plane_bytes(head.weight);
+LinearParameters draft_row_view(const LinearParameters& head, std::int32_t first,
+                                std::int32_t rows) {
+    const auto bytes = draft_row_plane_bytes(head.weight);
     if (first < 0 || rows <= 0 || first > head.weight.n - rows) {
         throw std::invalid_argument("draft head: row view outside the output head");
     }
     LinearParameters out = head;
     Weight& w            = out.weight;
     const auto f         = static_cast<std::size_t>(first);
-    w.qdata  = static_cast<const std::byte*>(head.weight.qdata) + f * bytes[0];
-    w.qhigh  = static_cast<const std::byte*>(head.weight.qhigh) + f * bytes[1];
-    w.scales = static_cast<const std::byte*>(head.weight.scales) + f * bytes[2];
+    w.qdata              = static_cast<const std::byte*>(head.weight.qdata) + f * bytes[0];
+    if (bytes[1] > 0) { w.qhigh = static_cast<const std::byte*>(head.weight.qhigh) + f * bytes[1]; }
+    if (bytes[2] > 0) {
+        w.scales = static_cast<const std::byte*>(head.weight.scales) + f * bytes[2];
+    }
     w.n               = rows;
     w.shape[0]        = rows;
     w.padded_shape[0] = rows;
@@ -133,17 +152,21 @@ LinearParameters q6_row_view(const LinearParameters& head, std::int32_t first, s
     return out;
 }
 
-LinearParameters q6_rows_weight(const LinearParameters& head,
-                                const std::array<std::byte*, 3>& planes, std::int32_t rows) {
-    (void)q6_row_plane_bytes(head.weight);
-    if (rows <= 0 || planes[0] == nullptr || planes[1] == nullptr || planes[2] == nullptr) {
+LinearParameters draft_rows_weight(const LinearParameters& head,
+                                   const std::array<std::byte*, 3>& planes, std::int32_t rows) {
+    const auto bytes = draft_row_plane_bytes(head.weight);
+    bool missing     = false;
+    for (std::size_t p = 0; p < bytes.size(); ++p) {
+        missing = missing || (bytes[p] > 0 && planes[p] == nullptr);
+    }
+    if (rows <= 0 || missing) {
         throw std::invalid_argument("draft head: gathered rows need planes");
     }
     LinearParameters out = head;
     Weight& w            = out.weight;
-    w.qdata           = planes[0];
-    w.qhigh           = planes[1];
-    w.scales          = planes[2];
+    w.qdata              = planes[0];
+    if (bytes[1] > 0) { w.qhigh = planes[1]; }
+    if (bytes[2] > 0) { w.scales = planes[2]; }
     w.n               = rows;
     w.shape[0]        = rows;
     w.padded_shape[0] = rows;
@@ -152,10 +175,10 @@ LinearParameters q6_rows_weight(const LinearParameters& head,
     return out;
 }
 
-void gather_q6_rows(const Weight& head, std::span<const std::int32_t> source_rows,
-                    const std::array<std::byte*, 3>& planes, std::int32_t destination_row0,
-                    cudaStream_t stream) {
-    const auto bytes = q6_row_plane_bytes(head);
+void gather_draft_rows(const Weight& head, std::span<const std::int32_t> source_rows,
+                       const std::array<std::byte*, 3>& planes, std::int32_t destination_row0,
+                       cudaStream_t stream) {
+    const auto bytes = draft_row_plane_bytes(head);
     const std::array<const std::byte*, 3> source{static_cast<const std::byte*>(head.qdata),
                                                  static_cast<const std::byte*>(head.qhigh),
                                                  static_cast<const std::byte*>(head.scales)};
@@ -174,9 +197,10 @@ void gather_q6_rows(const Weight& head, std::span<const std::int32_t> source_row
         }
         const auto destination = static_cast<std::size_t>(destination_row0) + i;
         for (std::size_t p = 0; p < 3; ++p) {
-            CUDA_CHECK(::ninfer::memcpy_device_async(planes[p] + destination * bytes[p],
-                                       source[p] + static_cast<std::size_t>(first) * bytes[p],
-                                       run * bytes[p], stream));
+            if (bytes[p] == 0) { continue; }
+            CUDA_CHECK(::ninfer::memcpy_device_async(
+                planes[p] + destination * bytes[p],
+                source[p] + static_cast<std::size_t>(first) * bytes[p], run * bytes[p], stream));
         }
         i += run;
     }

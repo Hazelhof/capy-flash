@@ -57,9 +57,7 @@ def encode_fp8_row_scaled(
     payload = bytearray(geometry.payload_bytes)
     payload[: geometry.code_plane_bytes] = codes.numpy().tobytes()
     scale_begin = geometry.scale_plane_offset
-    payload[scale_begin : scale_begin + geometry.scale_plane_bytes] = encode_direct(
-        scales, "bf16"
-    )
+    payload[scale_begin : scale_begin + geometry.scale_plane_bytes] = encode_direct(scales, "bf16")
     return bytes(payload)
 
 
@@ -72,8 +70,7 @@ def decode_fp8_row_scaled_words(
     geometry = row_scale_geometry("fp8_e4m3fn_row_bf16", shape)
     if _payload_length(payload) != geometry.payload_bytes:
         raise ValueError(
-            f"row-scaled FP8 payload has {_payload_length(payload)} bytes, "
-            f"expected {geometry.payload_bytes}"
+            f"row-scaled FP8 payload has {_payload_length(payload)} bytes, expected {geometry.payload_bytes}"
         )
     raw = _payload_tensor(payload, torch.device("cpu"))
     codes = raw[: geometry.code_plane_bytes].clone().reshape(geometry.n, geometry.k)
@@ -92,6 +89,4 @@ def dequantize_fp8_row_scaled(
     """Reconstruct a row-scaled FP8 matrix from its exact stored words."""
 
     codes, scales = decode_fp8_row_scaled_words(payload, shape)
-    return (codes.view(torch.float8_e4m3fn).float() * scales.float().unsqueeze(1)).to(
-        dtype
-    )
+    return (codes.view(torch.float8_e4m3fn).float() * scales.float().unsqueeze(1)).to(dtype)

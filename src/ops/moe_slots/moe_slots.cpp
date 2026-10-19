@@ -20,7 +20,9 @@ void require(bool condition, const std::string& message) {
 void require_dense(const Tensor& t, DType dtype, const char* label) {
     require(t.dtype == dtype && t.data != nullptr && t.is_contiguous() && t.numel() > 0,
             std::string(label) + " must be a contiguous non-empty " +
-                (dtype == DType::I32 ? "I32" : dtype == DType::FP32 ? "FP32" : "BF16") +
+                (dtype == DType::I32    ? "I32"
+                 : dtype == DType::FP32 ? "FP32"
+                                        : "BF16") +
                 " tensor");
 }
 

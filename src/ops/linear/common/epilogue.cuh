@@ -2,6 +2,8 @@
 
 #include "ops/linear/common/output.cuh"
 
+#include <concepts>
+
 namespace ninfer::ops::detail {
 
 // Thread-local operations over a fully reduced accumulator. The contraction
@@ -29,6 +31,27 @@ struct LinearResidualAddEpilogue {
                                                   float scale) const {
         return __fadd_rn(__fmul_rn(value, scale), residual.load(row, token));
     }
+
+    // apply(row, token, value) split in two, so a kernel can issue the residual read before its
+    // reduction instead of after it: apply_loaded(value, load(row, token)) == apply(row, token,
+    // value), bit for bit.
+    __device__ __forceinline__ float load(int row, int token) const {
+        return residual.load(row, token);
+    }
+
+    __device__ __forceinline__ float apply_loaded(float value, float loaded) const {
+        return value + loaded;
+    }
+};
+
+// A one-row-per-thread-group kernel spreads its rows' residual reads over the lanes of the warp
+// that owns them, one value per lane, before the K loop: the read then overlaps the weight stream
+// instead of adding a dependent memory round trip after the reduction (on the tp 2 rank-0 down half
+// [5120,8704] at T=4 the residual is cold in L2, and that round trip cost ~2.5 us of ~37).
+template <class Epilogue>
+concept LinearPreloadedEpilogue = requires(const Epilogue& epilogue) {
+    { epilogue.load(0, 0) } -> std::same_as<float>;
+    { epilogue.apply_loaded(0.0f, 0.0f) } -> std::same_as<float>;
 };
 
 // Row consumers run in the single thread owning the fully reduced row. They

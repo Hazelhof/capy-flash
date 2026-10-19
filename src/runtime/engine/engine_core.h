@@ -426,8 +426,8 @@ private:
         record_program_timing(timing, measurement.exposed);
     }
 
-    void record_detail(std::uint64_t RuntimeHostWorkStats::*elapsed_member,
-                       std::uint64_t RuntimeHostWorkStats::*invocation_member,
+    void record_detail(std::uint64_t RuntimeHostWorkStats::* elapsed_member,
+                       std::uint64_t RuntimeHostWorkStats::* invocation_member,
                        Clock::time_point started) noexcept {
         RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
         stats.*elapsed_member += elapsed_ns(started, Clock::now());
@@ -436,8 +436,8 @@ private:
 
     class DetailScope {
     public:
-        DetailScope(EngineCore& owner, std::uint64_t RuntimeHostWorkStats::*elapsed_member,
-                    std::uint64_t RuntimeHostWorkStats::*invocation_member,
+        DetailScope(EngineCore& owner, std::uint64_t RuntimeHostWorkStats::* elapsed_member,
+                    std::uint64_t RuntimeHostWorkStats::* invocation_member,
                     nvtx::Name range_name) noexcept
             : owner_(owner), elapsed_member_(elapsed_member), invocation_member_(invocation_member),
               started_(Clock::now()) {
@@ -454,8 +454,8 @@ private:
 
     private:
         EngineCore& owner_;
-        std::uint64_t RuntimeHostWorkStats::*elapsed_member_;
-        std::uint64_t RuntimeHostWorkStats::*invocation_member_;
+        std::uint64_t RuntimeHostWorkStats::* elapsed_member_;
+        std::uint64_t RuntimeHostWorkStats::* invocation_member_;
         Clock::time_point started_;
         std::optional<nvtx::ScopedRange> range_;
     };
@@ -991,8 +991,8 @@ private:
             // consumed the previous turn's continuation, and discarding it made the next turn
             // rebuild the whole conversation (issue #3). ResourceManager falls back to the
             // discard when the Program cannot retain the sequence.
-            auto settled = resources_.finish(*instance_.program, *request->lane,
-                                             *request->sequence, /*cancelled=*/true);
+            auto settled = resources_.finish(*instance_.program, *request->lane, *request->sequence,
+                                             /*cancelled=*/true);
             request->generation_timings = settled.timings;
             request->speculative_stats  = std::move(settled.speculative);
             if (scheduler_.prefill_lane() == lane) { scheduler_.clear_prefill_lane(lane); }
@@ -1863,6 +1863,40 @@ private:
         }
     }
 
+    // Idle KV to the Host (v0.6): with elastic KV and a Host KV tier, once the active requests
+    // are decoding (no prompt in flight, no context transaction), the Device KV of every idle
+    // retained owner moves to the Host and the Program packs the remaining pages and gives the
+    // freed backing back to the routed-expert cache. Runs again only after the Program's
+    // resources changed (a materialization, capture, release or demotion).
+    void offload_idle_device_kv() {
+        auto& program = *instance_.program;
+        if (!program.idle_device_kv_offload() || materializing_ ||
+            program.has_context_transaction()) {
+            return;
+        }
+        bool decoding = false;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr) { continue; }
+            if (!request->is_decode_ready() || request->capture_pending) { return; }
+            decoding = true;
+        }
+        if (!decoding || program.resource_revision().value == idle_kv_revision_) { return; }
+        const auto started = Clock::now();
+        const auto demoted = resources_.demote_idle_device_kv(program);
+        const auto packed  = program.compact_device_kv();
+        idle_kv_revision_  = program.resource_revision().value;
+        if (demoted.moved_owners != 0 || demoted.released_owners != 0 || packed.moved_pages != 0 ||
+            packed.columns_after != packed.columns_before) {
+            std::fprintf(stderr,
+                         "[engine] idle KV to Host: %u owner(s) moved, %u released, %u Device "
+                         "page(s) packed, expert columns %d -> %d, %.1f ms\n",
+                         demoted.moved_owners, demoted.released_owners, packed.moved_pages,
+                         packed.columns_before, packed.columns_after,
+                         std::chrono::duration<double, std::milli>(Clock::now() - started).count());
+        }
+    }
+
     void run_control_batch(const ControlMembership& membership) {
         nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
                                         static_cast<std::uint64_t>(membership.size));
@@ -2017,6 +2051,7 @@ private:
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
                 apply_device_kv_lease_settlements();
+                offload_idle_device_kv();
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
                 const bool admission_check_pending =
@@ -2104,6 +2139,8 @@ private:
     std::uint64_t next_publication_order_ = 1;
     std::array<std::shared_ptr<Request>, kMaximumConcurrency> slots_{};
     std::optional<MaterializingRequest> materializing_;
+    // offload_idle_device_kv(): the Program resource revision it last left behind.
+    std::uint64_t idle_kv_revision_ = 0;
     Scheduling scheduler_;
     std::atomic<bool> admission_check_pending_{false};
     std::uint64_t worker_accounted_elapsed_ns_ = 0;

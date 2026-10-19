@@ -71,7 +71,7 @@ struct Qwen4PersistentLayout {
     std::array<LayoutRegion, 4> stage_pool{};
     // The planar slot pool (one array per plane); bind_pool() gives the plane bases.
     std::array<LayoutRegion, 4> cache_pool{};
-    std::size_t cache_pool_bytes    = 0;
+    std::size_t cache_pool_bytes = 0;
 
     // `backing`: the persistent arena, or the elastic arena when PersistentLayout::elastic_bytes.
     [[nodiscard]] std::array<std::byte*, 4> bind_pool(DeviceSpan backing) const;
@@ -108,7 +108,7 @@ struct PersistentLayout {
     std::size_t bytes            = 0;
     std::size_t kv_payload_bytes = 0;
     // T64 elastic KV: bytes of the elastic layout (KV page planes, expert slot pools), 0 = none.
-    std::size_t elastic_bytes    = 0;
+    std::size_t elastic_bytes = 0;
 };
 
 struct VisionWorkspacePlan {
@@ -132,7 +132,7 @@ struct WorkspacePlan {
     std::size_t general_capacity = 0;
     // T42: one GPU's workspace for a Qwen4Exp prompt chunk of more than the base chunk (lent by
     // the offload backend from the slot pool, not part of `capacity`); 0 = off.
-    std::size_t qwen4_prompt     = 0;
+    std::size_t qwen4_prompt = 0;
     // T69: the same for every narrower planned chunk width (width, bytes), ascending, ending with
     // the chosen width: a narrower chunk borrows only what its width needs.
     std::vector<std::pair<std::uint32_t, std::size_t>> qwen4_prompt_steps;
@@ -166,17 +166,17 @@ struct SequencePlanningInputs {
     // may be rank 1's alone.
     const execution::Parameters* peer_parameters = nullptr;
     // Merged-token ceiling of one Vision item; the encode workspace is planned for it.
-    std::uint32_t max_vision_item_tokens    = static_cast<std::uint32_t>(kMaximumVisionItemTokens);
-    std::uint32_t capacity                  = 0;
-    std::uint32_t max_concurrency           = 1;
-    std::uint32_t prefill_chunk             = 0;
-    std::uint32_t kv_lease_window_tokens    = 0; // 0: whole max_tokens reserved at admission
-    std::uint32_t draft_window              = 0;
-    float mtp_min_p                         = 0.0F;
-    MtpWindowRule mtp_window_rule           = MtpWindowRule::Chain;
-    SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
-    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head              = ProposalHead::Full;
+    std::uint32_t max_vision_item_tokens   = static_cast<std::uint32_t>(kMaximumVisionItemTokens);
+    std::uint32_t capacity                 = 0;
+    std::uint32_t max_concurrency          = 1;
+    std::uint32_t prefill_chunk            = 0;
+    std::uint32_t kv_lease_window_tokens   = 0; // 0: whole max_tokens reserved at admission
+    std::uint32_t draft_window             = 0;
+    float mtp_min_p                        = 0.0F;
+    MtpWindowRule mtp_window_rule          = MtpWindowRule::Chain;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
@@ -212,21 +212,21 @@ struct SequencePlanImpl {
     const execution::Parameters* vision_parameters = nullptr;
     const execution::Parameters* peer_parameters   = nullptr;
     std::uint32_t max_vision_item_tokens           = 0;
-    std::uint32_t capacity                  = 0;
-    std::uint32_t kv_capacity               = 0;
-    std::uint32_t main_page_groups          = 0;
-    std::uint32_t max_concurrency           = 1;
-    std::uint32_t prefill_chunk             = 0;
+    std::uint32_t capacity                         = 0;
+    std::uint32_t kv_capacity                      = 0;
+    std::uint32_t main_page_groups                 = 0;
+    std::uint32_t max_concurrency                  = 1;
+    std::uint32_t prefill_chunk                    = 0;
     // T42: > 0 when Qwen4Exp prompt chunks wider than this run on lent workspace: the general
     // arena and prefill_hidden are planned for this width, prefill_chunk is the prompt chunk.
-    std::uint32_t qwen4_base_chunk          = 0;
-    std::uint32_t kv_lease_window_tokens    = 0; // 0: whole max_tokens reserved at admission
-    std::uint32_t draft_window              = 0;
-    float mtp_min_p                         = 0.0F;
-    MtpWindowRule mtp_window_rule           = MtpWindowRule::Chain;
-    SpeculativeBackend speculative_backend  = SpeculativeBackend::None;
-    KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
-    ProposalHead proposal_head              = ProposalHead::Full;
+    std::uint32_t qwen4_base_chunk         = 0;
+    std::uint32_t kv_lease_window_tokens   = 0; // 0: whole max_tokens reserved at admission
+    std::uint32_t draft_window             = 0;
+    float mtp_min_p                        = 0.0F;
+    MtpWindowRule mtp_window_rule          = MtpWindowRule::Chain;
+    SpeculativeBackend speculative_backend = SpeculativeBackend::None;
+    KvCacheStorage kv_storage              = KvCacheStorage::BFloat16;
+    ProposalHead proposal_head             = ProposalHead::Full;
     models::LoadOptions features;
     bool use_cuda_graph = true;
     bool causal_scoring = false;
@@ -235,8 +235,8 @@ struct SequencePlanImpl {
     bool tp_mailbox     = true;
     ContextCacheOptions context_cache;
     RoutedExpertOptions qwen4_experts;
-    ElasticKvOptions elastic_kv;              // T64
-    std::int32_t draft_prefix = 0;            // T43, see SequencePlanningInputs
+    ElasticKvOptions elastic_kv;   // T64
+    std::int32_t draft_prefix = 0; // T43, see SequencePlanningInputs
     std::vector<std::int32_t> draft_extras;
     bool draft_split = false;
     // Rank 0's persistent layout, and at tp 2 rank 1's: the same layout without the masked

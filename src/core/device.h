@@ -67,6 +67,7 @@ struct ExecutionContext {
     explicit ExecutionContext(const std::vector<int>& device_ids);
 
     [[nodiscard]] DeviceContext& primary() noexcept { return *dev[0]; }
+
     [[nodiscard]] const DeviceContext& primary() const noexcept { return *dev[0]; }
 };
 

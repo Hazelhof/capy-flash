@@ -37,9 +37,15 @@
 // slots. Measured in the engine: 80 KiB exchanges from a 320 KiB-slot slab cost ~2 us more each
 // (+1.7 % per DFlash2 K=7 round at one request), which a slab of their own does not.
 //
-// FAULTS. A poller that waits too long for its peer (kPeerSpinLimit, qualified below the 2 s display
-// watchdog by test_allreduce) gives up, skips its combine and sets a sticky hang word;
+// FAULTS. A poller that waits too long for its peer (kPeerSpinLimit, qualified below the 2 s
+// display watchdog by test_allreduce) gives up, skips its combine and sets a sticky hang word;
 // hang_reported() exposes it to the owner, which fails that round and every later one.
+//
+// ENTRY. A rank may reach its first captured exchange only after the peer has finished every
+// cross-device copy still owed from it: under WSL2 an outstanding copy stalls behind the peer's
+// spinning exchange kernel (issue #1) and the pair waits on each other until the spin limit. The
+// MTP draft phase ends its staged collectives with such a rendezvous; the DFlash2 draft share adds
+// its own (execution/tp2/draft_tp2.inc).
 
 #include "core/device.h" // ExecutionContext
 
@@ -47,6 +53,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace ninfer::ops {
 
@@ -57,13 +64,20 @@ namespace ninfer::ops {
 // hang word. A kernel using it must keep the pipelined geometry (lane w = 32 lanes x 2 vectors of
 // 16 bytes = bytes [w KiB, (w+1) KiB) of the payload) so its exchanges and the mailbox's own
 // interleave on the same slots.
+// One byte range of device memory for an exchange to prefetch into L2 (PeerMailbox::
+// set_l2_prefetch).
+struct PeerL2Range {
+    const void* data  = nullptr;
+    std::size_t bytes = 0;
+};
+
 struct PeerExchangeSlot {
-    void* mine_payload          = nullptr;
-    const void* peer_payload    = nullptr;
-    std::uint32_t* mine_flags   = nullptr;
-    std::uint32_t* peer_flags   = nullptr;
-    std::uint32_t* epochs       = nullptr;
-    std::uint32_t* hang         = nullptr;
+    void* mine_payload        = nullptr;
+    const void* peer_payload  = nullptr;
+    std::uint32_t* mine_flags = nullptr;
+    std::uint32_t* peer_flags = nullptr;
+    std::uint32_t* epochs     = nullptr;
+    std::uint32_t* hang       = nullptr;
 };
 
 // The exchange kernel a PeerMailbox launches (src/ops/kernel/peer_exchange.cuh).
@@ -86,7 +100,7 @@ public:
     // without two distinct devices, fewer than two slots or an empty slot, and std::runtime_error
     // on allocation failure.
     PeerMailbox(const ExecutionContext& ec, std::size_t slot_bytes, int slots = 2,
-                PeerExchangeKernel kernel = PeerExchangeKernel::Pipelined,
+                PeerExchangeKernel kernel   = PeerExchangeKernel::Pipelined,
                 std::size_t wide_slot_bytes = 0);
     ~PeerMailbox();
 
@@ -132,8 +146,8 @@ public:
     // stored there too. Same slots, sets and protocol as the BF16 exchange, so the two interleave
     // on one mailbox. Only the pipelined kernel has this form: throws std::logic_error on a
     // mailbox created with PeerExchangeKernel::Legacy (allreduce_sum_f32 keeps such pairs staged).
-    void enqueue_exchange_sum_f32(int rank, int slot, void* data, std::size_t bytes,
-                                  void* bf16_out, cudaStream_t stream) const;
+    void enqueue_exchange_sum_f32(int rank, int slot, void* data, std::size_t bytes, void* bf16_out,
+                                  cudaStream_t stream) const;
 
     // Rank `rank`'s view of slot `slot` (taken by take_capture_slot(bytes) for both ranks) of the
     // set that carries `bytes`, for a fused kernel that exchanges itself. Pipelined mailboxes only:
@@ -152,7 +166,24 @@ public:
     // their input before waiting); Qwen4Exp turns it on (its dependents are the hyper-connection
     // mixers, T45). Applies to exchanges enqueued afterwards.
     void set_release_dependents(bool release) noexcept { release_dependents_ = release; }
+
     [[nodiscard]] bool release_dependents() const noexcept { return release_dependents_; }
+
+    // L2 PREFETCH (q27/dexch, peer_exchange.cuh). The next pipelined exchange enqueued for `rank`
+    // (BF16 or FP32) also prefetches `ranges` -- rank `rank`'s device memory, at most
+    // kL2PrefetchRanges of them, e.g. the leading rows of the weight the kernel after the exchange
+    // streams -- into that device's L2 from blocks of its own, while the exchange waits on PCIe.
+    // The ranges are consumed by that one launch (a later exchange prefetches nothing unless set
+    // again); each is shrunk to whole 16-byte units, empty ones dropped. A hint never changes a
+    // result bit. A Legacy mailbox ignores hints.
+    static constexpr int kL2PrefetchRanges = 4;
+    void set_l2_prefetch(int rank, std::span<const PeerL2Range> ranges);
+
+    // Bytes per exchange the owner's hints should cover (0: the owner sets none). The Program sets
+    // it once (NINFER_TP_EXCHANGE_PREFETCH_KIB); the mailbox only stores it for the forward code.
+    void set_l2_prefetch_budget(std::size_t bytes) noexcept { l2_prefetch_budget_ = bytes; }
+
+    [[nodiscard]] std::size_t l2_prefetch_budget() const noexcept { return l2_prefetch_budget_; }
 
     // Test aid: sets the sticky hang word from the host, as a poller that gave up would, so the
     // owner's recovery can be exercised on hardware where no exchange ever hangs.
@@ -162,9 +193,9 @@ private:
     // One set of slots: its pinned slab (payloads, then flag lines; the ordinary set's also holds
     // the hang word) and each device's arrival and epoch words.
     struct SlotSet {
-        void* slab                     = nullptr; // pinned host allocation, UVA-mapped
-        std::uint8_t* payload[2]       = {nullptr, nullptr};
-        std::uint32_t* flags[2]        = {nullptr, nullptr}; // [slot][lane * kPeerFlagStride]
+        void* slab               = nullptr; // pinned host allocation, UVA-mapped
+        std::uint8_t* payload[2] = {nullptr, nullptr};
+        std::uint32_t* flags[2]  = {nullptr, nullptr}; // [slot][lane * kPeerFlagStride]
         // Legacy: [arrival x slots][epoch x slots]. Pipelined: [slot][lane] epochs.
         std::uint32_t* device_words[2] = {nullptr, nullptr};
         std::size_t slot_bytes         = 0;
@@ -176,14 +207,25 @@ private:
     [[nodiscard]] int set_for(std::size_t bytes) const noexcept {
         return bytes <= sets_[0].slot_bytes || sets_[1].slot_bytes == 0 ? 0 : 1;
     }
+
     void release() noexcept;
 
-    SlotSet sets_[2];                    // ordinary, wide (slot_bytes 0: absent)
+    SlotSet sets_[2]; // ordinary, wide (slot_bytes 0: absent)
     std::uint32_t* hang_            = nullptr;
     int slots_                      = 0;
     PeerExchangeKernel kernel_      = PeerExchangeKernel::Pipelined;
     int devices_[2]                 = {0, 0};
     bool release_dependents_        = false;
+    std::size_t l2_prefetch_budget_ = 0;
+
+    // Per rank: the hint the next enqueue consumes. Mutable: enqueueing is const (it changes no
+    // transport state), the hint is a one-shot argument of that launch.
+    struct L2Hint {
+        PeerL2Range ranges[kL2PrefetchRanges];
+        int count = 0;
+    };
+
+    mutable L2Hint l2_hint_[2];
 };
 
 } // namespace ninfer::ops

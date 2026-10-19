@@ -74,8 +74,12 @@ def _parts(directory, name):
 
 @pytest.mark.parametrize("dense", [False, True, "mix", "gdn"])
 def test_flash_next_recipes_import_experts_and_table_exactly(tmp_path, dense):
-    recipe = {False: qwen3_8_flash_next_nvfp4, True: qwen3_8_flash_next_nvfp4_dense,
-              "mix": qwen3_8_flash_next_nvfp4_mix, "gdn": qwen3_8_flash_next_nvfp4_gdn}[dense]
+    recipe = {
+        False: qwen3_8_flash_next_nvfp4,
+        True: qwen3_8_flash_next_nvfp4_dense,
+        "mix": qwen3_8_flash_next_nvfp4_mix,
+        "gdn": qwen3_8_flash_next_nvfp4_gdn,
+    }[dense]
     out, store = _convert(tmp_path, recipe, {False: "q8", True: "dense", "mix": "mix", "gdn": "gdn"}[dense])
     with store, Artifact(out) as artifact:
         directory = artifact.directory
@@ -115,9 +119,7 @@ def test_flash_next_recipes_import_experts_and_table_exactly(tmp_path, dense):
                     # swizzled plane, and unswizzle to the checkpoint's natural scales.
                     first = g.scale_plane_offset + row * k // 16
                     span = raw[first : first + rows * k // 16]
-                    natural = unswizzle_nvfp4_scales(
-                        torch.frombuffer(bytearray(span), dtype=torch.uint8), (rows, k)
-                    )
+                    natural = unswizzle_nvfp4_scales(torch.frombuffer(bytearray(span), dtype=torch.uint8), (rows, k))
                     want = store.read_flat(prefix + ".weight_scale").view(torch.uint8)
                     assert torch.equal(natural.reshape(-1), want.reshape(-1))
                     # Divisor: the source's own word, at the source's index.
@@ -125,8 +127,12 @@ def test_flash_next_recipes_import_experts_and_table_exactly(tmp_path, dense):
                     word = raw[g.weight_divisor_offset + 4 * source_index :][:4]
                     assert word == fixture.divisor_word(store.read_flat(prefix + ".weight_scale_2"))
                     # Activation divisor of the source's own Use.
-                    use = uses[(f"{lp}{e}/{role}", f"text/layers/{layer}/" + (
-                        f"moe/experts/{e}/product" if role == "down" else "ffn_input"))]
+                    use = uses[
+                        (
+                            f"{lp}{e}/{role}",
+                            f"text/layers/{layer}/" + (f"moe/experts/{e}/product" if role == "down" else "ffn_input"),
+                        )
+                    ]
                     assert use["activation_policy"] == "AllowA4"
                     assert "activation_input_divisor" in use.get("auxiliaries", {})
 
@@ -145,9 +151,9 @@ def test_flash_next_recipes_import_experts_and_table_exactly(tmp_path, dense):
             ]
         )
         assert raw[: rows * 8] == table.numpy().tobytes()
-        scale = store.read_flat(
-            "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight_scale"
-        ).view(torch.uint8)
+        scale = store.read_flat("model.language_model.layers.0.ple.ple_embedding.ngram_embedding.weight_scale").view(
+            torch.uint8
+        )
         scale_offset = (rows * 8 + 255) // 256 * 256
         assert raw[scale_offset : scale_offset + 2 * rows] == scale.numpy().tobytes() * rows
 
@@ -155,9 +161,7 @@ def test_flash_next_recipes_import_experts_and_table_exactly(tmp_path, dense):
         (part,) = _parts(directory, "mtp/layers/0/moe/experts/1/gate")
         bank = artifact.object(part["object"])
         assert bank.format == "nvfp4" and bank.divisors == 2 * E
-        assert uses[("mtp/layers/0/moe/experts/1/gate", "mtp/layers/0/ffn_input")][
-            "activation_policy"
-        ] == "A16Only"
+        assert uses[("mtp/layers/0/moe/experts/1/gate", "mtp/layers/0/ffn_input")]["activation_policy"] == "A16Only"
         raw = artifact.read_object(bank.id)
         g = block_scale_geometry("nvfp4", bank.shape, bank.divisors)
         row = 2 * IR  # expert 1's gate
@@ -232,9 +236,7 @@ def test_stacked_quantization_keeps_one_divisor_per_source():
         nvfp4_mse_stacked(PrepareRequest(TensorSpec("w", (256, 64), "nvfp4", "x", 1), inputs, {}, {}))
     with pytest.raises(ValueError, match="one divisor per parent"):
         nvfp4_mse(PrepareRequest(TensorSpec("w", (256, 64), "nvfp4", "x", 2), inputs, {}, {}))
-    request = PrepareRequest(
-        TensorSpec("w", (256, 64), "nvfp4", "x", 2), inputs, {}, {}, device="cpu"
-    )
+    request = PrepareRequest(TensorSpec("w", (256, 64), "nvfp4", "x", 2), inputs, {}, {}, device="cpu")
     written = []
 
     class Output:

@@ -116,9 +116,7 @@ def ple_constants(text: dict) -> dict:
     vocab, order, per = text["vocab_size"], text["ngram_size"], text["heads_per_ngram"]
     bound = max(1, ((1 << 63) - 1) // vocab // 2)
     seed = text["seed"]  # the single PLE layer has index 0
-    multipliers = [
-        2 * (_splitmix64((seed + _GAMMA * (i + 1)) & _MASK64) % bound) + 1 for i in range(order)
-    ]
+    multipliers = [2 * (_splitmix64((seed + _GAMMA * (i + 1)) & _MASK64) % bound) + 1 for i in range(order)]
     prime, moduli, offsets, total = text["ngram_vocab_size_base"] - 1, [], [], 0
     for _ in range((order - 1) * per):
         prime += 1
@@ -156,9 +154,7 @@ def _block_fp8(tensors: dict, prefix: str, shape, generator: torch.Generator) ->
     values = torch.randn(shape, generator=generator).clamp(-4, 4) * 30
     tensors[prefix + ".weight"] = values.to(torch.float8_e4m3fn)
     tiles = (-(-shape[0] // 128), -(-shape[1] // 128))
-    tensors[prefix + ".weight_scale_inv"] = (
-        torch.rand(tiles, generator=generator) * 4e-4 + 2e-4
-    ).to(torch.bfloat16)
+    tensors[prefix + ".weight_scale_inv"] = (torch.rand(tiles, generator=generator) * 4e-4 + 2e-4).to(torch.bfloat16)
 
 
 def write_checkpoint(path: Path, *, seed: int = 0) -> dict:
@@ -235,9 +231,7 @@ def write_checkpoint(path: Path, *, seed: int = 0) -> dict:
             half = constants["rows"] // 2
             tensors[emb + "ngram_embedding.shard_0.weight"] = table[:half].clone()
             tensors[emb + "ngram_embedding.shard_1.weight"] = table[half:].clone()
-            tensors[emb + "ngram_embedding.weight_scale"] = torch.tensor(
-                [0.015625], dtype=torch.bfloat16
-            )
+            tensors[emb + "ngram_embedding.weight_scale"] = torch.tensor([0.015625], dtype=torch.bfloat16)
             tensors[emb + "layer_multipliers"] = torch.tensor(
                 [m - (1 << 64) if m >= 1 << 63 else m for m in constants["multipliers"]],
                 dtype=torch.int64,
@@ -271,9 +265,7 @@ def write_checkpoint(path: Path, *, seed: int = 0) -> dict:
     for name, shard in shards.items():
         save_file({k: v.contiguous() for k, v in shard.items()}, str(path / name))
         weight_map.update({k: name for k in shard})
-    (path / "model.safetensors.index.json").write_text(
-        json.dumps({"metadata": {}, "weight_map": weight_map}, indent=1)
-    )
+    (path / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}, indent=1))
     write_tokenizer(path)
     return tensors
 
@@ -313,13 +305,9 @@ def write_tokenizer(path: Path) -> None:
 
     tokens = [added(256 + i, content) for i, content in enumerate(_SPECIALS)]
     (path / "tokenizer.json").write_text(
-        json.dumps(
-            {"model": {"type": "BPE", "vocab": vocab, "merges": []}, "added_tokens": tokens[:8]}
-        )
+        json.dumps({"model": {"type": "BPE", "vocab": vocab, "merges": []}, "added_tokens": tokens[:8]})
     )
-    (path / "tokenizer_config.json").write_text(
-        json.dumps({"added_tokens_decoder": {str(t["id"]): t for t in tokens}})
-    )
+    (path / "tokenizer_config.json").write_text(json.dumps({"added_tokens_decoder": {str(t["id"]): t for t in tokens}}))
     (path / "generation_config.json").write_text(json.dumps({"eos_token_id": [256, 258]}))
     (path / "chat_template.jinja").write_text("{{ messages }}")
 

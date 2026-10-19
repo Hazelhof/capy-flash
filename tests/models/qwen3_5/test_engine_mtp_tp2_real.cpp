@@ -326,8 +326,8 @@ int exercise_accepted_lengths(ninfer::Engine& engine) {
     const auto run             = [&](std::uint32_t steps) {
         return engine
             .submit(engine.prepare(user_prompt(prompt)), greedy(tokens),
-                    ninfer::OutputConsumerMode::Aggregate,
-                    ninfer::GenerationObservationOptions{.accepted_length_steps = steps})
+                                ninfer::OutputConsumerMode::Aggregate,
+                                ninfer::GenerationObservationOptions{.accepted_length_steps = steps})
             .wait();
     };
     const ninfer::GenerationResult plain    = run(0);

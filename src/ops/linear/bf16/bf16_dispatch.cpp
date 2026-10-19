@@ -16,6 +16,24 @@ constexpr std::array kShapes{
     ShapeEntry{256, 5120, select_bf16_n256_k5120},
     ShapeEntry{7168, 5120, select_bf16_n7168_k5120},
     ShapeEntry{5120, 3072, select_bf16_n5120_k3072},
+    // Qwen3.8-Flash-Next (FP4-Local keeps these BF16): hyper-connection Down(+inject) and Up,
+    // whole and stream-split (tp 2 hc_split_streams), then the MTP dense layer (tp 1 and the
+    // tp 2 shards) and the PLE key|value parent.
+    ShapeEntry{324, 10240, select_bf16_qwen4_hc_down},
+    ShapeEntry{320, 10240, select_bf16_qwen4_hc_down},
+    ShapeEntry{324, 5120, select_bf16_qwen4_hc_down},
+    ShapeEntry{320, 5120, select_bf16_qwen4_hc_down},
+    ShapeEntry{10240, 320, select_bf16_qwen4_hc_up},
+    ShapeEntry{5120, 320, select_bf16_qwen4_hc_up},
+    ShapeEntry{13312, 2560, select_bf16_qwen4_dense<13312, 2560>},
+    ShapeEntry{6656, 2560, select_bf16_qwen4_dense<6656, 2560>},
+    ShapeEntry{640, 2560, select_bf16_qwen4_dense<640, 2560>},
+    ShapeEntry{2560, 6144, select_bf16_qwen4_dense<2560, 6144>},
+    ShapeEntry{2560, 3072, select_bf16_qwen4_dense<2560, 3072>},
+    ShapeEntry{1280, 2560, select_bf16_qwen4_dense<1280, 2560>},
+    ShapeEntry{2560, 640, select_bf16_qwen4_dense<2560, 640>},
+    ShapeEntry{2560, 2560, select_bf16_qwen4_dense<2560, 2560>},
+    ShapeEntry{12800, 2560, select_bf16_qwen4_dense<12800, 2560>},
 };
 } // namespace
 
@@ -25,7 +43,7 @@ Bf16Launch select_bf16_a16_launch(std::int32_t n, std::int32_t k, std::int32_t t
         if (entry.n == n && entry.k == k) return entry.select(t);
     }
     // T103: any other shape takes the generic route (correct for every N/K/T, untuned), e.g.
-    // Qwen3.8-Flash-Next's indexer, hyper-connection and GDN projections kept in BF16.
+    // Qwen3.8-Flash-Next's GDN projections kept in BF16 by the nvfp4 *bf16 recipes.
     if (n > 0 && k > 0) return launch_bf16_generic;
     throw std::invalid_argument("bf16 linear: unsupported shape");
 }

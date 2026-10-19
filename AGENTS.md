@@ -205,6 +205,6 @@ Select model artifacts by explicit path, never glob order, modification time, or
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
 
 Create commits only when requested. Subjects name the area and the change (`qwen4 PLE: ...`,
-`serve: ...`). Run `pre-commit install` once: the hooks check the lines a commit changes
-(clang-format) and Python errors (ruff), as CI does on pull requests. A commit written with AI
+`serve: ...`). Run `pre-commit install` once: the hooks format the files a commit changes
+(clang-format, ruff format) and check Python errors and spelling (ruff, typos), as CI does on pull requests. A commit written with AI
 assistance says so in its trailer (`Co-Authored-By:`), and so does its pull request.

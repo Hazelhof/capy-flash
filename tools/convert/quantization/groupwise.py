@@ -84,9 +84,7 @@ def quantize_matrix(
     if not isinstance(spec, QuantFormat):
         raise ValueError("grouped quantization requires a quantized numeric format")
     if weight.dim() != 2:
-        raise ValueError(
-            f"grouped quantization requires rank 2, got {tuple(weight.shape)}"
-        )
+        raise ValueError(f"grouped quantization requires rank 2, got {tuple(weight.shape)}")
     if not weight.dtype.is_floating_point:
         raise TypeError(f"weight must be floating point, got {weight.dtype}")
 
@@ -94,9 +92,7 @@ def quantize_matrix(
     target = pick_device() if device is None else pick_device(device)
     logical = weight.detach().to(device=target, dtype=torch.float32)
     if geometry.k_pad != geometry.k:
-        physical = torch.zeros(
-            (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
-        )
+        physical = torch.zeros((geometry.n, geometry.k_pad), dtype=torch.float32, device=target)
         physical[:, : geometry.k].copy_(logical)
         logical = physical
 
@@ -105,7 +101,5 @@ def quantize_matrix(
     host_scales, host_reciprocal = _canonical_scale_words(max_abs, spec.qmax)
     scales = host_scales.to(target)
     reciprocal = host_reciprocal.to(target)
-    codes = torch.clamp(
-        torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax
-    ).to(torch.int8)
+    codes = torch.clamp(torch.round(grouped * reciprocal.unsqueeze(-1)), spec.qmin, spec.qmax).to(torch.int8)
     return QuantizedMatrix(codes=codes, scales=scales)

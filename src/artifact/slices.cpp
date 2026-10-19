@@ -15,6 +15,8 @@ constexpr std::uint64_t kScaleTileRows    = 128;
 constexpr std::uint64_t kScaleTileColumns = 64;
 constexpr std::uint64_t kScaleTileBytes   = 512;
 constexpr std::uint64_t kRowSplitColumns  = 128;
+constexpr std::uint64_t kMxfp8Columns     = 32; // One UE8M0 scale word per 32 columns.
+constexpr std::uint64_t kNvfp4RowColumns  = 16; // One E4M3FN scale word per 16 columns.
 constexpr std::uint64_t kDivisorBytes     = 4;
 
 void require_slice(bool condition, std::string_view reason) {
@@ -130,9 +132,14 @@ TensorSlice tensor_row_slice(const WeightGeometry& parent, std::span<const Slice
                   rows);
         break;
     case QuantLayout::RowScale:
+    case QuantLayout::BlockScaleK32:
         copy_rows(out.copies, {0, 0, parent.code_bytes_per_row}, rows);
         copy_rows(out.copies, {parent.scale_offset, shard.scale_offset, parent.scale_bytes_per_row},
                   rows);
+        break;
+    case QuantLayout::RowInterleaved:
+        // Each row carries its own scales: whole rows of the one interleaved plane.
+        copy_rows(out.copies, {0, 0, parent.code_bytes_per_row}, rows);
         break;
     case QuantLayout::BlockScaleK16M128x4:
         copy_rows(out.copies, {0, 0, parent.code_bytes_per_row}, rows);
@@ -151,10 +158,21 @@ TensorSlice tensor_row_slice(const WeightGeometry& parent, std::span<const Slice
 TensorSlice tensor_column_slice(const WeightGeometry& parent, std::span<const SliceRange> columns) {
     require_slice(parent.shape.size() == 2, "a column slice requires a matrix");
     const auto rows      = parent.shape[0];
-    const auto alignment = parent.layout == QuantLayout::RowSplit              ? kRowSplitColumns
-                           : parent.layout == QuantLayout::BlockScaleK16M128x4 ? kScaleTileColumns
-                                                                               : 1;
-    const auto count     = selected_count(columns, parent.shape[1], alignment);
+    const auto alignment = [&]() -> std::uint64_t {
+        switch (parent.layout) {
+        case QuantLayout::RowSplit:
+            return kRowSplitColumns;
+        case QuantLayout::BlockScaleK16M128x4:
+            return kScaleTileColumns;
+        case QuantLayout::BlockScaleK32:
+            return kMxfp8Columns;
+        case QuantLayout::RowInterleaved:
+            return kNvfp4RowColumns;
+        default:
+            return 1;
+        }
+    }();
+    const auto count = selected_count(columns, parent.shape[1], alignment);
     require_slice(parent.layout == QuantLayout::Contiguous || columns.size() == 1,
                   "only a contiguous layout accepts several column ranges");
     TensorSlice out{narrowed(parent, 1, count), {}};
@@ -201,6 +219,24 @@ TensorSlice tensor_column_slice(const WeightGeometry& parent, std::span<const Sl
         copy_columns(out.copies, {0, 0, parent.code_bytes_per_row, shard.code_bytes_per_row}, rows,
                      column.begin, column.count);
         push(out.copies, parent.scale_offset, shard.scale_offset, parent.scale_bytes);
+        break;
+    case QuantLayout::BlockScaleK32:
+        // Whole 32-column groups: the same column range of the codes and K/32 of the scales.
+        copy_columns(out.copies, {0, 0, parent.code_bytes_per_row, shard.code_bytes_per_row}, rows,
+                     column.begin, column.count);
+        copy_columns(out.copies,
+                     {parent.scale_offset, shard.scale_offset, parent.scale_bytes_per_row,
+                      shard.scale_bytes_per_row},
+                     rows, column.begin / kMxfp8Columns, column.count / kMxfp8Columns);
+        break;
+    case QuantLayout::RowInterleaved:
+        // Every shard row is its code bytes, then its scale bytes, at the shard's row stride.
+        copy_columns(out.copies, {0, 0, parent.code_bytes_per_row, shard.code_bytes_per_row}, rows,
+                     column.begin / 2, column.count / 2);
+        copy_columns(out.copies,
+                     {parent.scale_offset, shard.scale_offset, parent.code_bytes_per_row,
+                      shard.code_bytes_per_row},
+                     rows, column.begin / kNvfp4RowColumns, column.count / kNvfp4RowColumns);
         break;
     case QuantLayout::BlockScaleK16M128x4: {
         copy_columns(out.copies, {0, 0, parent.code_bytes_per_row, shard.code_bytes_per_row}, rows,

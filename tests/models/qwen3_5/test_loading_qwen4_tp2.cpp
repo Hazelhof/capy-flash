@@ -60,8 +60,8 @@ const char* axis_name(ShardAxis axis) {
 
 struct Expectation {
     ShardAxis axis = ShardAxis::Replicated;
-    int holder     = 0;  // SingleDevice
-    std::string kind;    // inventory class
+    int holder     = 0; // SingleDevice
+    std::string kind;   // inventory class
 };
 
 bool contains(const std::string& name, const char* part) {
@@ -74,8 +74,9 @@ bool ends_with(const std::string& name, const char* suffix) {
 }
 
 std::uint32_t block_index(const std::string& name, std::uint32_t layers) {
-    for (const auto& [prefix, base] : {std::pair<std::string, std::uint32_t>{"text/layers/", 0},
-                                       std::pair<std::string, std::uint32_t>{"mtp/layers/", layers}}) {
+    for (const auto& [prefix, base] :
+         {std::pair<std::string, std::uint32_t>{"text/layers/", 0},
+          std::pair<std::string, std::uint32_t>{"mtp/layers/", layers}}) {
         if (name.rfind(prefix, 0) == 0) {
             return base + static_cast<std::uint32_t>(std::stoul(name.substr(prefix.size())));
         }
@@ -87,8 +88,13 @@ std::uint32_t block_index(const std::string& name, std::uint32_t layers) {
 // load/sharding.cpp: a table over the names T30 documents).
 std::optional<Expectation> expected_placement(const std::string& name, std::uint32_t layers,
                                               bool split, bool embedding_host) {
-    if (contains(name, "/moe/experts/")) { return Expectation{ShardAxis::HostMapped, 0, "experts"}; }
+    if (contains(name, "/moe/experts/")) {
+        return Expectation{ShardAxis::HostMapped, 0, "experts"};
+    }
     if (ends_with(name, "/ple/table")) { return std::nullopt; } // HostFile
+    if (ends_with(name, "/ple/table_global_scale")) {
+        return Expectation{ShardAxis::Replicated, 0, "ple"};
+    }
     if (name.rfind("vision/", 0) == 0) { return Expectation{ShardAxis::SingleDevice, 0, "vision"}; }
     if (name == "text/token_embedding") {
         return Expectation{embedding_host ? ShardAxis::HostMapped : ShardAxis::Replicated, 0,
@@ -105,7 +111,9 @@ std::optional<Expectation> expected_placement(const std::string& name, std::uint
     if (name.rfind("mtp/", 0) == 0 && !contains(name, "/layers/")) {
         return Expectation{ShardAxis::Replicated, 0, "mtp stem"};
     }
-    if (contains(name, "/attention/indexer_")) { return Expectation{ShardAxis::Replicated, 0, "indexer"}; }
+    if (contains(name, "/attention/indexer_")) {
+        return Expectation{ShardAxis::Replicated, 0, "indexer"};
+    }
     if (contains(name, "/attention/")) {
         if (ends_with(name, "_norm")) { return Expectation{ShardAxis::Replicated, 0, "attention"}; }
         if (ends_with(name, "/output")) { return Expectation{ShardAxis::Columns, 0, "attention"}; }
@@ -129,8 +137,8 @@ std::optional<Expectation> expected_placement(const std::string& name, std::uint
         if (!split || ends_with(name, "/key") || ends_with(name, "/value")) {
             return Expectation{ShardAxis::Replicated, 0, "ple"};
         }
-        return Expectation{ends_with(name, "/convolution") ? ShardAxis::Columns : ShardAxis::Rows, 0,
-                           "ple"};
+        return Expectation{ends_with(name, "/convolution") ? ShardAxis::Columns : ShardAxis::Rows,
+                           0, "ple"};
     }
     throw std::runtime_error(name + ": the test has no expectation for this parameter");
 }
@@ -154,8 +162,8 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
     auto plan          = qwen::plan_load(reader, options);
     const auto& config = plan.config().text;
     require(config.qwen4(), "not a Qwen4Exp artifact");
-    const auto layers  = config.num_hidden_layers;
-    const auto& mplan  = plan.materialization();
+    const auto layers = config.num_hidden_layers;
+    const auto& mplan = plan.materialization();
     require(mplan.device_count == 2, "the plan is not for two devices");
 
     // object -> placement per device
@@ -174,8 +182,8 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
         const auto& reference = plan.parameter(qwen::WeightId{index});
         const auto& name      = reference.name;
         if (reference.residency != artifact::Residency::Device) { continue; }
-        const auto expect = expected_placement(name, layers, options.hc_split_streams,
-                                               options.embedding_host);
+        const auto expect =
+            expected_placement(name, layers, options.hc_split_streams, options.embedding_host);
         if (!expect) { continue; }
         for (const auto& part : reference.binding.parts) {
             const auto object = part.object.index;
@@ -194,7 +202,8 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
             }
             for (int device = 0; device < 2; ++device) {
                 const auto* item = found->second[static_cast<std::size_t>(device)];
-                const bool held  = expect->axis != ShardAxis::SingleDevice || expect->holder == device;
+                const bool held =
+                    expect->axis != ShardAxis::SingleDevice || expect->holder == device;
                 if ((item != nullptr) != held) {
                     std::cerr << name << ": device " << device << (held ? " lacks" : " holds")
                               << " the parent\n";
@@ -233,7 +242,8 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
                 static_cast<unsigned long long>(mplan.per_device_capacity_bytes[0]),
                 static_cast<unsigned long long>(mplan.per_device_capacity_bytes[1]));
     std::printf("  host-mapped %llu B, file-mapped objects %zu\n",
-                static_cast<unsigned long long>(mplan.host_mapped_bytes), mplan.file_objects.size());
+                static_cast<unsigned long long>(mplan.host_mapped_bytes),
+                mplan.file_objects.size());
     if (failures != 0 || plan_only) { return failures; }
 
     int devices = 0;
@@ -245,8 +255,7 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
     const std::vector<artifact::DevicePlacement> placements = mplan.device_objects;
     std::vector<std::optional<std::size_t>> parameter_object(plan.parameter_count());
     for (std::size_t index = 0; index < plan.parameter_count(); ++index) {
-        const auto& parts =
-            plan.parameter(qwen::WeightId{index}).binding.parts;
+        const auto& parts = plan.parameter(qwen::WeightId{index}).binding.parts;
         if (parts.empty()) { continue; }
         bool one = true;
         for (const auto& part : parts) { one = one && part.object == parts.front().object; }
@@ -277,7 +286,7 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
         }
     }
     // Every device parent is byte-identical to the host-applied slice of its artifact parent.
-    std::uint64_t compared = 0;
+    std::uint64_t compared       = 0;
     std::size_t parents_compared = 0;
     for (const auto& placement : placements) {
         const auto found = parents.find({placement.object.index, placement.device});
@@ -320,7 +329,8 @@ int run(const std::filesystem::path& path, const LoadOptions& options, bool plan
         const auto& a = model->weight_data(0)[index];
         const auto& b = model->weight_data(1)[index];
         if (!contains(a.name, "/moe/experts/") || a.view.parts.empty()) { continue; }
-        if (b.view.parts.empty() || a.view.parts.front().parent->data != b.view.parts.front().parent->data) {
+        if (b.view.parts.empty() ||
+            a.view.parts.front().parent->data != b.view.parts.front().parent->data) {
             std::cerr << a.name << ": ranks do not share the host-mapped bank\n";
             ++failures;
         }

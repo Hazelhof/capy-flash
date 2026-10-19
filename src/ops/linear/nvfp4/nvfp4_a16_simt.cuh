@@ -245,6 +245,20 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
 #pragma unroll
     for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
         parent[r] = nvfp4_a16_parent_row<Schedule>(rb, local0 + r, rows, policy);
+    // Lane r * kBlockTokens + t reads the residual of (row r, token t) now; lane 0 collects it.
+    constexpr bool kPreload = LinearPreloadedEpilogue<Epilogue> && !Rows::kPaired &&
+                              Schedule::kWarpsPerRow == 1 &&
+                              Schedule::kRowsPerWarp * Schedule::kBlockTokens <= 32;
+    float preloaded = 0.0f;
+    if constexpr (kPreload) {
+        const int r = lane / Schedule::kBlockTokens, t = lane % Schedule::kBlockTokens;
+        int row = parent[0];
+#pragma unroll
+        for (int i = 1; i < Schedule::kRowsPerWarp; ++i)
+            if (r == i) row = parent[i];
+        if (r < Schedule::kRowsPerWarp && token0 + t < live)
+            preloaded = epilogue.load(row, token0 + t);
+    }
     float acc[Schedule::kRowsPerWarp][Schedule::kBlockTokens][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_simt_rows<Geometry, ActiveTokens, Schedule>(
         x, codes, scales, shared, alpha, parent, local0, token0, wr, lane, acc, live);
@@ -275,6 +289,24 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
                     totals[r][t] = warp_reduce_sum(sum);
                 }
         }
+    }
+    if constexpr (kPreload) {
+        float loaded[Schedule::kRowsPerWarp][Schedule::kBlockTokens];
+#pragma unroll
+        for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+#pragma unroll
+            for (int t = 0; t < Schedule::kBlockTokens; ++t)
+                loaded[r][t] = __shfl_sync(0xffffffffU, preloaded, r * Schedule::kBlockTokens + t);
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < Schedule::kRowsPerWarp; ++r)
+#pragma unroll
+                for (int t = 0; t < Schedule::kBlockTokens; ++t)
+                    if (token0 + t < live)
+                        output.store(parent[r], token0 + t,
+                                     epilogue.apply_loaded(totals[r][t], loaded[r][t]));
+        }
+        return;
     }
     if (wr == 0 && lane == 0) {
 #pragma unroll

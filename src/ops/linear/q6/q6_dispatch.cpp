@@ -35,12 +35,18 @@ Q6Launch select_q6_draft_head(std::int32_t t) {
         return v != nullptr ? std::atoi(v) : -1;
     }();
     switch (route) {
-    case 0: return launch_q6_a16_gemv_r4_w2_g16;
-    case 1: return launch_q6_a16_gemv_r4_w2_g20_cg;
-    case 2: return launch_q6_a16_gemv_r8_w1_g8_s4_cg;
-    case 3: return launch_q6_a16_gemv_r4_w2_g12_s3_cg;
-    case 4: return launch_q6_a16_gemv_r2_w4_g12_cg;
-    case 5: return launch_q6_a16_simt_r8_t4;
+    case 0:
+        return launch_q6_a16_gemv_r4_w2_g16;
+    case 1:
+        return launch_q6_a16_gemv_r4_w2_g20_cg;
+    case 2:
+        return launch_q6_a16_gemv_r8_w1_g8_s4_cg;
+    case 3:
+        return launch_q6_a16_gemv_r4_w2_g12_s3_cg;
+    case 4:
+        return launch_q6_a16_gemv_r2_w4_g12_cg;
+    case 5:
+        return launch_q6_a16_simt_r8_t4;
     default:
         // Measured (T43, RTX 5070 Ti eco, cold L2, T = 1, K = 2560): 708 us for 248 072 rows =
         // 701 GB/s, 317 us for 108 856, vs 999 us / 498 GB/s for the full head's T <= 2 route

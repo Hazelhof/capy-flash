@@ -6,7 +6,7 @@ namespace ninfer::ops::detail::q6_instances {
 
 using SimtR8T4 = Q6A16SimtSchedule<8, 4, 1, 16, 2, Cache::ca, 1>;
 
-using GemvR4W2G16      = Q6A16GemvSchedule<4, 2, 16, 2, Cache::ca, 1>;
+using GemvR4W2G16 = Q6A16GemvSchedule<4, 2, 16, 2, Cache::ca, 1>;
 // T43: T = 1 candidates for the Qwen4Exp draft proposal head (K = 2560 = 40 groups per row).
 using GemvR4W2G20Cg    = Q6A16GemvSchedule<4, 2, 20, 2, Cache::cg, 1>;
 using GemvR8W1G8S4Cg   = Q6A16GemvSchedule<8, 1, 8, 4, Cache::cg, 1>;

@@ -71,8 +71,8 @@ int run_rmsnorm_rope() {
     int failures = 0;
     for (const auto [W, B] : {std::pair{8, 1}, std::pair{8, 4}, std::pair{16, 2}}) {
         const int tokens = W * B;
-        std::vector<float> q(static_cast<std::size_t>(D) * 32 * tokens), k(D * 8 * tokens),
-            qn(D), kn(D);
+        std::vector<float> q(static_cast<std::size_t>(D) * 32 * tokens), k(D * 8 * tokens), qn(D),
+            kn(D);
         fill_uniform(q, 11U + W * B, -2.f, 2.f);
         fill_uniform(k, 13U + W * B, -2.f, 2.f);
         fill_uniform(qn, 17U, 0.5f, 1.5f);
@@ -117,15 +117,17 @@ void copy_q8_rows(const qw::PackedWeight& parent, qw::PackedWeight& shard, int b
     std::copy_n(parent.payload.data() + begin * code_row, count * code_row,
                 shard.payload.data() + at * code_row);
     std::copy_n(parent.payload.data() + parent.scale_plane_offset + begin * scale_row,
-                count * scale_row, shard.payload.data() + shard.scale_plane_offset + at * scale_row);
+                count * scale_row,
+                shard.payload.data() + shard.scale_plane_offset + at * scale_row);
 }
 
 // ---------------------------------------------------------------- 2. attn_input_proj shard
 int run_attn_input() {
-    int failures                  = 0;
-    const qw::PackedWeight parent = qw::make_patterned_weight(QType::Q8_G32_FP16, 6144, Hidden, 77U);
-    DeviceBuffer dparent          = to_device(parent.payload);
-    const Weight wparent          = parent.device_weight(dparent.p);
+    int failures = 0;
+    const qw::PackedWeight parent =
+        qw::make_patterned_weight(QType::Q8_G32_FP16, 6144, Hidden, 77U);
+    DeviceBuffer dparent = to_device(parent.payload);
+    const Weight wparent = parent.device_weight(dparent.p);
     std::array<qw::PackedWeight, 2> shard{
         qw::make_patterned_weight(QType::Q8_G32_FP16, 3072, Hidden, 1U),
         qw::make_patterned_weight(QType::Q8_G32_FP16, 3072, Hidden, 2U)};
@@ -153,20 +155,20 @@ int run_attn_input() {
             DeviceBuffer sq(2048 * T * 2), sk(512 * T * 2), sv(512 * T * 2);
             Tensor tsq(sq.p, DType::BF16, {2048, T}), tsk(sk.p, DType::BF16, {512, T}),
                 tsv(sv.p, DType::BF16, {512, T});
-            ops::attn_input_proj_head_block(tx, shard[r].device_weight(dshard[r].p), tsq, tsk,
-                                            tsv, nullptr);
+            ops::attn_input_proj_head_block(tx, shard[r].device_weight(dshard[r].p), tsq, tsk, tsv,
+                                            nullptr);
             cuda_synchronize();
             const std::string label =
                 "attn_input_proj shard T=" + std::to_string(T) + " rank " + std::to_string(r);
-            failures += verify_exact((label + " q").c_str(),
-                                     from_device<std::uint16_t>(sq.p, 2048 * T),
-                                     head_block(q_all, 32, T, 16 * r, 16));
-            failures += verify_exact((label + " k").c_str(),
-                                     from_device<std::uint16_t>(sk.p, 512 * T),
-                                     head_block(k_all, 8, T, 4 * r, 4));
-            failures += verify_exact((label + " v").c_str(),
-                                     from_device<std::uint16_t>(sv.p, 512 * T),
-                                     head_block(v_all, 8, T, 4 * r, 4));
+            failures +=
+                verify_exact((label + " q").c_str(), from_device<std::uint16_t>(sq.p, 2048 * T),
+                             head_block(q_all, 32, T, 16 * r, 16));
+            failures +=
+                verify_exact((label + " k").c_str(), from_device<std::uint16_t>(sk.p, 512 * T),
+                             head_block(k_all, 8, T, 4 * r, 4));
+            failures +=
+                verify_exact((label + " v").c_str(), from_device<std::uint16_t>(sv.p, 512 * T),
+                             head_block(v_all, 8, T, 4 * r, 4));
         }
     }
     return failures;
@@ -179,8 +181,8 @@ std::vector<std::uint16_t> ring_block(const std::vector<std::uint16_t>& all, int
     const std::size_t head_elements = static_cast<std::size_t>(D) * padded;
     for (int lane = 0; lane < lanes; ++lane)
         for (int h = 0; h < count; ++h)
-            std::copy_n(all.begin() + (static_cast<std::size_t>(lane) * heads + first + h) *
-                                          head_elements,
+            std::copy_n(all.begin() +
+                            (static_cast<std::size_t>(lane) * heads + first + h) * head_elements,
                         head_elements,
                         out.begin() + (static_cast<std::size_t>(lane) * count + h) * head_elements);
     return out;
@@ -198,9 +200,9 @@ CyclicKVCacheLayerView ring_view(void* k, void* v, int window, int padded, int h
 
 // ---------------------------------------------------------------- 3. sliding window attention
 int run_sliding_window() {
-    int failures             = 0;
-    constexpr int Window     = 2048, Padded = 2056, Lanes = 4;
-    constexpr float Scale    = 0.08838834764831844055f;
+    int failures         = 0;
+    constexpr int Window = 2048, Padded = 2056, Lanes = 4;
+    constexpr float Scale = 0.08838834764831844055f;
     std::vector<float> kf(static_cast<std::size_t>(D) * Padded * 8 * Lanes), vf(kf.size());
     fill_uniform(kf, 401U, -0.4f, 0.4f);
     fill_uniform(vf, 503U, -0.8f, 0.8f);
@@ -253,7 +255,7 @@ int run_sliding_window() {
         }
         const auto out_all = from_device<std::uint16_t>(out.p, D * 32 * tokens);
         for (int r = 0; r < 2; ++r) {
-            DeviceBuffer rq = to_device(head_block(qb, 32, tokens, 16 * r, 16));
+            DeviceBuffer rq  = to_device(head_block(qb, 32, tokens, 16 * r, 16));
             DeviceBuffer rqk = to_device(head_block(qkb, 8, tokens, 4 * r, 4));
             DeviceBuffer rqv = to_device(head_block(qvb, 8, tokens, 4 * r, 4));
             DeviceBuffer rout(static_cast<std::size_t>(D) * 16 * tokens * 2);
@@ -266,12 +268,12 @@ int run_sliding_window() {
                 Scale, ring_view(rk[r].p, rv[r].p, Window, Padded, 4, Lanes), envelope, ws, tout,
                 nullptr);
             cuda_synchronize();
-            failures += verify_exact(("sliding window W=" + std::to_string(W) + " B=" +
-                                      std::to_string(B) + " L=" + std::to_string(L) + " rank " +
-                                      std::to_string(r))
-                                         .c_str(),
-                                     from_device<std::uint16_t>(rout.p, D * 16 * tokens),
-                                     head_block(out_all, 32, tokens, 16 * r, 16));
+            failures +=
+                verify_exact(("sliding window W=" + std::to_string(W) + " B=" + std::to_string(B) +
+                              " L=" + std::to_string(L) + " rank " + std::to_string(r))
+                                 .c_str(),
+                             from_device<std::uint16_t>(rout.p, D * 16 * tokens),
+                             head_block(out_all, 32, tokens, 16 * r, 16));
         }
     }
     return failures;
@@ -285,10 +287,10 @@ int run_context_kv() {
     std::vector<qw::PackedWeight> key, value;
     std::vector<DeviceBuffer> dkey, dvalue, dnorm;
     for (int l = 0; l < Layers; ++l) {
-        key.push_back(qw::make_patterned_weight(QType::Q8_G32_FP16, 1024, Hidden, 0x310U + 2 * l,
-                                                options));
-        value.push_back(qw::make_patterned_weight(QType::Q8_G32_FP16, 1024, Hidden,
-                                                  0x311U + 2 * l, options));
+        key.push_back(
+            qw::make_patterned_weight(QType::Q8_G32_FP16, 1024, Hidden, 0x310U + 2 * l, options));
+        value.push_back(
+            qw::make_patterned_weight(QType::Q8_G32_FP16, 1024, Hidden, 0x311U + 2 * l, options));
         dkey.push_back(to_device(key.back().payload));
         dvalue.push_back(to_device(value.back().payload));
         std::vector<float> norm(D);
@@ -300,16 +302,16 @@ int run_context_kv() {
     const auto block = [&](const qw::PackedWeight& w, const DeviceBuffer& d, int r) {
         qw::PackedWeight geometry =
             qw::make_patterned_weight(QType::Q8_G32_FP16, 512, Hidden, 1U, options);
-        Weight view  = geometry.device_weight(d.p);
-        view.qdata   = static_cast<const std::uint8_t*>(d.p) + std::size_t(512) * r * Hidden;
-        view.scales  = static_cast<const std::uint8_t*>(d.p) + w.scale_plane_offset +
+        Weight view = geometry.device_weight(d.p);
+        view.qdata  = static_cast<const std::uint8_t*>(d.p) + std::size_t(512) * r * Hidden;
+        view.scales = static_cast<const std::uint8_t*>(d.p) + w.scale_plane_offset +
                       std::size_t(512) * r * (Hidden / 32) * 2;
         view.payload_bytes = w.payload.size();
         return view;
     };
     const std::size_t ring8 = static_cast<std::size_t>(D) * Padded * 8 * Lanes;
-    for (const auto [W, B] : {std::pair{8, 1}, std::pair{8, 4}, std::pair{16, 2},
-                              std::pair{300, 1}, std::pair{1024, 1}}) {
+    for (const auto [W, B] : {std::pair{8, 1}, std::pair{8, 4}, std::pair{16, 2}, std::pair{300, 1},
+                              std::pair{1024, 1}}) {
         const int tokens = W * B;
         std::vector<float> context(static_cast<std::size_t>(Hidden) * tokens);
         fill_uniform(context, 91U + tokens, -1.f, 1.f);
@@ -321,7 +323,8 @@ int run_context_kv() {
             for (int t = 0; t < W; ++t) positions[b * W + t] = 5000 + 1000 * b + t;
         }
         int min_count = W, max_count = 0;
-        for (const int c : counts) min_count = std::min(min_count, c), max_count = std::max(max_count, c);
+        for (const int c : counts)
+            min_count = std::min(min_count, c), max_count = std::max(max_count, c);
         DeviceBuffer dp = to_device(positions), dc = to_device(counts), ds = to_device(slots);
         const Tensor tctx(dctx.p, DType::BF16, {Hidden, W, B}), tp(dp.p, DType::I32, {W, B}),
             tc(dc.p, DType::I32, {B}), ts(ds.p, DType::I32, {B});
@@ -356,22 +359,23 @@ int run_context_kv() {
                                   Tensor(dnorm[l].p, DType::BF16, {D}),
                                   ring_view(rk.back().p, rv.back().p, 2048, Padded, 4, Lanes)};
             }
-            WorkspaceArena ws(ops::context_kv_materialize_head_block_workspace_capacity_bytes(B, W, W));
+            WorkspaceArena ws(
+                ops::context_kv_materialize_head_block_workspace_capacity_bytes(B, W, W));
             ops::context_kv_materialize_head_block(tctx, tp, tc, ts, rank_layers, envelope, ws,
                                                    nullptr);
             cuda_synchronize();
             for (int l = 0; l < Layers; ++l) {
-                const std::string label = "context kv W=" + std::to_string(W) + " B=" +
-                                          std::to_string(B) + " layer " + std::to_string(l) +
-                                          " rank " + std::to_string(r);
-                failures += verify_exact(
-                    (label + " K").c_str(), from_device<std::uint16_t>(rk[l].p, ring8 / 2),
-                    ring_block(from_device<std::uint16_t>(pk[l].p, ring8), Padded, 8, Lanes,
-                               4 * r, 4));
-                failures += verify_exact(
-                    (label + " V").c_str(), from_device<std::uint16_t>(rv[l].p, ring8 / 2),
-                    ring_block(from_device<std::uint16_t>(pv[l].p, ring8), Padded, 8, Lanes,
-                               4 * r, 4));
+                const std::string label = "context kv W=" + std::to_string(W) +
+                                          " B=" + std::to_string(B) + " layer " +
+                                          std::to_string(l) + " rank " + std::to_string(r);
+                failures += verify_exact((label + " K").c_str(),
+                                         from_device<std::uint16_t>(rk[l].p, ring8 / 2),
+                                         ring_block(from_device<std::uint16_t>(pk[l].p, ring8),
+                                                    Padded, 8, Lanes, 4 * r, 4));
+                failures += verify_exact((label + " V").c_str(),
+                                         from_device<std::uint16_t>(rv[l].p, ring8 / 2),
+                                         ring_block(from_device<std::uint16_t>(pv[l].p, ring8),
+                                                    Padded, 8, Lanes, 4 * r, 4));
             }
         }
     }
@@ -401,7 +405,7 @@ int run_finish() {
         for (int h = 0; h < H; ++h) {
             const std::size_t i = static_cast<std::size_t>(col) * H + h;
             const int di        = col * 2 * G + h / 16;
-            double value        = double(residual[i]) + (double(base[2 * H + h]) + delta[di]) * z[i];
+            double value = double(residual[i]) + (double(base[2 * H + h]) + delta[di]) * z[i];
             if (col % W != 0) value += (double(base[3 * H + h]) + delta[di + G]) * z[i - H];
             const double tol = std::max(1e-6, std::abs(value) / 128.0);
             if (std::abs(got[i] - value) > tol) ++bad;
@@ -423,10 +427,10 @@ int run_linear_half() {
         DeviceBuffer dx = to_device_bf16(x), dout(static_cast<std::size_t>(5120) * T * 2);
         Tensor tout(dout.p, DType::BF16, {5120, T});
         WorkspaceArena ws(ops::linear_workspace_capacity_bytes(QType::Q8_G32_FP16, 5120, 2048,
-                                                              ops::LinearPolicy::A16Only, T, T) +
+                                                               ops::LinearPolicy::A16Only, T, T) +
                           256);
-        ops::linear(Tensor(dx.p, DType::BF16, {2048, T}), weight, tout,
-                    ops::LinearPolicy::A16Only, ws, nullptr);
+        ops::linear(Tensor(dx.p, DType::BF16, {2048, T}), weight, tout, ops::LinearPolicy::A16Only,
+                    ws, nullptr);
         cuda_synchronize();
         const auto got = from_device_bf16(dout, static_cast<std::size_t>(5120) * T);
         int bad        = 0;
@@ -434,11 +438,13 @@ int run_linear_half() {
             for (int n = 0; n < 5120; n += 37) {
                 double ref = 0.0, mag = 0.0;
                 for (int k = 0; k < 2048; ++k) {
-                    const double term = qw::logical_weight_fp64(w, n, k) * x[std::size_t(t) * 2048 + k];
+                    const double term =
+                        qw::logical_weight_fp64(w, n, k) * x[std::size_t(t) * 2048 + k];
                     ref += term;
                     mag += std::abs(term);
                 }
-                if (std::abs(got[std::size_t(t) * 5120 + n] - ref) > 1e-2 * mag / 32 + std::abs(ref) / 128)
+                if (std::abs(got[std::size_t(t) * 5120 + n] - ref) >
+                    1e-2 * mag / 32 + std::abs(ref) / 128)
                     ++bad;
             }
         if (bad) {

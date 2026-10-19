@@ -77,11 +77,11 @@ struct LoadOptions {
 }
 
 [[nodiscard]] inline LoadOptions load_options(const EngineOptions& options) noexcept {
-    return {.purpose        = options.purpose,
-            .vision         = options.enable_vision,
-            .speculative    = options.speculative.backend,
-            .proposal_head  = options.speculative.proposal_head,
-            .tp             = options.tp,
+    return {.purpose          = options.purpose,
+            .vision           = options.enable_vision,
+            .speculative      = options.speculative.backend,
+            .proposal_head    = options.speculative.proposal_head,
+            .tp               = options.tp,
             .vision_rank      = vision_rank(options),
             .embedding_host   = options.embedding_host,
             .hc_split_streams = options.tp_hc_split_streams};

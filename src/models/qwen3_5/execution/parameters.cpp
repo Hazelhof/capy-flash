@@ -1,10 +1,12 @@
 #include "models/qwen3_5/execution/parameters.h"
 
+#include "core/device.h"
 #include "core/weight_view.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/moe_route.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <span>
 #include <stdexcept>
@@ -272,29 +274,31 @@ public:
         out.output_head        = linear(w.output_head_use);
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
-            out.layers.push_back(with_context(
-                std::string(model_.options().speculative_component()) + "/layers/" +
-                    std::to_string(i),
-                [&] {
-                    const auto& layer = w.layers[i];
-                    const auto& a     = layer.attention;
-                    DraftBlockParameters result;
-                    result.input_norm          = tensor(layer.input_norm);
-                    result.post_attention_norm = tensor(layer.post_attention_norm);
-                    result.query_key_value     = ops::prepare_attn_input_proj_weights(
-                        input(a.query), input(a.key), input(a.value));
-                    result.context_key   = linear(a.context_key);
-                    result.context_value = linear(a.context_value);
-                    result.query_norm    = tensor(a.query_norm);
-                    result.key_norm      = tensor(a.key_norm);
-                    result.output        = linear(a.output);
-                    result.mlp           = dense(layer.mlp);
-                    if (layer.attention_conv) {
-                        result.attention_conv = convolution(*layer.attention_conv);
-                    }
-                    if (layer.mlp_conv) { result.mlp_conv = convolution(*layer.mlp_conv); }
-                    return result;
-                }));
+            out.layers.push_back(
+                with_context(std::string(model_.options().speculative_component()) + "/layers/" +
+                                 std::to_string(i),
+                             [&] {
+                                 const auto& layer = w.layers[i];
+                                 const auto& a     = layer.attention;
+                                 DraftBlockParameters result;
+                                 result.input_norm          = tensor(layer.input_norm);
+                                 result.post_attention_norm = tensor(layer.post_attention_norm);
+                                 result.query_key_value     = ops::prepare_attn_input_proj_weights(
+                                     input(a.query), input(a.key), input(a.value));
+                                 result.context_key   = linear(a.context_key);
+                                 result.context_value = linear(a.context_value);
+                                 result.query_norm    = tensor(a.query_norm);
+                                 result.key_norm      = tensor(a.key_norm);
+                                 result.output        = linear(a.output);
+                                 result.mlp           = dense(layer.mlp);
+                                 if (layer.attention_conv) {
+                                     result.attention_conv = convolution(*layer.attention_conv);
+                                 }
+                                 if (layer.mlp_conv) {
+                                     result.mlp_conv = convolution(*layer.mlp_conv);
+                                 }
+                                 return result;
+                             }));
         }
         // At tp 2 the split drafter's selector stays on rank 0 (load/sharding.h).
         if (w.selector && resident(w.selector->hidden_projection)) {
@@ -360,7 +364,8 @@ public:
         if (geo.num_experts != 512 || geo.num_experts_per_tok != ops::kMoeSlotsTopK ||
             geo.moe_intermediate_size != ops::kMoeSlotsIntermediate ||
             config.hidden_size != ops::kMoeSlotsHidden) {
-            throw std::invalid_argument("routed experts implement the 2560/512/top-10/640 geometry");
+            throw std::invalid_argument(
+                "routed experts implement the 2560/512/top-10/640 geometry");
         }
         const auto single = [&](WeightId id) -> const WeightRegion& {
             const auto& parts = weight(id).view.parts;
@@ -415,10 +420,10 @@ public:
                 !(*out.down_divisors > 0.0F)) {
                 throw std::invalid_argument("MTP expert bank divisors are invalid");
             }
-            uniform->gate_up      = *out.gate_up_divisors;
-            uniform->down         = *out.down_divisors;
-            out.gate_up_divisors  = nullptr;
-            out.down_divisors     = nullptr;
+            uniform->gate_up     = *out.gate_up_divisors;
+            uniform->down        = *out.down_divisors;
+            out.gate_up_divisors = nullptr;
+            out.down_divisors    = nullptr;
         }
         if (mtp) {
             // Calibrated activation divisors stored with the bank (AllowA4 uses) are used like the
@@ -456,9 +461,9 @@ public:
             }
             return smallest_divisor;
         };
-        out.gate_up_input_divisor = smallest(
-            [](const DenseWeights& expert) { return std::array{expert.gate, expert.up}; },
-            "gate/up");
+        out.gate_up_input_divisor =
+            smallest([](const DenseWeights& expert) { return std::array{expert.gate, expert.up}; },
+                     "gate/up");
         out.down_input_divisor =
             smallest([](const DenseWeights& expert) { return std::array{expert.down}; }, "down");
         return out;
@@ -477,16 +482,42 @@ public:
                 ops::prepare_linear_weight(std::array{input(w.shared.gate), input(w.shared.up)}),
                 linear(w.shared.down)};
         }
-        out.experts     = expert_bank(w, mtp, uniform);
+        out.experts = expert_bank(w, mtp, uniform);
         return out;
+    }
+
+    // The FP32 scalar of an NVFP4 n-gram table, read back once for the host decode.
+    float global_scale(WeightId id) const {
+        const auto& bound = weight(id);
+        return with_context(bound.name, [&] {
+            const Tensor scalar = tensor(id);
+            if (scalar.dtype != DType::FP32 || scalar.numel() != 1) {
+                throw std::invalid_argument("PLE table global scale must be one FP32 value");
+            }
+            float value = 0.0F;
+            CUDA_CHECK(cudaMemcpy(&value, scalar.data, sizeof(value), cudaMemcpyDefault));
+            if (!std::isfinite(value) || value <= 0.0F) {
+                throw std::invalid_argument("PLE table global scale must be finite and positive");
+            }
+            return value;
+        });
     }
 
     PleParameters ple(const PleWeights& w) const {
         const auto& config = *model_.config().text.ple;
         const auto& table  = model_.file_weight(w.table);
         const auto& geo    = table.mapped_geometry;
-        if (geo.format != QType::FP8_E4M3FN_ROW_BF16 || geo.shape.size() != 2) {
-            throw std::invalid_argument("PLE table must be a file-mapped row-scaled FP8 matrix");
+        const bool fp8 =
+            geo.format == QType::FP8_E4M3FN_ROW_BF16 && geo.layout == QuantLayout::RowScale;
+        const bool nvfp4 =
+            geo.format == QType::NVFP4_ROW_E4M3_G16 && geo.layout == QuantLayout::RowInterleaved;
+        if (!(fp8 || nvfp4) || geo.shape.size() != 2) {
+            throw std::invalid_argument("PLE table must be a file-mapped row-scaled FP8 or "
+                                        "row-interleaved NVFP4 matrix");
+        }
+        if (nvfp4 == (w.table_global_scale == WeightId{})) {
+            throw std::invalid_argument(
+                "PLE table global scale must be bound for an NVFP4 table and only for it");
         }
         PleParameters out;
         for (const auto& segment : table.mapped) {
@@ -496,10 +527,21 @@ public:
                                           .file          = segment.file,
                                           .file_offset   = segment.file_offset});
         }
-        out.table.rows        = geo.shape[0];
-        out.table.row_width   = static_cast<std::uint32_t>(geo.shape[1]);
-        out.table.row_bytes   = geo.code_bytes_per_row;
-        out.table.scale_plane = geo.scale_offset;
+        out.table.rows      = geo.shape[0];
+        out.table.row_width = static_cast<std::uint32_t>(geo.shape[1]);
+        if (fp8) {
+            out.table.format      = PleRowFormat::Fp8RowBf16;
+            out.table.row_bytes   = geo.code_bytes_per_row;
+            out.table.scale_plane = geo.scale_offset;
+        } else {
+            // row_interleaved_v1: each row's codes then its group scales, rows back to back.
+            out.table.format       = PleRowFormat::Nvfp4RowE4m3G16;
+            out.table.row_bytes    = out.table.row_record_bytes();
+            out.table.global_scale = global_scale(w.table_global_scale);
+            if (out.table.row_width % 16 != 0 || geo.bytes < out.table.rows * out.table.row_bytes) {
+                throw std::invalid_argument("PLE NVFP4 table geometry is inconsistent");
+            }
+        }
         out.hash.ngram_size      = config.ngram_size;
         out.hash.heads_per_ngram = config.heads_per_ngram;
         out.hash.eos_token_id    = config.eos_token_id;
@@ -525,27 +567,28 @@ public:
         out.ffn_hc       = hyper_connection(w.ffn_hc);
         if (const auto* q = std::get_if<QsaWeights>(&w.mixer)) {
             const auto& a = q->attention;
-            out.mixer     = QsaParameters{
-                ops::prepare_linear_weight(
-                    std::array{input(a.query), input(a.key), input(a.gate), input(a.value)}),
-                tensor(a.query_norm),
-                tensor(a.key_norm),
-                linear(a.output),
-                ops::prepare_linear_weight(
-                    std::array{input(q->indexer_query), input(q->indexer_key)}),
-                tensor(q->indexer_query_norm),
-                tensor(q->indexer_key_norm)};
+            out.mixer =
+                QsaParameters{ops::prepare_linear_weight(std::array{input(a.query), input(a.key),
+                                                                    input(a.gate), input(a.value)}),
+                              tensor(a.query_norm),
+                              tensor(a.key_norm),
+                              linear(a.output),
+                              ops::prepare_linear_weight(
+                                  std::array{input(q->indexer_query), input(q->indexer_key)}),
+                              tensor(q->indexer_query_norm),
+                              tensor(q->indexer_key_norm)};
         } else {
             const auto& g = std::get<GdnWeights>(w.mixer);
-            out.mixer     = Qwen4GdnParameters{
-                ops::prepare_linear_weight(
-                    std::array{input(g.query), input(g.key), input(g.value), input(g.z)}),
-                ops::prepare_linear_weight(std::array{input(g.a_projection), input(g.b_projection)}),
-                tensor(g.a_log),
-                tensor(g.dt_bias),
-                tensor(g.convolution),
-                tensor(g.norm),
-                linear(g.output)};
+            out.mixer =
+                Qwen4GdnParameters{ops::prepare_linear_weight(std::array{
+                                       input(g.query), input(g.key), input(g.value), input(g.z)}),
+                                   ops::prepare_linear_weight(
+                                       std::array{input(g.a_projection), input(g.b_projection)}),
+                                   tensor(g.a_log),
+                                   tensor(g.dt_bias),
+                                   tensor(g.convolution),
+                                   tensor(g.norm),
+                                   linear(g.output)};
         }
         out.moe = qwen4_moe(w.moe, mtp, uniform);
         if (w.ple) { out.ple = ple(*w.ple); }
@@ -579,11 +622,12 @@ private:
 
 Parameters::Parameters(const Model& source, int rank) : model(source), device(rank) {
     const Prepare prepare(model, device);
-    const auto& w        = model.weights();
+    const auto& w = model.weights();
     if (model.config().text.qwen4()) {
-        // Qwen4Exp Text at one device or at tp 2 (this rank's shards), and its MTP layer (T24).
-        // Vision, draft and proposal heads have no Qwen4Exp execution yet; loading and the
-        // Program refuse them.
+        // Qwen4Exp Text at one device or at tp 2 (this rank's shards), its MTP layer (T24) and the
+        // Vision tower on the rank that holds it (the Qwen3.5 tower; its merger widens to H).
+        // Draft and proposal heads have no Qwen4Exp execution; loading and the Program refuse
+        // them.
         if (model.device_count() > 2 || !w.qwen4) {
             throw std::invalid_argument(
                 "Qwen4ExpForCausalLM executes on one or two devices with its Text weights bound");
@@ -591,7 +635,8 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
         text.token_embedding = native_weight(prepare.weight(w.text.token_embedding).view);
         text.output_head     = prepare.linear(w.text.output_head_use);
         Qwen4Parameters q;
-        q.head = with_context("text/hc_head", [&] { return prepare.hyper_connection(w.qwen4->head); });
+        q.head =
+            with_context("text/hc_head", [&] { return prepare.hyper_connection(w.qwen4->head); });
         q.layers.reserve(w.qwen4->layers.size());
         for (std::size_t i = 0; i < w.qwen4->layers.size(); ++i) {
             q.layers.push_back(with_context("text/layers/" + std::to_string(i), [&] {
@@ -600,7 +645,7 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
         }
         qwen4 = std::move(q);
         if (w.qwen4_mtp) {
-            qwen4_mtp = with_context("mtp", [&] { return prepare.qwen4_mtp(*w.qwen4_mtp); });
+            qwen4_mtp  = with_context("mtp", [&] { return prepare.qwen4_mtp(*w.qwen4_mtp); });
             auto& bank = qwen4_mtp->layer.moe.experts;
             if (!(bank.gate_up_input_divisor > 0.0F) || !(bank.down_input_divisor > 0.0F)) {
                 // No calibrated activation divisors for the MTP experts: the widest calibrated
@@ -615,6 +660,9 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
                 bank.down_input_divisor                = down / kQwen4MtpActivationRangeMargin;
                 qwen4_mtp->derived_activation_divisors = true;
             }
+        }
+        if (w.vision && prepare.resident(w.vision->patch_embedding)) {
+            vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
         }
         return;
     }

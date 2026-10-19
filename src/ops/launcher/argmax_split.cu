@@ -37,7 +37,7 @@ __global__ void argmax_split_pack_kernel(const __nv_bfloat16* logits, const std:
     const std::int32_t row = min(max(local[t], 0), rows - 1);
     const std::uint32_t bits =
         __bfloat16_as_ushort(logits[static_cast<std::int64_t>(t) * rows + row]);
-    const auto l      = static_cast<std::uint32_t>(row);
+    const auto l       = static_cast<std::uint32_t>(row);
     __nv_bfloat16* out = candidates + static_cast<std::int64_t>(t) * kArgmaxSplitCandidateRows;
     const __nv_bfloat16 zero = __float2bfloat16_rn(0.0F);
 #pragma unroll
@@ -61,8 +61,8 @@ __global__ void argmax_split_select_kernel(const __nv_bfloat16* candidates,
         const auto bits = static_cast<unsigned short>((digit_value(c[4 * r + 0]) << 8U) |
                                                       digit_value(c[4 * r + 1]));
         value[r]        = __bfloat162float(__ushort_as_bfloat16(bits));
-        row[r] = static_cast<std::int32_t>((digit_value(c[4 * r + 2]) << 8U) |
-                                           digit_value(c[4 * r + 3]));
+        row[r]          = static_cast<std::int32_t>((digit_value(c[4 * r + 2]) << 8U) |
+                                                    digit_value(c[4 * r + 3]));
     }
     // Rank 1's rows all follow rank 0's, so only a strictly larger value moves the argmax there.
     out[t] = value[1] > value[0] ? rows_per_rank + row[1] : row[0];
@@ -73,11 +73,11 @@ __global__ void argmax_split_select_kernel(const __nv_bfloat16* candidates,
 void argmax_split_pack_launch(const Tensor& logits, const Tensor& local, int rank,
                               Tensor& candidates, cudaStream_t stream) {
     const std::int32_t columns = logits.ne[1];
-    argmax_split_pack_kernel<<<static_cast<unsigned int>(div_up(columns, kSplitBlock)),
-                               kSplitBlock, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(logits.data),
-        static_cast<const std::int32_t*>(local.data), logits.ne[0], columns, rank,
-        static_cast<__nv_bfloat16*>(candidates.data));
+    argmax_split_pack_kernel<<<static_cast<unsigned int>(div_up(columns, kSplitBlock)), kSplitBlock,
+                               0, stream>>>(static_cast<const __nv_bfloat16*>(logits.data),
+                                            static_cast<const std::int32_t*>(local.data),
+                                            logits.ne[0], columns, rank,
+                                            static_cast<__nv_bfloat16*>(candidates.data));
     CUDA_CHECK(cudaGetLastError());
 }
 

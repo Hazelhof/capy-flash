@@ -6,6 +6,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/../launcher/concat_rows.cu"
   "${CMAKE_CURRENT_LIST_DIR}/../launcher/topk_split.cu"
   "${CMAKE_CURRENT_LIST_DIR}/../rmsnorm_rope/tp2/rmsnorm_rope_tp2.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/../rmsnorm_rope/tp2/rmsnorm_rope_text_shard.cu"
   "${CMAKE_CURRENT_LIST_DIR}/../context_kv_materialize/tp2/context_kv_materialize_tp2.cpp"
 )
 
