@@ -68,6 +68,18 @@ std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
     return a * b;
 }
 
+// The routed-expert banks of the offload backend's cache layers (Text, then MTP under MTP).
+std::vector<execution::Qwen4ExpertBank> gguf_bank_list(const execution::Parameters& parameters,
+                                                       SpeculativeBackend speculative) {
+    std::vector<execution::Qwen4ExpertBank> banks;
+    if (!parameters.qwen4) { return banks; }
+    for (const auto& layer : parameters.qwen4->layers) { banks.push_back(layer.moe.experts); }
+    if (speculative == SpeculativeBackend::Mtp && parameters.qwen4_mtp) {
+        banks.push_back(parameters.qwen4_mtp->layer.moe.experts);
+    }
+    return banks;
+}
+
 std::int32_t checked_i32(std::uint64_t value, const char* label) {
     if (value == 0 ||
         value > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -409,6 +421,45 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                 q.prefetch_workspace = builder.add(ops::moe_predict_workspace_bytes(), kArenaAlign,
                                                    "Qwen4Exp prefetch predictor workspace");
             }
+            // ggml block banks: one arena of variable-size slots (Qwen4OffloadExperts::gguf_pool).
+            std::vector<execution::Qwen4ExpertBank> banks;
+            for (const auto& layer : parameters.qwen4->layers) { banks.push_back(layer.moe.experts); }
+            if (mtp) { banks.push_back(parameters.qwen4_mtp->layer.moe.experts); }
+            q.gguf = execution::Qwen4OffloadExperts::gguf_banks(banks);
+            if (q.gguf) {
+                if (q.staging_slots > 0) {
+                    throw std::invalid_argument(
+                        "Qwen4Exp ggml block banks: the router-ahead prefetch is not implemented");
+                }
+                std::vector<std::int64_t> bytes;
+                for (const auto& b : banks) {
+                    bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(b));
+                }
+                const auto layer_base = execution::Qwen4OffloadExperts::layer_slot_profile(
+                    cache_layers, layers, q.expert_slots, q.elastic_columns,
+                    static_cast<std::int32_t>(plan.tp));
+                const auto pool = execution::Qwen4OffloadExperts::gguf_pool(
+                    bytes, layer_base, q.elastic_columns);
+                // The pools slots, then the prefill rings (Qwen4OffloadExperts::gguf_ring_slots).
+                q.cache_slot_offsets = add_tensor(
+                    builder, DType::I64,
+                    {checked_i32(pool.slot_offset.size() +
+                                     static_cast<std::size_t>(
+                                         execution::Qwen4OffloadExperts::gguf_ring_slots(
+                                             static_cast<std::int32_t>(plan.tp))),
+                                 "Qwen4Exp GGUF slots")},
+                    "Qwen4Exp expert slot offsets");
+                for (std::size_t plane = 0; plane < 4; ++plane) {
+                    const std::size_t region =
+                        plane == 0 ? static_cast<std::size_t>(pool.total_bytes) : kArenaAlign;
+                    q.cache_pool[plane] = (elastic ? elastic_builder : builder)
+                                              .add(region, kArenaAlign, "Qwen4Exp expert slot pool");
+                    q.cache_pool_bytes += region;
+                    q.elastic_first[plane] = plane == 0 ? static_cast<std::size_t>(pool.base_bytes) : region;
+                    q.elastic_bytes[plane] =
+                        plane == 0 ? static_cast<std::size_t>(pool.column_bytes) * q.elastic_columns : 0;
+                }
+            } else {
             // Base slots, the prefetch staging slots, then the elastic columns (T64).
             const auto planes = execution::Qwen4OffloadExperts::pool_plane_bytes(
                 cache_layers, q.expert_slots + q.elastic_columns, q.staging_slots);
@@ -417,6 +468,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan, int rank_index)
                                           .add(static_cast<std::size_t>(planes[plane]), kArenaAlign,
                                                "Qwen4Exp expert slot pool");
                 q.cache_pool_bytes += static_cast<std::size_t>(planes[plane]);
+                const std::int64_t stride =
+                    execution::Qwen4OffloadExperts::plane_slot_bytes(static_cast<std::int32_t>(plane));
+                q.elastic_first[plane] = static_cast<std::size_t>(
+                    (static_cast<std::int64_t>(cache_layers) * q.expert_slots + q.staging_slots) * stride);
+                q.elastic_bytes[plane] = static_cast<std::size_t>(
+                    static_cast<std::int64_t>(cache_layers) * q.elastic_columns * stride);
+            }
             }
         }
         // T43: the draft shortlist head: rank 0 alone, or split over both ranks (rank 0's block
@@ -1401,8 +1459,15 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         const auto& experts      = impl->qwen4_experts;
         const auto& text         = impl->parameters->model.config().text;
         const std::uint32_t base = impl->prefill_chunk;
+        // ggml block banks (capy-flash v0.7): the zero-copy prefill needs no ring, only the
+        // borrowed workspace, counted in the arena bytes of the lent layers' base slots.
+        const std::vector<execution::Qwen4ExpertBank> gguf_list =
+            gguf_bank_list(*impl->parameters, impl->speculative_backend);
+        const bool gguf_lend = text.qwen4() && experts.backend == RoutedExpertBackend::Offload &&
+                               experts.gguf_stream_min_tokens > 0 &&
+                               execution::Qwen4OffloadExperts::gguf_banks(gguf_list);
         if (text.qwen4() && experts.backend == RoutedExpertBackend::Offload &&
-            experts.slots_per_layer > 0 && experts.stream_min_tokens > 0 &&
+            experts.slots_per_layer > 0 && (experts.stream_min_tokens > 0 || gguf_lend) &&
             experts.prompt_chunk > base && !impl->causal_scoring && impl->capacity > base &&
             // T64: at tp 2 the elastic expert pool is VMM memory, which a cross-device pull
             // (ops::allreduce pull_peer) cannot read without P2P; the lent workspace lives there.
@@ -1419,9 +1484,23 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     text_layers + (mtp_layer ? 1 : 0), text_layers,
                     static_cast<std::int32_t>(experts.slots_per_layer),
                     static_cast<std::int32_t>(experts.elastic_columns), impl->tp);
-            const std::int32_t ring_layers = execution::Qwen4OffloadExperts::ring_layers(
-                static_cast<std::int32_t>(std::max<std::uint32_t>(experts.stream_ring_slots, 512)),
-                layer_base, text_layers, impl->tp);
+            std::int32_t ring_layers =
+                gguf_lend ? 0
+                          : execution::Qwen4OffloadExperts::ring_layers(
+                                static_cast<std::int32_t>(
+                                    std::max<std::uint32_t>(experts.stream_ring_slots, 512)),
+                                layer_base, text_layers, impl->tp);
+            std::vector<std::int64_t> gguf_bytes;
+            if (gguf_lend) {
+                for (const auto& b : gguf_list) {
+                    gguf_bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(b));
+                }
+                // The prefill ring on the last Text layers (as the backend lends it).
+                ring_layers = execution::Qwen4OffloadExperts::gguf_layers_below(
+                    layer_base, gguf_bytes, text_layers,
+                    execution::Qwen4OffloadExperts::gguf_ring_bytes(gguf_bytes, text_layers,
+                                                                    impl->tp));
+            }
             // The workspace is the lent layers' slots of the gate/up code plane (one contiguous
             // region of the planar pool), the layers just below the ring.
             constexpr auto lend_bytes = execution::Qwen4OffloadExperts::kLendPlaneBytes;
@@ -1441,9 +1520,13 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 const std::uint32_t width = std::min(chunk, impl->capacity);
                 if (width <= base || width % kPrefillChunkAlignment != 0) { continue; }
                 const std::size_t need    = need_for(width);
-                const std::int32_t layers = execution::Qwen4OffloadExperts::layers_below(
-                    layer_base, text_layers - ring_layers,
-                    static_cast<std::int64_t>((need + lend_bytes - 1) / lend_bytes));
+                const std::int32_t layers =
+                    gguf_lend ? execution::Qwen4OffloadExperts::gguf_layers_below(
+                                    layer_base, gguf_bytes, text_layers - ring_layers,
+                                    static_cast<std::int64_t>(need))
+                              : execution::Qwen4OffloadExperts::layers_below(
+                                    layer_base, text_layers - ring_layers,
+                                    static_cast<std::int64_t>((need + lend_bytes - 1) / lend_bytes));
                 if (execution::Qwen4OffloadExperts::may_lend(layer_base, text_layers,
                                                              ring_layers + layers)) {
                     impl->qwen4_base_chunk = base;

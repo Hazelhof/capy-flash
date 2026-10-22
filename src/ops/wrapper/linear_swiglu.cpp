@@ -5,6 +5,8 @@
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear/nvfp4/nvfp4_geometry.h"
+#include "ops/linear/q3/q3_arena.h"
+#include "ops/linear/q3/q3_linear.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/linear_swiglu/q4/q4_linear_swiglu_plan.h"
@@ -63,6 +65,12 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         (void)detail::q8_linear_swiglu_resolve_plan(
             {gate_up_rows, gate_up_rows / 2, input_rows, input_rows, max_tokens});
         return 0;
+    }
+    if (qtype == QType::Q3_G128_FP16) {
+        if (input_rows % 128 != 0) {
+            throw std::invalid_argument("linear_swiglu workspace: Q3 needs K a multiple of 128");
+        }
+        return detail::q3_workspace_bytes(input_rows, max_tokens);
     }
     if (qtype == QType::Q4_G64_FP16) {
         return detail::q4_linear_swiglu_capacity_workspace_bytes(
@@ -133,6 +141,12 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
     const bool fused_shape  = large_shape || shard_shape;
     const bool nvfp4_weight = fused_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = fused_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
+    // v0.7 27b-16gb: the GSQ-3 gate|up parent [34816,5120] (and its [17408,5120] half).
+    const bool q3_weight = fused_shape && gate_up_weight.qtype == QType::Q3_G128_FP16;
+    if (q3_weight) {
+        detail::validate_q3_weight(gate_up_weight, "linear_swiglu");
+        return;
+    }
     if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
@@ -157,6 +171,11 @@ void validate_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const
 void dispatch_linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out,
                             LinearPolicy policy, WorkspaceArena* ws, cudaStream_t stream) {
     switch (gate_up_weight.qtype) {
+    case QType::Q3_G128_FP16: {
+        const detail::Q3ArenaWorkspace q3ws(ws, gate_up_weight.k, x.ne[1]);
+        detail::q3_linear_swiglu_dispatch(x, gate_up_weight, out, stream, q3ws.get());
+        return;
+    }
     case QType::FP8_E4M3FN_ROW_BF16:
         if (gate_up_weight.n == kShardGateUpRows) {
             return detail::fp8_linear_swiglu_half_dispatch(x, gate_up_weight, out, policy, ws,

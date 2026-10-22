@@ -574,10 +574,11 @@ void test_layer(std::mt19937_64& rng, int E, int H, int I, bool statistics) {
 
 int main() {
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
-    if (!host_avx512_vnni_supported()) {
-        std::printf("SKIP: no AVX-512 VNNI\n");
+    if (!host_experts_supported()) {
+        std::printf("SKIP: neither AVX2 + FMA + F16C nor AVX-512 VNNI\n");
         return 77;
     }
+    std::printf("host ISA: %s\n", host_isa_name(host_isa()));
     std::mt19937_64 rng(20261007);
     test_dots(rng);
     test_layer(rng, 16, 2560, 640, true); // Flash-Next expert shape

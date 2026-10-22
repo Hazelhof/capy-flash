@@ -57,6 +57,22 @@ DType direct_dtype(QType format) {
     }
 }
 
+// (elements, bytes) of one ggml block of a GgufBlocks format, or {0, 0}.
+struct GgufBlock {
+    std::uint64_t elements = 0, bytes = 0;
+};
+GgufBlock gguf_block(QType format) {
+    switch (format) {
+    case QType::GGUF_IQ3_XXS: return {256, 98};
+    case QType::GGUF_IQ4_NL: return {32, 18};
+    case QType::GGUF_IQ3_S: return {256, 110};
+    case QType::GGUF_IQ2_S: return {256, 82};
+    case QType::GGUF_IQ4_XS: return {256, 136};
+    case QType::GGUF_Q2_0: return {64, 18};
+    default: return {};
+    }
+}
+
 void validate_region(const WeightRegion& region) {
     if (!region.parent || region.begin >= region.end ||
         region.end > region.parent->geometry.elements) {
@@ -101,7 +117,12 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     out.padded_columns = k;
     if (layout == QuantLayout::RowSplit) {
         std::uint64_t high_per_group = 0;
+        std::uint64_t code_per_group = 32;
         switch (format) {
+        case QType::Q3_G128_FP16: // one dense 3-bit stream per group, no high plane
+            out.group_size = 128;
+            code_per_group = 48;
+            break;
         case QType::Q4_G64_FP16:
             out.group_size = 64;
             break;
@@ -121,7 +142,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;
-        out.code_bytes_per_row  = mul(groups, 32);
+        out.code_bytes_per_row  = mul(groups, code_per_group);
         out.high_bytes_per_row  = mul(groups, high_per_group);
         out.scale_bytes_per_row = mul(groups, 2);
         out.code_bytes          = mul(n, out.code_bytes_per_row);
@@ -170,6 +191,17 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.scale_offset        = k / 2;
         out.bytes = out.code_bytes = mul(n, out.code_bytes_per_row);
         return out;
+    } else if (layout == QuantLayout::GgufBlocks) {
+        // gguf_blocks_v1: N rows of K / block_elements ggml blocks, as the GGUF exporter wrote
+        // them (block scales inside the blocks); one plane, no padding, no divisor.
+        const auto block = gguf_block(format);
+        if (!block.elements || k % block.elements) {
+            throw std::invalid_argument("GgufBlocks requires a ggml block format and whole blocks per row");
+        }
+        out.group_size         = block.elements;
+        out.code_bytes_per_row = mul(k / block.elements, block.bytes);
+        out.bytes = out.code_bytes = mul(n, out.code_bytes_per_row);
+        return out;
     } else {
         throw std::invalid_argument("unknown quantized weight layout");
     }
@@ -210,7 +242,8 @@ std::vector<ByteSpan> weight_row_block_spans(const WeightGeometry& g, std::uint6
             out.push_back({offset, bytes});
         }
     };
-    if (g.layout == QuantLayout::Contiguous || g.layout == QuantLayout::RowInterleaved) {
+    if (g.layout == QuantLayout::Contiguous || g.layout == QuantLayout::RowInterleaved ||
+        g.layout == QuantLayout::GgufBlocks) {
         const auto row_bytes = g.code_bytes / rows;
         push(mul(row_begin, row_bytes), mul(row_count, row_bytes));
         return out;
@@ -312,6 +345,7 @@ WeightRowPlanes weight_row_planes(const WeightRegion& region) {
         out.high = parent.data + g.high_offset + out.row_begin * out.high_row_bytes;
     }
     out.swizzled_scales = g.layout == QuantLayout::BlockScaleK16M128x4;
+    if (g.layout == QuantLayout::GgufBlocks) { return out; } // codes only: scales are in-block
     if (g.layout == QuantLayout::RowInterleaved) {
         // One interleaved plane: both pointers advance by the row stride.
         out.scales          = out.codes + g.scale_offset;
@@ -369,6 +403,10 @@ Weight native_weight(const WeightView& view, float input_divisor) {
     if (g.layout == QuantLayout::RowInterleaved) {
         throw std::invalid_argument(
             "a row-scaled NVFP4 table is read by row gathers, not as a native Weight");
+    }
+    if (g.layout == QuantLayout::GgufBlocks) {
+        throw std::invalid_argument(
+            "ggml block banks are read by the routed-expert paths, not as a native Weight");
     }
     const auto planes = weight_row_planes(region);
     if ((g.layout == QuantLayout::RowScale || g.layout == QuantLayout::BlockScaleK16M128x4) &&

@@ -500,8 +500,8 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (!host_avx512_vnni_supported()) {
-        std::fprintf(stderr, "needs AVX-512 VNNI\n");
+    if (!host_experts_supported()) {
+        std::fprintf(stderr, "needs AVX2 + FMA + F16C\n");
         return 77;
     }
     CUDA_CHECK(cudaSetDevice(0));

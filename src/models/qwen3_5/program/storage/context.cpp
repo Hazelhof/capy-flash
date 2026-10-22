@@ -391,6 +391,28 @@ ProgramImpl::owner_exclusive_resources(const SequenceState& sequence) const {
     return out;
 }
 
+void ProgramImpl::adopt_unshared_active_kv() noexcept {
+    if (has_context_transaction()) { return; }
+    for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
+        if (active_continuations[lane] >= continuation_capacity ||
+            requests[lane].lifecycle == Lifecycle::Empty) {
+            continue;
+        }
+        try {
+            const SequenceState& sequence = active_sequence(lane);
+            if (!sequence.kv) { continue; }
+            const detail::PhysicalResources exclusive = owner_exclusive_resources(sequence);
+            detail::PhysicalResources& active         = requests[lane].active_resources;
+            // Only ownership moves: the pages are allocated already and stay where they are.
+            active.device.main_kv_pages =
+                std::max(active.device.main_kv_pages, exclusive.device.main_kv_pages);
+            active.device.backend_kv_pages =
+                std::max(active.device.backend_kv_pages, exclusive.device.backend_kv_pages);
+            active.host.kv_bytes = std::max(active.host.kv_bytes, exclusive.host.kv_bytes);
+        } catch (...) {}
+    }
+}
+
 detail::PhysicalResources
 ProgramImpl::owner_exclusive_resources(const SharedPrefixState& shared) const {
     if (!state_store || !text_kv_addresses || !text_kv_pages) {

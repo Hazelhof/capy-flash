@@ -52,6 +52,7 @@ struct PeerRuntime {
     // Miss-split share on rank 1 (T42): residency mirror, reads, staged scratch.
     std::int32_t* qwen4_cache_mirror = nullptr;
     std::int32_t* qwen4_cache_reads  = nullptr;
+    std::int64_t* qwen4_slot_offsets = nullptr; // ggml block banks (Qwen4PersistentLayout)
     std::int32_t* qwen4_stage_table  = nullptr;
     std::int32_t* qwen4_stage_picks  = nullptr;
     std::array<std::byte*, 4> qwen4_staging{};
@@ -75,6 +76,10 @@ std::optional<ops::PeerMailbox> peer_mailbox;
 // without P2P or with elastic KV (NINFER_TP_HOST_EXCHANGE=0 / =1 force it off / on). Declared
 // before peer_events, which points to it.
 std::optional<ops::HostExchange> host_exchange;
+// v07/p2p-overlap: the split-phase sums' direct-copy lanes, attached to peer_events with peer
+// access and no HostExchange (NINFER_TP_PEER_OVERLAP=0 / =force: off / also without P2P).
+// Declared before peer_events, which points to it.
+std::optional<ops::PeerLanes> peer_lanes;
 std::optional<ops::PeerEvents> peer_events;
 std::optional<DecodeGraphPeerBridge> graph_bridge;
 std::optional<execution::TpExecution> tp_execution;

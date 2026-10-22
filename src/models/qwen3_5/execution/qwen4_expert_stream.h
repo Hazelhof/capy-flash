@@ -50,7 +50,17 @@ public:
         // GPU, each over its own link); the others are -1 in its tables and never copied.
         std::int32_t partitions = 1;
         std::int32_t partition  = 0;
+        // v0.7 pinned fallback: [layers] 0 = the layer's bank is pageable and never streamed
+        // (its prefill calls take the backend's CPU path); empty = every layer streams. release()
+        // issues the next streamed layer's copies; exchanged(l) only when l + 1 streams.
+        std::vector<std::uint8_t> streamable;
     };
+
+    [[nodiscard]] bool streams(std::int32_t layer) const noexcept {
+        return layer >= 0 && layer < config_.layers &&
+               (config_.streamable.empty() ||
+                config_.streamable[static_cast<std::size_t>(layer)] != 0);
+    }
 
     // Per-window counters.
     struct Stats {

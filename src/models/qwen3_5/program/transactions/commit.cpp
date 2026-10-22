@@ -738,6 +738,7 @@ ReleaseResult ProgramImpl::release_continuation(ContinuationHandle&& continuatio
     } catch (...) { return out; }
     release_continuation_slot_strict(index);
     ContractAccess::consume(continuation);
+    adopt_unshared_active_kv();
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
     return out;
@@ -803,6 +804,7 @@ ReleaseResult ProgramImpl::release_shared_prefix(SharedPrefixHandle&& handle) no
     } catch (...) { return out; }
     (void)release_shared_prefix_state_strict(index, SharedPrefixSlotRole::Catalogued);
     ContractAccess::consume(handle);
+    adopt_unshared_active_kv();
     advance_resource_revision();
     out.status = runtime::ConsumeStatus::Consumed;
     return out;

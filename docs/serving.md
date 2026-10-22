@@ -827,7 +827,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B) for the KV pool, identical results; see [Two GPUs](#two-gpus) | off |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
-| `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`: `8`) |
+| `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`, `--profile flash-next`: `8`) |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192`; at `--tp 2` `0` unless set (`--profile 27b`: `8192`, `--profile flash-next`: `4096`) |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
@@ -907,7 +907,10 @@ rank 0's half followed by rank 1's, and each GPU copies its own half on its own 
 the RAM cost per token is the same as on one GPU. They are off unless asked for: an omitted
 `--host-state-slots` or `--host-kv-mib` becomes `0` (on Qwen3.8-Flash-Next the routed experts
 already pin most of the RAM and the PLE table is read through the page cache); `--profile 27b`
-sets `--host-state-slots 8 --host-kv-mib 8192`, `--profile flash-next` sets `--host-kv-mib 4096`.
+sets `--host-state-slots 8 --host-kv-mib 8192`, `--profile flash-next` sets `--host-state-slots 8
+--host-kv-mib 4096` (884 MiB of pinned StateImages on Flash-Next: without a Host StateImage tier, a
+capture that finds the Device StateImages full drops a whole idle conversation, so an agent that
+runs subagents in parallel re-prefills the smaller one from the root at almost every turn).
 With them, a checkpoint that no longer fits on the GPUs moves to RAM and comes back when its
 conversation resumes, as on one GPU.
 

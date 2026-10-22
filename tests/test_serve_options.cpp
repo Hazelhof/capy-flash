@@ -516,11 +516,32 @@ int main() {
                       "--kv-lease-window is not 4096 by default or does not take 0");
     const ServeOptions profile_flash =
         parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next"});
-    failures += check(profile_flash.context_cache.host_state_slots == 0 &&
+    failures += check(profile_flash.context_cache.host_state_slots == 8 &&
                           profile_flash.context_cache.host_kv_capacity_bytes == 4096ULL << 20U,
-                      "--profile flash-next does not set 4 GiB of Host KV (and no Host states)");
+                      "--profile flash-next does not set 4 GiB of Host KV and 8 Host states");
     failures += check(profile_flash.embedding_host,
                       "--profile flash-next does not keep the token embedding in host memory (T200)");
+    // v0.7: both reasoning guards are on by default for every model and every profile.
+    failures += check(defaults.reasoning_close_retry && profile_flash.reasoning_close_retry &&
+                          profile_27b.reasoning_close_retry &&
+                          !parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next",
+                                  "--no-reasoning-close-retry"})
+                               .reasoning_close_retry &&
+                          parse({"ninfer-serve", "model.ninfer", "--no-reasoning-close-retry",
+                                 "--reasoning-close-retry"})
+                              .reasoning_close_retry,
+                      "--reasoning-close-retry is not on by default, or its switches are not "
+                      "parsed (docs/v07/vuote-fn.md)");
+    failures += check(defaults.reasoning_eos_guard && profile_flash.reasoning_eos_guard &&
+                          profile_27b.reasoning_eos_guard &&
+                          !parse({"ninfer-serve", "model.ninfer", "--profile", "27b",
+                                  "--no-reasoning-eos-guard"})
+                               .reasoning_eos_guard,
+                      "--reasoning-eos-guard is not on by default, or --no-reasoning-eos-guard "
+                      "does not turn it off");
+    failures += check(serve_usage_text("ninfer-serve").find("--reasoning-close-retry") !=
+                          std::string::npos,
+                      "serve help omits --reasoning-close-retry");
     failures += check(profile_27b.prefill_chunk == 2048,
                       "--profile 27b does not use 2048-token prefill chunks (T205b, T205c)");
     failures += check(
@@ -583,6 +604,21 @@ int main() {
                           dense.vision_device == 0 && dense.max_vision_tokens == 4096u &&
                           !dense.elastic_kv.enabled,
                       "--profile 27b does not apply the launcher configuration");
+    const ServeOptions fn1 = parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next-1gpu"});
+    failures += check(fn1.tp == 1 && fn1.device == 0 && fn1.max_context == 262144 &&
+                          fn1.elastic_kv.enabled && fn1.embedding_host &&
+                          fn1.context_cache.host_state_slots == 2 &&
+                          fn1.context_cache.host_kv_capacity_bytes == (1024ULL << 20),
+                      "--profile flash-next-1gpu does not apply the one-GPU Flash-Next configuration");
+    const ServeOptions single = parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb"});
+    failures += check(single.tp == 1 && single.device == 0 && single.max_context == 65536 &&
+                          single.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          single.enable_vision && single.vision_device == 0 &&
+                          single.context_cache.host_state_slots == 8 &&
+                          single.context_cache.host_kv_capacity_bytes == (4096ULL << 20) &&
+                          single.prefill_chunk == 2048 && single.embedding_host &&
+                          single.reasoning_eos_guard,
+                      "--profile 27b-16gb does not apply the one-GPU configuration");
     const ServeOptions blind =
         parse({"ninfer-serve", "model.ninfer", "--profile", "27b", "--no-vision"});
     failures += check(!blind.enable_vision && !blind.vision_device && !blind.max_vision_tokens,

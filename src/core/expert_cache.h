@@ -23,6 +23,15 @@
 // whose slot was reassigned before it was issued (a backlog never copies stale experts). The
 // queue advances whenever the cache is called (begin_window, submit_fills, poll).
 //
+// SM fills (NINFER_QWEN4_FILL_SM=<ctas>, off by default; v07/decode-overheads A): the batches are
+// copied by a kernel of <ctas> blocks on the fill stream that reads the host bank in place (mapped
+// pinned memory) instead of the copy engine. Same bytes, same events, same ordering. A copy engine
+// keeps enough reads in flight to fill the link, and every small PCIe read of the same GPU (the TP
+// exchange's flag and payload, the host experts' partial) waits behind them: T201 measured the
+// decode exchange at 5.3 us without a fill on either link, 16.1 with one on GPU 0's, 27.0 with one
+// on both (0.42 ms per round). A kernel of a few blocks bounds the fill's reads in flight (256
+// threads x 4 x 16 B = 16 KiB per block) at the price of a slower fill.
+//
 // Epoch fence: an evicted expert is unpublished (table entry -1) at the next begin_window, and
 // every fill batch first waits for the fence of the last window launched before it is issued, so
 // no launched window can read a slot while it is rewritten. A filled expert is published at the
@@ -30,9 +39,16 @@
 // names complete slots. Until then the policy counts the expert as resident and the device does
 // not (observe reports it missing).
 //
+// Pageable banks (v0.7 pinned fallback): a layer whose bank planes are not page-locked host memory
+// (cudaPointerGetAttributes: unregistered) is filled through a ring of pinned staging slots of one
+// expert each, per GPU: the execution thread copies the expert into a free staging slot (memcpy)
+// and the slot joins the batch's cudaMemcpyBatchAsync; it is free again once that batch's event
+// completed. A batch takes no more pageable fills than free staging slots (the rest stays queued).
+// Layers whose banks are pinned are copied exactly as before.
+//
 // Not thread-safe: every call comes from the Program's execution thread. The caller owns the
-// device pool and table memory (sizes from pool_slots / table_entries) and the pinned host banks,
-// and keeps them alive until the ExpertCache is destroyed.
+// device pool and table memory (sizes from pool_slots / table_entries) and the host banks, and
+// keeps them alive until the ExpertCache is destroyed.
 
 #include "core/expert_cache_policy.h"
 
@@ -55,12 +71,44 @@ inline constexpr int kMaxGpus   = 2;
 // bank_stride[q] in pinned host memory. Device pool of GPU p: plane q of slot s begins at
 // pool_base[p][q] + s * pool_stride[q] (one contiguous slot of all planes, as ninfer-ext's
 // kExpertSlotBytes layout, or one array per plane, as qf_moe's).
+//
+// Variable expert sizes (capy-flash v0.7, ggml block banks: the bytes of an expert depend on its
+// layer's formats): when `slot_offset` is not empty, plane q of (layer l, expert e) has
+// layer_plane_bytes[l * planes + q] bytes at bank_base[l * planes + q] + e *
+// layer_bank_stride[l * planes + q], and plane q of slot s (holding an expert of layer l) begins
+// at pool_base[p][q] + slot_offset[s] + layer_plane_offset[l * planes + q]; plane_bytes,
+// bank_stride and pool_stride are then unused.
 struct ExpertLayout {
     std::int32_t planes = 0;
     std::array<std::int64_t, kMaxPlanes> plane_bytes{};
     std::array<std::int64_t, kMaxPlanes> bank_stride{};
     std::vector<const std::byte*> bank_base; // [layers * planes]
     std::array<std::int64_t, kMaxPlanes> pool_stride{};
+    std::vector<std::int64_t> layer_plane_bytes;  // [layers * planes]
+    std::vector<std::int64_t> layer_bank_stride;  // [layers * planes]
+    std::vector<std::int64_t> layer_plane_offset; // [layers * planes]
+    std::vector<std::int64_t> slot_offset;        // [pool slots of one GPU]
+
+    [[nodiscard]] bool variable() const noexcept { return !slot_offset.empty(); }
+
+    [[nodiscard]] std::int64_t bytes(std::int32_t layer, std::int32_t q) const noexcept {
+        return variable() ? layer_plane_bytes[static_cast<std::size_t>(layer * planes + q)]
+                          : plane_bytes[static_cast<std::size_t>(q)];
+    }
+
+    [[nodiscard]] const std::byte* bank(std::int32_t layer, std::int32_t q,
+                                        std::int32_t expert) const noexcept {
+        const auto i = static_cast<std::size_t>(layer * planes + q);
+        return bank_base[i] + static_cast<std::int64_t>(expert) *
+                                  (variable() ? layer_bank_stride[i] : bank_stride[static_cast<std::size_t>(q)]);
+    }
+
+    [[nodiscard]] std::int64_t pool_offset(std::int32_t layer, std::int32_t q,
+                                           std::int32_t slot) const noexcept {
+        if (!variable()) { return static_cast<std::int64_t>(slot) * pool_stride[static_cast<std::size_t>(q)]; }
+        return slot_offset[static_cast<std::size_t>(slot)] +
+               layer_plane_offset[static_cast<std::size_t>(layer * planes + q)];
+    }
 };
 
 struct GpuBinding {
@@ -106,7 +154,13 @@ struct CacheCounters {
     // Elastic columns (T64): experts dropped and moved by set_active_columns shrinks.
     std::int64_t shrink_evicted = 0;
     std::int64_t moved          = 0;
+    // v0.7 pinned fallback: fills from pageable banks, copied through the staging ring.
+    std::int64_t staged_fills = 0;
 };
+
+// True when `p` is page-locked host memory registered with CUDA (cudaHostAlloc or
+// cudaHostRegister): device copies from it are DMA and kernels may read it when mapped.
+[[nodiscard]] bool pinned_host_memory(const void* p) noexcept;
 
 class ExpertCache {
 public:
@@ -117,6 +171,10 @@ public:
     // Default fill depth: ~19 ms of one PCIe 5.0 x8 link (26.8 GB/s), enough to keep the copy
     // engine busy between two calls of a ~25 ms window.
     static constexpr std::int64_t kDefaultInFlightBytes = std::int64_t(512) << 20;
+
+    // Pinned staging ring of each GPU when some bank is pageable (NINFER_HOST_STAGING_MIB
+    // overrides; at least one expert).
+    static constexpr std::int64_t kDefaultStagingBytes = std::int64_t(128) << 20;
 
     ExpertCache(const PolicyConfig& policy, ExpertLayout layout, std::span<const GpuBinding> gpus,
                 std::int64_t max_in_flight_bytes = kDefaultInFlightBytes);
@@ -141,6 +199,14 @@ public:
     [[nodiscard]] const CacheCounters& counters() const noexcept { return counters_; }
 
     [[nodiscard]] std::int32_t gpus() const noexcept { return gpus_; }
+
+    // v0.7 pinned fallback: whether `layer`'s bank is in pageable host memory (filled through the
+    // staging ring), and the staging ring of each GPU (experts; 0 when every bank is pinned).
+    [[nodiscard]] bool pageable_layer(std::int32_t layer) const noexcept {
+        return layer >= 0 && layer < layers_ && pageable_[static_cast<std::size_t>(layer)] != 0;
+    }
+
+    [[nodiscard]] std::int32_t staging_slots() const noexcept { return staging_slots_; }
 
     /**
      * Initializes every table to -1 on its GPU (synchronously) and, when `profile` is not empty,
@@ -304,6 +370,7 @@ private:
     struct FillBatch {
         cudaEvent_t done = nullptr;
         std::vector<PendingFill> fills;
+        std::int32_t staged = 0; // staging slots it holds (pageable fills)
     };
 
     struct Gpu {
@@ -317,6 +384,10 @@ private:
         std::deque<FillBatch> in_flight;
         std::int64_t in_flight_bytes = 0;
         std::vector<cudaEvent_t> spare_events;
+        // Pinned staging ring (pageable banks): slots [0, staging_slots_), FIFO like in_flight.
+        std::byte* staging          = nullptr;
+        std::int64_t staging_head   = 0; // slots handed out, ever
+        std::int32_t staging_in_use = 0;
     };
 
     [[nodiscard]] std::size_t cell(std::int32_t layer, std::int32_t expert) const noexcept {
@@ -346,6 +417,8 @@ private:
     std::int32_t layers_              = 0;
     std::int32_t experts_             = 0;
     std::array<Gpu, kMaxGpus> gpu_{};
+    std::vector<std::uint8_t> pageable_; // [layers] bank in pageable host memory
+    std::int32_t staging_slots_ = 0;     // per GPU
 
     std::vector<std::int32_t> published_; // [cells] table value on the owner GPU
     std::vector<std::int32_t> target_;    // [cells] value to publish at the next begin_window
@@ -361,6 +434,9 @@ private:
     std::int64_t fenced_   = 0; // windows whose fence is recorded
     bool initialized_      = false;
     bool frozen_           = false;
+    // NINFER_QWEN4_FILL_SM=<ctas> (v07/decode-overheads A): CTAs of the kernel that copies fills
+    // from the mapped host bank instead of the copy engine; 0 = copy engine (cudaMemcpyBatchAsync).
+    std::int32_t sm_fill_ctas_ = 0;
 
     LayerDecision decision_;
     std::vector<ResidentExpert> resident_;

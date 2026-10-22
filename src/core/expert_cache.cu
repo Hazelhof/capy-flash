@@ -4,6 +4,9 @@
 #include "core/device_scope.h" // ScopedCurrentDevice
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -11,6 +14,56 @@
 namespace ninfer::expert_cache {
 
 namespace {
+
+// SM fills (expert_cache.h): one kernel per fill batch, the batch's (dst, src, 16-byte units)
+// as a kernel parameter (copied at launch: 3 KiB for 16 experts x 8 planes).
+constexpr int kSmFillThreads   = 256;
+constexpr int kSmFillUnroll    = 4; // 16-byte loads in flight per thread
+constexpr int kMaxSmFillCopies = ExpertCache::kFillChunkExperts * kMaxPlanes;
+
+struct SmFillCopies {
+    std::int32_t count = 0;
+    const uint4* src[kMaxSmFillCopies];
+    uint4* dst[kMaxSmFillCopies];
+    std::int64_t units[kMaxSmFillCopies];
+};
+
+// Copies every (src, dst, units) of the batch in order: each thread keeps kSmFillUnroll loads in
+// flight, a warp reads 512 contiguous bytes per load, the grid strides over the copy. Streaming
+// loads and stores: neither the host bank nor the slot just written belongs in L2.
+__global__ __launch_bounds__(kSmFillThreads) void sm_fill_kernel(const SmFillCopies c) {
+    const long long stride = static_cast<long long>(gridDim.x) * blockDim.x;
+    const long long first  = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (int k = 0; k < c.count; ++k) {
+        const uint4* src   = c.src[k];
+        uint4* dst         = c.dst[k];
+        const long long n  = c.units[k];
+        for (long long base = first; base < n; base += stride * kSmFillUnroll) {
+            uint4 v[kSmFillUnroll];
+#pragma unroll
+            for (int u = 0; u < kSmFillUnroll; ++u) {
+                const long long i = base + u * stride;
+                if (i < n) { v[u] = __ldcs(src + i); }
+            }
+#pragma unroll
+            for (int u = 0; u < kSmFillUnroll; ++u) {
+                const long long i = base + u * stride;
+                if (i < n) { __stcs(dst + i, v[u]); }
+            }
+        }
+    }
+}
+
+// Host memory a kernel on the current device reads at the same address (mapped, unified
+// addressing).
+bool device_reads_in_place(const void* p) {
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    return attr.type == cudaMemoryTypeHost && attr.devicePointer == p;
+}
 
 // Table updates travel as kernel parameters (copied at launch), so the host never shares a
 // buffer with an update in flight. 8 KiB of parameters per launch (CUDA 12.1+ allows 32 KiB).
@@ -64,6 +117,8 @@ bool pinned_host(const void* p) {
 
 } // namespace
 
+bool pinned_host_memory(const void* p) noexcept { return pinned_host(p); }
+
 std::int64_t ExpertCache::pool_slots(const PolicyConfig& policy, std::int32_t gpu) {
     return ExpertCachePolicy::pool_slot_count(policy, gpu);
 }
@@ -81,21 +136,57 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
         throw std::invalid_argument(
             "expert cache: 1..8 planes and one bank base per layer and plane");
     }
-    for (std::int32_t q = 0; q < layout_.planes; ++q) {
-        if (layout_.plane_bytes[q] <= 0 || layout_.bank_stride[q] < layout_.plane_bytes[q] ||
-            layout_.pool_stride[q] <= 0) {
-            throw std::invalid_argument("expert cache: plane " + std::to_string(q) +
-                                        " needs bytes > 0, bank stride >= bytes, pool stride > 0");
+    if (layout_.variable()) {
+        const auto cells = static_cast<std::size_t>(layers_ * layout_.planes);
+        if (layout_.layer_plane_bytes.size() != cells || layout_.layer_bank_stride.size() != cells ||
+            layout_.layer_plane_offset.size() != cells) {
+            throw std::invalid_argument("expert cache: variable layout needs every layer's planes");
         }
+        for (std::int32_t l = 0; l < layers_; ++l) {
+            std::int64_t bytes = 0;
+            for (std::int32_t q = 0; q < layout_.planes; ++q) {
+                const auto i = static_cast<std::size_t>(l * layout_.planes + q);
+                if (layout_.layer_plane_bytes[i] <= 0 ||
+                    layout_.layer_bank_stride[i] < layout_.layer_plane_bytes[i]) {
+                    throw std::invalid_argument("expert cache: variable layout plane sizes");
+                }
+                bytes += layout_.layer_plane_bytes[i];
+            }
+            expert_bytes_ = std::max(expert_bytes_, bytes); // the in-flight budget's unit
+        }
+    } else {
+        for (std::int32_t q = 0; q < layout_.planes; ++q) {
+            if (layout_.plane_bytes[q] <= 0 || layout_.bank_stride[q] < layout_.plane_bytes[q] ||
+                layout_.pool_stride[q] <= 0) {
+                throw std::invalid_argument("expert cache: plane " + std::to_string(q) +
+                                            " needs bytes > 0, bank stride >= bytes, pool stride > 0");
+            }
+        }
+        for (std::int32_t q = 0; q < layout_.planes; ++q) { expert_bytes_ += layout_.plane_bytes[q]; }
     }
-    for (std::int32_t q = 0; q < layout_.planes; ++q) { expert_bytes_ += layout_.plane_bytes[q]; }
     if (max_in_flight_bytes_ < expert_bytes_) {
         throw std::invalid_argument("expert cache: the fill depth must hold at least one expert");
     }
-    for (const std::byte* base : layout_.bank_base) {
-        if (base == nullptr || !pinned_host(base)) {
-            throw std::invalid_argument("expert cache: host banks must be pinned host memory");
+    // v0.7 pinned fallback: a layer with any plane outside page-locked memory fills through the
+    // staging ring.
+    pageable_.assign(static_cast<std::size_t>(layers_), 0);
+    bool any_pageable = false;
+    for (std::int32_t l = 0; l < layers_; ++l) {
+        for (std::int32_t q = 0; q < layout_.planes; ++q) {
+            const std::byte* base =
+                layout_.bank_base[static_cast<std::size_t>(l * layout_.planes + q)];
+            if (base == nullptr) { throw std::invalid_argument("expert cache: null host bank"); }
+            if (!pinned_host(base)) { pageable_[static_cast<std::size_t>(l)] = 1; }
         }
+        any_pageable = any_pageable || pageable_[static_cast<std::size_t>(l)] != 0;
+    }
+    if (any_pageable) {
+        std::int64_t staging = kDefaultStagingBytes;
+        if (const char* v = std::getenv("NINFER_HOST_STAGING_MIB"); v != nullptr && *v != 0) {
+            staging = std::max<std::int64_t>(0, std::atoll(v)) << 20;
+        }
+        staging_slots_ = static_cast<std::int32_t>(std::clamp<std::int64_t>(
+            staging / expert_bytes_, 1, max_in_flight_bytes_ / expert_bytes_));
     }
     const std::size_t cells =
         static_cast<std::size_t>(layers_) * static_cast<std::size_t>(experts_);
@@ -117,6 +208,46 @@ ExpertCache::ExpertCache(const PolicyConfig& policy, ExpertLayout layout,
         ScopedCurrentDevice scope(g.binding.device);
         CUDA_CHECK(cudaStreamCreateWithFlags(&g.fill_stream, cudaStreamNonBlocking));
         CUDA_CHECK(cudaEventCreateWithFlags(&g.fence, cudaEventDisableTiming));
+        if (staging_slots_ > 0) {
+            void* ring       = nullptr;
+            const auto bytes = static_cast<std::size_t>(staging_slots_) *
+                               static_cast<std::size_t>(expert_bytes_);
+            const cudaError_t err = cudaHostAlloc(&ring, bytes, cudaHostAllocPortable);
+            if (err != cudaSuccess) {
+                throw std::runtime_error(
+                    "expert cache: pinned staging ring of " + std::to_string(bytes >> 20) +
+                    " MiB for the pageable expert banks: cudaHostAlloc failed: " +
+                    cudaGetErrorString(err) +
+                    " (lower --host-pinned-max-gib or NINFER_HOST_STAGING_MIB)");
+            }
+            g.staging = static_cast<std::byte*>(ring);
+        }
+    }
+    if (const char* v = std::getenv("NINFER_QWEN4_FILL_SM"); v != nullptr && *v != 0) {
+        sm_fill_ctas_ = std::clamp(std::atoi(v), 0, 1024);
+    }
+    if (sm_fill_ctas_ > 0) {
+        // Every bank must be readable in place by a kernel on every GPU; otherwise the copy
+        // engine stays (a bank that is pinned but not mapped).
+        bool in_place = true;
+        for (std::int32_t p = 0; p < gpus_ && in_place; ++p) {
+            ScopedCurrentDevice scope(gpu_[static_cast<std::size_t>(p)].binding.device);
+            for (const std::byte* base : layout_.bank_base) {
+                if (!device_reads_in_place(base)) {
+                    in_place = false;
+                    break;
+                }
+            }
+        }
+        if (!in_place) {
+            std::fprintf(stderr, "expert cache: NINFER_QWEN4_FILL_SM ignored, the host banks are "
+                                 "not mapped; fills use the copy engine\n");
+            sm_fill_ctas_ = 0;
+        } else {
+            std::fprintf(stderr,
+                         "expert cache: fills copied by a %d-block kernel (NINFER_QWEN4_FILL_SM)\n",
+                         sm_fill_ctas_);
+        }
     }
 }
 
@@ -133,6 +264,7 @@ ExpertCache::~ExpertCache() {
             (void)cudaEventDestroy(lend_events_[static_cast<std::size_t>(p)]);
         }
         if (g.fill_stream != nullptr) { (void)cudaStreamDestroy(g.fill_stream); }
+        if (g.staging != nullptr) { (void)cudaFreeHost(g.staging); }
     }
 }
 
@@ -502,13 +634,11 @@ void ExpertCache::set_active_columns(std::int32_t columns, std::span<const cudaS
         for (const SlotMove& m : moves) {
             if (m.partition != p) { continue; }
             for (std::int32_t q = 0; q < layout_.planes; ++q) {
-                CUDA_CHECK(
-                    cudaMemcpyAsync(g.binding.pool_base[q] +
-                                        static_cast<std::int64_t>(m.to) * layout_.pool_stride[q],
-                                    g.binding.pool_base[q] +
-                                        static_cast<std::int64_t>(m.from) * layout_.pool_stride[q],
-                                    static_cast<std::size_t>(layout_.plane_bytes[q]),
-                                    cudaMemcpyDeviceToDevice, g.fill_stream));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    g.binding.pool_base[q] + layout_.pool_offset(m.layer, q, m.to),
+                    g.binding.pool_base[q] + layout_.pool_offset(m.layer, q, m.from),
+                    static_cast<std::size_t>(layout_.bytes(m.layer, q)), cudaMemcpyDeviceToDevice,
+                    g.fill_stream));
             }
             ++g.generation[static_cast<std::size_t>(m.from)];
             ++g.generation[static_cast<std::size_t>(m.to)];
@@ -645,15 +775,21 @@ void ExpertCache::prioritize_queue(std::span<const std::int32_t> rank) {
 void ExpertCache::pump(Gpu& g) {
     retire(g, false);
     std::vector<PendingFill> batch;
+    std::int32_t staged = 0; // pageable fills in `batch`: each needs a free staging slot
     while (!g.queue.empty() &&
            g.in_flight_bytes + static_cast<std::int64_t>(batch.size() + 1) * expert_bytes_ <=
                max_in_flight_bytes_) {
         const PendingFill f = g.queue.front();
-        g.queue.pop_front();
         if (g.generation[static_cast<std::size_t>(f.slot)] != f.generation) {
+            g.queue.pop_front();
             ++counters_.fills_dropped;
             continue;
         }
+        if (pageable_[static_cast<std::size_t>(f.cell / experts_)] != 0) {
+            if (g.staging_in_use + staged >= staging_slots_) { break; } // stays queued
+            ++staged;
+        }
+        g.queue.pop_front();
         batch.push_back(f);
     }
     issue(g, batch);
@@ -680,18 +816,56 @@ void ExpertCache::issue(Gpu& g, std::span<const PendingFill> fills) {
             const PendingFill& f = fills[i];
             const std::int32_t l = f.cell / experts_;
             const std::int32_t e = f.cell % experts_;
+            // A pageable bank's expert first goes into a free staging slot (pump checked there is
+            // one); the slot is held until the batch's event completes (retire).
+            std::byte* stage = nullptr;
+            std::int64_t staged_bytes = 0; // planes packed back to back in the staging slot
+            if (pageable_[static_cast<std::size_t>(l)] != 0) {
+                const std::int64_t at = g.staging_head++ % staging_slots_;
+                stage                 = g.staging + at * expert_bytes_;
+                ++g.staging_in_use;
+                ++batch.staged;
+                ++counters_.staged_fills;
+            }
             for (std::int32_t q = 0; q < planes; ++q) {
-                copy_dst_.push_back(g.binding.pool_base[q] +
-                                    static_cast<std::int64_t>(f.slot) * layout_.pool_stride[q]);
-                copy_src_.push_back(layout_.bank_base[static_cast<std::size_t>(l * planes + q)] +
-                                    static_cast<std::int64_t>(e) * layout_.bank_stride[q]);
-                copy_bytes_.push_back(static_cast<std::size_t>(layout_.plane_bytes[q]));
-                counters_.fill_bytes += layout_.plane_bytes[q];
+                const std::byte* src = layout_.bank(l, q, e);
+                const std::int64_t bytes = layout_.bytes(l, q);
+                if (stage != nullptr) {
+                    std::memcpy(stage + staged_bytes, src, static_cast<std::size_t>(bytes));
+                    src = stage + staged_bytes;
+                    staged_bytes += bytes;
+                }
+                copy_dst_.push_back(g.binding.pool_base[q] + layout_.pool_offset(l, q, f.slot));
+                copy_src_.push_back(src);
+                copy_bytes_.push_back(static_cast<std::size_t>(bytes));
+                counters_.fill_bytes += bytes;
             }
             batch.fills.push_back(f);
         }
-        CUDA_CHECK(cudaMemcpyBatchAsync(copy_dst_.data(), copy_src_.data(), copy_bytes_.data(),
-                                        copy_dst_.size(), &attr, &attr_index, 1, g.fill_stream));
+        bool by_kernel = sm_fill_ctas_ > 0 &&
+                         copy_dst_.size() <= static_cast<std::size_t>(kMaxSmFillCopies);
+        if (by_kernel) {
+            SmFillCopies c;
+            c.count = static_cast<std::int32_t>(copy_dst_.size());
+            for (std::size_t i = 0; i < copy_dst_.size() && by_kernel; ++i) {
+                const auto d = reinterpret_cast<std::uintptr_t>(copy_dst_[i]);
+                const auto s = reinterpret_cast<std::uintptr_t>(copy_src_[i]);
+                by_kernel    = d % 16 == 0 && s % 16 == 0 && copy_bytes_[i] % 16 == 0;
+                c.dst[i]     = static_cast<uint4*>(copy_dst_[i]);
+                c.src[i]     = static_cast<const uint4*>(copy_src_[i]);
+                c.units[i]   = static_cast<std::int64_t>(copy_bytes_[i] / 16);
+            }
+            if (by_kernel) {
+                sm_fill_kernel<<<static_cast<unsigned>(sm_fill_ctas_), kSmFillThreads, 0,
+                                 g.fill_stream>>>(c);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+        if (!by_kernel) {
+            CUDA_CHECK(cudaMemcpyBatchAsync(copy_dst_.data(), copy_src_.data(),
+                                            copy_bytes_.data(), copy_dst_.size(), &attr,
+                                            &attr_index, 1, g.fill_stream));
+        }
         if (!g.spare_events.empty()) {
             batch.done = g.spare_events.back();
             g.spare_events.pop_back();
@@ -722,6 +896,7 @@ void ExpertCache::retire(Gpu& g, bool wait) {
             }
         }
         g.in_flight_bytes -= static_cast<std::int64_t>(b.fills.size()) * expert_bytes_;
+        g.staging_in_use -= b.staged;
         g.spare_events.push_back(b.done);
         g.in_flight.pop_front();
     }

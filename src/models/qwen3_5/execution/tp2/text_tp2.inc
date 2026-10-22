@@ -87,6 +87,48 @@ int prefill_overlap_split(int len) {
     return split >= kMinHalf && len - split >= kMinHalf ? split : 0;
 }
 
+// v07/prefill-slices: the sliced prefill's mode (NINFER_TP_PREFILL_SLICES, prefill_slices.h) and
+// width override (NINFER_TP_PREFILL_SLICE_TOKENS, a positive multiple of 128; unset or 0: the
+// plan's own width), read once. NINFER_TP_PREFILL_OVERLAP=0 turns the slices off too.
+PrefillSlicesMode prefill_slices_mode_env() {
+    static const PrefillSlicesMode mode = [] {
+        const char* overlap = std::getenv("NINFER_TP_PREFILL_OVERLAP");
+        if (overlap != nullptr && std::string_view(overlap) == "0") {
+            return PrefillSlicesMode::Off;
+        }
+        const char* value = std::getenv("NINFER_TP_PREFILL_SLICES");
+        return prefill_slices_mode(value != nullptr ? value : "");
+    }();
+    return mode;
+}
+
+std::int32_t prefill_slice_tokens_env() {
+    static const std::int32_t tokens = [] {
+        const char* value = std::getenv("NINFER_TP_PREFILL_SLICE_TOKENS");
+        if (value == nullptr || *value == '\0') { return std::int32_t{0}; }
+        char* end         = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        if (*end != '\0' || parsed < 0 || parsed > (1 << 20) ||
+            !prefill_slice_width_valid(static_cast<std::int32_t>(parsed))) {
+            throw std::invalid_argument(
+                "NINFER_TP_PREFILL_SLICE_TOKENS must be 0 or a positive multiple of 128");
+        }
+        return static_cast<std::int32_t>(parsed);
+    }();
+    return tokens;
+}
+
+static_assert(kPrefillSliceMaxCount <= ops::HostExchange::kSumLanes &&
+                  kPrefillSliceMaxCount <= ops::PeerLanes::kSumLanes,
+              "one split-exchange lane per prefill slice");
+
+// Columns [first, first + count) of both ranks' operands.
+std::array<Tensor, kTensorParallelWidth>
+column_window(const std::array<Tensor, kTensorParallelWidth>& t, std::int32_t first,
+              std::int32_t count) {
+    return {t[0].slice(1, first, count), t[1].slice(1, first, count)};
+}
+
 } // namespace
 
 // =================================================================================================
@@ -373,7 +415,8 @@ const GdnReplayRecords& TextContext::rank_replay_records(int rank) const {
 }
 
 void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
-                               const RankTensors& staging, int exchange_lane) {
+                               const RankTensors& staging, int exchange_lane,
+                               const PrefillSlicePlan* slices) {
     const ExecutionContext& execution = *tp_->execution;
     const AttentionConfig& shard      = *shard_config_->attention;
     const auto ws                     = workspaces();
@@ -457,12 +500,24 @@ void TextContext::attn_mix_tp2(const RankBlocks& w, RankTensors& x, int fidx,
         ops::sigmoid_mul(gate, a[r], s);
     });
 
-    attention_output_split({a[0].view({q_width, T}), a[1].view({q_width, T})}, p, x, staging, ws,
-                           execution, *tp_->events, exchange_lane);
+    const RankTensors mixed{a[0].view({q_width, T}), a[1].view({q_width, T})};
+    if (slices != nullptr) {
+        // Sliced prefill: slice s's output projection begins its all-reduce on lane s.
+        for (std::int32_t s = 0; s < slices->count; ++s) {
+            const std::int32_t first = slices->first(s), count = slices->columns(s, T);
+            attention_output_split(column_window(mixed, first, count), p,
+                                   column_window(x, first, count),
+                                   column_window(staging, first, count), ws, execution,
+                                   *tp_->events, static_cast<int>(s));
+        }
+        return;
+    }
+    attention_output_split(mixed, p, x, staging, ws, execution, *tp_->events, exchange_lane);
 }
 
 void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Phase ph,
-                              const RankTensors& staging, int exchange_lane) {
+                              const RankTensors& staging, int exchange_lane,
+                              const PrefillSlicePlan* slices) {
     const ExecutionContext& execution = *tp_->execution;
     const GdnConfig& shard            = *shard_config_->gdn;
     const auto ws                     = workspaces();
@@ -625,8 +680,18 @@ void TextContext::gdn_mix_tp2(const RankBlocks& w, RankTensors& x, int gidx, Pha
         ops::gated_rmsnorm(o[r], p[r]->norm, gate, config_.rms_norm_eps, on[r], rank_stream(rank));
     });
 
-    gdn_output_split({on[0].view({value_width, T}), on[1].view({value_width, T})}, p, x, staging,
-                     ws, execution, *tp_->events, exchange_lane);
+    const RankTensors mixed{on[0].view({value_width, T}), on[1].view({value_width, T})};
+    if (slices != nullptr) {
+        // Sliced prefill: slice s's output projection begins its all-reduce on lane s.
+        for (std::int32_t s = 0; s < slices->count; ++s) {
+            const std::int32_t first = slices->first(s), count = slices->columns(s, T);
+            gdn_output_split(column_window(mixed, first, count), p, column_window(x, first, count),
+                             column_window(staging, first, count), ws, execution, *tp_->events,
+                             static_cast<int>(s));
+        }
+        return;
+    }
+    gdn_output_split(mixed, p, x, staging, ws, execution, *tp_->events, exchange_lane);
 }
 
 void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTensors& staging,
@@ -643,6 +708,32 @@ void TextContext::mlp_tail_tp2(const RankBlocks& w, RankTensors& x, const RankTe
                      rank_stream(rank));
     });
     ffn_split(h, {&w[0]->ffn, &w[1]->ffn}, x, staging, ws, execution, *tp_->events, exchange_lane);
+}
+
+// Sliced prefill, post-mixer block: slice s waits for its mixer all-reduce (lane s) only, so its
+// norm and FFN run while the later slices' exchanges still move; its FFN all-reduce then begins on
+// the same lane. The per-column ops are mlp_tail_tp2's over the slice's columns.
+void TextContext::mlp_tail_sliced_tp2(const RankBlocks& w, RankTensors& x,
+                                      const RankTensors& staging, const PrefillSlicePlan& slices) {
+    const ExecutionContext& execution = *tp_->execution;
+    const ops::PeerEvents& events     = *tp_->events;
+    const auto ws                     = workspaces();
+    const std::int32_t T              = x[0].ne[1];
+    RankTensors h;
+    for (std::size_t r = 0; r < 2; ++r) { h[r] = workspace::post_mixer_hidden(*ws[r], config_, T); }
+    for (std::int32_t s = 0; s < slices.count; ++s) {
+        const std::int32_t first = slices.first(s), count = slices.columns(s, T);
+        ops::allreduce_sum_finish(execution, events, static_cast<int>(s));
+        const RankTensors xs = column_window(x, first, count);
+        RankTensors hs       = column_window(h, first, count);
+        for_each_rank(execution, [&](int rank) {
+            const auto r = static_cast<std::size_t>(rank);
+            ops::rmsnorm(xs[r], w[r]->post_attention_norm, config_.rms_norm_eps, true, hs[r],
+                         rank_stream(rank));
+        });
+        ffn_split(hs, {&w[0]->ffn, &w[1]->ffn}, xs, column_window(staging, first, count), ws,
+                  execution, events, static_cast<int>(s));
+    }
 }
 
 template <class Tap>
@@ -848,6 +939,79 @@ void TextContext::prefill_layers_overlap_tp2(RankTensors& x, const RankTensors& 
     }
 }
 
+// v07/prefill-slices (idea: kurcontko/ninfer-tp2 292c33d2 + d0925e24, rewritten on the split
+// exchange's lanes). Every layer runs its mixer core over the whole chunk, exactly as
+// run_layers_tp2, then cuts the column-local rest in `slices`: the mixer's output projection of
+// slice s begins its all-reduce on lane s; the post-mixer block of slice s finishes lane s, norms
+// and runs the FFN of its columns and begins the FFN all-reduce on lane s again; the layer ends
+// once every lane has finished. So slice s's exchange moves while later slices compute, and a
+// layer pays about one slice of exposed exchange instead of two whole ones. Every sliced op is
+// column-local (the all-reduce combine is the one-call residual_add), so the bits are those of
+// run_layers_tp2 as long as the linear routes of a slice's width compute the same per-column
+// values (prefill_slices.h keeps slices >= 64 columns; verified end to end by the perplexity
+// gate under NINFER_TP_PREFILL_SLICES=force). A tap gets each layer's whole output after the
+// last lane of the layer has finished, as from run_layers_tp2.
+template <class Tap>
+void TextContext::prefill_layers_sliced_tp2(RankTensors& x, const RankTensors& staging,
+                                            const PrefillSlicePlan& slices, Tap& tap) {
+    const ExecutionContext& execution = *tp_->execution;
+    const ops::PeerEvents& events     = *tp_->events;
+    const int len                     = x[0].ne[1];
+    if (!slices.usable() || slices.count > kPrefillSliceMaxCount ||
+        slices.first(slices.count - 1) >= len || active_sequence_batch_ != 0) {
+        throw std::logic_error("prefill slices: invalid slice plan");
+    }
+    const auto& layers0 = parameters_.text.layers;
+    const auto& layers1 = tp_->parameters->text.layers;
+    std::size_t layer   = 0;
+    try {
+        for (; layer < layers0.size(); ++layer) {
+            const RankBlocks block{&layers0[layer], &layers1[layer]};
+            const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
+            const auto compact = dimension(config_.compact_layer_indices[layer]);
+            nvtx::ScopedRange layer_range(
+                full ? nvtx::Name::PrefillLayerFull : nvtx::Name::PrefillLayerGdn,
+                full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+            {
+                nvtx::ScopedRange mixer_range(
+                    full ? nvtx::Name::PrefillAttention : nvtx::Name::PrefillGdn,
+                    full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+                auto scope0 = work_.scope();
+                auto scope1 = tp_->work->scope();
+                if (full) {
+                    attn_mix_tp2(block, x, compact, staging, -1, &slices);
+                } else {
+                    gdn_mix_tp2(block, x, compact, Phase::Prefill, staging, -1, &slices);
+                }
+            }
+            {
+                nvtx::ScopedRange range(nvtx::Name::PrefillPostMixer, nvtx::Category::PostMixer,
+                                        layer);
+                auto scope0 = work_.scope();
+                auto scope1 = tp_->work->scope();
+                mlp_tail_sliced_tp2(block, x, staging, slices);
+            }
+            for (std::int32_t s = 0; s < slices.count; ++s) {
+                ops::allreduce_sum_finish(execution, events, static_cast<int>(s));
+            }
+            if constexpr (Tap::enabled) {
+                tap.capture_layer(static_cast<int>(layer), x[0], ctx_.stream);
+                peer_tap_capture_layer(static_cast<int>(layer), x[1]);
+            }
+        }
+    } catch (const std::exception& error) {
+        // Leave no lane open for the next call; the request fails either way.
+        for (std::int32_t s = 0; s < slices.count; ++s) {
+            try {
+                ops::allreduce_sum_finish(execution, events, static_cast<int>(s));
+            } catch (...) {}
+        }
+        throw std::runtime_error("text/layers/" + std::to_string(layer) +
+                                 " prefill slices tp2 columns=" + std::to_string(len) + ": " +
+                                 error.what());
+    }
+}
+
 void TextContext::logits_tp2(const RankTensors& hidden, Tensor& logits) {
     logits_tp2(hidden, {&parameters_.text.output_head, &tp_->parameters->text.output_head}, logits);
 }
@@ -1049,11 +1213,24 @@ TextContext::prefill_impl_tp2(std::span<const int> ids, const TextPrefill* text_
         // multimodal chunk's three-axis RoPE positions are not column-sliceable.
         bool column_tap = true;
         if constexpr (Tap::enabled) { column_tap = tap.batch_features == nullptr; }
+        // v07/prefill-slices: where the halves do not apply (chunks under 768 columns, multimodal
+        // chunks, batched-feature taps), or everywhere under NINFER_TP_PREFILL_SLICES=force, the
+        // chunk runs sliced when the split exchange is available and the plan has two slices.
+        const PrefillSlicesMode slices_mode = prefill_slices_mode_env();
         const int overlap_split =
-            column_tap && multimodal == nullptr ? prefill_overlap_split(len) : 0;
+            column_tap && multimodal == nullptr && slices_mode != PrefillSlicesMode::Force
+                ? prefill_overlap_split(len)
+                : 0;
+        const PrefillSlicePlan slices =
+            slices_mode != PrefillSlicesMode::Off && active_sequence_batch_ == 0
+                ? prefill_slice_plan(len, prefill_slice_tokens_env())
+                : PrefillSlicePlan{};
         if (overlap_split > 0 && ops::allreduce_sum_split_available(execution, *tp_->events)) {
             prefill_layers_overlap_tp2(x, staging, positions, rope_positions, base_i, overlap_split,
                                        tap);
+        } else if (slices.usable() &&
+                   ops::allreduce_sum_split_available(execution, *tp_->events)) {
+            prefill_layers_sliced_tp2(x, staging, slices, tap);
         } else {
             run_layers_tp2(x, Phase::Prefill, staging, tap);
         }

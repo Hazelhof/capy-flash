@@ -887,6 +887,14 @@ struct TpTransportStatus {
     // NINFER_TP_SELECTOR=primary, NINFER_TP_DRAFT_HEAD=primary or Vision on rank 1) or "rank 0"
     // (NINFER_TP_DRAFTER=primary); empty otherwise.
     std::string drafter;
+    // The eager (prefill) all-reduces' transport: "pinned host exchange", "direct peer copies"
+    // or "driver-staged copies"; empty at tp 1.
+    std::string eager_transport;
+    // The text prefill overlap's split-phase sums (dense models): "pinned host lanes", "direct
+    // peer lanes", "driver-staged peer lanes (test only)" (NINFER_TP_PEER_OVERLAP=force without
+    // P2P), "off (one call per chunk)" or "off (NINFER_TP_PREFILL_OVERLAP=0)"; empty at tp 1
+    // and for Qwen4Exp.
+    std::string prefill_overlap;
 };
 
 class Program {
@@ -1215,6 +1223,8 @@ struct RuntimeContractAccess {
 
 // Device bytes one more offloaded-expert slot per layer costs (every layer's slot), or 0 when the
 // model's routed experts are not offloaded (EngineOptions::routed_experts does not apply).
+// True when the Qwen4Exp routed experts are ggml block banks (capy-flash v0.7).
+[[nodiscard]] bool gguf_routed_experts(const execution::Parameters& parameters);
 [[nodiscard]] std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
                                                        const EngineOptions& options);
 // Device bytes of the offload backend's prefetch staging slots (T25; 0 when prefetch is off).

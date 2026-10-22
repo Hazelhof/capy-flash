@@ -154,7 +154,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
         const bool supported =
             (moe && format == QType::Q8_G32_FP16) ||
             (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
-                       (attention && format == QType::BF16))) ||
+                       format == QType::Q3_G128_FP16 || (attention && format == QType::BF16))) ||
             (shard && (format == QType::FP8_E4M3FN_ROW_BF16 || format == QType::NVFP4));
         require(supported, "input projection: unsupported single-parent format");
         return result;

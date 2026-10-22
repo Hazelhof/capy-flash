@@ -14,6 +14,7 @@ add_library(ninfer_serve STATIC
   openai_responses_store.cpp
   translate.cpp
   generation_service.cpp
+  reasoning_retry.cpp
   prompt_overlap.cpp
   prefill_miss_dump.cpp
   request_events.cpp

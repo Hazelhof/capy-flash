@@ -6,6 +6,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -365,6 +366,7 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
     }
+    adopt_unshared_active_kv();
     const CaptureAssessment assessment = inspect_capture(
         offer, exact_shared, replacement, private_replacement, permit_shared_publication);
     if (!assessment.publishes_private && !assessment.publishes_shared) {
@@ -384,6 +386,44 @@ runtime::ContextTransactionReserveStatus ProgramImpl::reserve_active_capture_imp
     if (!pressure && !assessment.physically_feasible) {
         skip_capture(std::move(offer));
         return runtime::ContextTransactionReserveStatus::Aborted;
+    }
+    {
+        // Publication moves these resources out of the request's entitlements. Check that it can
+        // before anything changes: a capture whose accounting disagrees is skipped (the request
+        // only loses this checkpoint) instead of failing mid-publication for the whole Engine.
+        const RequestControl& request = requests[ContractAccess::lane(offer).value];
+        const detail::PhysicalResources& removed =
+            assessment.implementation->demand.final_removed;
+        const detail::PhysicalResources& prepared =
+            assessment.implementation->capacity_preparation_removed;
+        const auto covers = [](const detail::PhysicalResources& held,
+                               const detail::PhysicalResources& taken) {
+            return taken.device.active_lanes <= held.device.active_lanes &&
+                   taken.device.state_slots <= held.device.state_slots &&
+                   taken.device.main_kv_pages <= held.device.main_kv_pages &&
+                   taken.device.backend_kv_pages <= held.device.backend_kv_pages &&
+                   taken.host.state_slots <= held.host.state_slots &&
+                   taken.host.kv_bytes <= held.host.kv_bytes;
+        };
+        if (!covers(removed, prepared) ||
+            !covers(request.optional_resources, positive_resource_difference(removed, prepared)) ||
+            !covers(request.active_resources,
+                    assessment.implementation->active_entitlement_delta.removed)) {
+            const detail::PhysicalResources& active = request.active_resources;
+            const detail::PhysicalResources& taken =
+                assessment.implementation->active_entitlement_delta.removed;
+            std::fprintf(stderr,
+                         "[context cache] warning: capture at frontier %u skipped: its accounting "
+                         "exceeds the request's entitlement (active Main KV %u - %u, Backend KV "
+                         "%u - %u, Device State %u - %u); the request continues without this "
+                         "checkpoint\n",
+                         assessment.frontier, active.device.main_kv_pages,
+                         taken.device.main_kv_pages, active.device.backend_kv_pages,
+                         taken.device.backend_kv_pages, active.device.state_slots,
+                         taken.device.state_slots);
+            skip_capture(std::move(offer));
+            return runtime::ContextTransactionReserveStatus::Aborted;
+        }
     }
 
     const std::uint32_t lane         = ContractAccess::lane(offer).value;
@@ -911,16 +951,19 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
     }
 
     const detail::PhysicalResources private_replacement_removed =
-        checked_resource_difference(removed, transaction.capacity_preparation_removed);
+        checked_resource_difference(removed, transaction.capacity_preparation_removed,
+                                    "capture replacement release");
     request.optional_resources =
-        checked_resource_difference(request.optional_resources, private_replacement_removed);
+        checked_resource_difference(request.optional_resources, private_replacement_removed,
+                                    "capture optional entitlement");
     if (transaction.publish_private && !transaction.publish_shared) {
         request.optional_resources =
             checked_resource_sum(request.optional_resources, transaction.resource_delta.added);
     }
     request.active_resources = checked_resource_sum(
         checked_resource_difference(request.active_resources,
-                                    transaction.active_entitlement_delta.removed),
+                                    transaction.active_entitlement_delta.removed,
+                                    "capture active entitlement"),
         transaction.active_entitlement_delta.added);
 
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::DeviceFork) {

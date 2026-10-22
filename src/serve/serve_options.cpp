@@ -3,6 +3,7 @@
 #include "product/tensor_parallel_options.h"
 #include "product/vision_options.h"
 
+#include <cmath>
 #include <algorithm>
 #include <cerrno>
 #include <cstddef>
@@ -77,7 +78,7 @@ std::uint32_t resolve_turn_anchors(std::optional<std::uint32_t> configured,
 
 namespace {
 
-// Serving profiles: the configurations the release launchers start (two 16 GB boards). They are
+// Serving profiles: the configurations the release launchers start (two 16 GB boards; 27b-16gb: one). They are
 // inserted before the command line's own flags, so an explicit flag overrides its profile value;
 // the KV capacity is left to follow --max-context.
 struct ServeProfile {
@@ -90,7 +91,7 @@ const std::vector<ServeProfile>& serve_profiles() {
         {"flash-next",
          {"--tp", "2", "--devices", "0,1", "--kv-dtype", "int8", "--elastic", "--max-context",
           "262144", "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3",
-          "--host-kv-mib", "4096", "--embedding-host"}},
+          "--host-kv-mib", "4096", "--host-state-slots", "8", "--embedding-host"}},
         {"27b",
          {"--tp",
           "2",
@@ -119,6 +120,20 @@ const std::vector<ServeProfile>& serve_profiles() {
           "8192",
           "--prefill-chunk",
           "2048"}},
+        // v0.7: Qwen3.8-Flash-Next on ONE 16 GB GPU (T242: GSQ-RCO 64 GB edition, 57 GiB of RAM,
+        // LocalMaxxing 110 tok/s): the flash-next configuration at one device with small RAM caches.
+        {"flash-next-1gpu",
+         {"--device", "0", "--kv-dtype", "int8", "--elastic", "--max-context", "262144",
+          "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3", "--embedding-host",
+          "--host-kv-mib", "1024", "--host-state-slots", "2"}},
+        // v0.7: Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
+        // (docs/v07/27b-16gb.md, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9 GiB).
+        {"27b-16gb",
+         {"--device", "0", "--kv-dtype", "int8", "--max-context", "65536", "--kv-capacity", "auto",
+          "--vram-headroom-mib", "384", "--device-state-slots", "2", "--max-concurrency", "1",
+          "--spec", "mtp", "--draft-tokens", "3", "--lm-head-draft", "--embedding-host",
+          "--vision", "--vision-device", "0", "--max-vision-tokens", "4096", "--host-state-slots",
+          "8", "--host-kv-mib", "4096", "--prefill-chunk", "2048"}},
     };
     return profiles;
 }
@@ -128,7 +143,7 @@ const ServeProfile& find_profile(std::string_view name) {
         if (profile.name == name) { return profile; }
     }
     throw std::invalid_argument("unknown --profile " + std::string(name) +
-                                " (known: flash-next, 27b)");
+                                " (known: flash-next, flash-next-1gpu, 27b, 27b-16gb)");
 }
 
 std::string profile_text(std::string_view name) {
@@ -165,7 +180,7 @@ std::vector<std::string> expand_profiles(int argc, char** argv) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--profile flash-next|27b] [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] [--port N] [--api-key KEY] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--kv-lease-window N] [--log-stats-interval-ms N] [--device N] "
@@ -177,7 +192,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--turn-anchors N] "
            "[--elastic] [--kv-grow N] [--kv-budget-gib G] [--miss-split auto|off] "
-           "[--stream-min-tokens N] "
+           "[--stream-min-tokens N] [--expert-cpu-threads N] "
            "[--request-log-jsonl FILE] [--log-speculation-detail] "
            "[--log-speculation-detail-max-steps N] "
            "[--prefill-miss-dump DIR [--prefill-miss-min-tokens N] [--prefill-miss-min-match F]] "
@@ -185,20 +200,28 @@ std::string serve_usage_text(const char* argv0) {
            "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision|--no-vision] [--vision-device N] [--max-vision-tokens N] [--no-cuda-graph] "
-           "[--no-tp-mailbox] [--embedding-host] [--no-prefix-reuse] "
+           "[--no-tp-mailbox] [--embedding-host] [--host-pinned-max-gib G] [--no-prefix-reuse] "
+           "[--reasoning-close-retry|--no-reasoning-close-retry] "
+           "[--reasoning-eos-guard|--no-reasoning-eos-guard] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
            "       serves OpenAI Responses/Chat Completions and Anthropic Messages endpoints\n"
-           "       --profile applies the tested two-GPU configuration of a model before the other "
-           "flags, which override it:\n"
+           "       --profile applies the tested configuration of a model before the other "
+           "flags, which override it (27b-16gb: one 16 GB GPU, 3-bit GSQ 27B artifact):\n"
            "         flash-next: " +
            profile_text("flash-next") +
            "\n"
            "         27b:        " +
            profile_text("27b") +
+           "\n"
+           "         flash-next-1gpu: " +
+           profile_text("flash-next-1gpu") +
+           "\n"
+           "         27b-16gb:   " +
+           profile_text("27b-16gb") +
            "\n"
            "       --default-max-tokens defaults to " +
            std::to_string(kDefaultMaxTokens) +
@@ -244,7 +267,9 @@ std::string serve_usage_text(const char* argv0) {
            "at least --stream-min-tokens N tokens stream the non-resident experts to the GPU "
            "over PCIe, shorter ones compute them on the CPU (default " +
            std::to_string(RoutedExpertOptions{}.stream_min_tokens) +
-           ", 0 = never stream)\n"
+           ", 0 = never stream); --expert-cpu-threads N: CPU threads of the missing experts "
+           "(default " + std::to_string(RoutedExpertOptions{}.cpu_threads) + ", " +
+           std::to_string(RoutedExpertOptions{}.gguf_cpu_threads) + " with ggml block expert banks)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --tp 2 --devices A,B splits the dense model across two GPUs (rank 0 on A) for "
@@ -261,11 +286,23 @@ std::string serve_usage_text(const char* argv0) {
            "memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees "
            "the table's VRAM (1.18 GiB per GPU on Qwen3.8-27B) for the KV pool, identical "
            "results\n"
+           "       --host-pinned-max-gib G keeps at most G GiB of the host-mapped weights (Flash-Next "
+           "expert banks) page-locked; the banks of the least used layers beyond it stay in "
+           "pageable memory (CPU reads them in place, GPU copies go through a pinned staging "
+           "ring, no prefill streaming on them). Without it the whole page-locked allocation is "
+           "tried first and the fallback starts only if the driver refuses it (Windows WDDM / "
+           "WSL2 allow about half the RAM). Same results, slower where pageable "
+           "(NINFER_HOST_PINNED_MAX_GIB also sets it)\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
+           "       --reasoning-close-retry: a reply that ends with the model's terminal token inside "
+           "its thinking (or right after </think> with blank content and no tool call) is closed "
+           "with \"\\n</think>\\n\\n\" and continued once (on by default; --no-reasoning-close-retry turns it off)\n"
+           "       --reasoning-eos-guard: the first token of a reply that starts in thinking is never "
+           "a terminal token (a terminal draw is redrawn without them; on by default; --no-reasoning-eos-guard turns it off)\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
            "       --greedy forces temperature 0 (exact argmax).\n";
@@ -445,6 +482,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             } else {
                 throw std::invalid_argument("--miss-split must be auto or off");
             }
+        } else if (arg == "--expert-cpu-threads") {
+            const int n = parse_nonnegative_int(require_value("--expert-cpu-threads"), "expert-cpu-threads");
+            if (n < 1 || n > 64) { throw std::invalid_argument("--expert-cpu-threads must be 1..64"); }
+            options.expert_cpu_threads = static_cast<std::uint32_t>(n);
         } else if (arg == "--stream-min-tokens") {
             options.stream_min_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--stream-min-tokens"), "stream-min-tokens"));
@@ -543,8 +584,28 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.tp_mailbox = false;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
+        } else if (arg == "--host-pinned-max-gib") {
+            const std::string value = require_value("--host-pinned-max-gib");
+            double gib              = 0.0;
+            try {
+                gib = std::stod(value);
+            } catch (const std::exception&) {
+                throw std::invalid_argument("--host-pinned-max-gib must be a number");
+            }
+            if (!(gib > 0.0) || !std::isfinite(gib)) {
+                throw std::invalid_argument("--host-pinned-max-gib must be positive");
+            }
+            options.host_pinned_max_bytes = static_cast<std::uint64_t>(gib * 1073741824.0);
         } else if (arg == "--no-prefix-reuse") {
             options.allow_prefix_reuse = false;
+        } else if (arg == "--reasoning-close-retry") {
+            options.reasoning_close_retry = true;
+        } else if (arg == "--no-reasoning-close-retry") {
+            options.reasoning_close_retry = false;
+        } else if (arg == "--reasoning-eos-guard") {
+            options.reasoning_eos_guard = true;
+        } else if (arg == "--no-reasoning-eos-guard") {
+            options.reasoning_eos_guard = false;
         } else if (arg == "--lm-head-draft") {
             options.speculative.proposal_head = ProposalHead::Optimized;
         } else if (arg == "--chat-template") {
@@ -622,7 +683,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         // per StateImage), so --host-kv-mib and --host-state-slots work as at tp 1. Unset, they
         // stay 0 at tp 2: on Qwen3.8-Flash-Next the routed experts already pin most of the RAM,
         // and the PLE table is read through the page cache. --profile 27b turns them on;
-        // --profile flash-next sets 4 GiB of Host KV for the idle conversations' KV (v0.6).
+        // --profile flash-next sets 4 GiB of Host KV for the idle conversations' KV (v0.6) and 8
+        // Host StateImages (884 MiB pinned): without them a capture that finds the 8+1 Device
+        // StateImages full releases a whole idle conversation (reclaim_private_owners_for_capture),
+        // and agents with parallel subagents (Claude Code) re-prefilled the smaller conversation
+        // from the root at almost every turn (banco B4 19/10: 71 of 114 subagent turns).
         if (!host_state_explicit) { options.context_cache.host_state_slots = 0; }
         if (!host_kv_explicit) { options.context_cache.host_kv_capacity_bytes = 0; }
     }

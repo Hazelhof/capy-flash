@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from .methods import (
+    IMPORT_CHUNK_BYTES,
     PreparedMethod,
+    _preflight,
     PrepareRequest,
     cast_direct,
     fp8_row_maxabs,
@@ -13,6 +15,7 @@ from .methods import (
     nvfp4_mse_stacked,
 )
 
+Q3 = "q3_g128_fp16"
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
 Q6 = "q6_g64_fp16"
@@ -479,7 +482,94 @@ def qwen3_8_flash_next_fp4_local(model, recipe, sources):
             used.update(names)
 
 
+def import_q4_as_q8(request: PrepareRequest) -> PreparedMethod:
+    """Re-express imported q4_g64_fp16 rows as q8_g32_fp16 without changing a value.
+
+    Every Q4 group of 64 becomes two Q8 groups of 32 with the same binary16 multiplier and the
+    same signed codes ([-8, 7] lies inside the Q8 code domain), so each represented weight is
+    identical. Used where an Op has a Q8 route and no Q4 one (the token-embedding gather).
+    """
+    if request.target.format != Q8 or len(request.target.shape) != 2:
+        raise ValueError("import_q4_as_q8 requires a q8_g32_fp16 matrix target")
+    _preflight(request, values=False)
+    n, k = request.target.shape
+    if k % 64:
+        raise ValueError("import_q4_as_q8 requires whole Q4 groups")
+    chunk = max(request.rows_per_chunk, IMPORT_CHUNK_BYTES // (k + k // 16))
+
+    def produce(output):
+        for begin in range(0, n, chunk):
+            words = request.encoded_rows(begin, min(n, begin + chunk))
+            if words.format != Q4:
+                raise ValueError(f"import_q4_as_q8: source rows are {words.format}, expected {Q4}")
+            rows = words.codes.shape[0]
+            codes = words.codes.reshape(rows, k // 32, 32)
+            scales = words.scales.repeat_interleave(2, dim=1)
+            output.write_codes(begin, codes, scales)
+
+    return request.job(produce=produce)
+
+
+def qwen3_8_27b_gsq3(model, recipe, sources):
+    """ISTA-DASLab Qwen3.8-27B 3-bit GSQ -> one 16 GB GPU (v0.7 27b-16gb).
+
+    ``--model`` is the GSQ checkpoint (ISTA-DASLab/Qwen3.8-27B-3Bit-GSQ, compressed-tensors
+    pack-quantized) and ``--source mtp=`` any checkpoint carrying the official BF16 MTP layer.
+
+    - Text body (320 projections): the GSQ 3-bit G128 codes imported verbatim as q3_g128_fp16
+      (signed codes unchanged; BF16 multipliers rounded to binary16, rejected above 2^-25).
+    - Output head: the GSQ 4-bit RTN G64 words imported verbatim as q4_g64_fp16; the proposal
+      head is a row gather of the same words (no requantization).
+    - Token embedding: the same Q4 words re-expressed losslessly as q8_g32_fp16 (the gather has
+      a Q8 route, no Q4 one); meant to stay in host RAM (--embedding-host).
+    - GDN a/b projections, norms, convolution: BF16 as published.
+    - Vision (BF16 in the GSQ release): the official optional formats (Q4/Q5/Q6/Q8).
+    - MTP (from ``mtp``): Q8 stem and attention input, NVFP4 MLP and attention output by
+      nvfp4_mse with A16 activations, as the production MTP3 artifact (quasar_mtpnv).
+    """
+    from .proposal import DEFAULT_RANKING, add_proposal
+
+    if "num_experts" in model.config:
+        raise ValueError("this recipe requires Qwen3.5 Dense mathematics")
+    base = sources["base"]
+    _optional(model, recipe)
+    if "mtp" in model.components:
+        _mtp_nvfp4_layer(model, recipe)
+        mtp_store = sources["mtp"]
+        for name in model.parameters:
+            if name.startswith("mtp/"):
+                recipe.assign(name, source=model.source(name, mtp_store))
+    recipe.assign(
+        "text/token_embedding",
+        format=Q8,
+        method=import_q4_as_q8,
+        source=model.source("text/token_embedding", base, Q4),
+    )
+    recipe.assign(
+        "text/output_head",
+        format=Q4,
+        method=import_encoded,
+        source=model.source("text/output_head", base, Q4),
+        activation_policy="A16Only",
+    )
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if name.endswith(("/gdn/a_projection", "/gdn/b_projection")):
+            continue  # BF16 in the checkpoint (compressed-tensors ignore list)
+        recipe.assign(
+            name,
+            format=Q3,
+            method=import_encoded,
+            source=model.source(name, base, Q3),
+            activation_policy="A16Only",
+        )
+    add_proposal(recipe, ranking=DEFAULT_RANKING, source=recipe.selections["text/output_head"][0].source)
+    recipe.assign("proposal/head", format=Q4, method=import_encoded)
+
+
 RECIPES = {
+    "qwen3_8_27b_gsq3": qwen3_8_27b_gsq3,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

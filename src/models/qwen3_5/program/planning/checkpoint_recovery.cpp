@@ -809,6 +809,7 @@ ProgramImpl::drop_continuation_anchor(const ContinuationHandle& continuation,
     } catch (...) { return std::nullopt; }
     try {
         publish_checkpoint_drop(sequence, anchor);
+        adopt_unshared_active_kv();
         advance_resource_revision();
         return continuation_summary(sequence);
     } catch (...) { std::terminate(); }

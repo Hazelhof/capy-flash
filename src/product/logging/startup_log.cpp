@@ -305,12 +305,25 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
                 format_pretty_bytes(device.local_bytes), host_mapped);
         }
     }
-    if (load.host_mapped_bytes != 0) {
+    if (load.host_mapped_bytes != 0 && load.host_pageable_bytes == 0) {
         // One copy that every device reads in place, outside every device's `weights`.
         impl_->logger->info("host-mapped weights | {} of pinned host memory | read in place by {} "
                             "device{} over PCIe",
                             format_pretty_bytes(load.host_mapped_bytes), load.devices.size(),
                             load.devices.size() == 1 ? "" : "s");
+    }
+    if (load.host_pageable_bytes != 0) {
+        // v0.7 pinned fallback: part of the expert banks beyond the page-locked limit.
+        const std::string why =
+            load.host_pinned_alloc_failed
+                ? std::string("the driver refused the whole page-locked allocation")
+                : "limit " + format_pretty_bytes(load.host_pinned_limit_bytes);
+        impl_->logger->info(
+            "host-mapped weights | {} pinned ({} of {} parents) | {} pageable ({} parents: CPU "
+            "reads in place, GPU copies through pinned staging, no prefill streaming) | {}",
+            format_pretty_bytes(load.host_mapped_bytes),
+            load.host_mapped_objects - load.host_pageable_objects, load.host_mapped_objects,
+            format_pretty_bytes(load.host_pageable_bytes), load.host_pageable_objects, why);
     }
     impl_->logger->debug(
         "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "

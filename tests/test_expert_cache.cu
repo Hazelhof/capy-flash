@@ -34,7 +34,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <new>
 #include <iostream>
 #include <memory>
 #include <numeric>
@@ -110,19 +112,34 @@ void check(bool ok, const std::string& what) {
     }
 }
 
-// Pinned fake banks: layers x planes x experts, stride = plane bytes + pad.
+// Fake banks: layers x planes x experts, stride = plane bytes + pad. Pinned (one cudaHostAlloc),
+// unless `pageable_layers` lists layers whose banks are plain malloc memory (v0.7 pinned
+// fallback: those fill through the cache's pinned staging ring).
 struct Banks {
     std::byte* host     = nullptr;
     std::int32_t layers = 0, experts = 0;
     std::size_t bytes = 0;
+    std::vector<std::byte*> layer_base; // [layers]
+    std::vector<std::uint8_t> pageable; // [layers]
 
-    Banks(std::int32_t L, std::int32_t E) : layers(L), experts(E) {
+    Banks(std::int32_t L, std::int32_t E, const std::vector<std::int32_t>& pageable_layers = {})
+        : layers(L), experts(E) {
+        std::size_t layer_bytes = 0;
         for (int q = 0; q < kPlanes; ++q) {
-            bytes += static_cast<std::size_t>(L) * E * (kPlaneBytes[q] + kBankPad);
+            layer_bytes += static_cast<std::size_t>(E) * (kPlaneBytes[q] + kBankPad);
         }
+        bytes = layer_bytes * static_cast<std::size_t>(L);
+        pageable.assign(static_cast<std::size_t>(L), 0);
+        for (const std::int32_t l : pageable_layers) { pageable.at(static_cast<std::size_t>(l)) = 1; }
         CUDA_CHECK(cudaHostAlloc(&host, bytes, cudaHostAllocPortable));
-        std::byte* p = host;
         for (std::int32_t l = 0; l < L; ++l) {
+            std::byte* p = host + static_cast<std::size_t>(l) * layer_bytes;
+            if (pageable[static_cast<std::size_t>(l)] != 0) {
+                p = static_cast<std::byte*>(
+                    std::aligned_alloc(4096, (layer_bytes + 4095) / 4096 * 4096));
+                if (p == nullptr) { throw std::bad_alloc(); }
+            }
+            layer_base.push_back(p);
             for (int q = 0; q < kPlanes; ++q) {
                 for (std::int32_t e = 0; e < E; ++e) {
                     auto* w = reinterpret_cast<std::uint64_t*>(p);
@@ -138,17 +155,21 @@ struct Banks {
         }
     }
 
-    ~Banks() { (void)cudaFreeHost(host); }
+    ~Banks() {
+        for (std::int32_t l = 0; l < layers; ++l) {
+            if (pageable[static_cast<std::size_t>(l)] != 0) {
+                std::free(layer_base[static_cast<std::size_t>(l)]);
+            }
+        }
+        (void)cudaFreeHost(host);
+    }
 
     [[nodiscard]] const std::byte* base(std::int32_t l, int q) const {
         std::size_t off = 0;
-        for (std::int32_t ll = 0; ll < layers; ++ll) {
-            for (int qq = 0; qq < kPlanes; ++qq) {
-                if (ll == l && qq == q) { return host + off; }
-                off += static_cast<std::size_t>(experts) * (kPlaneBytes[qq] + kBankPad);
-            }
+        for (int qq = 0; qq < q; ++qq) {
+            off += static_cast<std::size_t>(experts) * (kPlaneBytes[qq] + kBankPad);
         }
-        return nullptr;
+        return layer_base[static_cast<std::size_t>(l)] + off;
     }
 };
 
@@ -499,6 +520,19 @@ ScenarioResult run_windows(const std::vector<int>& devices, const PolicyConfig& 
     check(res.bad_words == 0, "no window ever read a wrong byte");
     check(res.reads > 0 && k.fills_issued > 0 && k.unpublished > 0,
           "scenario exercised reads, fills, evictions");
+    const bool any_pageable =
+        std::any_of(banks.pageable.begin(), banks.pageable.end(), [](auto v) { return v != 0; });
+    for (std::int32_t l = 0; l < banks.layers; ++l) {
+        check(cache.pageable_layer(l) == (banks.pageable[static_cast<std::size_t>(l)] != 0),
+              "layer " + std::to_string(l) + " classified pinned/pageable");
+    }
+    check(any_pageable ? k.staged_fills > 0 && cache.staging_slots() > 0
+                       : k.staged_fills == 0 && cache.staging_slots() == 0,
+          "staged fills only for pageable banks (" + std::to_string(k.staged_fills) + ")");
+    if (any_pageable) {
+        std::printf("  staged fills %lld through %d staging slots per GPU\n",
+                    static_cast<long long>(k.staged_fills), cache.staging_slots());
+    }
     for (auto& d : dev) {
         (void)cudaGraphExecDestroy(d.graph);
         (void)cudaStreamDestroy(d.stream);
@@ -1175,6 +1209,25 @@ int main(int argc, char** argv) {
                 (void)run_windows({0, 1}, ela2, false, banks, 90, 4, 6, 100'000, 16,
                                   ExpertCache::kDefaultInFlightBytes);
             }
+            // v0.7 pinned fallback: layer 1 pageable, a 2-slot staging ring (backpressure).
+            setenv("NINFER_HOST_STAGING_MIB", "6", 1);
+            {
+                Banks mixed(3, 64, {1});
+                std::printf(" 1 GPU, layer 1 pageable (2-slot staging ring), admission + cap 3:\n");
+                (void)run_windows({0}, adm, false, mixed, 60, 4, 6, 200'000, 17,
+                                  ExpertCache::kDefaultInFlightBytes);
+                if (count >= 2) {
+                    PolicyConfig two = lru;
+                    two.partitions   = 2;
+                    std::printf(" 2 GPUs, layer 1 pageable (2-slot ring per GPU), LRU:\n");
+                    (void)run_windows({0, 1}, two, true, mixed, 60, 4, 6, 200'000, 18, shallow);
+                }
+                Banks all(3, 64, {0, 1, 2});
+                std::printf(" 1 GPU, every layer pageable, 6 base + 3 elastic resized:\n");
+                (void)run_windows({0}, ela, false, all, 90, 4, 6, 100'000, 19,
+                                  ExpertCache::kDefaultInFlightBytes);
+            }
+            unsetenv("NINFER_HOST_STAGING_MIB");
             fence_scenario(0, banks);
             unfenced_scenario(0, banks, false);
             unfenced_scenario(0, banks, true);

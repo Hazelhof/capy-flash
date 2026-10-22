@@ -41,7 +41,7 @@ approval requirements beyond the user's instructions and the actual execution en
 capy-flash is a C++/CUDA inference engine built on NInfer (ninfer-tp2, renamed at v0.5.0) for two
 16 GB `sm_120a` boards without P2P, tensor-parallel (`--tp 2`). It serves Qwen3.8-Flash-Next
 (`Qwen4ExpForCausalLM`: NVFP4 routed experts in page-locked host RAM, missing experts computed on
-the CPU with AVX-512 VNNI, n-gram (PLE) table read from disk) and the dense Qwen3.8-27B
+the CPU with AVX-512 VNNI or AVX2 (chosen at run time), n-gram (PLE) table read from disk) and the dense Qwen3.8-27B
 (`Qwen3_5ForCausalLM`) through the same Engine. It is tuned on 2x RTX 5070 Ti, Ryzen 9 9900X,
 96 GB DDR5; `--profile flash-next|27b` is the tested serving configuration of each model.
 

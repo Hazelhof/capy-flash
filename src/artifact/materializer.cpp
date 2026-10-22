@@ -1,6 +1,7 @@
 #include "artifact/materializer.h"
 
 #include "artifact/framing.h"
+#include "artifact/host_residency.h"
 #include "artifact/reader.h"
 #include "core/startup.h"
 
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -77,6 +79,32 @@ void require_host_memory(std::uint64_t bytes) {
 #else
     (void)bytes;
 #endif
+}
+
+// v0.7 pinned fallback: page-locked room left for the engine's other pinned buffers on the first
+// split try after the whole allocation failed, and the step of each further try.
+constexpr std::uint64_t kPinnedReserveBytes = 8ULL << 30;
+constexpr std::uint64_t kPinnedStepBytes    = 4ULL << 30;
+
+std::string gib_text(std::uint64_t bytes) {
+    char text[32];
+    std::snprintf(text, sizeof text, "%.1f GiB",
+                  static_cast<double>(bytes) / static_cast<double>(1ULL << 30));
+    return text;
+}
+
+// The page-locked limit of the host-mapped parents: the plan's, else NINFER_HOST_PINNED_MAX_GIB
+// (GiB, may be fractional), else 0 = none.
+std::uint64_t host_pinned_limit(const MaterializationPlan& plan) {
+    if (plan.host_pinned_limit_bytes != 0) { return plan.host_pinned_limit_bytes; }
+    const char* env = std::getenv("NINFER_HOST_PINNED_MAX_GIB");
+    if (env == nullptr || *env == 0) { return 0; }
+    char* end         = nullptr;
+    const double gib  = std::strtod(env, &end);
+    if (end == env || *end != 0 || !(gib > 0.0) || !std::isfinite(gib)) {
+        throw ArtifactError("NINFER_HOST_PINNED_MAX_GIB must be a positive number of GiB");
+    }
+    return static_cast<std::uint64_t>(gib * static_cast<double>(1ULL << 30));
 }
 
 constexpr std::size_t kSlotBytes        = 64ULL * 1024 * 1024;
@@ -524,30 +552,117 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
     if (!plan.host_mapped_objects.empty()) {
         // One mapped page-locked allocation for every device: the parents' bytes are read into
         // it once and never uploaded, and each device's parent is that device's address of them.
+        // v0.7 pinned fallback (artifact/host_residency.h): above the page-locked limit, or when
+        // that allocation fails (Windows WDDM / WSL2 cap page-locked memory at about half the
+        // RAM), the parents that allow it go to pageable memory instead.
         if (plan.host_mapped_bytes > std::numeric_limits<std::size_t>::max()) {
             throw ArtifactError("host-mapped backing exceeds size_t");
         }
         require_host_memory(plan.host_mapped_bytes);
-        try {
-            out.host_mapped_ =
-                std::make_unique<PinnedHostBuffer>(static_cast<std::size_t>(plan.host_mapped_bytes),
-                                                   HostMapping::Yes, PinnedHostPages::Huge);
-        } catch (const std::exception& error) {
-            throw ArtifactError("host-mapped weight buffer of " +
-                                std::to_string(plan.host_mapped_bytes) + " bytes: " + error.what());
+        const std::span<const HostMappedPlacement> placements(plan.host_mapped_objects);
+        const std::uint64_t limit = host_pinned_limit(plan);
+        const bool may_split      = any_pageable_candidate(placements);
+        out.stats_.host_pinned_limit_bytes = limit;
+        HostResidency residency;
+        bool placed_whole = false;
+        if (limit == 0 || limit >= plan.host_mapped_bytes || !may_split) {
+            try {
+                out.host_mapped_ = std::make_unique<PinnedHostBuffer>(
+                    static_cast<std::size_t>(plan.host_mapped_bytes), HostMapping::Yes,
+                    PinnedHostPages::Huge);
+                residency    = plan_host_residency(placements, plan.host_mapped_bytes,
+                                                   plan.host_mapped_bytes);
+                placed_whole = true;
+            } catch (const std::exception& error) {
+                if (!may_split) {
+                    throw ArtifactError("host-mapped weight buffer of " +
+                                        std::to_string(plan.host_mapped_bytes) +
+                                        " bytes: " + error.what());
+                }
+                out.stats_.host_pinned_alloc_failed = true;
+                std::fprintf(stderr,
+                             "host-mapped weights: the page-locked allocation of %s failed (%s); "
+                             "keeping part of the expert banks in pageable memory\n",
+                             gib_text(plan.host_mapped_bytes).c_str(), error.what());
+            }
         }
-        auto* host = static_cast<std::byte*>(out.host_mapped_->data());
+        if (!placed_whole) {
+            // The first try leaves room for the engine's other page-locked buffers (Host KV,
+            // StateImages, mailboxes, the staging ring) unless the limit is explicit; every failed
+            // try steps down.
+            const std::uint64_t reserve = std::min(plan.host_mapped_bytes, kPinnedReserveBytes);
+            std::uint64_t budget        = limit != 0 && limit < plan.host_mapped_bytes
+                                              ? limit
+                                              : plan.host_mapped_bytes - reserve;
+            for (;;) {
+                residency = plan_host_residency(placements, plan.host_mapped_bytes, budget);
+                if (residency.required_pinned_bytes > budget) {
+                    throw ArtifactError(
+                        "host-mapped weights: the parents that must stay page-locked need " +
+                        gib_text(residency.required_pinned_bytes) + ", more than the " +
+                        gib_text(budget) +
+                        " allowed (--host-pinned-max-gib / NINFER_HOST_PINNED_MAX_GIB, or what "
+                        "the driver grants); drop --embedding-host or raise the limit");
+                }
+                try {
+                    out.host_mapped_.reset();
+                    if (residency.pinned_bytes != 0) {
+                        out.host_mapped_ = std::make_unique<PinnedHostBuffer>(
+                            static_cast<std::size_t>(residency.pinned_bytes), HostMapping::Yes,
+                            PinnedHostPages::Huge);
+                    }
+                    break;
+                } catch (const std::exception& error) {
+                    const std::uint64_t next = residency.pinned_bytes > kPinnedStepBytes
+                                                   ? residency.pinned_bytes - kPinnedStepBytes
+                                                   : 0;
+                    std::fprintf(stderr,
+                                 "host-mapped weights: page-locked allocation of %s failed "
+                                 "(%s)%s\n",
+                                 gib_text(residency.pinned_bytes).c_str(), error.what(),
+                                 next >= residency.required_pinned_bytes ? "; trying less" : "");
+                    if (next < residency.required_pinned_bytes || residency.pinned_bytes == 0) {
+                        throw ArtifactError("host-mapped weight buffer of " +
+                                            std::to_string(residency.pinned_bytes) +
+                                            " bytes: " + error.what());
+                    }
+                    budget = next;
+                }
+            }
+            if (residency.pageable_bytes != 0) {
+                out.host_pageable_ = std::make_unique<PageableHostBuffer>(
+                    static_cast<std::size_t>(residency.pageable_bytes));
+            }
+            std::fprintf(stderr,
+                         "host-mapped weights: %s page-locked (%zu of %zu parents), %s pageable "
+                         "(%zu parents: the CPU reads them in place, device copies go through "
+                         "pinned staging)%s\n",
+                         gib_text(residency.pinned_bytes).c_str(),
+                         placements.size() - residency.pageable_objects, placements.size(),
+                         gib_text(residency.pageable_bytes).c_str(), residency.pageable_objects,
+                         limit != 0 ? (", limit " + gib_text(limit)).c_str() : "");
+        }
+        auto* host = out.host_mapped_ ? static_cast<std::byte*>(out.host_mapped_->data()) : nullptr;
+        auto* pageable =
+            out.host_pageable_ ? static_cast<std::byte*>(out.host_pageable_->data()) : nullptr;
         reader.open_all(); // parallel_read below must not race a lazy continuation open
         std::array<const std::byte*, kMaximumDevices> mapped{};
-        for (std::size_t device = 0; device < devices.size(); ++device) {
+        for (std::size_t device = 0; device < devices.size() && out.host_mapped_; ++device) {
             selection.select(device);
             mapped[device] = static_cast<const std::byte*>(out.host_mapped_->device_data());
         }
+        // The placement's bytes in the allocation the residency gave it.
+        const auto bytes_of = [&](std::size_t i) {
+            const auto& placement = plan.host_mapped_objects[i];
+            std::byte* base       = residency.pageable[i] != 0 ? pageable : host;
+            return std::span(base + residency.offset[i], static_cast<std::size_t>(placement.bytes));
+        };
         std::uint64_t end = 0;
         std::vector<HostRead> reads;
         reads.reserve(plan.host_mapped_objects.size());
         std::vector<bool> placed(out.objects_.size(), false);
-        for (const auto& placement : plan.host_mapped_objects) {
+        for (std::size_t i = 0; i < plan.host_mapped_objects.size(); ++i) {
+            const auto& placement = plan.host_mapped_objects[i];
             reader.validate_object(placement.object);
             const auto& geometry   = reader.geometry(placement.object);
             const auto& descriptor = reader.directory().tensor(placement.object);
@@ -564,9 +679,8 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
             }
             placed[placement.object.index] = true;
             end                            = placement.offset + placement.bytes;
-            const auto bytes =
-                std::span(host + placement.offset, static_cast<std::size_t>(placement.bytes));
-            const auto payload = static_cast<std::size_t>(descriptor.bytes);
+            const auto bytes               = bytes_of(i);
+            const auto payload             = static_cast<std::size_t>(descriptor.bytes);
             reads.push_back({descriptor.offset, bytes.first(payload)});
             // Padding after the stored payload reads as zero, as in a device arena.
             std::fill(bytes.begin() + static_cast<std::ptrdiff_t>(payload), bytes.end(),
@@ -575,21 +689,31 @@ MaterializedArtifact materialize(const Reader& reader, MaterializationPlan&& pla
                 checked_add(out.stats_.read_bytes, descriptor.bytes, "host-mapped read bytes");
         }
         parallel_read(reader, reads, [&](std::uint64_t read) { phase.progress(read, all_total); });
-        for (const auto& placement : plan.host_mapped_objects) {
-            const auto& geometry = reader.geometry(placement.object);
-            auto& object         = out.objects_.at(placement.object.index);
-            const auto bytes =
-                std::span(host + placement.offset, static_cast<std::size_t>(placement.bytes));
+        for (std::size_t i = 0; i < plan.host_mapped_objects.size(); ++i) {
+            const auto& placement = plan.host_mapped_objects[i];
+            const auto& geometry  = reader.geometry(placement.object);
+            auto& object          = out.objects_.at(placement.object.index);
+            const auto bytes      = bytes_of(i);
             const auto divisor =
                 read_divisor(reader, placement.object, geometry, bytes, out.stats_);
+            const bool in_pageable = residency.pageable[i] != 0;
             for (std::size_t device = 0; device < devices.size(); ++device) {
-                auto& backing  = object.device[device];
-                backing.parent = WeightParent{geometry, mapped[device] + placement.offset, divisor};
+                auto& backing = object.device[device];
+                // A pageable parent has one host address for every device (no device mapping:
+                // only the CPU reads it in place, devices receive copies through pinned staging).
+                const std::byte* base = in_pageable ? bytes.data()
+                                                    : mapped[device] + residency.offset[i];
+                backing.parent = WeightParent{geometry, base, divisor};
                 backing.shard  = {ShardAxis::HostMapped, {}, geometry.shape};
-                out.stats_.per_device_host_mapped_bytes[device] += placement.bytes;
+                if (!in_pageable) {
+                    out.stats_.per_device_host_mapped_bytes[device] += placement.bytes;
+                }
             }
         }
-        out.stats_.host_mapped_bytes = plan.host_mapped_bytes;
+        out.stats_.host_mapped_bytes     = residency.pinned_bytes;
+        out.stats_.host_pageable_bytes   = residency.pageable_bytes;
+        out.stats_.host_pageable_objects = residency.pageable_objects;
+        out.stats_.host_mapped_objects   = plan.host_mapped_objects.size();
     }
     for (const auto handle : plan.file_objects) {
         reader.validate_object(handle);

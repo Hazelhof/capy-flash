@@ -3,6 +3,8 @@
 
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 #include "ops/linear/fp8/fp8_geometry.h"
+#include "ops/linear/q3/q3_arena.h"
+#include "ops/linear/q3/q3_linear.h"
 #include "ops/linear/fp8/fp8_format.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
@@ -132,6 +134,12 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         (void)detail::bf16_linear_add_select(output_rows, input_rows, max_tokens);
         return 0;
     }
+    if (qtype == QType::Q3_G128_FP16) {
+        if (output_rows <= 0 || input_rows <= 0 || input_rows % 128 != 0) {
+            throw std::invalid_argument("linear_add workspace: Q3 needs K a multiple of 128");
+        }
+        return detail::q3_workspace_bytes(input_rows, max_tokens);
+    }
     if (qtype == QType::Q4_G64_FP16) {
         (void)detail::select_q4_linear_add(output_rows, input_rows, min_tokens);
         (void)detail::select_q4_linear_add(output_rows, input_rows, max_tokens);
@@ -187,6 +195,14 @@ void validate_linear_add(const Tensor& x, const Weight& w, const Tensor& residua
             !aligned_to(w.qdata, 16)) {
             throw std::invalid_argument(
                 "linear_add: BF16 requires 16-byte x/residual/weight alignment");
+        }
+        return;
+    }
+
+    if (w.qtype == QType::Q3_G128_FP16) {
+        detail::validate_q3_weight(w, "linear_add");
+        if (!aligned_to(x.data, 16)) {
+            throw std::invalid_argument("linear_add: Q3 requires 16-byte x alignment");
         }
         return;
     }
@@ -256,6 +272,11 @@ void validate_linear_add(const Tensor& x, const Weight& w, const Tensor& residua
 void dispatch_linear_add(const Tensor& x, const Weight& w, Tensor& residual_out,
                          LinearPolicy policy, WorkspaceArena* ws, cudaStream_t stream) {
     switch (w.qtype) {
+    case QType::Q3_G128_FP16: {
+        const detail::Q3ArenaWorkspace q3ws(ws, w.k, x.ne[1]);
+        detail::q3_linear_add_dispatch(x, w, residual_out, stream, q3ws.get());
+        return;
+    }
     case QType::BF16:
         detail::bf16_linear_add_dispatch(x, w, residual_out, stream);
         return;

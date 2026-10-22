@@ -17,6 +17,8 @@ from typing import Sequence
 from .formats import (
     DirectFormat,
     Fp8RowFormat,
+    GgufFormat,
+    GGUF_FORMATS,
     Mxfp8Format,
     Nvfp4Format,
     Nvfp4RowFormat,
@@ -106,11 +108,22 @@ class RowInterleavedGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class GgufBlocksGeometry:
+    """N rows of ``row_bytes``: K / block_elements ggml blocks per row, nothing else."""
+
+    n: int
+    k: int
+    blocks_per_row: int
+    row_bytes: int
+    payload_bytes: int
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
-    frozenset(("q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16")),
+    frozenset(("q3_g128_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16")),
 )
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
@@ -134,6 +147,8 @@ ROW_INTERLEAVED_V1 = Layout(
     frozenset(("nvfp4_row_e4m3_g16",)),
 )
 
+GGUF_BLOCKS_V1 = Layout("gguf_blocks_v1", 256, frozenset(GGUF_FORMATS))
+
 LAYOUTS = MappingProxyType(
     {
         layout.name: layout
@@ -144,6 +159,7 @@ LAYOUTS = MappingProxyType(
             ROW_SCALE_V1,
             BLOCK_SCALE_K32_V1,
             ROW_INTERLEAVED_V1,
+            GGUF_BLOCKS_V1,
         )
     }
 )
@@ -205,8 +221,12 @@ def row_split_geometry(format: str | QuantFormat, shape: Sequence[int]) -> RowSp
     n, k = _shape(shape, rank=2)
     k_pad = align_up(k, K_ALIGNMENT)
     groups_per_row = k_pad // spec.group_size
-    base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
-    high_bytes_per_group = 0 if spec.bits in (4, 8) else spec.group_size * (spec.bits - 4) // 8
+    # Q3: one dense 3-bit stream per group (8 codes in 3 bytes), no high plane.
+    if spec.bits == 3:
+        base_bytes_per_group = spec.group_size * 3 // 8
+    else:
+        base_bytes_per_group = spec.group_size if spec.bits == 8 else spec.group_size // 2
+    high_bytes_per_group = 0 if spec.bits in (3, 4, 8) else spec.group_size * (spec.bits - 4) // 8
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
     scale_row_bytes = groups_per_row * 2
@@ -331,6 +351,22 @@ def row_interleaved_geometry(format: str | Nvfp4RowFormat, shape: Sequence[int])
     )
 
 
+def gguf_blocks_geometry(format: str | GgufFormat, shape: Sequence[int]) -> GgufBlocksGeometry:
+    """Rows of whole ggml blocks in row-major order (ninfer-all's gguf_blocks_v1)."""
+
+    spec = _format(format)
+    if not isinstance(spec, GgufFormat):
+        raise ValueError("gguf_blocks_v1 requires a ggml block format")
+    n, k = _shape(shape, rank=2)
+    if k % spec.block_elements:
+        raise ValueError(f"gguf_blocks_v1 requires K divisible by {spec.block_elements}, got {k}")
+    blocks_per_row = k // spec.block_elements
+    row_bytes = blocks_per_row * spec.block_bytes
+    return GgufBlocksGeometry(
+        n=n, k=k, blocks_per_row=blocks_per_row, row_bytes=row_bytes, payload_bytes=n * row_bytes
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -366,4 +402,6 @@ def encoded_size(
         return block_scale_k32_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is ROW_INTERLEAVED_V1:
         return row_interleaved_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is GGUF_BLOCKS_V1:
+        return gguf_blocks_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

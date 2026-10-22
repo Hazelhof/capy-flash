@@ -138,7 +138,8 @@ TensorSlice tensor_row_slice(const WeightGeometry& parent, std::span<const Slice
                   rows);
         break;
     case QuantLayout::RowInterleaved:
-        // Each row carries its own scales: whole rows of the one interleaved plane.
+    case QuantLayout::GgufBlocks:
+        // Each row carries its own scales: whole rows of the one plane.
         copy_rows(out.copies, {0, 0, parent.code_bytes_per_row}, rows);
         break;
     case QuantLayout::BlockScaleK16M128x4:

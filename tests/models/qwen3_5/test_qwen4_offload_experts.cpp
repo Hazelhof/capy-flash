@@ -751,8 +751,8 @@ int main() {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
-    if (!ops::host::host_avx512_vnni_supported()) {
-        std::cout << "SKIP: the host expert executor needs AVX-512 VNNI\n";
+    if (!ops::host::host_experts_supported()) {
+        std::cout << "SKIP: the host expert executor needs AVX2 + FMA + F16C\n";
         return 77;
     }
     try {

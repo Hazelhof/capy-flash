@@ -253,9 +253,11 @@ ModelInstance::~ModelInstance() = default;
 namespace {
 
 // `execution` is null at tensor-parallel width 1, where `device` is the only device.
-ConstructedModel construct_model_on(const EngineOptions& options, DeviceContext& device,
+ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContext& device,
                                     ExecutionContext* execution) {
-    validate_options(options);
+    validate_options(requested);
+    // Adjusted below once the routed-expert storage is known (ggml block banks).
+    EngineOptions options = requested;
     if ((execution != nullptr) != (options.tp == 2)) {
         throw std::logic_error("Engine execution context does not match the tensor-parallel width");
     }
@@ -278,6 +280,22 @@ ConstructedModel construct_model_on(const EngineOptions& options, DeviceContext&
         throw std::logic_error("loaded Model device count does not match the Engine tp");
     }
     frontend.complete();
+    if (models::qwen3_5::gguf_routed_experts(instance->parameters)) {
+        // capy-flash v0.7: ggml block expert banks run without prefill expert streaming, the
+        // router-ahead prefetch and the miss split (not implemented for them): plan and run so.
+        auto& e = options.routed_experts;
+        if (e.stream_min_tokens > 0 || e.prefetch_slots > 0 || e.device_reads > 0 ||
+            e.miss_split.mode != MissSplitMode::Off) {
+            std::fprintf(stderr, "routed experts: ggml block banks; prefill experts zero-copy from "
+                                 "%u tokens, prefetch and miss split off\n", e.stream_min_tokens);
+        }
+        e.gguf_stream_min_tokens = e.stream_min_tokens; // the GGUF prefill ring
+        e.cpu_threads            = e.gguf_cpu_threads;
+        e.stream_min_tokens      = 0;
+        e.prefetch_slots    = 0;
+        e.device_reads      = 0;
+        e.miss_split.mode   = MissSplitMode::Off;
+    }
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
@@ -440,6 +458,11 @@ ConstructedModel construct_model_on(const EngineOptions& options, DeviceContext&
     summary.device_object_count  = stats.device_object_count;
     summary.host_object_count    = stats.host_object_count;
     summary.host_mapped_bytes    = stats.host_mapped_bytes;
+    summary.host_pageable_bytes      = stats.host_pageable_bytes;
+    summary.host_pageable_objects    = stats.host_pageable_objects;
+    summary.host_mapped_objects      = stats.host_mapped_objects;
+    summary.host_pinned_limit_bytes  = stats.host_pinned_limit_bytes;
+    summary.host_pinned_alloc_failed = stats.host_pinned_alloc_failed;
     for (int i = 0; i < stats.device_count; ++i) {
         const auto rank = static_cast<std::size_t>(i);
         summary.devices.push_back(
@@ -459,6 +482,8 @@ ConstructedModel construct_model_on(const EngineOptions& options, DeviceContext&
     summary.tp_mailbox_slot_bytes = instance->program->tp_transport().slot_bytes;
     summary.tp_proposal_head      = instance->program->tp_transport().proposal_head;
     summary.tp_drafter            = instance->program->tp_transport().drafter;
+    summary.tp_eager_transport    = instance->program->tp_transport().eager_transport;
+    summary.tp_prefill_overlap    = instance->program->tp_transport().prefill_overlap;
     return {std::move(instance), std::move(summary), std::move(context_cost.model)};
 }
 

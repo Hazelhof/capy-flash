@@ -3,8 +3,12 @@
 #include "artifact/reader.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/sharding.h"
+#include "models/qwen3_5/qwen4_layer_profile.h"
 
+#include <charconv>
 #include <stdexcept>
+#include <string_view>
+#include <unordered_map>
 #include <string>
 #include <utility>
 
@@ -66,6 +70,53 @@ void validate_tensor_parallel(const Config& config, const LoadOptions& options) 
         config.text.architecture != Architecture::Qwen4Exp) {
         throw std::invalid_argument(std::string(architecture_name(config.text.architecture)) +
                                     " does not support tensor parallelism");
+    }
+}
+
+// The expert layer of a Qwen4Exp routed-expert parameter name: Text block i is layer i, MTP block
+// i is layer text_layers + i; -1 for any other name.
+std::int32_t qwen4_expert_layer(std::string_view name, std::uint32_t text_layers) {
+    if (name.find("/moe/experts/") == std::string_view::npos) { return -1; }
+    using Prefix = std::pair<std::string_view, std::uint32_t>;
+    for (const auto& [prefix, base] :
+         {Prefix{"text/layers/", 0U}, Prefix{"mtp/layers/", text_layers}}) {
+        if (!name.starts_with(prefix)) { continue; }
+        const auto digits   = name.substr(prefix.size());
+        std::uint32_t index = 0;
+        const auto [end, error] =
+            std::from_chars(digits.data(), digits.data() + digits.size(), index);
+        if (error != std::errc{} || end == digits.data() || *end != '/') { return -1; }
+        return static_cast<std::int32_t>(base + index);
+    }
+    return -1;
+}
+
+// v0.7 pinned fallback: ranks the routed-expert banks (models/qwen3_5/qwen4_layer_profile.h) so the
+// materializer may move the least important layers' banks to pageable memory when the page-locked
+// allocation cannot hold them all; every other HostMapped parent (--embedding-host) keeps rank 0.
+void rank_host_mapped(artifact::MaterializationPlan& plan,
+                      std::span<const loading::PendingWeight> weights, const TextConfig& text) {
+    std::unordered_map<std::size_t, std::int32_t> layer_of;
+    std::int32_t layers = static_cast<std::int32_t>(text.num_hidden_layers);
+    for (const auto& weight : weights) {
+        const auto layer = qwen4_expert_layer(weight.reference.name, text.num_hidden_layers);
+        if (layer < 0) { continue; }
+        layers = std::max(layers, layer + 1);
+        for (const auto& part : weight.reference.binding.parts) {
+            layer_of[part.object.index] = layer;
+        }
+    }
+    const auto order =
+        qwen4_host_pin_order(layers, static_cast<std::int32_t>(text.num_hidden_layers));
+    std::vector<std::uint32_t> rank(static_cast<std::size_t>(layers), 0);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        rank[static_cast<std::size_t>(order[i])] = static_cast<std::uint32_t>(i + 1);
+    }
+    for (auto& placement : plan.host_mapped_objects) {
+        const auto found = layer_of.find(placement.object.index);
+        if (found != layer_of.end()) {
+            placement.pageable_rank = rank[static_cast<std::size_t>(found->second)];
+        }
     }
 }
 
@@ -131,6 +182,8 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
     loading::install_shard_resolver(binder, bindings.weights, out->config, options);
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish();
+    out->materialization.host_pinned_limit_bytes = options.host_pinned_max_bytes;
+    if (text.qwen4()) { rank_host_mapped(out->materialization, out->pending, text); }
     out->info.name       = reader.directory().metadata.value(
         "name", std::string(architecture_name(text.architecture)));
     out->info.metadata_json   = reader.directory().metadata.dump();

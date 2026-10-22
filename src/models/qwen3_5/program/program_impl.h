@@ -1192,6 +1192,11 @@ private:
     owner_exclusive_resources(const SequenceState& sequence) const;
     [[nodiscard]] detail::PhysicalResources
     owner_exclusive_resources(const SharedPrefixState& shared) const;
+    // An active sequence's KV entitlement leaves out the prefix pages another owner still
+    // references (a retained private source, a shared prefix). Releasing that owner outside the
+    // request's own materialization makes them exclusive to the active sequence; this adds them
+    // to its entitlement, which a later shared capture subtracts by their reference count.
+    void adopt_unshared_active_kv() noexcept;
     [[nodiscard]] detail::PhysicalResources physical_occupancy() const noexcept;
     [[nodiscard]] bool physical_peak_fits(detail::PhysicalResources peak) const noexcept;
     [[nodiscard]] StateImageHandle

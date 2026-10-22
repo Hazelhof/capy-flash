@@ -72,6 +72,14 @@ struct Qwen4PersistentLayout {
     // The planar slot pool (one array per plane); bind_pool() gives the plane bases.
     std::array<LayoutRegion, 4> cache_pool{};
     std::size_t cache_pool_bytes = 0;
+    // ggml block banks (capy-flash v0.7, Qwen4OffloadExperts::gguf_pool): cache_pool[0] is one
+    // arena of variable-size slots, cache_pool[1..3] are placeholders; the I64 slot offsets.
+    bool gguf = false;
+    std::optional<TensorLayout> cache_slot_offsets;
+    // T64: the elastic tail of each pool region (its last elastic_columns columns), from the
+    // region's start.
+    std::array<std::size_t, 4> elastic_first{};
+    std::array<std::size_t, 4> elastic_bytes{};
 
     // `backing`: the persistent arena, or the elastic arena when PersistentLayout::elastic_bytes.
     [[nodiscard]] std::array<std::byte*, 4> bind_pool(DeviceSpan backing) const;

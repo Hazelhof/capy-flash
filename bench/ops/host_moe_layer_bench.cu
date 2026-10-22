@@ -1209,10 +1209,11 @@ void run_graph(const Args& a, const Bank& bank, bool calib_only) {
 
 int main(int argc, char** argv) {
     const Args a = parse(argc, argv);
-    if (!host_avx512_vnni_supported()) {
-        std::fprintf(stderr, "needs AVX-512 VNNI\n");
+    if (!host_experts_supported()) {
+        std::fprintf(stderr, "needs AVX2 + FMA + F16C\n");
         return 77;
     }
+    std::fprintf(stderr, "host ISA: %s\n", host_isa_name(host_isa()));
     Bank bank            = make_bank(a.bank_gib, 12, a.huge != 0);
     const bool need_cuda = a.mode != "cpu" || a.fill_gpus > 0;
     if (need_cuda) {

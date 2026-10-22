@@ -610,8 +610,10 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
     refresh_state_views(source);
 
     const detail::PhysicalResources after   = owner_exclusive_resources(source);
-    const detail::PhysicalResources removed = checked_resource_difference(before, after);
-    (void)checked_resource_difference(details.demand.final_removed, removed);
+    const detail::PhysicalResources removed =
+        checked_resource_difference(before, after, "consumed source release");
+    (void)checked_resource_difference(details.demand.final_removed, removed,
+                                      "consumed source planned release");
 }
 
 void ProgramImpl::prepare_materialization(MaterializationTransaction& transaction) {
@@ -1935,8 +1937,10 @@ ProgramImpl::progress_materialization_transaction(runtime::CancellationFlagView 
     }
 
     const auto complete_pressure_delta = [&](MaterializationTransaction::PressureWork& work) {
-        (void)checked_resource_difference(work.option.effect.removed, work.committed_delta.removed);
-        (void)checked_resource_difference(work.option.effect.added, work.committed_delta.added);
+        (void)checked_resource_difference(work.option.effect.removed, work.committed_delta.removed,
+                                          "pressure committed release");
+        (void)checked_resource_difference(work.option.effect.added, work.committed_delta.added,
+                                          "pressure committed addition");
         work.committed_delta = work.option.effect;
     };
 
@@ -2226,7 +2230,12 @@ void ProgramImpl::finalize_context_transaction() noexcept {
             }
         },
         context_transaction_);
-    if (terminal) { context_transaction_.emplace<std::monostate>(); }
+    if (terminal) {
+        context_transaction_.emplace<std::monostate>();
+        // Pressure inside the transaction may have released owners that other active sequences
+        // (or, after an aborted capture, the capturing one) still share prefix pages with.
+        adopt_unshared_active_kv();
+    }
 }
 
 bool ProgramImpl::has_context_transaction() const noexcept {

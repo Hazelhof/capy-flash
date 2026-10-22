@@ -593,6 +593,43 @@ int run_split_lane_case(const char* label, std::int32_t ne0, std::int32_t ne1, s
     return failures;
 }
 
+// v07/p2p-overlap: with PeerLanes attached next to a HostExchange, a split-phase sum opens on the
+// lanes, never on the HostExchange, and allreduce_sum_finish closes it there.
+int run_peer_lane_selection(const ExecutionContext& ec, const ops::PeerEvents& events,
+                            const ops::PeerLanes& lanes, const ops::HostExchange& exchange) {
+    constexpr std::int32_t ne0 = 16, ne1 = 8;
+    const std::size_t bytes    = static_cast<std::size_t>(ne0) * ne1 * 2;
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 2> buffer, staging;
+    std::array<Tensor, 2> buffer_t, staging_t;
+    const std::vector<std::uint16_t> zeros(bytes / 2, 0);
+    for (int rank = 0; rank < 2; ++rank) {
+        set_device(ec, rank);
+        buffer[rank]  = std::make_unique<GuardedDeviceBuffer>(bytes);
+        staging[rank] = std::make_unique<GuardedDeviceBuffer>(bytes);
+        buffer[rank]->copy_from_host(zeros.data(), bytes);
+        buffer_t[rank]  = Tensor(buffer[rank]->data(), DType::BF16, {ne0, ne1});
+        staging_t[rank] = Tensor(staging[rank]->data(), DType::BF16, {ne0, ne1});
+    }
+    synchronize_both(ec);
+    int failures = 0;
+    if (!ops::allreduce_sum_split_available(ec, events)) {
+        std::cerr << "peer lane selection: split all-reduce unavailable\n";
+        return 1;
+    }
+    ops::allreduce_sum_begin(buffer_t, staging_t, ec, events, 1);
+    if (!lanes.sum_open(1) || exchange.sum_open(1)) {
+        std::cerr << "peer lane selection: lane 1 did not open on the PeerLanes\n";
+        ++failures;
+    }
+    ops::allreduce_sum_finish(ec, events, 1);
+    if (lanes.sum_open(1) || exchange.sum_open(1)) {
+        std::cerr << "peer lane selection: lane 1 still open after finish\n";
+        ++failures;
+    }
+    synchronize_both(ec);
+    return failures;
+}
+
 // T62: the pipelined prefill exchange (HostExchange::begin_sum_f32 / columns_ready /
 // finish_sum_f32). Oracle, exact: S = fl32(n(a) + n(b)) with n = identity (FP32), RNE to binary16
 // (FP16, the host's _Float16 conversion) or RNE to bfloat16 (BF16); both ranks hold S and
@@ -818,6 +855,102 @@ int main(int argc, char** argv) {
         // Prefill-sized halves: 5 MiB per lane, three 2 MiB chunks each.
         failures += run_split_lane_case("split lanes bf16 [2560,2048] 1024+1024 x2 + sum", kHidden,
                                         2048, 1024, 2, 215u, ec, wide_events);
+    }
+
+    {
+        // v07/p2p-overlap: the split-phase sums on PeerLanes, issued as the overlapped prefill
+        // issues them (run_split_lane_case). Next to a HostExchange (the Program's layout under
+        // NINFER_TP_PEER_OVERLAP=force; the closing one-call sum takes the HostExchange) on every
+        // pair: without P2P the lane copies are driver-staged and host-ordered (direct = false).
+        // Alone (the Program's layout with P2P; the closing sum is the direct pull) only with
+        // peer access. [5120,2048] 1024+1024 is the 27B's chunk-2048 prefill half.
+        const bool p2p = ops::enable_peer_access(ec);
+        ops::PeerLanes lanes(ec, p2p);
+        ops::HostExchange exchange(ec);
+        ops::PeerEvents mixed(ec);
+        mixed.attach_host_exchange(&exchange);
+        mixed.attach_peer_lanes(&lanes);
+        // One line per case (the other cases print only failures): the line users send us.
+        const auto report = [](const std::string& label, int case_failures) {
+            std::cout << label << ": " << (case_failures != 0 ? "FAIL" : "ok") << '\n';
+            return case_failures;
+        };
+        const std::string staged = p2p ? "direct" : "driver-staged";
+        failures += report("peer lanes selection (" + staged + ")",
+                           run_peer_lane_selection(ec, mixed, lanes, exchange));
+        for (const auto& [ne0, ne1, split, rounds, seed] :
+             {std::array<int, 5>{kHidden, 96, 32, 3, 217},
+              std::array<int, 5>{5120, 2048, 1024, 3, 219}}) {
+            const std::string label = "peer lanes (" + staged + ") + host exchange bf16 [" +
+                                      std::to_string(ne0) + "," + std::to_string(ne1) + "] " +
+                                      std::to_string(split) + "+" + std::to_string(ne1 - split) +
+                                      " x" + std::to_string(rounds) + " + sum";
+            failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
+                                                          static_cast<std::uint32_t>(seed), ec,
+                                                          mixed));
+        }
+        // PR #15 (tzolkincz) shapes: odd column counts (odd lane bytes, the pull and the residual
+        // add unaligned) and tiny lanes; then a graph capture with the lanes attached stays on
+        // the staged nodes (the lanes are eager only).
+        for (const auto& [ne0, ne1, split, rounds, seed] :
+             {std::array<int, 5>{kHidden, 101, 37, 2, 231},
+              std::array<int, 5>{17, 5, 2, 2, 233}}) {
+            const std::string label = "peer lanes (" + staged + ") + host exchange bf16 [" +
+                                      std::to_string(ne0) + "," + std::to_string(ne1) + "] " +
+                                      std::to_string(split) + "+" + std::to_string(ne1 - split) +
+                                      " x" + std::to_string(rounds) + " + sum";
+            failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split, rounds,
+                                                          static_cast<std::uint32_t>(seed), ec,
+                                                          mixed));
+        }
+        failures += report("captured with peer lanes + host exchange stays staged",
+                           run_captured_case("captured with peer lanes + host exchange stays staged",
+                                             kHidden, 1, 5, 0, ec, mixed, nullptr));
+        if (p2p) {
+            ops::PeerEvents direct(ec);
+            direct.attach_peer_lanes(&lanes);
+            // PR #15 (tzolkincz) direct-lane cases: odd and tiny lanes, one-call sums with only
+            // the lanes attached (the plain peer pull), and a capture that stays staged.
+            for (const auto& [ne0, ne1, split, rounds, seed] :
+                 {std::array<int, 5>{kHidden, 101, 37, 2, 235},
+                  std::array<int, 5>{17, 5, 2, 2, 237}}) {
+                const std::string label = "peer lanes direct bf16 [" + std::to_string(ne0) + "," +
+                                          std::to_string(ne1) + "] " + std::to_string(split) +
+                                          "+" + std::to_string(ne1 - split) + " x" +
+                                          std::to_string(rounds) + " + sum";
+                failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split,
+                                                              rounds,
+                                                              static_cast<std::uint32_t>(seed), ec,
+                                                              direct));
+            }
+            failures += report("peer lanes direct: one-call [2560,48]",
+                               run_eager_case("peer lanes direct: one-call [2560,48]", kHidden, 48,
+                                              239u, true, ec, direct));
+            failures += report("peer lanes direct: one-call [2560] fp32 only",
+                               run_eager_case("peer lanes direct: one-call [2560] fp32 only",
+                                              kHidden, 1, 241u, false, ec, direct));
+            if (!ops::allreduce_sum_split_available(ec, direct)) {
+                std::cerr << "split all-reduce unavailable with only peer lanes attached\n";
+                ++failures;
+            }
+            failures += report("captured with peer lanes direct stays staged",
+                               run_captured_case("captured with peer lanes direct stays staged",
+                                                 kHidden, 1, 5, 0, ec, direct, nullptr));
+            for (const auto& [ne0, ne1, split, rounds, seed] :
+                 {std::array<int, 5>{kHidden, 96, 32, 3, 221},
+                  std::array<int, 5>{5120, 2048, 1024, 4, 223}}) {
+                const std::string label = "peer lanes direct bf16 [" + std::to_string(ne0) + "," +
+                                          std::to_string(ne1) + "] " + std::to_string(split) +
+                                          "+" + std::to_string(ne1 - split) + " x" +
+                                          std::to_string(rounds) + " + sum";
+                failures += report(label, run_split_lane_case(label.c_str(), ne0, ne1, split,
+                                                              rounds,
+                                                              static_cast<std::uint32_t>(seed), ec,
+                                                              direct));
+            }
+        } else {
+            std::cout << "peer lanes direct: skipped (no peer access)\n";
+        }
     }
 
     {

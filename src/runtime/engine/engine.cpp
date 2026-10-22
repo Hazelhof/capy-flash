@@ -9,6 +9,7 @@
 #include "runtime/engine/causal_score_core.h"
 #include "runtime/engine/engine_core.h"
 #include "runtime/engine/model_instance.h"
+#include "models/qwen3_5/execution/reasoning_eos_guard.h"
 
 #include <algorithm>
 #include <limits>
@@ -246,6 +247,48 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids,
     const PromptPreparationStats preparation = prepared.preparation_stats();
     return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
         info, preparation, SamplingMode::Thinking, std::move(prepared)));
+}
+
+PreparedPrompt Engine::prepare_continuation(PromptInput input, std::span<const TokenId> appended,
+                                            const PreparationControl& control) const {
+    nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime);
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    auto prepared =
+        impl_->active->frontend.prepare_continuation(std::move(input), appended, control);
+    PromptSummary info = prepared.summary();
+    if (info.prompt_tokens > impl_->active->capacity) {
+        throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                           context_capacity_error(info.prompt_tokens, impl_->active->capacity));
+    }
+    const PromptPreparationStats preparation = prepared.preparation_stats();
+    // The reply began in thinking: its continuation keeps the thinking-mode sampling defaults.
+    return PreparedPrompt(std::make_unique<PreparedPrompt::Impl>(
+        info, preparation, SamplingMode::Thinking, std::move(prepared)));
+}
+
+ReasoningGuardTokens Engine::reasoning_guard_tokens() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    return impl_->active->frontend.reasoning_guard_tokens();
+}
+
+void Engine::configure_reasoning_eos_guard(bool enabled) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    models::qwen3_5::execution::ReasoningEosGuardConfig config;
+    config.enabled = enabled;
+    if (enabled) {
+        const ReasoningGuardTokens tokens = impl_->active->frontend.reasoning_guard_tokens();
+        if (tokens.stop_token_ids.empty() || tokens.stop_token_ids.size() > 2) {
+            throw std::invalid_argument("reasoning EOS guard supports one or two terminal tokens");
+        }
+        config.banned0    = tokens.stop_token_ids[0];
+        config.banned1    = tokens.stop_token_ids.size() > 1 ? tokens.stop_token_ids[1] : -1;
+        config.think_open = impl_->active->frontend.tokenize_text("<think>\n");
+    }
+    models::qwen3_5::execution::configure_reasoning_eos_guard(std::move(config));
+}
+
+std::uint64_t Engine::reasoning_eos_guard_replacements() const noexcept {
+    return models::qwen3_5::execution::reasoning_eos_guard_replacements();
 }
 
 std::vector<TokenId> Engine::tokenize_text(std::string_view text) const {

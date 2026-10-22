@@ -14,7 +14,8 @@ Qwen4ExpertStream::Qwen4ExpertStream(Config config) : config_(std::move(config))
     if (c.layers <= 0 || c.experts <= 0 || c.partitions < 1 ||
         c.ring_slots < (c.experts + c.partitions - 1) / c.partitions || c.ring_first < 0 ||
         c.tables == nullptr || c.bank_base.size() != static_cast<std::size_t>(c.layers) * 4 ||
-        c.partitions < 1 || c.partition < 0 || c.partition >= c.partitions) {
+        c.partitions < 1 || c.partition < 0 || c.partition >= c.partitions ||
+        (!c.streamable.empty() && c.streamable.size() != static_cast<std::size_t>(c.layers))) {
         throw std::invalid_argument("Qwen4Exp expert stream: invalid configuration (the ring needs "
                                     "at least one layer of this device's partition)");
     }
@@ -107,6 +108,10 @@ void Qwen4ExpertStream::wait_for(std::int32_t owner) {
 
 void Qwen4ExpertStream::issue(std::int32_t layer) {
     if (!open_) { throw std::logic_error("Qwen4Exp expert stream: no open window"); }
+    if (!streams(layer)) {
+        throw std::logic_error("Qwen4Exp expert stream: layer " + std::to_string(layer) +
+                               " is not streamed (pageable bank)");
+    }
     const Config& c = config_;
     ScopedCurrentDevice scope(c.device);
     if (wait_first_ != nullptr) {
@@ -201,11 +206,16 @@ void Qwen4ExpertStream::release(std::int32_t layer, cudaStream_t compute) {
     CUDA_CHECK(cudaEventRecord(done_[static_cast<std::size_t>(layer)], compute));
     recorded_[static_cast<std::size_t>(layer)] = 1;
     last_recorded_                             = layer;
-    if (!defer_ && layer + 1 < config_.layers && !issued(layer + 1)) { issue(layer + 1); }
+    if (defer_) { return; }
+    // The next streamed layer (a pageable layer in between runs on the CPU path, no copies).
+    std::int32_t next = layer + 1;
+    while (next < config_.layers && !streams(next)) { ++next; }
+    if (next < config_.layers && !issued(next)) { issue(next); }
 }
 
 void Qwen4ExpertStream::exchanged(std::int32_t layer, cudaStream_t compute) {
-    if (!defer_ || !open_ || layer < 0 || layer + 1 >= config_.layers || issued(layer + 1)) {
+    if (!defer_ || !open_ || layer < 0 || layer + 1 >= config_.layers || issued(layer + 1) ||
+        !streams(layer + 1)) {
         return;
     }
     const ScopedCurrentDevice scope(config_.device);

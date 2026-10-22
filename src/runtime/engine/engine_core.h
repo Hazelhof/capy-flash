@@ -1454,6 +1454,40 @@ private:
                                   request->publication_order, allowance);
     }
 
+    // Admission planning prices a request against the current physical state without changing
+    // it: no resource transaction is open, the Program's planning scratch is rebuilt by every
+    // search and the catalog only refreshes its index. An invariant that planning trips for one
+    // request therefore fails that request alone; the worker keeps serving the others instead of
+    // failing every active and queued request. The same exception once a resource transaction
+    // is open (physical state half moved) still fails the Engine.
+    [[nodiscard]] std::optional<ResourceInspection>
+    inspect_admission_contained(const std::shared_ptr<Request>& request,
+                                PlanningAllowance allowance) {
+        std::exception_ptr caught;
+        std::string failure;
+        try {
+            return inspect_admission(request, allowance);
+        } catch (const std::logic_error& error) {
+            caught  = std::current_exception();
+            failure = error.what();
+        } catch (const std::overflow_error& error) {
+            caught  = std::current_exception();
+            failure = error.what();
+        }
+        if (instance_.program->has_context_transaction() ||
+            resources_.context_transaction_kind().has_value()) {
+            std::rethrow_exception(caught);
+        }
+        std::fprintf(stderr,
+                     "[engine] warning: admission planning of request %llu failed (%s); the "
+                     "request is rejected, the engine keeps serving\n",
+                     static_cast<unsigned long long>(request->id), failure.c_str());
+        (void)remove_pending_error(
+            request, std::make_exception_ptr(std::runtime_error(
+                         "context-cache admission planning failed: " + failure)));
+        return std::nullopt;
+    }
+
     [[nodiscard]] AdmissionProgress remove_pending_error(const std::shared_ptr<Request>& request,
                                                          std::exception_ptr error) {
         if (!erase_pending(request)) { return AdmissionProgress::None; }
@@ -1707,7 +1741,13 @@ private:
                 control_progress = true;
                 continue;
             }
-            auto head_inspection = inspect_admission(head, allowance);
+            std::optional<ResourceInspection> contained_head =
+                inspect_admission_contained(head, allowance);
+            if (!contained_head) {
+                control_progress = true;
+                continue;
+            }
+            auto& head_inspection = *contained_head;
             if (head_inspection.readiness == Readiness::PermanentlyInfeasible) {
                 (void)remove_pending_error(
                     head, std::make_exception_ptr(RequestError(
@@ -1781,7 +1821,13 @@ private:
                     control_progress = true;
                     continue;
                 }
-                auto candidate_inspection = inspect_admission(candidate, allowance);
+                std::optional<ResourceInspection> contained_candidate =
+                    inspect_admission_contained(candidate, allowance);
+                if (!contained_candidate) {
+                    control_progress = true;
+                    continue;
+                }
+                auto& candidate_inspection = *contained_candidate;
                 if (candidate_inspection.readiness == Readiness::PermanentlyInfeasible) {
                     (void)remove_pending_error(
                         candidate, std::make_exception_ptr(RequestError(

@@ -94,6 +94,7 @@ namespace ninfer::ops {
 
 class PeerMailbox; // see ops/peer_mailbox.h
 class HostExchange;
+class PeerLanes;
 
 // Probes cudaDeviceCanAccessPeer in both directions and enables peer access on both devices only
 // when both directions report support; a device that already had peer access enabled is left
@@ -185,11 +186,21 @@ public:
 
     [[nodiscard]] HostExchange* host_exchange() const noexcept { return host_exchange_; }
 
+    // Selects `lanes` (null: none) as the transport of this pair's EAGER split-phase sums
+    // (allreduce_sum_begin / allreduce_sum_finish), ahead of an attached HostExchange's lanes.
+    // Every other collective ignores it. It must serve the ExecutionContext these events were
+    // created for. The Program attaches it only with peer access and no HostExchange, or under
+    // NINFER_TP_PEER_OVERLAP=force (a correctness test without P2P).
+    void attach_peer_lanes(PeerLanes* lanes) noexcept { peer_lanes_ = lanes; }
+
+    [[nodiscard]] PeerLanes* peer_lanes() const noexcept { return peer_lanes_; }
+
 private:
     std::array<cudaEvent_t, 2> inputs_ready_{nullptr, nullptr};
     std::array<cudaEvent_t, 2> pull_done_{nullptr, nullptr};
     PeerMailbox* mailbox_        = nullptr;
     HostExchange* host_exchange_ = nullptr;
+    PeerLanes* peer_lanes_       = nullptr;
     mutable int staged_scopes_   = 0;
 };
 
@@ -308,8 +319,9 @@ public:
     // sum_finish, rank r's stream is ordered after every copy of the lane (the post-condition of
     // allreduce_sum()), so staged and lane calls interleave freely. Eager only (the caller checks
     // that neither stream is capturing); the lanes' pinned buffers are their own, grown on demand
-    // (growing synchronizes both devices).
-    static constexpr int kSumLanes = 2;
+    // (growing synchronizes both devices). Eight lanes: the 27B prefill overlap opens two (one per
+    // half-chunk); the sliced prefill (v07/prefill-slices) one per column slice, up to eight.
+    static constexpr int kSumLanes = 8;
     void sum_begin(int lane, const std::array<Tensor, 2>& buffer,
                    const std::array<Tensor, 2>& staging, const ExecutionContext& ec);
     void sum_finish(int lane, const ExecutionContext& ec);
@@ -368,6 +380,67 @@ private:
     std::array<cudaStream_t, 2> lane_receive_{nullptr, nullptr};
 };
 
+/**
+ * Split-phase BF16 summing all-reduce over a direct cross-device copy (boards WITH peer access).
+ *
+ * The HostExchange lanes' contract (sum_begin / sum_finish, kSumLanes independent lanes, same
+ * arguments, same bits) with the one-call staged path's transport: rank r pulls the peer's operand
+ * into staging[r] with the same cudaMemcpyAsync(DeviceToDevice) over UVA that allreduce_sum issues
+ * (a direct PCIe copy with peer access), only on a side stream of rank r instead of rank r's own
+ * stream, so the ranks keep computing while the bytes move:
+ *
+ *   sum_begin(lane, ...)  phase A, both ranks: record(begun[r]) on ec.dev[r]->stream (operand r is
+ *                         complete, staging[r] is free); phase B, both ranks: the side stream of
+ *                         rank r waits begun[r] and begun[1-r], copies buffer[1-r] -> staging[r]
+ *                         and records received[r]. Nothing else lands on the ranks' streams.
+ *   sum_finish(lane, ec)  rank r's stream waits received[r] (inbound data) and received[1-r] (the
+ *                         peer finished reading buffer[r]) and combines buffer[r] += staging[r]
+ *                         with residual_add, the one-call combine.
+ *
+ * Same post-condition as allreduce_sum(): after sum_finish rank r's stream is ordered after the
+ * peer's read of buffer[r], so one-call, HostExchange-lane and peer-lane calls interleave freely.
+ * Each lane's events are its own: finishing one lane never waits for the other. Eager only.
+ *
+ * `direct == false` (NINFER_TP_PEER_OVERLAP=force without P2P, a correctness test only): the copy
+ * is staged by the driver, which blocks the host and is not ordered after the source device's work
+ * (T65), so sum_begin first waits on the host for both begun events and synchronizes the side
+ * stream after the copy. Nothing overlaps then; the bits must be the same.
+ */
+class PeerLanes {
+public:
+    static constexpr int kSumLanes = HostExchange::kSumLanes;
+
+    PeerLanes(const ExecutionContext& ec, bool direct);
+    ~PeerLanes();
+    PeerLanes(const PeerLanes&)            = delete;
+    PeerLanes& operator=(const PeerLanes&) = delete;
+
+    [[nodiscard]] bool serves(const ExecutionContext& ec) const noexcept;
+    [[nodiscard]] bool direct() const noexcept { return direct_; }
+
+    void sum_begin(int lane, const std::array<Tensor, 2>& buffer,
+                   const std::array<Tensor, 2>& staging, const ExecutionContext& ec);
+    void sum_finish(int lane, const ExecutionContext& ec);
+
+    [[nodiscard]] bool sum_open(int lane) const noexcept {
+        return lane >= 0 && lane < kSumLanes && lanes_[static_cast<std::size_t>(lane)].active;
+    }
+
+private:
+    struct Lane {
+        bool active = false;
+        std::array<Tensor, 2> buffer, staging;
+        std::array<cudaEvent_t, 2> begun{nullptr, nullptr};
+        std::array<cudaEvent_t, 2> received{nullptr, nullptr};
+    };
+
+    std::array<int, 2> devices_{-1, -1};
+    bool direct_ = true;
+    // Rank r's side stream (on dev r), shared by the lanes: their calls are issued in time order.
+    std::array<cudaStream_t, 2> pull_{nullptr, nullptr};
+    std::array<Lane, kSumLanes> lanes_;
+};
+
 // T68: the HostExchange attached to `events` when it serves `ec` and neither rank's stream is
 // capturing (the eager collectives' own selection); null otherwise (callers keep their UVA copy).
 HostExchange* eager_exchange(const ExecutionContext& ec, const PeerEvents& events);
@@ -396,10 +469,11 @@ void allreduce_sum(const std::array<Tensor, 2>& buffer, const std::array<Tensor,
                    const ExecutionContext& ec, const PeerEvents& events);
 
 /**
- * Split-phase allreduce_sum() on `lane` of the eager HostExchange attached to `events`
- * (HostExchange::sum_begin / sum_finish): identical arguments, result and bits, but the transfer
- * runs on the exchange's own streams between the two calls, so work the caller enqueues in
- * between overlaps it. allreduce_sum_split_available() tells whether the split form can run (an
+ * Split-phase allreduce_sum() on `lane` of the eager PeerLanes attached to `events` when there are
+ * any (PeerLanes::sum_begin / sum_finish), else of the eager HostExchange (HostExchange::sum_begin
+ * / sum_finish): identical arguments, result and bits, but the transfer runs on the transport's
+ * own streams between the two calls, so work the caller enqueues in between overlaps it.
+ * allreduce_sum_split_available() tells whether the split form can run (eager PeerLanes or an
  * eager HostExchange serving `ec` is attached and neither stream is capturing); begin throws
  * otherwise. The caller completes every begun lane with allreduce_sum_finish() before reading
  * `buffer` or reusing `staging`, and does not touch either in between.

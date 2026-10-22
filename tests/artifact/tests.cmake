@@ -2,6 +2,10 @@ ninfer_add_test(ninfer_artifact_reader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reader.cpp"
   LIBRARIES ninfer_artifact)
 
+ninfer_add_test(ninfer_artifact_host_residency_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_residency.cpp"
+  LIBRARIES ninfer_artifact)
+
 ninfer_add_test(ninfer_artifact_slices_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_slices.cpp"
   LIBRARIES ninfer_artifact)

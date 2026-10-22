@@ -16,6 +16,7 @@
 #include "core/tensor.h"
 #include "models/qwen3_5/config.h"
 #include "models/qwen3_5/execution/parameters.h"
+#include "models/qwen3_5/execution/tp2/prefill_slices.h"
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "ninfer/ops/allreduce.h"

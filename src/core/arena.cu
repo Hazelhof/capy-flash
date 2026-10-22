@@ -363,6 +363,21 @@ PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept
     return *this;
 }
 
+PageableHostBuffer::PageableHostBuffer(std::size_t size_bytes) {
+    if (size_bytes == 0) { throw std::invalid_argument("PageableHostBuffer size must be nonzero"); }
+    if (size_bytes > std::numeric_limits<std::size_t>::max() - kPinnedHugePageBytes) {
+        throw std::overflow_error("PageableHostBuffer size overflow");
+    }
+    const std::size_t reserved =
+        (size_bytes + kPinnedHugePageBytes - 1) / kPinnedHugePageBytes * kPinnedHugePageBytes;
+    data_ = std::aligned_alloc(kPinnedHugePageBytes, reserved);
+    if (data_ == nullptr) { throw std::bad_alloc(); }
+    (void)madvise(data_, reserved, MADV_HUGEPAGE);
+    size_ = size_bytes;
+}
+
+PageableHostBuffer::~PageableHostBuffer() { std::free(data_); }
+
 void* PinnedHostBuffer::data() const noexcept { return data_; }
 
 std::size_t PinnedHostBuffer::size() const noexcept { return size_; }

@@ -12,7 +12,7 @@ The storage registry contains exactly these identities:
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
 | `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
-| `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
+| `row_split_k128_v1` | tensor layout | `q3_g128_fp16`, `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
@@ -85,6 +85,7 @@ group size `G`:
 
 | Format | `b` | `G` | Base bytes per group `B` | High bytes per group `H` |
 |---|---:|---:|---:|---:|
+| `q3_g128_fp16` | 3 | 128 | 48 | 0 |
 | `q4_g64_fp16` | 4 | 64 | 32 | 0 |
 | `q5_g64_fp16` | 5 | 64 | 32 | 8 |
 | `q6_g64_fp16` | 6 | 64 | 32 | 16 |
@@ -99,8 +100,8 @@ logical_groups     = ceil_div(K, G)
 physical_group_cnt = N * groups_per_row
 ```
 
-`K_pad` is physical geometry and is not added to the JSON `shape`. Because both registered group
-sizes divide 128, `groups_per_row` is integral.
+`K_pad` is physical geometry and is not added to the JSON `shape`. Because every registered group
+size divides 128, `groups_per_row` is integral.
 
 For the final partially logical group, lanes whose column is at least `K` have signed code zero. Its
 scale remains the scale of the logical group defined by the numeric-format contract. Any complete
@@ -131,6 +132,15 @@ row 0 group 0, row 0 group 1, ..., row 1 group 0, ...
 Bytes belonging to one group are adjacent.
 
 ### 3.3 Base-code plane
+
+For Q3, every group is one little-endian bit stream of its 128 lanes: with `u[i] = q[i] modulo 8`,
+lane `i` occupies stream bits `3i`, `3i+1`, `3i+2`, and stream bit `t` is bit `(t mod 8)` of byte
+`floor(t / 8)`. Equivalently, bytes `3j..3j+2` hold the 24-bit little-endian word
+`u[8j] | u[8j+1] << 3 | ... | u[8j+7] << 21`, and a G128 group occupies 48 base bytes. Q3 has no
+high-bit plane. Codes `-4, -3, ..., 3` in lanes 0..7 encode as bytes `ac 8f 68`. This is the
+`Q3G128_F16S` base plane of roofkid/ninfer-4080, and it is the compressed-tensors `pack-quantized`
+stream of the ISTA-DASLab GSQ checkpoints (which store `q + 4`) after XOR with the repeating byte
+mask `24 49 92`.
 
 For Q4, Q5, and Q6, let `q[i]` be lane `i`'s signed code and let:
 

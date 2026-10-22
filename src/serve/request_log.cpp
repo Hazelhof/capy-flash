@@ -534,6 +534,7 @@ std::string format_server_start_json(
                                                           {"device_object_count", load.device_object_count},
                                                           {"host_object_count", load.host_object_count},
                                                           {"host_mapped_bytes", load.host_mapped_bytes},
+                                                          {"host_pageable_bytes", load.host_pageable_bytes},
                                                           {"load_seconds", load.load_seconds},
                                                           {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
@@ -558,6 +559,7 @@ std::string format_server_start_json(
              {"vision", engine_options.enable_vision},
              {"cuda_graph", engine_options.use_cuda_graph},
              {"embedding_host", engine_options.embedding_host},
+             {"host_pinned_max_bytes", engine_options.host_pinned_max_bytes},
              {"prefix_reuse", options.allow_prefix_reuse},
              {"speculative_backend",
               product::speculative_backend_name(engine_options.speculative.backend)},
@@ -636,6 +638,19 @@ std::string format_request_rejected_json(const std::string& server_instance_id,
     return record.dump();
 }
 
+static Json reasoning_retry_json(const ReasoningRetryStats& stats) {
+    if (stats.trigger == ReasoningRetryTrigger::None) { return Json(nullptr); }
+    Json value{{"trigger", reasoning_retry_trigger_name(stats.trigger)},
+               {"kept_tokens", stats.kept_tokens},
+               {"injected_tokens", stats.injected_tokens},
+               {"continuation_prompt_tokens", stats.continuation_prompt},
+               {"continuation_reused_tokens", stats.continuation_reused},
+               {"continuation_completion_tokens", stats.continuation_completion},
+               {"continuation_reuse_path", prefix_reuse_path_name(stats.continuation_path)}};
+    if (!stats.error.empty()) { value["error"] = stats.error; }
+    return value;
+}
+
 std::string format_request_done_json(const std::string& server_instance_id, std::uint64_t timestamp,
                                      const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
@@ -658,7 +673,9 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"thinking_control_applied", outcome.thinking.applied},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)},
-             {"prompt_ngram_overlap", optional_json(outcome.metrics.prompt_ngram_overlap)}};
+             {"prompt_ngram_overlap", optional_json(outcome.metrics.prompt_ngram_overlap)},
+             {"reasoning_close_retry", reasoning_retry_json(outcome.reasoning_retry)},
+             {"reasoning_eos_guard_total", optional_json(outcome.reasoning_eos_guard_total)}};
     record["timings_seconds"] = Json{
         {"prepare", outcome.metrics.prepare_seconds}, {"ttft", outcome.metrics.ttft_seconds},
         {"vision", outcome.metrics.vision_seconds},   {"prefill", outcome.metrics.prefill_seconds},

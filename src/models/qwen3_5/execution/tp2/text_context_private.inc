@@ -40,13 +40,19 @@ void require_single_device(const char* operation) const;
 [[nodiscard]] const GdnReplayRecords& rank_replay_records(int rank) const;
 void validate_tensor_parallel_mtp();
 // `exchange_lane` >= 0: the block's closing all-reduce is only begun on that lane of the split
-// exchange (ops::allreduce_sum_begin); the caller finishes it before reading x.
+// exchange (ops::allreduce_sum_begin); the caller finishes it before reading x. Non-null `slices`
+// (sliced prefill): the mixer core runs over the whole chunk and its output projection slice by
+// slice, slice s's all-reduce begun on lane s.
 void attn_mix_tp2(const RankBlocks& weights, RankTensors& x, int index, const RankTensors& staging,
-                  int exchange_lane = -1);
+                  int exchange_lane = -1, const PrefillSlicePlan* slices = nullptr);
 void gdn_mix_tp2(const RankBlocks& weights, RankTensors& x, int index, Phase phase,
-                 const RankTensors& staging, int exchange_lane = -1);
+                 const RankTensors& staging, int exchange_lane = -1,
+                 const PrefillSlicePlan* slices = nullptr);
 void mlp_tail_tp2(const RankBlocks& weights, RankTensors& x, const RankTensors& staging,
                   int exchange_lane = -1);
+// Sliced prefill's post-mixer block: per slice s, finish lane s, norm, FFN, begin lane s.
+void mlp_tail_sliced_tp2(const RankBlocks& weights, RankTensors& x, const RankTensors& staging,
+                         const PrefillSlicePlan& slices);
 template <class Tap>
 void run_layers_tp2(RankTensors& x, Phase phase, const RankTensors& staging, Tap& tap);
 // Prefill overlap: the layers of one text prefill chunk as two interleaved halves, [0,split) and
@@ -58,6 +64,13 @@ template <class Tap>
 void prefill_layers_overlap_tp2(RankTensors& x, const RankTensors& staging,
                                 const RankTensors& positions, const RankTensors& rope_positions,
                                 int base, int split, Tap& tap);
+// v07/prefill-slices: the layers of one prefill chunk with the column-local tail of every block
+// (output projection, all-reduce, norm, FFN) issued in `slices`, slice s's all-reduces on lane s
+// of the split exchange, so they overlap the later slices' compute. Mixer cores run over the whole
+// chunk with the chunk's bindings (also multimodal RoPE). A tap gets every layer's whole output.
+template <class Tap>
+void prefill_layers_sliced_tp2(RankTensors& x, const RankTensors& staging,
+                               const PrefillSlicePlan& slices, Tap& tap);
 template <class Tap>
 void target_verify_batch_tp2_impl(
     const RankTensors& ids, const RankTensors& cache_positions, const RankTensors& rope_positions,

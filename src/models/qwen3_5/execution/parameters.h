@@ -4,6 +4,7 @@
 #include "models/qwen3_5/model.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/moe_slots.h"
+#include "ninfer/ops/moe_slots_gguf.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <array>
@@ -167,12 +168,27 @@ struct Qwen4GdnParameters {
 // pinned memory, ShardAxis::HostMapped) in the moe_slots plane description, expert e of a plane at
 // base + e * stride; the stacked weight divisors (gate of e at 2e, up at 2e+1; down at e), also
 // host-mapped; and the layer's two activation divisors.
+//
+// GGUF banks (gguf = true; artifact layout gguf_blocks_v1, capy-flash v0.7): the same two parents
+// as ggml block rows, expert e = gate|up rows [e*1280, (e+1)*1280) and down rows [e*2560,
+// (e+1)*2560); no divisors, `bank` and the divisor fields stay empty.
 struct Qwen4ExpertBank {
     ops::MoeSlotPool bank; // slots = experts
     const float* gate_up_divisors = nullptr;
     const float* down_divisors    = nullptr;
     float gate_up_input_divisor   = 0.0F;
     float down_input_divisor      = 0.0F;
+    bool gguf                     = false;
+    ops::MoeGgufFormat gguf_gate_up        = ops::MoeGgufFormat::IQ3_XXS;
+    ops::MoeGgufFormat gguf_down           = ops::MoeGgufFormat::IQ4_NL;
+    const std::byte* gguf_gate_up_rows     = nullptr;
+    const std::byte* gguf_down_rows        = nullptr;
+    std::int64_t gguf_gate_up_row_bytes    = 0;
+    std::int64_t gguf_down_row_bytes       = 0;
+    // Bytes of one expert (1280 gate|up rows and 2560 down rows).
+    [[nodiscard]] std::int64_t gguf_expert_bytes() const noexcept {
+        return 1280 * gguf_gate_up_row_bytes + 2560 * gguf_down_row_bytes;
+    }
 };
 
 // The shared expert (gate|up rows, down) of one block.

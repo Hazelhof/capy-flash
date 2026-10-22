@@ -352,15 +352,36 @@ __device__ __forceinline__ bool host_partial_present(const std::uint32_t* active
     return present != 0;
 }
 
+// v07/decode-overheads B (NINFER_HOST_MOE_EARLY_PARTIAL=1, decode calls only): every thread issues
+// its partial load before thread 0's read of the active word, so the two PCIe round trips overlap
+// instead of following each other (the partial is complete before the kernel starts: the host
+// writes it, then active, then releases done, which the stream waited for). A call without host
+// experts then reads its partial for nothing (T x H x 4 bytes, ignored). Volatile asm: the load
+// stays ahead of the barrier in host_partial_present; the register is waited for at its first use.
+__device__ __forceinline__ float4 ldcv_early(const float4* p) {
+    float4 v;
+    asm volatile("ld.global.cv.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w)
+                 : "l"(p));
+    return v;
+}
+
 __global__ void accumulate_bf16_kernel(__nv_bfloat16* __restrict__ y, const float* partial,
                                        const std::uint32_t* active, int vectors,
-                                       unsigned long long* stamp) {
+                                       unsigned long long* stamp, int early) {
     if (stamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *stamp = global_ns();
-    if (!host_partial_present(active)) return;
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    float4 a{}, b{};
+    if (early != 0 && i < vectors) {
+        a = ldcv_early(reinterpret_cast<const float4*>(partial) + 2 * i);
+        b = ldcv_early(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
+    }
+    if (!host_partial_present(active)) return;
     if (i >= vectors) return;
-    const float4 a   = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i);
-    const float4 b   = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
+    if (early == 0) {
+        a = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i);
+        b = __ldcv(reinterpret_cast<const float4*>(partial) + 2 * i + 1);
+    }
     uint4 raw        = reinterpret_cast<uint4*>(y)[i];
     auto* h          = reinterpret_cast<__nv_bfloat162*>(&raw);
     const float p[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
@@ -377,11 +398,13 @@ __global__ void accumulate_f32_kernel(float* __restrict__ y, const float* partia
                                       const std::uint32_t* active, int vectors,
                                       unsigned long long* stamp,
                                       const float* __restrict__ device_partial, float* echo,
-                                      float* echo_y) {
+                                      float* echo_y, int early) {
     if (stamp != nullptr && blockIdx.x == 0 && threadIdx.x == 0) *stamp = global_ns();
+    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    float4 a{};
+    if (early != 0 && i < vectors) a = ldcv_early(reinterpret_cast<const float4*>(partial) + i);
     const bool host = host_partial_present(active);
     if (!host && device_partial == nullptr && echo_y == nullptr) return;
-    const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= vectors) return;
     float4 v = reinterpret_cast<float4*>(y)[i];
     if (echo_y != nullptr)
@@ -395,7 +418,7 @@ __global__ void accumulate_f32_kernel(float* __restrict__ y, const float* partia
         v.w += d.w;
     }
     if (host) {
-        const float4 a = __ldcv(reinterpret_cast<const float4*>(partial) + i);
+        if (early == 0) a = __ldcv(reinterpret_cast<const float4*>(partial) + i);
         if (echo != nullptr) reinterpret_cast<float4*>(echo)[i] = a; // T98: what the device read
         v.x += a.x;
         v.y += a.y;
@@ -464,6 +487,9 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_A4"); v != nullptr && *v != 0) {
         config_.executor.a4 = std::atoi(v) != 0; // T98: CPU with the GPU's W4A4 activation codec
+    }
+    if (const char* v = std::getenv("NINFER_HOST_MOE_EARLY_PARTIAL"); v != nullptr && *v != 0) {
+        early_partial_ = std::atoi(v) != 0; // v07/decode-overheads B
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_CPUS"); v != nullptr && *v != 0) {
         config_.cpus.clear();
@@ -775,7 +801,8 @@ void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::in
     const int vectors      = tokens * config_.hidden / 8;
     constexpr int kThreads = 256;
     accumulate_bf16_kernel<<<(vectors + kThreads - 1) / kThreads, kThreads, 0, stream>>>(
-        y, v.out, const_cast<const std::uint32_t*>(v.active), vectors, accumulate_stamp(layer));
+        y, v.out, const_cast<const std::uint32_t*>(v.active), vectors, accumulate_stamp(layer),
+        early_partial_ && tokens <= kHostMaxTokens ? 1 : 0);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -800,7 +827,8 @@ void HostMoeMailbox::accumulate(cudaStream_t stream, std::int32_t layer, std::in
         echo_ != nullptr && tokens <= kHostMaxTokens
             ? echo_ + static_cast<std::size_t>(2 * layer + 1) * kHostMaxTokens *
                           static_cast<std::size_t>(config_.hidden)
-            : nullptr);
+            : nullptr,
+        early_partial_ && tokens <= kHostMaxTokens ? 1 : 0);
     CUDA_CHECK(cudaGetLastError());
 }
 

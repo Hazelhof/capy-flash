@@ -557,6 +557,11 @@ const TpTransportStatus& Program::tp_transport() const noexcept {
     return impl_->tp_transport_status;
 }
 
+bool gguf_routed_experts(const execution::Parameters& parameters) {
+    return parameters.qwen4 && !parameters.qwen4->layers.empty() &&
+           parameters.qwen4->layers.front().moe.experts.gguf;
+}
+
 std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters,
                                          const EngineOptions& options) {
     if (!parameters.qwen4 || options.routed_experts.backend != RoutedExpertBackend::Offload) {
@@ -564,8 +569,31 @@ std::int64_t offloaded_expert_slot_bytes(const execution::Parameters& parameters
     }
     // Under MTP the MTP layer is one more cache layer (planning: Qwen4PersistentLayout).
     const bool mtp = options.speculative.backend == SpeculativeBackend::Mtp && parameters.qwen4_mtp;
-    return execution::Qwen4OffloadExperts::slot_bytes(
-        static_cast<std::int32_t>(parameters.qwen4->layers.size()) + (mtp ? 1 : 0));
+    const auto layers = static_cast<std::int32_t>(parameters.qwen4->layers.size()) + (mtp ? 1 : 0);
+    if (gguf_routed_experts(parameters)) {
+        // ggml block banks: one slot of every cache layer, each its own size; the per-layer base
+        // slot profile moves slots between layers of different sizes, so the larger of the
+        // profile-weighted and the uniform bytes (an elastic column is uniform).
+        std::vector<std::int64_t> bytes;
+        for (const auto& layer : parameters.qwen4->layers) {
+            bytes.push_back(execution::Qwen4OffloadExperts::gguf_slot_bytes(layer.moe.experts));
+        }
+        if (mtp) {
+            bytes.push_back(
+                execution::Qwen4OffloadExperts::gguf_slot_bytes(parameters.qwen4_mtp->layer.moe.experts));
+        }
+        constexpr std::int32_t kProbe = 100;
+        const auto base               = execution::Qwen4OffloadExperts::layer_slot_profile(
+            layers, static_cast<std::int32_t>(parameters.qwen4->layers.size()), kProbe, 0,
+            static_cast<std::int32_t>(options.tp));
+        std::int64_t uniform = 0, weighted = 0;
+        for (std::size_t l = 0; l < bytes.size(); ++l) {
+            uniform += bytes[l];
+            weighted += bytes[l] * base[l];
+        }
+        return std::max(uniform, (weighted + kProbe - 1) / kProbe);
+    }
+    return execution::Qwen4OffloadExperts::slot_bytes(layers);
 }
 
 std::int64_t offloaded_expert_staging_bytes(const execution::Parameters& parameters,

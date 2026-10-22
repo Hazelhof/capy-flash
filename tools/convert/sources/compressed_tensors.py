@@ -1,4 +1,4 @@
-"""Interpret the current compressed-tensors FP8/NVFP4 fields and scale semantics.
+"""Interpret the current compressed-tensors FP8/NVFP4/pack-quantized-int fields and scale semantics.
 
 The matrix resolver also accepts direct tensors. Resolution remains lazy so a
 recipe can replace an unused checkpoint source before its weights are inspected.
@@ -117,6 +117,102 @@ def compressed_matrix_source(
     )
 
 
+# compressed-tensors "pack-quantized" symmetric integer weights (ISTA-DASLab GSQ checkpoints):
+# ``weight_packed`` I32[N, K*bits/32] is one dense little-endian bit stream per row, element i at
+# bits [bits*i, bits*i+bits) holding the unsigned code q + 2^(bits-1); ``weight_scale`` BF16[N, K/G]
+# is the per-group multiplier (w = q * scale, negative for about half of the 3-bit groups);
+# ``weight_shape`` I64[2] = [N, K]. The registered row-split formats keep the same signed codes and
+# convert each scale to binary16.
+PACKED_INT_FORMATS = {"q3_g128_fp16": (3, 128), "q4_g64_fp16": (4, 64)}
+
+# BF16 -> binary16 multipliers: the only rounding a verbatim repack performs. Finite BF16 values
+# below the binary16 normal range lose mantissa bits; the conversion is accepted when every
+# multiplier stays within this absolute error (GSQ-3 27B: 218 of 240 271 360 inexact, max 2.98e-8).
+PACKED_SCALE_ABS_ERROR = 2.0**-25
+
+
+def packed_int_format(store: SafetensorsSource, prefix: str, shape: tuple[int, int]) -> str | None:
+    """Name the registered format of a pack-quantized integer matrix, or None."""
+    packed, scale = f"{prefix}.weight_packed", f"{prefix}.weight_scale"
+    if not store.has(packed) or not store.has(scale) or store.describe(packed).dtype != "I32":
+        return None
+    n, k = shape
+    words, groups = store.describe(packed).shape, store.describe(scale).shape
+    for name, (bits, group) in PACKED_INT_FORMATS.items():
+        if k % group == 0 and (k * bits) % 32 == 0 and tuple(words) == (n, k * bits // 32) and tuple(groups) == (n, k // group):
+            return name
+    raise ValueError(f"{prefix}: pack-quantized geometry {words}/{groups} matches no registered format")
+
+
+def unpack_int_stream(words: torch.Tensor, bits: int, k: int) -> torch.Tensor:
+    """Signed codes [rows, k] from I32[rows, k*bits/32] dense little-endian bit streams."""
+    rows = words.shape[0]
+    raw = words.contiguous().view(torch.uint8).reshape(rows, k * bits // 8).to(torch.int32)
+    if bits == 4:
+        unsigned = torch.stack((raw & 0xF, raw >> 4), dim=-1).reshape(rows, k)
+    elif bits == 3:
+        triples = raw.reshape(rows, k // 8, 3)
+        stream = triples[..., 0] | (triples[..., 1] << 8) | (triples[..., 2] << 16)
+        shifts = 3 * torch.arange(8, dtype=torch.int32)
+        unsigned = ((stream.unsqueeze(-1) >> shifts) & 7).reshape(rows, k)
+    else:
+        raise ValueError(f"unsupported packed width {bits}")
+    return (unsigned - (1 << (bits - 1))).to(torch.int8)
+
+
+def packed_scales_fp16(scales: torch.Tensor, label: str, *, signed: bool = False) -> torch.Tensor:
+    """BF16 multipliers -> binary16, rejecting any conversion beyond PACKED_SCALE_ABS_ERROR.
+
+    ``signed`` admits negative multipliers (q3_g128_fp16: GSQ uses the sign of the scale to put the
+    extra level of the asymmetric [-4, 3] grid on either side; about half of its groups are
+    negative). Grouped formats with a symmetric use keep the nonnegative rule.
+    """
+    wide = scales.float()
+    if not bool(torch.isfinite(wide).all()) or (not signed and bool((wide < 0).any())):
+        raise ValueError(f"{label}: multipliers must be finite{'' if signed else ' and nonnegative'}")
+    half = wide.to(torch.float16)
+    if not bool(torch.isfinite(half).all()):
+        raise ValueError(f"{label}: a multiplier overflows binary16")
+    error = (half.float() - wide).abs()
+    if bool((error > PACKED_SCALE_ABS_ERROR).any()):
+        raise ValueError(f"{label}: binary16 multiplier error {float(error.max())} exceeds 2^-25")
+    return half
+
+
+def packed_int_matrix_source(
+    store: SafetensorsSource, prefix: str, shape: tuple[int, int], format: str
+) -> LogicalSource:
+    """Signed codes and binary16 multipliers of a pack-quantized integer matrix, read verbatim."""
+    bits, group = PACKED_INT_FORMATS[format]
+    n, k = shape
+    packed, scale, stored_shape = f"{prefix}.weight_packed", f"{prefix}.weight_scale", f"{prefix}.weight_shape"
+    if store.has(stored_shape):
+        recorded = tuple(int(v) for v in store.read_flat(stored_shape).tolist())
+        if recorded != (n, k):
+            raise ValueError(f"{prefix}: weight_shape {recorded} differs from {shape}")
+    if store.describe(scale).dtype != "BF16":
+        raise ValueError(f"{scale}: expected BF16 multipliers")
+    words_per_row, groups_per_row = k * bits // 32, k // group
+
+    def encoded(begin: int, end: int) -> EncodedRows:
+        if not 0 <= begin < end <= n:
+            raise ValueError(f"{prefix}: invalid encoded rows [{begin},{end})")
+        words = store.read_flat(packed, begin * words_per_row, end * words_per_row).reshape(end - begin, words_per_row)
+        codes = unpack_int_stream(words, bits, k).reshape(end - begin, groups_per_row, group)
+        scales = store.read_flat(scale, begin * groups_per_row, end * groups_per_row).reshape(end - begin, groups_per_row)
+        return EncodedRows(format, codes, packed_scales_fp16(scales, scale, signed=bits == 3))
+
+    def read(begin: int, end: int) -> torch.Tensor:
+        if begin == end:
+            return torch.empty(0, dtype=torch.float32)
+        first, last = begin // k, (end + k - 1) // k
+        rows = encoded(first, last)
+        values = rows.codes.float() * rows.scales.float().unsqueeze(-1)
+        return values.reshape(-1)[begin - first * k : end - first * k]
+
+    return LogicalSource(shape, f"{store.path}:{prefix} ({format})", read, encoded)
+
+
 def matrix_source(
     store: SafetensorsSource,
     name: str,
@@ -134,6 +230,8 @@ def matrix_source(
         nonlocal resolved
         if resolved is None:
             actual = format
+            if actual is None:
+                actual = packed_int_format(store, prefix, shape)
             if actual is None and store.has(prefix + ".weight_packed"):
                 actual = "nvfp4"
             if actual is None and is_mxfp8(store, prefix):
@@ -144,6 +242,8 @@ def matrix_source(
                 resolved = tensor_source(store, name, shape)
             elif actual == MXFP8:
                 resolved = mxfp8_source(store, prefix, shape)
+            elif actual in PACKED_INT_FORMATS:
+                resolved = packed_int_matrix_source(store, prefix, shape, actual)
             else:
                 resolved = compressed_matrix_source(store, prefix, shape, actual)
         return resolved

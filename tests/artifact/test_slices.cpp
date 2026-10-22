@@ -359,6 +359,49 @@ void row_interleaved() {
     check(weight_scale_offset(g, 2, 9) == 2 * 90 + 80 + 9, "nvfp4 row scale coordinate");
 }
 
+
+// ggml block banks (gguf_blocks_v1): N rows of K/block ggml blocks, one plane, no scale plane and
+// no divisor; row slices are whole rows, column slices are refused (a block is indivisible here).
+void gguf_blocks() {
+    constexpr auto layout = QuantLayout::GgufBlocks;
+    const auto g = weight_geometry(QType::GGUF_IQ3_S, layout, std::vector<std::uint64_t>{6, 512});
+    check(g.group_size == 256 && g.code_bytes_per_row == 220 && g.code_bytes == 1320 &&
+              g.bytes == 1320 && g.scale_bytes == 0 && g.divisor_offset == 0,
+          "gguf iq3_s geometry");
+    // The Flash-Next banks per expert row: gate/up K = 2560, down K = 640.
+    const struct {
+        QType format;
+        std::uint64_t k, row_bytes;
+    } kRows[] = {{QType::GGUF_IQ2_S, 2560, 820},   {QType::GGUF_IQ3_XXS, 2560, 980},
+                 {QType::GGUF_IQ3_S, 2560, 1100},  {QType::GGUF_IQ4_XS, 2560, 1360},
+                 {QType::GGUF_IQ4_NL, 640, 360},   {QType::GGUF_Q2_0, 640, 180}};
+    for (const auto& r : kRows) {
+        const auto b = weight_geometry(r.format, layout, std::vector<std::uint64_t>{2560, r.k});
+        check(b.code_bytes_per_row == r.row_bytes && b.bytes == 2560 * r.row_bytes,
+              "gguf bank row bytes");
+    }
+    expect_invalid([&] { (void)weight_geometry(QType::GGUF_IQ3_S, layout, std::vector<std::uint64_t>{4, 640}); },
+                   "gguf iq3_s K not a whole number of superblocks");
+    expect_invalid([&] { (void)weight_geometry(QType::NVFP4, layout, std::vector<std::uint64_t>{128, 64}); },
+                   "GgufBlocks with a non-ggml format");
+    expect_invalid(
+        [&] {
+            (void)weight_geometry(QType::GGUF_IQ4_NL, QuantLayout::BlockScaleK16M128x4,
+                                  std::vector<std::uint64_t>{128, 64});
+        },
+        "a ggml format in another layout");
+    const auto spans = weight_row_block_spans(g, 2, 3);
+    check(spans.size() == 1 && spans[0] == ByteSpan{440, 660}, "gguf row block span");
+    const auto slice = tensor_row_slice(g, std::vector<SliceRange>{{1, 2}, {4, 1}});
+    std::uint64_t copied = 0;
+    for (const auto& c : slice.copies) copied += c.bytes;
+    check(slice.geometry.shape[0] == 3 && slice.geometry.bytes == 660 && copied == 660 &&
+              slice.copies.front().source_offset == 220 && slice.copies.back().source_offset == 880 &&
+              slice.copies.back().dest_offset == 440,
+          "gguf row slice copies whole rows");
+    expect_rejected([&] { (void)tensor_column_slice(g, std::vector<SliceRange>{{0, 256}}); },
+                    "gguf column slice");
+}
 } // namespace
 
 // A stacked NVFP4 plane (one divisor per source matrix, e.g. a layer's routed experts) and the
@@ -433,6 +476,7 @@ int main() {
         row_scale();
         block_scale_k32();
         row_interleaved();
+        gguf_blocks();
         stacked_row_blocks();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

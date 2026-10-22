@@ -43,6 +43,7 @@
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/qwen4_prefetch.h"
 #include "ninfer/ops/moe_slots.h"
+#include "ninfer/ops/moe_slots_gguf.h"
 #include "ninfer/types.h"
 #include "ops/sparse_moe/host/host_moe_mailbox.h"
 
@@ -253,6 +254,10 @@ struct Qwen4OffloadOptions {
     // (Qwen4ExpertStream, ops::moe_grouped_nvfp4); 0 = never (the CPU computes them).
     std::int32_t stream_min_tokens = 0;
     std::int32_t stream_ring_slots = 576; // rounded up to whole cache layers
+    // ggml block banks: prefill calls of at least this many columns of a Text layer run every
+    // routed expert of the GPU's partition on the GPU, the resident ones from their slots and the
+    // others read in place from the host bank (moe_grouped_gguf, host_table); 0 = the CPU path.
+    std::int32_t gguf_stream_min_tokens = 0;
     // CPU tail of a streamed chunk (RoutedExpertOptions::stream_cpu_tail and its cost model).
     bool stream_cpu_tail               = true;
     double stream_cpu_expert_us        = 45.0;
@@ -431,6 +436,9 @@ public:
         std::array<std::byte*, 4> staging{};
         std::int32_t* stage_table = nullptr;
         std::int32_t* picks       = nullptr;
+        // ggml block banks (capy-flash v0.7): pool[0] is one byte arena of variable-size slots,
+        // slot s at pool[0] + slot_offsets[s] (I64 [pool slots], gguf_pool()); pool[1..3] unused.
+        std::int64_t* slot_offsets = nullptr;
     };
 
     // tp 2: rank 1's device, compute stream and slot memory (pool, table, divisor copy).
@@ -447,6 +455,7 @@ public:
         std::int32_t* stage_table = nullptr;
         std::int32_t* picks       = nullptr;
         std::array<std::byte*, 4> staging{};
+        std::int64_t* slot_offsets = nullptr; // ggml block banks (DeviceMemory::slot_offsets)
     };
 
     // `options.slots_per_layer` is per GPU; with `peer` the cache spans both GPUs. Each GPU's
@@ -483,6 +492,12 @@ public:
     [[nodiscard]] std::array<DeviceSpan, 2>
     prompt_workspace(std::span<const cudaStream_t> streams) override;
 
+    // ggml block banks: whether a call of `layer` with `columns` columns runs zero-copy on the GPUs
+    // (both ranks: rank 1's Qwen4OffloadPeerExperts reads its own host table).
+    [[nodiscard]] bool gguf_streams(std::int32_t layer, std::int32_t columns) const noexcept {
+        return gguf_ && options_.gguf_stream_min_tokens > 0 && columns > ops::kMoeSlotsMaxTokens &&
+               columns >= options_.gguf_stream_min_tokens && layer < text_layers_;
+    }
     // tp 2: whether rank 1's call of `layer` with `columns` columns streams (then rank 1's
     // Qwen4OffloadPeerExperts runs it through run_peer_streamed).
     [[nodiscard]] bool streams_call(std::int32_t layer, std::int32_t columns) const noexcept;
@@ -533,6 +548,47 @@ public:
     [[nodiscard]] Qwen4OffloadSplitCounters split_counters() const noexcept;
 
     static constexpr std::int32_t kDivisorsPerLayer = 1536;
+
+    // ggml block banks (capy-flash v0.7, artifact layout gguf_blocks_v1). Every routed-expert
+    // layer of the backend is either NVFP4 (the planar pool above) or ggml blocks; a mix is
+    // refused. With ggml blocks one GPU's pool is one byte arena: slot s of layer l holds the
+    // expert's 1280 gate|up rows then its 2560 down rows (gguf_slot_bytes(l), 256-aligned), the
+    // slots numbered as ExpertCachePolicy::pool_slot does: each layer's base slots
+    // (layer_slot_profile) in layer order, then the elastic columns, column-major, each column one
+    // slot of every layer (so the last columns stay one contiguous tail of the arena). Prefill
+    // streaming, the router-ahead prefetch and the miss split are not implemented for them: the
+    // backend runs without (prefill: resident experts on the GPU, moe_grouped_gguf, the rest on
+    // the CPU).
+    struct GgufPool {
+        std::vector<std::int64_t> slot_offset; // [pool slots of one GPU]
+        std::int64_t base_bytes   = 0;         // the base slots of every layer
+        std::int64_t column_bytes = 0;         // one elastic column (one slot of every layer)
+        std::int64_t total_bytes  = 0;
+    };
+    // True when every bank is a ggml block bank, false when none is; throws on a mix.
+    [[nodiscard]] static bool gguf_banks(std::span<const Qwen4ExpertBank> banks);
+    [[nodiscard]] static std::int64_t gguf_slot_bytes(const Qwen4ExpertBank& bank) noexcept;
+    [[nodiscard]] static GgufPool gguf_pool(std::span<const std::int64_t> layer_slot_bytes,
+                                            std::span<const std::int32_t> layer_base,
+                                            std::int32_t elastic_columns);
+    // T42 for ggml block banks: the fewest layers just below `end` whose base slots hold `bytes`
+    // of the arena (end + 1 when even layers [0, end) do not). They lend a prompt workspace (no
+    // ring: the zero-copy prefill needs none).
+    [[nodiscard]] static std::int32_t gguf_layers_below(std::span<const std::int32_t> layer_base,
+                                                        std::span<const std::int64_t> slot_bytes,
+                                                        std::int32_t end, std::int64_t bytes);
+    // The prefill ring of ggml block banks: one layer's non-resident experts of a GPU's partition,
+    // at most kExperts / partitions, each in a ring slot of the largest Text expert's bytes. Its
+    // slots follow the pool's in the slot offset table (DeviceMemory::slot_offsets holds
+    // pool slots + gguf_ring_slots(partitions) entries).
+    // Two halves (double buffer): layer l streams into half l % 2 while layer l - 1 computes.
+    [[nodiscard]] static std::int32_t gguf_ring_slots(std::int32_t partitions) noexcept {
+        return 2 * (kGgufExperts / std::max(partitions, 1));
+    }
+    [[nodiscard]] static std::int64_t gguf_ring_bytes(std::span<const std::int64_t> slot_bytes,
+                                                      std::int32_t text_layers,
+                                                      std::int32_t partitions);
+    static constexpr std::int32_t kGgufExperts = 512;
     // Bytes of one plane array of the pool (all layers' slots, plus `extra_slots`: the prefetch
     // staging slots).
     [[nodiscard]] static std::array<std::int64_t, 4> pool_plane_bytes(std::int32_t layers,
@@ -631,6 +687,55 @@ private:
         return layer_offset_[static_cast<std::size_t>(layer)];
     }
 
+    // ggml block banks: run() and the decode call of one layer.
+    void run_gguf(std::int32_t layer, const Qwen4ExpertBank& bank, const Tensor& x,
+                  const Tensor& ids, const Tensor& weights, Tensor& partial, WorkspaceArena& work,
+                  cudaStream_t stream);
+    bool gguf_ = false;
+    GgufPool gguf_pool_;
+    // Per rank, per Text layer: expert -> its host row (= e) when it is of the rank's partition and
+    // not resident at the prompt window's begin, else -1 (the zero-copy prefill's host_table).
+    std::array<std::vector<std::int32_t>, 2> gguf_host_rows_;
+    std::vector<std::int64_t> gguf_slot_bytes_; // [layers] arena bytes of one slot
+    // The prefill ring (lent layers [lend_first_, text_layers_), arena bytes from ring_base_):
+    // per rank and Text layer the copies of its streamed experts into the ring (destination
+    // offset in the arena, source, bytes), built with the host rows at each prompt window.
+    std::int32_t gguf_ring_slots_  = 0;
+    std::int64_t gguf_ring_base_   = 0;
+    std::int64_t gguf_ring_stride_ = 0;
+    struct RingCopies {
+        std::vector<std::int64_t> dst; // arena offsets
+        std::vector<const std::byte*> src;
+        std::vector<std::size_t> bytes;
+    };
+    std::array<std::vector<RingCopies>, 2> gguf_ring_copies_;
+    // Overlap: per rank a copy stream and, per ring half, "copied" and "free again" events; the
+    // layers whose copies this window already issued.
+    std::array<cudaStream_t, 2> gguf_copy_stream_{};
+    std::array<std::array<cudaEvent_t, 2>, 2> gguf_ready_{};
+    std::array<std::array<cudaEvent_t, 2>, 2> gguf_free_{};
+    std::array<std::vector<std::uint8_t>, 2> gguf_issued_;
+    void gguf_issue_copies(int rank, std::int32_t layer);
+    std::vector<void*> ring_dst_;
+    std::vector<const void*> ring_src_;
+    std::vector<std::size_t> ring_bytes_;
+    [[nodiscard]] bool gguf_ring_ready() const noexcept {
+        return gguf_ring_slots_ > 0 && lend_count_ > 0 && cache_->lending();
+    }
+public:
+    // ggml block banks, prefill ring: enqueues on `stream` (rank `rank`'s compute stream) the
+    // copies of `layer`'s streamed experts into the ring, after the copies that were in flight
+    // into the lent layers. False when the window does not stream through the ring.
+    bool gguf_ring_copy(int rank, std::int32_t layer, cudaStream_t stream);
+    // After the layer's grouped call on `stream`: its ring half may be overwritten again.
+    void gguf_ring_done(int rank, std::int32_t layer, cudaStream_t stream);
+    [[nodiscard]] std::int32_t gguf_stream_slots() const noexcept {
+        return pool_slots_ + gguf_ring_slots_;
+    }
+private:
+    void upload_gguf_host_rows(cudaStream_t stream);
+    std::int32_t pool_slots_ = 0; // one GPU's pool slots (all layers, staging, elastic)
+
     std::int32_t layers_     = 0;
     std::int32_t partitions_ = 1;            // GPUs the cache spans
     std::vector<std::int32_t> layer_base_;   // [layers_] base slots per layer on each GPU
@@ -687,6 +792,10 @@ private:
     bool split_on_peer_ = false;
     Peer peer_{};                        // rank 1's memory (tp 2)
     std::vector<Qwen4ExpertBank> banks_; // host banks (input divisors, planes)
+    // v0.7 pinned fallback: [layers] bank in pageable host memory (the CPU reads it in place, the
+    // cache fills through its staging ring, never streamed nor read by a kernel).
+    std::vector<std::uint8_t> pageable_;
+    std::int32_t pageable_layers_ = 0;
     // The refill profile of each lent Text layer ([layer]): the last prompt window's routing,
     // hottest first, or (T211) the residency the layer held when lent, most recently used first.
     std::vector<std::vector<std::int32_t>> lent_profile_;

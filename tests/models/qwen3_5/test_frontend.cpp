@@ -1136,6 +1136,47 @@ int test_media_token_ids_come_from_tokenizer() {
                  "Vision preparation ignored the loaded image token ID");
 }
 
+// Reasoning-close retry (serve --reasoning-close-retry): the chat prompt plus the reply so far
+// and the canonical close, continuing in content with the chat prompt's identity.
+int test_reasoning_continuation(const Frontend& frontend) {
+    const auto text_input = [](std::optional<bool> thinking) {
+        ninfer::ChatMessage message;
+        message.role = ninfer::ChatRole::User;
+        message.parts.push_back(
+            ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = "x", .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(message));
+        input.options.enable_thinking = thinking;
+        return input;
+    };
+    const ninfer::ReasoningGuardTokens tokens = frontend.reasoning_guard_tokens();
+    int failures = check(!tokens.close_suffix.empty() && !tokens.stop_token_ids.empty() &&
+                             tokens.think_close.size() == 1,
+                         "reasoning guard tokens are incomplete");
+    const auto base         = frontend.prepare(text_input(std::nullopt));
+    const auto& base_data   = FrontendFactory::inspect(base);
+    std::vector<ninfer::TokenId> appended{fixture_byte_token('o'), fixture_byte_token('k')};
+    appended.insert(appended.end(), tokens.close_suffix.begin(), tokens.close_suffix.end());
+    const auto continued    = frontend.prepare_continuation(text_input(std::nullopt), appended);
+    const auto& data        = FrontendFactory::inspect(continued);
+    std::vector<ninfer::TokenId> expected = base_data.token_ids;
+    expected.insert(expected.end(), appended.begin(), appended.end());
+    failures += check(data.token_ids == expected && !data.starts_in_reasoning &&
+                          data.identity.rewrite_checkpoint &&
+                          data.identity.rewrite_checkpoint->frontier ==
+                              base_data.identity.rewrite_checkpoint->frontier &&
+                          data.position_axis(0).back() ==
+                              static_cast<std::int32_t>(expected.size() - 1U) &&
+                          data.tool_call_output == base_data.tool_call_output,
+                      "reasoning continuation did not append the reply and close to the chat "
+                      "prompt, or did not continue in content");
+    failures += check(throws_invalid_argument([&] {
+                          (void)frontend.prepare_continuation(text_input(false), appended);
+                      }),
+                      "reasoning continuation accepted a prompt that does not start in thinking");
+    return failures;
+}
+
 int test_text_and_image_prepare(const Frontend& frontend) {
     ninfer::ChatMessage text_message;
     text_message.role = ninfer::ChatRole::User;
@@ -2211,6 +2252,7 @@ int main() {
     failures += test_template_file_execution();
     failures += test_invalid_public_part_enums(frontend);
     failures += test_text_and_image_prepare(frontend);
+    failures += test_reasoning_continuation(frontend);
     failures += test_media_token_ids_come_from_tokenizer();
     failures += test_template_media_contract();
     failures += test_image_resize_rejection_policy();

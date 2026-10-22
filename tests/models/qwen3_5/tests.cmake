@@ -56,7 +56,7 @@ ninfer_add_test(ninfer_qwen3_5_frontend_test
 
 ninfer_add_test(ninfer_qwen3_5_runtime_mechanisms_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_runtime_mechanisms.cpp"
-  LIBRARIES ninfer_engine ninfer_core)
+  LIBRARIES ninfer_engine ninfer_core ninfer::json)
 
 ninfer_add_test(ninfer_qwen3_5_state_image_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_state_image.cpp"
@@ -262,3 +262,9 @@ ninfer_add_test(ninfer_qwen3_5_ple_gather_test
 # a teacher-forcing harness (tfdump/1 format, src/models/qwen3_5/execution/qwen4_tfdump.h).
 add_executable(ninfer_qwen4_tf_driver "${CMAKE_CURRENT_LIST_DIR}/qwen4_tf_driver.cpp")
 target_link_libraries(ninfer_qwen4_tf_driver PRIVATE ninfer_engine)
+
+# capy-flash v0.7: the GGUF slot arena of the offload backend against the expert cache's slot
+# numbering (CPU only).
+ninfer_add_test(ninfer_qwen4_gguf_pool_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_qwen4_gguf_pool.cpp"
+  LIBRARIES ninfer_model_runtime)

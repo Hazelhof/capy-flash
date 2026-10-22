@@ -204,8 +204,11 @@ struct MtpBridgeInput {
 // hit). Qwen4Exp retains the wide residual, which goes through the Text output mixer first; at
 // tensor-parallel width 2 `peer_hidden` is rank 1's retained copy when it keeps one (MTP), else
 // rank 0's is copied to rank 1.
+// reasoning_guard: the sampled token is the reply's first and the reply starts in thinking
+// (execution/reasoning_eos_guard.h).
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
-                        std::int32_t purpose, const Tensor* peer_hidden = nullptr);
+                        std::int32_t purpose, const Tensor* peer_hidden = nullptr,
+                        bool reasoning_guard = false);
 // Resumes the MTP head at `position` from the retained target hidden of that position. At
 // tensor-parallel width 2 `peer_previous_hidden` is rank 1's retained copy (the same StateImage
 // slot of its mirror pool) and both ranks run the split head; it is null on one device.

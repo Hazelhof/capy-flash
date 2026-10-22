@@ -18,6 +18,7 @@ enum SamplePurpose : std::int32_t {
     kSamplePurposeSpeculativeCorrection = 3,
     kSamplePurposeSpeculativeBonus      = 4,
     kSamplePurposeDFlash2Proposal       = 5,
+    kSamplePurposeReasoningGuard        = 6,
 };
 
 // Device-resident sampling parameters. token_counts is an optional device I32
@@ -76,6 +77,20 @@ struct SamplingConfig {
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
             WorkspaceArena& workspace, cudaStream_t stream);
+
+// Reasoning EOS guard (serve --reasoning-eos-guard). One row (B = 1) that sample() has just drawn
+// into `out`: when out[0] is banned0 or banned1 (-1 = unused), those ids are masked in `logits` (in
+// place) and out[0] is replaced by a draw from the same configuration over the remaining ids (RNG
+// purpose kSamplePurposeReasoningGuard; greedy rows take the best remaining id). Drawing again only
+// when a banned id was drawn samples exactly the distribution without the banned ids, and leaves
+// out untouched otherwise: a row that did not draw a banned id is token-identical. The penalty
+// counts follow the replacement. Each replacement adds one to *replacements when it is non-null
+// (device-visible memory, e.g. mapped pinned host memory).
+void replace_banned_token(Tensor& logits, Tensor& out, std::int32_t token_domain,
+                          const SamplingConfig* configs, const Tensor& logical_positions,
+                          std::int32_t banned0, std::int32_t banned1,
+                          unsigned long long* replacements, WorkspaceArena& workspace,
+                          cudaStream_t stream);
 
 // Adds every id in the contiguous non-empty I32 token_ids vector to the contiguous I32
 // [token_domain] committed count array. IDs must be in [0,token_domain).

@@ -69,3 +69,8 @@ ninfer_add_op_bench(ninfer_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DI
 ninfer_add_op_bench(ninfer_hyper_connection_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/hyper_connection_bench.cu")
 ninfer_add_op_bench(ninfer_ple_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/ple_bench.cu")
 ninfer_add_op_bench(ninfer_miss_split_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/miss_split_bench.cu")
+
+# Routed experts on the CPU, GGUF blocks vs NVFP4, on real banks (CPU only, no CUDA).
+add_executable(ninfer_host_gguf_bench "${CMAKE_CURRENT_LIST_DIR}/bench_host_gguf.cpp")
+ninfer_internal_includes(ninfer_host_gguf_bench)
+target_link_libraries(ninfer_host_gguf_bench PRIVATE ninfer_host_moe ninfer::json)

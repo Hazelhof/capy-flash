@@ -16,6 +16,57 @@ __global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std
     if (index < count) { atomicAdd(&token_counts[token_ids[index]], 1); }
 }
 
+__global__ void banned_token_check_kernel(__nv_bfloat16* logits, const std::int32_t* out,
+                                          std::int32_t banned0, std::int32_t banned1,
+                                          const SamplingConfig* configs,
+                                          SamplingConfig* config_copy, std::int32_t* flag) {
+    if (threadIdx.x != 0) { return; }
+    SamplingConfig copy = configs[0];
+    // The second draw must not count itself: the commit moves the count when it replaces.
+    copy.token_counts   = nullptr;
+    config_copy[0]      = copy;
+    const std::int32_t token = out[0];
+    const bool hit           = token >= 0 && (token == banned0 || token == banned1);
+    flag[0]                  = hit ? 1 : 0;
+    if (!hit) { return; }
+    const __nv_bfloat16 masked = __float2bfloat16(-CUDART_INF_F);
+    if (banned0 >= 0) { logits[banned0] = masked; }
+    if (banned1 >= 0) { logits[banned1] = masked; }
+}
+
+__global__ void banned_token_commit_kernel(std::int32_t* out, const std::int32_t* alt,
+                                           const std::int32_t* flag,
+                                           const SamplingConfig* configs,
+                                           unsigned long long* replacements) {
+    if (threadIdx.x != 0 || flag[0] == 0) { return; }
+    const std::int32_t old_token = out[0];
+    const std::int32_t new_token = alt[0];
+    if (configs[0].token_counts != nullptr) {
+        atomicSub(&configs[0].token_counts[old_token], 1);
+        atomicAdd(&configs[0].token_counts[new_token], 1);
+    }
+    out[0] = new_token;
+    if (replacements != nullptr) { atomicAdd(replacements, 1ULL); }
+}
+
+void banned_token_check_launch(Tensor& logits, const Tensor& out, std::int32_t banned0,
+                               std::int32_t banned1, const SamplingConfig* configs,
+                               SamplingConfig* config_copy, std::int32_t* flag,
+                               cudaStream_t stream) {
+    banned_token_check_kernel<<<1, 32, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(logits.data), static_cast<const std::int32_t*>(out.data),
+        banned0, banned1, configs, config_copy, flag);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void banned_token_commit_launch(Tensor& out, const std::int32_t* alt, const std::int32_t* flag,
+                                const SamplingConfig* configs, unsigned long long* replacements,
+                                cudaStream_t stream) {
+    banned_token_commit_kernel<<<1, 32, 0, stream>>>(static_cast<std::int32_t*>(out.data), alt,
+                                                     flag, configs, replacements);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;
 }

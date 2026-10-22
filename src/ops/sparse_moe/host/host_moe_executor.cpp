@@ -190,10 +190,8 @@ void HostCpuPool::barrier(std::int32_t index) noexcept {
 HostMoeExecutor::HostMoeExecutor(HostCpuPool& pool, std::int32_t hidden, std::int32_t intermediate,
                                  std::int32_t max_tokens, std::int32_t max_top_k, Options options)
     : pool_(pool), hidden_(hidden), intermediate_(intermediate), max_tokens_(max_tokens),
-      max_top_k_(max_top_k), options_(options) {
-    if (!host_avx512_vnni_supported()) {
-        throw std::runtime_error("host MoE executor: the CPU lacks AVX-512 F/BW/VL/VNNI");
-    }
+      max_top_k_(max_top_k), options_(options), kernels_(host_nvfp4_kernels(options.isa)),
+      gguf_kernels_(gguf::host_gguf_kernels(gguf::host_gguf_isa(kernels_.isa))) {
     if (options.a4 && options.emulate_w4a4)
         throw std::invalid_argument("host MoE executor: a4 and emulate_w4a4");
     if (hidden <= 0 || hidden % kNvfp4RowTile || intermediate <= 0 ||
@@ -234,10 +232,12 @@ HostMoeCallStats HostMoeExecutor::run(const HostExpertLayer& layer, const HostMo
         !job.alpha || !job.out) {
         throw std::invalid_argument("host MoE executor: invalid job");
     }
+    const bool gguf_layer = layer.format == HostExpertFormat::Gguf;
     if (layer.hidden != hidden_ || layer.intermediate != intermediate_ ||
-        layer.gate_up.k != hidden_ || layer.down.k != intermediate_ ||
-        layer.gate_up.rows != std::int64_t{layer.experts} * 2 * intermediate_ ||
-        layer.down.rows != std::int64_t{layer.experts} * hidden_) {
+        (!gguf_layer &&
+         (layer.gate_up.k != hidden_ || layer.down.k != intermediate_ ||
+          layer.gate_up.rows != std::int64_t{layer.experts} * 2 * intermediate_ ||
+          layer.down.rows != std::int64_t{layer.experts} * hidden_))) {
         throw std::invalid_argument("host MoE executor: layer geometry mismatch");
     }
     if (expert_slot_.size() < static_cast<std::size_t>(layer.experts)) {
@@ -316,6 +316,20 @@ HostMoeCallStats HostMoeExecutor::run(const HostExpertLayer& layer, const HostMo
         pair_begin_[0] = 0;
     }
     for (std::int32_t u = 0; u < U; ++u) expert_slot_[static_cast<std::size_t>(unique_[u])] = -1;
+    if (gguf_layer) {
+        layer_ = &layer;
+        job_   = &job;
+        HostMoeCallStats gs{U, pairs, {}};
+        gs.dispatch_ns = now_rel();
+        gguf_call();
+        gs.end_ns = now_rel();
+        for (int i = 0; i < 3; ++i) gs.phase_ns[i] = phase_ns_[i] - start_ns_;
+        if (options_.record_members) {
+            gs.members      = members_.data();
+            gs.member_count = pool_.size();
+        }
+        return gs;
+    }
     if (options_.emulate_w4a4) {
         layer_ = &layer;
         job_   = &job;
@@ -486,11 +500,12 @@ void HostMoeExecutor::static_gate_up(std::int32_t member) {
                     const W4A8Activation a = member_x_[static_cast<std::size_t>(member)].at(t);
                     if ((quantized >> t & 1U) == 0) {
                         if (options_.a4) {
-                            quantize_bf16_a4(job_->x + static_cast<std::size_t>(t) * hidden_,
-                                             hidden_, layer_->gate_up_input_divisor, a);
+                            kernels_.quantize_bf16_a4(job_->x +
+                                                          static_cast<std::size_t>(t) * hidden_,
+                                                      hidden_, layer_->gate_up_input_divisor, a);
                         } else
-                            quantize_bf16(job_->x + static_cast<std::size_t>(t) * hidden_, hidden_,
-                                          a);
+                            kernels_.quantize_bf16(job_->x + static_cast<std::size_t>(t) * hidden_,
+                                                   hidden_, a);
                         quantized |= 1U << t;
                     }
                     acts[k] = a;
@@ -499,23 +514,25 @@ void HostMoeExecutor::static_gate_up(std::int32_t member) {
                 }
             }
             const DotKernel kernel = kernel_for(m);
-            rows_dot(layer_->gate_up, e * 2 * I + r, rows, acts, m, gate, rows, kernel, pf);
-            rows_dot(layer_->gate_up, e * 2 * I + I + r, rows, acts, m, up, rows, kernel, pf);
+            kernels_.rows_dot(layer_->gate_up, e * 2 * I + r, rows, acts, m, gate, rows, kernel,
+                              pf);
+            kernels_.rows_dot(layer_->gate_up, e * 2 * I + I + r, rows, acts, m, up, rows, kernel,
+                              pf);
             for (std::int32_t k = 0; k < m; ++k) {
                 if (options_.a4) {
                     for (std::int32_t j = 0; j < rows; ++j) {
                         const float g = a4_bf16(gate[k * rows + j]), u = a4_bf16(up[k * rows + j]);
                         h[j] = a4_bf16(g * (1.0F / (1.0F + std::exp(-g))) * u);
                     }
-                    quantize_blocks_a4(h, r / kNvfp4Group, c, layer_->down_input_divisor,
-                                       h_act_.at(g0 + k));
+                    kernels_.quantize_blocks_a4(h, r / kNvfp4Group, c, layer_->down_input_divisor,
+                                                h_act_.at(g0 + k));
                     continue;
                 }
                 for (std::int32_t j = 0; j < rows; ++j) {
                     const float g = gate[k * rows + j];
                     h[j]          = g / (1.0F + std::exp(-g)) * up[k * rows + j];
                 }
-                quantize_blocks(h, r / kNvfp4Group, c, h_act_.at(g0 + k));
+                kernels_.quantize_blocks(h, r / kNvfp4Group, c, h_act_.at(g0 + k));
             }
         }
     };
@@ -561,7 +578,8 @@ void HostMoeExecutor::static_down(std::int32_t member) {
             for (std::int32_t g0 = first; g0 < last; g0 += kHostMaxTokens) {
                 const std::int32_t m = std::min(kHostMaxTokens, last - g0);
                 for (std::int32_t k = 0; k < m; ++k) acts[k] = h_act_.at(g0 + k);
-                rows_dot(layer_->down, e * H + r, rows, acts, m, partial, rows, kernel_for(m), pf);
+                kernels_.rows_dot(layer_->down, e * H + r, rows, acts, m, partial, rows,
+                                  kernel_for(m), pf);
                 for (std::int32_t k = 0; k < m; ++k) {
                     const std::size_t p = static_cast<std::size_t>(g0 + k);
                     const float a       = pair_alpha_[p];
@@ -743,10 +761,11 @@ void HostMoeExecutor::phase_tokens(std::int32_t) {
     for (std::int32_t i; (i = next_token_.fetch_add(1, std::memory_order_relaxed)) < n;) {
         const std::int32_t t = used_tokens_[static_cast<std::size_t>(i)];
         if (options_.a4) {
-            quantize_bf16_a4(job_->x + static_cast<std::size_t>(t) * hidden_, hidden_,
-                             layer_->gate_up_input_divisor, x_act_.at(t));
+            kernels_.quantize_bf16_a4(job_->x + static_cast<std::size_t>(t) * hidden_, hidden_,
+                                      layer_->gate_up_input_divisor, x_act_.at(t));
         } else
-            quantize_bf16(job_->x + static_cast<std::size_t>(t) * hidden_, hidden_, x_act_.at(t));
+            kernels_.quantize_bf16(job_->x + static_cast<std::size_t>(t) * hidden_, hidden_,
+                                   x_act_.at(t));
     }
 }
 
@@ -777,10 +796,10 @@ void HostMoeExecutor::phase_gate_up() {
             const DotKernel kernel = kernel_for(m);
             for (std::int32_t k = 0; k < S; ++k) {
                 const std::int64_t r = base + k * kSliceStride;
-                rows_dot(layer_->gate_up, e * 2 * I + r, kSliceRows, acts, m, gate + k * kSliceRows,
-                         kItemRows, kernel, options_.prefetch_rows);
-                rows_dot(layer_->gate_up, e * 2 * I + I + r, kSliceRows, acts, m,
-                         up + k * kSliceRows, kItemRows, kernel, options_.prefetch_rows);
+                kernels_.rows_dot(layer_->gate_up, e * 2 * I + r, kSliceRows, acts, m,
+                                  gate + k * kSliceRows, kItemRows, kernel, options_.prefetch_rows);
+                kernels_.rows_dot(layer_->gate_up, e * 2 * I + I + r, kSliceRows, acts, m,
+                                  up + k * kSliceRows, kItemRows, kernel, options_.prefetch_rows);
             }
             for (std::int32_t n = 0; n < m; ++n) {
                 for (std::int32_t r = 0; r < kItemRows; ++r) {
@@ -794,12 +813,12 @@ void HostMoeExecutor::phase_gate_up() {
                 const W4A8Activation dst = h_act_.at(g0 + n);
                 for (std::int32_t k = 0; k < S; ++k) {
                     if (options_.a4) {
-                        quantize_blocks_a4(h + k * kSliceRows,
-                                           (base + k * kSliceStride) / kNvfp4Group, 1,
-                                           layer_->down_input_divisor, dst);
+                        kernels_.quantize_blocks_a4(h + k * kSliceRows,
+                                                    (base + k * kSliceStride) / kNvfp4Group, 1,
+                                                    layer_->down_input_divisor, dst);
                     } else
-                        quantize_blocks(h + k * kSliceRows, (base + k * kSliceStride) / kNvfp4Group,
-                                        1, dst);
+                        kernels_.quantize_blocks(h + k * kSliceRows,
+                                                 (base + k * kSliceStride) / kNvfp4Group, 1, dst);
                 }
             }
         }
@@ -827,8 +846,9 @@ void HostMoeExecutor::phase_down(std::int32_t member) {
                 for (std::int32_t n = 0; n < m; ++n) acts[n] = h_act_.at(g0 + n);
                 const DotKernel kernel = kernel_for(m);
                 for (std::int32_t k = 0; k < S; ++k) {
-                    rows_dot(layer_->down, e * H + base + k * kSliceStride, kSliceRows, acts, m,
-                             partial + k * kSliceRows, kItemRows, kernel, options_.prefetch_rows);
+                    kernels_.rows_dot(layer_->down, e * H + base + k * kSliceStride, kSliceRows,
+                                      acts, m, partial + k * kSliceRows, kItemRows, kernel,
+                                      options_.prefetch_rows);
                 }
                 for (std::int32_t n = 0; n < m; ++n) {
                     const std::size_t i = static_cast<std::size_t>(g0 + n);

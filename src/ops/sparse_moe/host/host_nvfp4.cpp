@@ -3,8 +3,11 @@
 // Copyright FlashML-org / FreeToken authors), changed to read the scale quad of a row from the
 // swizzled plane and to divide by the plane's FP32 divisor. dot_multi_token is the T03
 // kernel (variants V1 and V4 of a standalone CPU probe; docs/capy-flash/development-log.md),
-// changed the same way.
+// changed the same way. The AVX2 forms of the same kernels are in host_nvfp4_avx2.cpp; this file
+// also selects the ISA (host_isa) and dispatches the public functions.
 #include "ops/sparse_moe/host/host_nvfp4.h"
+
+#include "ops/sparse_moe/host/host_nvfp4_isa.h"
 
 #include <immintrin.h>
 
@@ -15,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #define NINFER_HOST_AVX512 __attribute__((target("avx512f,avx512bw,avx512vl,avx512vnni,avx2,fma")))
 
@@ -45,11 +49,18 @@ alignas(16) const std::int8_t kE2M1x2[16]   = {0, 1,  2,  3,  4,  6,  8,  12,
                                                0, -1, -2, -3, -4, -6, -8, -12};
 alignas(16) const std::uint8_t kE2M1x2u[16] = {12, 13, 14, 15, 16, 18, 20, 24,
                                                12, 11, 10, 9,  8,  6,  4,  0};
+} // namespace
+
+namespace detail::avx512 {
+namespace {
 
 // ---------------------------------------------------------------- FreeToken (Apache-2.0)
-NINFER_HOST_AVX512 inline __m512 grp4(const std::uint8_t* packed, const std::uint8_t* scale_quad,
-                                      const std::int8_t* asi8, const float* asb, int b, __m512i lut,
-                                      __m512i idx, __m512i mask0F, __m512i idxsc) {
+// acc + di * (e4m3 * asb) per lane, one explicit FMA: GCC contracted FreeToken's mul + add into
+// this FMA anyway (-ffp-contract=fast); spelled out so the AVX2 form can match it bit for bit.
+NINFER_HOST_AVX512 inline __m512 grp4(__m512 acc, const std::uint8_t* packed,
+                                      const std::uint8_t* scale_quad, const std::int8_t* asi8,
+                                      const float* asb, int b, __m512i lut, __m512i idx,
+                                      __m512i mask0F, __m512i idxsc) {
     const __mmask64 hi_half = 0xFF00FF00FF00FF00ULL;
     const __m256i raw       = _mm256_loadu_si256(
         reinterpret_cast<const __m256i*>(packed + static_cast<std::size_t>(b) * 8));
@@ -68,7 +79,7 @@ NINFER_HOST_AVX512 inline __m512 grp4(const std::uint8_t* packed, const std::uin
     const __m128 s4 =
         _mm_mul_ps(_mm_i32gather_ps(kE4m3.value.data(), sc4, 4), _mm_loadu_ps(asb + b));
     const __m512 scv = _mm512_permutexvar_ps(idxsc, _mm512_castps128_ps512(s4));
-    return _mm512_mul_ps(_mm512_cvtepi32_ps(di), scv);
+    return _mm512_fmadd_ps(_mm512_cvtepi32_ps(di), scv, acc);
 }
 
 // One row, one token; k % 64 == 0 (the layout guarantees it, so FreeToken's scalar tail is gone).
@@ -91,18 +102,16 @@ NINFER_HOST_AVX512 float dot_per_token(const std::uint8_t* packed, const std::ui
             reinterpret_cast<const char*>(packed + static_cast<std::size_t>(b + pf) * 8 + 64),
             _MM_HINT_T0);
         const std::uint8_t* s = sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride;
-        acc0 = _mm512_add_ps(acc0, grp4(packed, s, asi8, asb, b, lut, idx, mask0F, idxsc));
-        acc1 = _mm512_add_ps(
-            acc1, grp4(packed, s + kScaleQuadStride, asi8, asb, b + 4, lut, idx, mask0F, idxsc));
-        acc2 = _mm512_add_ps(acc2, grp4(packed, s + 2 * kScaleQuadStride, asi8, asb, b + 8, lut,
-                                        idx, mask0F, idxsc));
-        acc3 = _mm512_add_ps(acc3, grp4(packed, s + 3 * kScaleQuadStride, asi8, asb, b + 12, lut,
-                                        idx, mask0F, idxsc));
+        acc0                  = grp4(acc0, packed, s, asi8, asb, b, lut, idx, mask0F, idxsc);
+        acc1 = grp4(acc1, packed, s + kScaleQuadStride, asi8, asb, b + 4, lut, idx, mask0F, idxsc);
+        acc2 =
+            grp4(acc2, packed, s + 2 * kScaleQuadStride, asi8, asb, b + 8, lut, idx, mask0F, idxsc);
+        acc3 = grp4(acc3, packed, s + 3 * kScaleQuadStride, asi8, asb, b + 12, lut, idx, mask0F,
+                    idxsc);
     }
     for (; b + 4 <= nb; b += 4) {
-        acc0 = _mm512_add_ps(acc0,
-                             grp4(packed, sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride,
-                                  asi8, asb, b, lut, idx, mask0F, idxsc));
+        acc0 = grp4(acc0, packed, sc + static_cast<std::size_t>(b / 4) * kScaleQuadStride, asi8,
+                    asb, b, lut, idx, mask0F, idxsc);
     }
     return _mm512_reduce_add_ps(
         _mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3)));
@@ -252,13 +261,100 @@ NINFER_HOST_AVX512 void quantize_bf16_impl(const std::uint16_t* x, int k, W4A8Ac
 }
 
 } // namespace
+} // namespace detail::avx512
 
 float e4m3_value(std::uint8_t code) noexcept { return kE4m3.value[code]; }
 
-bool host_avx512_vnni_supported() noexcept {
-    return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
-           __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni") &&
-           __builtin_cpu_supports("fma");
+const float* detail::e4m3_table() noexcept { return kE4m3.value.data(); }
+
+// ---------------------------------------------------------------- ISA selection
+// __builtin_cpu_supports reads cpuid and, for the AVX/AVX-512 features, the OS-enabled state
+// (xgetbv): a feature the kernel does not save is reported absent.
+bool host_isa_supported(HostIsa isa) noexcept {
+    const bool avx2 = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+                      __builtin_cpu_supports("f16c");
+    switch (isa) {
+    case HostIsa::Avx2:
+        return avx2;
+    case HostIsa::Avx512Vnni:
+        return avx2 && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+               __builtin_cpu_supports("avx512vl") && __builtin_cpu_supports("avx512vnni");
+    }
+    return false;
+}
+
+bool host_experts_supported() noexcept { return host_isa_supported(HostIsa::Avx2); }
+
+bool host_avx512_vnni_supported() noexcept { return host_isa_supported(HostIsa::Avx512Vnni); }
+
+const char* host_isa_name(HostIsa isa) noexcept {
+    switch (isa) {
+    case HostIsa::Avx2:
+        return "avx2";
+    case HostIsa::Avx512Vnni:
+        return "avx512";
+    }
+    return "?";
+}
+
+namespace {
+HostIsa select_host_isa() {
+    const char* env        = std::getenv("NINFER_HOST_ISA");
+    const std::string want = env != nullptr ? env : "auto";
+    HostIsa isa;
+    if (want.empty() || want == "auto") {
+        if (host_isa_supported(HostIsa::Avx512Vnni)) return HostIsa::Avx512Vnni;
+        if (host_isa_supported(HostIsa::Avx2)) return HostIsa::Avx2;
+        throw std::runtime_error(
+            "host expert kernels: this CPU runs neither AVX-512 VNNI nor AVX2 + FMA + F16C");
+    }
+    if (want == "avx2") {
+        isa = HostIsa::Avx2;
+    } else if (want == "avx512") {
+        isa = HostIsa::Avx512Vnni;
+    } else {
+        throw std::runtime_error("NINFER_HOST_ISA=" + want + ": expected avx2, avx512 or auto");
+    }
+    if (!host_isa_supported(isa)) {
+        throw std::runtime_error("NINFER_HOST_ISA=" + want + ": this CPU does not run it");
+    }
+    return isa;
+}
+
+constexpr HostNvfp4Kernels kAvx512Kernels{HostIsa::Avx512Vnni,
+                                          detail::avx512::quantize_blocks,
+                                          detail::avx512::quantize_bf16,
+                                          detail::avx512::quantize_blocks_a4,
+                                          detail::avx512::quantize_bf16_a4,
+                                          detail::avx512::rows_dot};
+constexpr HostNvfp4Kernels kAvx2Kernels{HostIsa::Avx2,
+                                        detail::avx2::quantize_blocks,
+                                        detail::avx2::quantize_bf16,
+                                        detail::avx2::quantize_blocks_a4,
+                                        detail::avx2::quantize_bf16_a4,
+                                        detail::avx2::rows_dot};
+
+const HostNvfp4Kernels& active_kernels() {
+    static const HostNvfp4Kernels& k = host_nvfp4_kernels(host_isa());
+    return k;
+}
+} // namespace
+
+HostIsa host_isa() {
+    static const HostIsa isa = select_host_isa();
+    return isa;
+}
+
+const HostNvfp4Kernels& host_nvfp4_kernels(HostIsa isa) {
+    if (!host_isa_supported(isa)) {
+        throw std::runtime_error(std::string("host expert kernels: this CPU does not run ") +
+                                 host_isa_name(isa));
+    }
+    return isa == HostIsa::Avx512Vnni ? kAvx512Kernels : kAvx2Kernels;
+}
+
+const HostNvfp4Kernels& host_nvfp4_kernels(std::optional<HostIsa> isa) {
+    return isa ? host_nvfp4_kernels(*isa) : active_kernels();
 }
 
 std::size_t Nvfp4Plane::payload_bytes(std::int64_t rows, std::int32_t k,
@@ -320,16 +416,16 @@ W4A8Activation W4A8ActivationBuffer::at(std::int32_t i) const noexcept {
             reinterpret_cast<std::uint8_t*>(qu_ + q_stride_ * n)};
 }
 
-void quantize_blocks(const float* x, std::int32_t block0, std::int32_t blocks, W4A8Activation a) {
+void detail::avx512::quantize_blocks(const float* x, std::int32_t block0, std::int32_t blocks,
+                                     W4A8Activation a) {
     quantize_blocks_impl(x, block0, blocks, a);
 }
 
-void quantize_bf16(const std::uint16_t* x, std::int32_t k, W4A8Activation a) {
+void detail::avx512::quantize_bf16(const std::uint16_t* x, std::int32_t k, W4A8Activation a) {
     quantize_bf16_impl(x, k, a);
 }
 
-namespace {
-float a4_e4m3_rn(float v) {
+float detail::a4_e4m3_rn(float v) noexcept {
     if (!(v > 0.0F)) return 0.0F;
     if (v >= 448.0F) return 448.0F;
     int ex = 0;
@@ -338,6 +434,9 @@ float a4_e4m3_rn(float v) {
     const float step   = std::ldexp(1.0F, exponent - 3);
     return std::min(std::nearbyint(v / step) * step, 448.0F);
 }
+
+namespace {
+using detail::a4_e4m3_rn;
 
 // 2 * e2m1_rn(v): ties to the even code, satfinite
 int a4_e2m1x2_rn(float v) {
@@ -376,6 +475,7 @@ void a4_block(const float* v, int b, float gs, W4A8Activation a) {
 }
 } // namespace
 
+namespace detail::avx512 {
 namespace {
 // T148: the same block in AVX-512 (bit-identical to a4_block; see a4_selftest).
 NINFER_HOST_AVX512 void a4_block_vec(__m512 v, int b, float gs, W4A8Activation a) {
@@ -493,6 +593,31 @@ void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n, const W4
     } else {
         rows_per_token(plane, r0, n, acts, tokens, out, ldo);
     }
+}
+} // namespace detail::avx512
+
+// ---------------------------------------------------------------- public (host_isa()) entry points
+void quantize_blocks(const float* x, std::int32_t block0, std::int32_t blocks, W4A8Activation a) {
+    active_kernels().quantize_blocks(x, block0, blocks, a);
+}
+
+void quantize_bf16(const std::uint16_t* x, std::int32_t k, W4A8Activation a) {
+    active_kernels().quantize_bf16(x, k, a);
+}
+
+void quantize_blocks_a4(const float* x, std::int32_t block0, std::int32_t blocks, float gs,
+                        W4A8Activation a) {
+    active_kernels().quantize_blocks_a4(x, block0, blocks, gs, a);
+}
+
+void quantize_bf16_a4(const std::uint16_t* x, std::int32_t k, float gs, W4A8Activation a) {
+    active_kernels().quantize_bf16_a4(x, k, gs, a);
+}
+
+void rows_dot(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n, const W4A8Activation* acts,
+              std::int32_t tokens, float* out, std::size_t ldo, DotKernel kernel,
+              std::int32_t prefetch_rows) {
+    active_kernels().rows_dot(plane, r0, n, acts, tokens, out, ldo, kernel, prefetch_rows);
 }
 
 } // namespace ninfer::ops::host

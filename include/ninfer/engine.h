@@ -80,6 +80,19 @@ public:
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
 
+    // The chat prompt of `input` (which must start in thinking and carry no media) followed by
+    // `appended` tokens, prepared to continue in content: tool declarations, cache identity and
+    // markers are those of the chat prompt. Used to close a reply that stopped inside thinking.
+    [[nodiscard]] PreparedPrompt prepare_continuation(PromptInput input,
+                                                      std::span<const TokenId> appended,
+                                                      const PreparationControl& control = {}) const;
+    [[nodiscard]] ReasoningGuardTokens reasoning_guard_tokens() const;
+    // Reasoning EOS guard (serve --reasoning-eos-guard): the first token of a reply that starts in
+    // thinking is never a terminal token. Process-wide; call before the first request.
+    void configure_reasoning_eos_guard(bool enabled);
+    // First tokens redrawn by the guard since the process started.
+    [[nodiscard]] std::uint64_t reasoning_eos_guard_replacements() const noexcept;
+
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added.
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     // Artifact-tokenizer decoding of token IDs to text, special tokens included.

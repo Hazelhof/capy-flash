@@ -59,6 +59,35 @@ void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                                 scratch, stream);
 }
 
+void replace_banned_token(Tensor& logits, Tensor& out, std::int32_t token_domain,
+                          const SamplingConfig* configs, const Tensor& logical_positions,
+                          std::int32_t banned0, std::int32_t banned1,
+                          unsigned long long* replacements, WorkspaceArena& workspace,
+                          cudaStream_t stream) {
+    if (logits.ne[1] != 1 || out.ne[0] != 1) {
+        throw std::invalid_argument("replace_banned_token: one row (B = 1) only");
+    }
+    if (banned0 >= token_domain || banned1 >= token_domain) {
+        throw std::invalid_argument("replace_banned_token: banned id outside the token domain");
+    }
+    if (banned0 < 0 && banned1 < 0) { return; }
+    auto scope   = workspace.scope();
+    Tensor flag  = workspace.alloc(DType::I32, {1});
+    Tensor alt   = workspace.alloc(DType::I32, {1});
+    static_assert(sizeof(SamplingConfig) % sizeof(std::int32_t) == 0);
+    Tensor copy = workspace.alloc(
+        DType::I32, {static_cast<std::int32_t>(sizeof(SamplingConfig) / sizeof(std::int32_t))});
+    auto* config_copy = static_cast<SamplingConfig*>(copy.data);
+    detail::banned_token_check_launch(logits, out, banned0, banned1, configs, config_copy,
+                                      static_cast<std::int32_t*>(flag.data), stream);
+    // Unconditional on the host (no synchronization): the commit keeps it only after a hit.
+    sample(logits, alt, token_domain, config_copy, logical_positions,
+           kSamplePurposeReasoningGuard, workspace, stream);
+    detail::banned_token_commit_launch(out, static_cast<const std::int32_t*>(alt.data),
+                                       static_cast<const std::int32_t*>(flag.data), configs,
+                                       replacements, stream);
+}
+
 void increment_token_counts(const Tensor& token_ids, Tensor& token_counts, cudaStream_t stream) {
     if (token_ids.dtype != DType::I32 || token_ids.ne[0] <= 0 || token_ids.ne[1] != 1 ||
         token_ids.ne[2] != 1 || token_ids.ne[3] != 1 || !token_ids.is_contiguous() ||

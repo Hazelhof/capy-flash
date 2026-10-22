@@ -22,6 +22,7 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 
 | Canonical name | Code width | Group size | Legal signed codes | Scale | Full-group logical bits/weight |
 |---|---:|---:|---:|---|---:|
+| `q3_g128_fp16` | 3 | 128 | `[-4, 3]` | one binary16 scale/group (may be negative, §6.1) | 3.125 |
 | `q4_g64_fp16` | 4 | 64 | `[-8, 7]` | one binary16 scale/group | 4.25 |
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
@@ -417,7 +418,12 @@ A valid scale is either:
 - positive zero, binary16 bit pattern `0x0000`; or
 - a finite positive binary16 normal or subnormal number.
 
-Negative finite values, negative zero, positive or negative infinity, and every NaN are invalid.
+Negative finite values, negative zero, positive or negative infinity, and every NaN are invalid,
+with one exception: a `q3_g128_fp16` scale may also be a finite negative binary16 number. Its code
+interval `[-4, 3]` is asymmetric, and the GSQ quantizer that produces this format (ISTA-DASLab
+3-bit GSQ checkpoints) chooses the side of the extra level per group through the sign of the
+multiplier; in the Qwen3.8-27B checkpoint about half of the 94.9 million body groups are negative.
+The reconstruction below is unchanged; kernels must not assume a nonnegative scale.
 Positive binary16 subnormals are valid; consumers must preserve their defined value. In particular,
 the minimum positive binary16 scale is `2^-24`, bit pattern `0x0001`.
 

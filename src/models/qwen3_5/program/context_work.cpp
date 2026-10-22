@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -212,14 +213,33 @@ detail::PhysicalResources checked_resource_sum(detail::PhysicalResources left,
 }
 
 detail::PhysicalResources checked_resource_difference(detail::PhysicalResources value,
-                                                      detail::PhysicalResources removed) {
-    if (removed.device.active_lanes > value.device.active_lanes ||
-        removed.device.state_slots > value.device.state_slots ||
-        removed.device.main_kv_pages > value.device.main_kv_pages ||
-        removed.device.backend_kv_pages > value.device.backend_kv_pages ||
-        removed.host.state_slots > value.host.state_slots ||
-        removed.host.kv_bytes > value.host.kv_bytes) {
-        throw std::logic_error("Qwen3.5 resource subtraction underflow");
+                                                      detail::PhysicalResources removed,
+                                                      const char* site) {
+    const auto underflow = [&](const char* dimension, std::uint64_t held, std::uint64_t taken) {
+        std::string message = "Qwen3.5 resource subtraction underflow";
+        if (site != nullptr) { message += std::string(" in ") + site; }
+        message += std::string(" (") + dimension + " " + std::to_string(held) + " - " +
+                   std::to_string(taken) + ")";
+        throw std::logic_error(message);
+    };
+    if (removed.device.active_lanes > value.device.active_lanes) {
+        underflow("active lanes", value.device.active_lanes, removed.device.active_lanes);
+    }
+    if (removed.device.state_slots > value.device.state_slots) {
+        underflow("Device StateImages", value.device.state_slots, removed.device.state_slots);
+    }
+    if (removed.device.main_kv_pages > value.device.main_kv_pages) {
+        underflow("Main KV pages", value.device.main_kv_pages, removed.device.main_kv_pages);
+    }
+    if (removed.device.backend_kv_pages > value.device.backend_kv_pages) {
+        underflow("Backend KV pages", value.device.backend_kv_pages,
+                  removed.device.backend_kv_pages);
+    }
+    if (removed.host.state_slots > value.host.state_slots) {
+        underflow("Host StateImages", value.host.state_slots, removed.host.state_slots);
+    }
+    if (removed.host.kv_bytes > value.host.kv_bytes) {
+        underflow("Host KV bytes", value.host.kv_bytes, removed.host.kv_bytes);
     }
     return detail::PhysicalResources{
         .device =

@@ -64,9 +64,28 @@ ninfer_add_op_test(ninfer_host_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_moe.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_host_nvfp4_isa_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_nvfp4_isa.cpp"
+  LIBRARIES ninfer_ops)
+# The whole host MoE test on the AVX2 kernels (skips where the CPU lacks AVX2).
+add_test(NAME ninfer_host_moe_avx2_test COMMAND ninfer_host_moe_test)
+set_tests_properties(ninfer_host_moe_avx2_test PROPERTIES ENVIRONMENT "NINFER_HOST_ISA=avx2")
+# No AVX/AVX2/AVX-512 instruction outside the cpuid-dispatched host kernels (the binary must start on
+# any x86-64 CPU; tools/check_host_isa.py). Scans the objects of the library build.
+add_test(NAME ninfer_host_isa_guard_test
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_host_isa.py ${CMAKE_BINARY_DIR}/src)
+
 ninfer_add_op_test(ninfer_host_moe_mailbox_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_moe_mailbox.cu"
   LIBRARIES ninfer_ops)
+
+# GGUF routed-expert Ops; real banks with NINFER_GGUF_BANKS, --bench for timings. The FP64 oracle
+# is host code of a .cu file: keep its host compiler from contracting.
+ninfer_add_op_test(ninfer_moe_slots_gguf_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_moe_slots_gguf.cu"
+  LIBRARIES ninfer_ops)
+target_compile_options(ninfer_moe_slots_gguf_test PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
 
 ninfer_add_op_test(ninfer_candidate_selector_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_candidate_selector.cpp"
@@ -192,3 +211,32 @@ target_link_libraries(t98_expert_probe PRIVATE ninfer_ops)
 add_executable(t103_bf16_generic "${CMAKE_CURRENT_LIST_DIR}/t103_bf16_generic.cu")
 ninfer_test_includes(t103_bf16_generic)
 target_link_libraries(t103_bf16_generic PRIVATE ninfer_ops)
+
+# GGUF host kernels (fngine port) against ggml reference code; real GSQ-RCO rows when
+# NINFER_GGUF_BANKS names a tools/convert/gguf_experts.py extract directory.
+ninfer_add_test(ninfer_host_gguf_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_gguf.cpp"
+  LIBRARIES ninfer_host_moe ninfer::json)
+set_tests_properties(ninfer_host_gguf_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_op_oracle_options(ninfer_host_gguf_test)
+
+# The host MoE executor on GGUF layers against an FP64 oracle (CPU only).
+ninfer_add_test(ninfer_host_moe_gguf_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_moe_gguf.cpp"
+  LIBRARIES ninfer_host_moe ninfer::json)
+set_tests_properties(ninfer_host_moe_gguf_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_op_oracle_options(ninfer_host_moe_gguf_test)
+
+# The same two GGUF tests on the AVX2 kernels (skip where the CPU lacks AVX2).
+add_test(NAME ninfer_host_gguf_avx2_test COMMAND ninfer_host_gguf_test)
+set_tests_properties(ninfer_host_gguf_avx2_test PROPERTIES ENVIRONMENT "NINFER_HOST_ISA=avx2" SKIP_RETURN_CODE 77)
+add_test(NAME ninfer_host_moe_gguf_avx2_test COMMAND ninfer_host_moe_gguf_test)
+set_tests_properties(ninfer_host_moe_gguf_avx2_test PROPERTIES ENVIRONMENT "NINFER_HOST_ISA=avx2" SKIP_RETURN_CODE 77)
+
+# AVX2 GGUF kernels against the AVX-512 ones, bit for bit (needs a CPU with both; real rows with
+# NINFER_GGUF_BANKS).
+ninfer_add_test(ninfer_host_gguf_isa_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_host_gguf_isa.cpp"
+  LIBRARIES ninfer_host_moe ninfer::json)
+set_tests_properties(ninfer_host_gguf_isa_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_op_oracle_options(ninfer_host_gguf_isa_test)

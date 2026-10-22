@@ -40,12 +40,9 @@ std::vector<ElasticRangeSpec> qwen4_elastic_ranges(const PersistentLayout& layou
     if (layout.decoder.mtp_kv) { add_pool(*layout.decoder.mtp_kv, step_pages, out); }
     const Qwen4PersistentLayout& q = *layout.qwen4;
     for (std::int32_t plane = 0; plane < 4; ++plane) {
-        const std::int64_t stride = execution::Qwen4OffloadExperts::plane_slot_bytes(plane);
-        const auto first          = static_cast<std::size_t>(
-            (static_cast<std::int64_t>(q.cache_layers) * q.expert_slots + q.staging_slots) *
-            stride);
-        const auto bytes      = static_cast<std::size_t>(static_cast<std::int64_t>(q.cache_layers) *
-                                                         q.elastic_columns * stride);
+        // The tail the planner laid out (uniform NVFP4 planes, or the GGUF arena's columns).
+        const auto first      = q.elastic_first[static_cast<std::size_t>(plane)];
+        const auto bytes      = q.elastic_bytes[static_cast<std::size_t>(plane)];
         const LayoutRegion& r = q.cache_pool[static_cast<std::size_t>(plane)];
         if (first + bytes > r.bytes) {
             throw std::logic_error("elastic KV: expert pool too small");

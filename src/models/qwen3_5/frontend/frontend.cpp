@@ -909,6 +909,46 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids,
     return PreparedPrompt(std::move(prepared));
 }
 
+PreparedPrompt Frontend::prepare_continuation(PromptInput input, std::span<const TokenId> appended,
+                                              const PreparationControl& control) const {
+    PreparedPrompt prompt = prepare(std::move(input), control);
+    PreparedPromptData& data = *prompt.data_;
+    if (data.has_media()) {
+        throw std::invalid_argument("reasoning continuation does not support media prompts");
+    }
+    if (!data.starts_in_reasoning) {
+        throw std::invalid_argument("reasoning continuation requires a prompt that starts in thinking");
+    }
+    if (appended.size() > impl_->max_context ||
+        data.token_ids.size() > impl_->max_context - appended.size()) {
+        throw_context_length_exceeded(impl_->max_context);
+    }
+    for (const TokenId token : appended) {
+        if (!impl_->tokenizer->is_valid_token(token)) {
+            throw std::out_of_range("continuation token is outside the checkpoint vocabulary: " +
+                                    std::to_string(token));
+        }
+    }
+    data.token_ids.insert(data.token_ids.end(), appended.begin(), appended.end());
+    assign_text_positions(data);
+    (void)checked_token_count(data.token_ids.size());
+    // The appended tokens are the reply so far plus the closing suffix: decoding resumes in
+    // content, where the tool-call contract of the chat prompt still applies.
+    data.starts_in_reasoning = false;
+    return prompt;
+}
+
+ReasoningGuardTokens Frontend::reasoning_guard_tokens() const {
+    if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
+    ReasoningGuardTokens tokens;
+    // The bare canonical close, not the thinking-budget message: the reply chose to stop, it was not
+    // cut short.
+    tokens.close_suffix   = impl_->tokenizer->encode(fi::kCanonicalReasoningCloseSerialization);
+    tokens.stop_token_ids = impl_->defaults.token_ids;
+    tokens.think_close    = impl_->tokenizer->encode(kThinkClose);
+    return tokens;
+}
+
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
     if (impl_ == nullptr) { throw std::logic_error("frontend is empty"); }
     return impl_->tokenizer->encode(text);

@@ -11,6 +11,7 @@
 
 #include "models/qwen3_5/execution/qwen4_forward.h"
 #include "models/qwen3_5/execution/qwen4_draft_head.h"
+#include "models/qwen3_5/execution/reasoning_eos_guard.h"
 #include "models/qwen3_5/execution/tp.h"
 #include "models/qwen3_5/execution/tp2/workspace_split.h"
 #include "models/qwen3_5/execution/vision.h"
@@ -417,6 +418,11 @@ PrefillChunkResult TextContext::qwen4_prefill(std::span<const int> ids,
                     ops::sample(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count),
                                 sampling_config_, io_.pos, ops::kSamplePurposePrefill, work_, s);
+                    if (reasoning_eos_guard_applies(prompt)) {
+                        guard_first_token(logits, io_.token,
+                                          dimension(parameters_.model.resources().public_token_count),
+                                          sampling_config_, io_.pos, work_, s);
+                    }
                 } else {
                     ops::argmax(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count), s);
@@ -1178,6 +1184,11 @@ PrefillChunkResult TextContext::qwen4_prefill_tp2(std::span<const int> ids,
                 ops::sample(logits, io_.token,
                             dimension(parameters_.model.resources().public_token_count),
                             sampling_config_, io_.pos, ops::kSamplePurposePrefill, work_, s);
+                if (reasoning_eos_guard_applies(prompt)) {
+                    guard_first_token(logits, io_.token,
+                                      dimension(parameters_.model.resources().public_token_count),
+                                      sampling_config_, io_.pos, work_, s);
+                }
             } else {
                 ops::argmax(logits, io_.token,
                             dimension(parameters_.model.resources().public_token_count), s);

@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
+#include "models/qwen3_5/execution/reasoning_eos_guard.h"
 #include "core/device.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
@@ -184,7 +185,7 @@ void mtp_bridge_multimodal(PrefillContext& state, const PreparedPromptData& prom
 }
 
 void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_t absolute_position,
-                        std::int32_t purpose, const Tensor* peer_hidden) {
+                        std::int32_t purpose, const Tensor* peer_hidden, bool reasoning_guard) {
     const TextConfig& config = state.execution.parameters.model.config().text;
     // Qwen4Exp retains the wide residual (T66b: a zero-suffix hit of this architecture).
     const std::int32_t rows =
@@ -216,6 +217,12 @@ void sample_from_hidden(PrefillContext& state, const Tensor& hidden, std::int32_
                 dimension(state.execution.parameters.model.resources().public_token_count),
                 state.sampling, state.execution.io.pos, purpose, state.execution.work,
                 state.execution.device.stream);
+    if (reasoning_guard) {
+        guard_first_token(logits, state.execution.io.token,
+                          dimension(state.execution.parameters.model.resources().public_token_count),
+                          state.sampling, state.execution.io.pos, state.execution.work,
+                          state.execution.device.stream);
+    }
     state.execution.work.reset();
     if (state.execution.tp != nullptr) { state.execution.tp->work->reset(); }
 }
@@ -1347,10 +1354,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
             const Tensor peer_sample_hidden =
                 peer_retains_hidden() ? peer_tail_hidden(sequence) : Tensor{};
-            execution::sample_from_hidden(schedule_state, sequence.tail_hidden,
-                                          checked_i32(staged.prompt_tokens, "sample position"),
-                                          ops::kSamplePurposePrefill,
-                                          peer_retains_hidden() ? &peer_sample_hidden : nullptr);
+            execution::sample_from_hidden(
+                schedule_state, sequence.tail_hidden,
+                checked_i32(staged.prompt_tokens, "sample position"), ops::kSamplePurposePrefill,
+                peer_retains_hidden() ? &peer_sample_hidden : nullptr,
+                execution::reasoning_eos_guard_applies(staged.prompt.token_ids));
             set_device_i32(io.rope_pos, checked_i32(staged.prompt_tokens, "rope position") +
                                             sequence.rope_delta);
             if (staged.prepare_mtp) {

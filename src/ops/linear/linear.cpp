@@ -5,6 +5,8 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/mxfp8/mxfp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/q3/q3_arena.h"
+#include "ops/linear/q3/q3_linear.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
@@ -82,6 +84,13 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     switch (w.qtype) {
+    case QType::Q3_G128_FP16: {
+        // v0.7: A16 for T < 64; prefill widths take the A8 route when it is enabled
+        // (NINFER_Q3_A8), with its activation scratch from the caller workspace.
+        const detail::Q3ArenaWorkspace q3ws(workspace, w.k, x.ne[1]);
+        detail::q3_linear_dispatch(x, w, out, stream, q3ws.get());
+        return;
+    }
     case QType::Q4_G64_FP16:
         detail::q4_dispatch(x, w, out, policy, stream);
         return;
@@ -124,6 +133,11 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     }
 
     switch (qtype) {
+    case QType::Q3_G128_FP16:
+        if (input_rows % 128 != 0) {
+            throw std::invalid_argument("linear workspace: Q3 needs K a multiple of 128");
+        }
+        return detail::q3_workspace_bytes(input_rows, max_tokens);
     case QType::Q4_G64_FP16:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q4_launch(output_rows, input_rows, max_tokens, policy);

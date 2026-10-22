@@ -6,6 +6,8 @@
 // header. Our file; see docs/maintainer/upstream-merge.md.
 
 #include "models/qwen3_5/execution/tp2/workspace_split.h"
+#include "models/qwen3_5/execution/tp2/prefill_slices.h"
+#include "models/qwen3_5/program/tp2/eager_transport.h"
 
 #include <chrono>
 #include <cstdlib>
@@ -93,6 +95,10 @@ ProgramImpl::PeerRuntime::PeerRuntime(DeviceContext& peer_device, const Sequence
                     static_cast<std::int32_t*>(q1.cache_mirror->bind(backing).data);
             }
             qwen4_cache_reads = static_cast<std::int32_t*>(q1.cache_reads->bind(backing).data);
+            if (q1.cache_slot_offsets) {
+                qwen4_slot_offsets =
+                    static_cast<std::int64_t*>(q1.cache_slot_offsets->bind(backing).data);
+            }
             if (q1.stage_table) {
                 qwen4_stage_table = static_cast<std::int32_t*>(q1.stage_table->bind(backing).data);
                 qwen4_stage_picks = static_cast<std::int32_t*>(q1.stage_picks->bind(backing).data);
@@ -191,13 +197,49 @@ void ProgramImpl::construct_tensor_parallel(const SequencePlanImpl& plan,
             // lent workspace is VMM memory the peer pull cannot read (T64/T68; startup.cpp keeps
             // the lending on that assumption). NINFER_TP_HOST_EXCHANGE=0 / =1 force either way.
             // enable_peer_access() only reports here: the Engine enabled it already, idempotently.
+            // v07/p2p-overlap: with peer access and no HostExchange, the 27B prefill overlap's
+            // split-phase sums take ops::PeerLanes (the direct copy on a side stream per rank)
+            // instead of falling back to one call per chunk; NINFER_TP_PEER_OVERLAP=0 keeps the
+            // one-call schedule, =force attaches the lanes without P2P too (correctness test).
+            // The decision table is eager_transport.h (unit-tested on the host).
             const char* host_exchange_env = std::getenv("NINFER_TP_HOST_EXCHANGE");
-            const std::string_view forced = host_exchange_env ? host_exchange_env : "";
-            const bool host_exchange_auto =
-                !ops::enable_peer_access(*execution_context) || plan.elastic_kv.enabled;
-            if (forced != "0" && (forced == "1" || host_exchange_auto)) {
+            const char* peer_overlap_env  = std::getenv("NINFER_TP_PEER_OVERLAP");
+            const bool peer_access        = ops::enable_peer_access(*execution_context);
+            const Tp2EagerTransport eager = tp2_eager_transport(
+                peer_access, plan.elastic_kv.enabled, host_exchange_env ? host_exchange_env : "",
+                peer_overlap_env ? peer_overlap_env : "");
+            if (eager.host_exchange) {
                 host_exchange.emplace(*execution_context);
                 peer_events->attach_host_exchange(&*host_exchange);
+            }
+            if (eager.peer_lanes) {
+                peer_lanes.emplace(*execution_context, eager.peer_lanes_direct);
+                peer_events->attach_peer_lanes(&*peer_lanes);
+            }
+            tp_transport_status.eager_transport = eager.host_exchange ? "pinned host exchange"
+                                                  : peer_access       ? "direct peer copies"
+                                                                      : "driver-staged copies";
+            if (!parameters.model.config().text.qwen4()) {
+                const char* overlap_env = std::getenv("NINFER_TP_PREFILL_OVERLAP");
+                tp_transport_status.prefill_overlap =
+                    overlap_env != nullptr && std::string_view(overlap_env) == "0"
+                        ? "off (NINFER_TP_PREFILL_OVERLAP=0)"
+                    : eager.peer_lanes
+                        ? (eager.peer_lanes_direct ? "direct peer lanes"
+                                                   : "driver-staged peer lanes (test only)")
+                    : eager.host_exchange ? "pinned host lanes"
+                                          : "off (one call per chunk)";
+                // v07/prefill-slices: whether chunks the halves do not take run sliced.
+                const bool overlap_off =
+                    overlap_env != nullptr && std::string_view(overlap_env) == "0";
+                if (!overlap_off && (eager.peer_lanes || eager.host_exchange)) {
+                    const char* slices_env = std::getenv("NINFER_TP_PREFILL_SLICES");
+                    const auto mode = execution::prefill_slices_mode(slices_env ? slices_env : "");
+                    tp_transport_status.prefill_overlap +=
+                        mode == execution::PrefillSlicesMode::Force ? " + slices (force)"
+                        : mode == execution::PrefillSlicesMode::Auto ? " + slices"
+                                                                     : " (slices off)";
+                }
             }
             if (use_cuda_graph) {
                 graph_bridge.emplace(execution_context->dev[0]->device,

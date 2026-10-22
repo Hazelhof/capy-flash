@@ -321,6 +321,10 @@ private:
     std::int64_t dump_pending_       = -1; // byte offset of the last record's echo block, or -1
     std::int32_t dump_pending_layer_ = 0, dump_pending_tokens_ = 0;
     float* echo_ = nullptr; // mapped [layers][kHostMaxTokens * hidden]
+    // NINFER_HOST_MOE_EARLY_PARTIAL=1 (v07/decode-overheads B): decode accumulates load the host
+    // partial together with the active word (one PCIe round trip instead of two); read when the
+    // accumulates are captured.
+    bool early_partial_ = false;
 };
 
 } // namespace ninfer::ops::host

@@ -1,6 +1,11 @@
 #pragma once
 
-// NVFP4 W4A8 row dots on the host CPU (AVX-512 VNNI) over block_scale_k16_m128x4_v1 planes.
+// NVFP4 W4A8 row dots on the host CPU over block_scale_k16_m128x4_v1 planes, in two instruction
+// sets chosen at run time (HostIsa): AVX-512 F/BW/VL/VNNI and AVX2 + FMA + F16C (Zen 2/3, Intel
+// client cores without AVX-512). Both compute the same integer block sums and apply the same FP32
+// operations to the same 16 lanes in the same order (the AVX2 kernels keep each 512-bit lane set as
+// two 256-bit halves and reduce them as _mm512_reduce_add_ps does), so their results are identical
+// bit for bit (tests/ops/test_host_nvfp4_isa.cpp).
 //
 // Weights: E2M1 codes with one E4M3FN scale per 16 K elements and one FP32 divisor per stacked
 // source matrix (docs/maintainer/storage-layouts.md section 4): w = e2m1 * e4m3 / divisor.
@@ -21,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace ninfer::ops::host {
 
@@ -104,8 +110,42 @@ private:
 
 enum class DotKernel { PerToken, MultiToken };
 
-// True when the CPU runs AVX-512 F/BW/VL/VNNI (required by every function below).
+// Instruction set of the host expert kernels.
+enum class HostIsa : std::uint8_t {
+    Avx2,       // AVX2 + FMA + F16C (Haswell / Zen 1 and later)
+    Avx512Vnni, // AVX-512 F/BW/VL/VNNI + AVX2 + FMA (Ice Lake / Zen 4 and later)
+};
+
+// True when the CPU (and the OS: cpuid + xgetbv) runs `isa`.
+[[nodiscard]] bool host_isa_supported(HostIsa isa) noexcept;
+// True when the CPU runs one of the ISAs (AVX2 + FMA + F16C at least).
+[[nodiscard]] bool host_experts_supported() noexcept;
+// True when the CPU runs AVX-512 F/BW/VL/VNNI.
 [[nodiscard]] bool host_avx512_vnni_supported() noexcept;
+// The ISA of the functions below and of the executor: the widest the CPU runs, or the one named by
+// NINFER_HOST_ISA (avx2 | avx512 | auto), read once. Throws std::runtime_error when the CPU runs
+// none, when NINFER_HOST_ISA names one it lacks, or names none of these.
+[[nodiscard]] HostIsa host_isa();
+[[nodiscard]] const char* host_isa_name(HostIsa isa) noexcept;
+
+// The kernels of one ISA (the free functions below are those of host_isa()).
+struct HostNvfp4Kernels {
+    HostIsa isa;
+    void (*quantize_blocks)(const float* x, std::int32_t block0, std::int32_t blocks,
+                            W4A8Activation a);
+    void (*quantize_bf16)(const std::uint16_t* x, std::int32_t k, W4A8Activation a);
+    void (*quantize_blocks_a4)(const float* x, std::int32_t block0, std::int32_t blocks, float gs,
+                               W4A8Activation a);
+    void (*quantize_bf16_a4)(const std::uint16_t* x, std::int32_t k, float gs, W4A8Activation a);
+    void (*rows_dot)(const Nvfp4Plane& plane, std::int64_t r0, std::int32_t n,
+                     const W4A8Activation* acts, std::int32_t tokens, float* out, std::size_t ldo,
+                     DotKernel kernel, std::int32_t prefetch_rows);
+};
+
+// Throws std::runtime_error when the CPU does not run `isa`.
+[[nodiscard]] const HostNvfp4Kernels& host_nvfp4_kernels(HostIsa isa);
+// host_nvfp4_kernels(isa ? *isa : host_isa()).
+[[nodiscard]] const HostNvfp4Kernels& host_nvfp4_kernels(std::optional<HostIsa> isa = {});
 
 // Quantizes blocks [block0, block0 + blocks) of `a` from FP32 x (x[0] is element 16*block0).
 void quantize_blocks(const float* x, std::int32_t block0, std::int32_t blocks, W4A8Activation a);

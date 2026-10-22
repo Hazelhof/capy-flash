@@ -61,6 +61,18 @@ from the following works, each licensed under the Apache License, Version 2.0:
     mapped mailbox with cuStreamWriteValue32/cuStreamWaitValue32 inside the
     captured graph, here ported to NVFP4 W4A8 with a pinned pool.
 
+src/ops/sparse_moe/host/host_nvfp4_avx2.cpp (the AVX2 forms of the NVFP4 dots)
+follows the AVX2 NVFP4 row kernel of the following project, licensed under the
+MIT License:
+
+  * Niko1221 and the Strata contributors -- https://github.com/Niko1221/Strata
+    Copyright (c) 2026 Niko1221 and the Strata contributors.
+    src/kernels/cpu/nvfp4_avx2.cpp (commit f57c0ad): two nibble lookups per 16
+    code bytes rebuilt into element order with 64-bit unpacks, the
+    vpsignb + vpmaddubsw + vpmaddwd integer dot and the per-half broadcast of
+    the sub-block scales (no gathers). This tree keeps the lane order and the
+    operation order of its AVX-512 kernels so that both give identical bits.
+
 Agentic A/B benchmark: prior work
 ---------------------------------
 bench/agentic_ab/ (workload.py, runner.py, analyze.py, build_control.bat and the
@@ -167,3 +179,48 @@ MTP draft refit
 tools/mtp_refit/mtp_model.py follows the structure of tools/mtp_refit/mtp_ref.py in
   * Ciprian Ursu -- https://github.com/ursuciprian/qwen3.8-flash-next-dgx-spark-tp-2
     Licensed under the Apache License, Version 2.0.
+
+GGUF routed-expert formats and host kernels: prior work
+-------------------------------------------------------
+third_party/ggml-iq/ is ggml's reference code for the block formats of the GSQ-RCO
+expert banks (block definitions, grids and sign tables, dequantizers, the Q8_0/Q8_K
+reference quantizers and the generic dot products) from ggml commit
+3cf03257f219afbe7334045ff7c6a06ac68c627d, as extracted by fngine (below):
+  * The ggml authors -- https://github.com/ggml-org/llama.cpp
+    Copyright (c) 2023-2026 The ggml authors. MIT License (third_party/ggml-iq/LICENSE).
+
+src/ops/sparse_moe/host/host_gguf.{h,cpp} and host_q8.{h,cpp} derive from:
+  * satellitedown -- https://github.com/satellitedown/fngine (commit c20a885)
+    Licensed under the Apache License, Version 2.0; its CPU i-quant kernel files
+    (src/cpu/iq_cpu.{h,cpp}, here host_gguf.{h,cpp}) are SPDX MIT as derivatives of
+    ggml-cpu/arch/x86/quants.c. The AVX-512 VNNI/VBMI/BITALG decode-once kernels for
+    IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and Q2_0 and the Q8_K/Q8_0 quantizers that
+    are bit-identical to ggml's reference.
+
+src/ops/moe_slots_gguf/ (the GPU Ops moe_slots_gguf and moe_grouped_gguf) derives from
+the same fngine commit:
+  * iq_device.cuh from src/kernels/moe/iq_device.cuh: device block structs, the
+    dp4a sub-block decode (from ggml-cuda/vecdotq.cuh), the exact 8-element
+    dequantization (from ggml-quants.c dequantize_row_*) and the q8_1-style activation
+    quantizer (from ggml-cuda/quantize.cu); SPDX MIT for the ggml portions, ggml commit
+    3cf03257f219afbe7334045ff7c6a06ac68c627d (The ggml authors, MIT License);
+  * decode_kernels.cu from src/kernels/moe/moe_decode.cu (hot-expert gate/up and down
+    GEMV kernels) and grouped_kernels.cu from src/kernels/moe/moe_grouped_gemm.cu and
+    src/kernels/moe/moe_prefill.cu (BF16-dequant mma grouped GEMMs, per-expert grouping);
+    Apache License, Version 2.0. The routing/work-list, merge and launch code is
+    rewritten for this tree's Op interface; each file lists its changes.
+
+The gguf_* numeric format names and ids and the gguf_blocks_v1 layout
+(tools/artifact/formats.py, layouts.py) follow:
+  * iamwavecut -- https://github.com/iamwavecut/ninfer-all (commit 5ed86df)
+    Licensed under the Apache License, Version 2.0.
+
+The 3-bit GSQ path of Qwen3.8-27B (q3_g128_fp16: tools/convert/qwen3_8_27b/, the
+official recipe qwen3_8_27b_gsq3 and src/ops/linear/q3/) follows the work of:
+  * roofkid -- https://github.com/roofkid/ninfer-4080
+    Licensed under the Apache License, Version 2.0. The Q3G128_F16S code layout (signed
+    codes, 48 bytes per 128-code group, FP16 group scale) and the design of the small-T
+    tensor-core and staged GEMV routes; this tree's kernels keep the codes exact and
+    apply the multiplier in FP32 (see the comments in q3_linear.cu).
+  * The weights are ISTA-DASLab's Qwen3.8-27B-3Bit-GSQ
+    (https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-3Bit-GSQ), imported verbatim.

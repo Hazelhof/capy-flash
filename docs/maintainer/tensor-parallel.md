@@ -265,6 +265,23 @@ that every launch runs on both devices (an eager call would spin without a partn
 and the one-sided pulls (logits, acceptance results, draft tokens, Vision embeddings) are copies by
 nature. With direct P2P the staged path is a direct copy, so the Engine keeps it there.
 
+Eager calls (every prefill and warmup) are never captured, so `construct_tensor_parallel` gives
+them their own split transport for the prefill overlap, chosen once from peer access and
+`--elastic` ([`eager_transport.h`](../../src/models/qwen3_5/program/tp2/eager_transport.h)):
+`ops::HostExchange` (pinned-host lanes, T56) without P2P or with `--elastic` (the lent workspace is
+VMM memory a UVA pull cannot read); `ops::PeerLanes` with P2P: at `sum_begin` both ranks record
+their operand complete, a side stream per rank waits on both and pulls the peer's operand
+device-to-device, and `sum_finish` orders the main stream after both pulls and combines with the
+one-call `residual_add`, so the pull overlaps the peer's remaining GEMM with the bits of one call.
+One rule per prefill chunk: a text chunk of at least 768 tokens without a batched-feature tap runs
+the half-chunk overlap (lanes 0 and 1); a shorter, multimodal or batched-tap chunk runs the column
+slices (`NINFER_TP_PREFILL_SLICES`, one lane per slice, up to eight); with no split transport
+(`NINFER_TP_PEER_OVERLAP=0` with P2P, `NINFER_TP_HOST_EXCHANGE=0` without) or
+`NINFER_TP_PREFILL_OVERLAP=0` the chunk runs one call per all-reduce. PR #15 (tzolkincz) measured
+the same lane choreography (`DirectExchange` there) on 2x RTX 5070 Ti with the P2P driver patch:
+27B cold prefill 4k/16k/64k +45/+45/+29 % over the one-call copies and +41/+33/+20 % over host
+staging at stock clocks (chunk 2048).
+
 ### 4.4 Startup probe
 
 Right after creating the mailbox, before any decode graph is captured,

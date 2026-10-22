@@ -6,6 +6,7 @@
 #include "core/startup.h"
 #include "core/device.h"
 #include "core/device_scope.h"
+#include "core/expert_cache.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/target_logprobs.h"
@@ -543,6 +544,7 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
             offload_peer->stage_table   = peer->qwen4_stage_table;
             offload_peer->picks         = peer->qwen4_stage_picks;
             offload_peer->staging       = peer->qwen4_staging;
+            offload_peer->slot_offsets  = peer->qwen4_slot_offsets;
         }
         if (q.expert_slots <= 0 ||
             q.cache_layers !=
@@ -560,6 +562,10 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         memory.divisors = static_cast<float*>(q.cache_divisors->bind(backing).data);
         memory.identity = static_cast<std::int32_t*>(table.data);
         memory.reads    = static_cast<std::int32_t*>(q.cache_reads->bind(backing).data);
+        if (q.cache_slot_offsets) {
+            memory.slot_offsets =
+                static_cast<std::int64_t*>(q.cache_slot_offsets->bind(backing).data);
+        }
         if (q.cache_mirror) {
             memory.mirror = static_cast<std::int32_t*>(q.cache_mirror->bind(backing).data);
         }
@@ -597,6 +603,8 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         options.split_staged         = split.mode != MissSplitMode::Off && split.staged;
         options.split_on_peer        = offload_peer.has_value() && split.peer_share;
         options.stream_min_tokens = static_cast<std::int32_t>(plan.qwen4_experts.stream_min_tokens);
+        options.gguf_stream_min_tokens =
+            static_cast<std::int32_t>(plan.qwen4_experts.gguf_stream_min_tokens);
         options.stream_ring_slots = static_cast<std::int32_t>(plan.qwen4_experts.stream_ring_slots);
         options.stream_cpu_tail   = plan.qwen4_experts.stream_cpu_tail;
         options.stream_cpu_max_tokens =
@@ -647,6 +655,25 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         qwen4_expert_slots      = static_cast<std::uint32_t>(q.expert_slots);
         qwen4_expert_pool_bytes = q.cache_pool_bytes;
     } else {
+        // The mapped backend has every expert kernel read its bank in place: v0.7's pageable
+        // fallback banks (--host-pinned-max-gib, or a refused page-locked allocation) cannot.
+        const auto pinned = [](const execution::Qwen4ExpertBank& bank) {
+            const ops::MoeSlotPool& b = bank.bank;
+            return expert_cache::pinned_host_memory(b.gate_up_codes.base) &&
+                   expert_cache::pinned_host_memory(b.gate_up_scales.base) &&
+                   expert_cache::pinned_host_memory(b.down_codes.base) &&
+                   expert_cache::pinned_host_memory(b.down_scales.base);
+        };
+        bool all_pinned = !mtp || pinned(*qwen4_mtp_bank);
+        for (const auto& layer : parameters.qwen4->layers) {
+            all_pinned = all_pinned && pinned(layer.moe.experts);
+        }
+        if (!all_pinned) {
+            throw std::invalid_argument(
+                "the mapped expert backend reads every expert bank in place from page-locked "
+                "memory, and part of the banks is in pageable memory (page-locked limit); use "
+                "the offload backend");
+        }
         qwen4_experts = std::make_unique<execution::Qwen4MappedExperts>(table);
     }
     if (use_cuda_graph && !qwen4_experts->graph_capturable()) {

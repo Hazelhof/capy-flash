@@ -709,8 +709,8 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
 int main() {
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
-        !host_avx512_vnni_supported()) {
-        std::printf("SKIP: needs a CUDA device and AVX-512 VNNI\n");
+        !host_experts_supported()) {
+        std::printf("SKIP: needs a CUDA device and AVX2 + FMA + F16C\n");
         return 77;
     }
     CK(cudaSetDevice(0));

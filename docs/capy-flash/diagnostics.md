@@ -39,13 +39,14 @@ residency (`NINFER_QWEN4_EXPERT_FREEZE`, see below).
 | variable | values (default) | effect | class | results | scope |
 |---|---|---|---|---|---|
 | `NINFER_HOST_MOE_A4` | `0` / unset (on, since v0.5.0) | The CPU expert path uses the GPU kernel's W4A4 activation codec and its BF16 roundings of gate/up and h, instead of int8 activations (W4A8). Removes the CPU/GPU mix that changed answers with residency (T98). AVX-512 implementation at no measurable cost (T148). **On by default since v0.2.1; keep it on.** | production | numerics | capy |
+| `NINFER_HOST_ISA` | `auto` (default), `avx2`, `avx512` | Instruction set of the CPU expert kernels: `auto` takes AVX-512 VNNI where the CPU has it, else AVX2 + FMA + F16C; `avx2` forces the AVX2 kernels on an AVX-512 CPU (to test them); a value the CPU cannot run stops the server at startup. The log line `qwen4 experts: host expert kernels …` names the choice. Both compute identical bits (`ninfer_host_nvfp4_isa_test`); only speed differs. | performance | timing | capy |
 | `NINFER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked host weights (64.6 GiB for Flash-Next) + max(2 GiB, 5 % of MemTotal). Otherwise the server refuses to start and prints the numbers. `0` skips the check (T156). | production | none | capy |
 | `NINFER_CUDA_SYNC` | `spin` (default), `blocking`, `yield`, `auto` | CUDA device synchronization schedule ([cli.md](../cli.md#cuda-synchronization)). | performance | timing (host CPU use) | ninfer |
 
 `CUDA_VISIBLE_DEVICES=0,1` in the serve line is the standard CUDA variable, not an engine setting.
 
 About A4: the source describes the two paths as matching ("CPU ≈ GPU numerics"), and the README calls them
-numerically identical. Tests check the AVX-512 A4 code against the scalar A4 code bit for bit
+numerically identical. Tests check the AVX-512 and AVX2 A4 code against scalar A4 code bit for bit
 (`NINFER_HOST_A4_SELFTEST`). No test in the tree compares CPU-A4 output with GPU output bit for bit, and summation
 order differs between the two.
 
@@ -107,6 +108,8 @@ equivalent transports.
 | `NINFER_TP_AR_PIPE` | `1` / unset | `1` uses the pipelined exchange even with an FP32 payload and no groups. | performance | timing | capy |
 | `NINFER_TP_MIX` | FP32 partials (default since T138), `bf16` | Attention/GDN output exchange: FP32 partials (FP16 transport in prefill, FP32 in decode, one BF16 rounding as at 1 GPU), or the older BF16 partials (T128c, T138). | legacy A/B | numerics | capy |
 | `NINFER_TP_HOST_EXCHANGE` | auto (default), `0`, `1` | Eager (prefill) exchanges go through pinned host buffers asynchronously (T56). Auto: on without P2P or with `--elastic`, off with P2P (direct peer copy, faster: issue #3); `0` / `1` force it. `0` brings back the driver-staged peer pull, which blocks per call and is unstable on closely spaced calls (T65). With `--elastic` at TP2, `0` also turns off prompt-workspace borrowing, and from the code path the T62 grouped/narrow exchange is not used. | legacy A/B | timing; prefill exchange precision | capy (generic TP2 code) |
+| `NINFER_TP_PEER_OVERLAP` | auto (default), `0`, `force` | Transport of the 27B prefill overlap's split-phase all-reduces on P2P boards: `ops::PeerLanes` pull the peer's operand device-to-device on a side stream per rank, so the pull overlaps the remaining compute (attached with P2P when no HostExchange is; issue #3, PR #15). `0` keeps one call per chunk (the no-overlap A/B arm); `force` attaches the lanes without P2P too, driver-staged and host-ordered (a bit test, no overlap). | performance | same bits | capy (generic TP2 code) |
+| `NINFER_TP_PREFILL_SLICES` | auto (default), `0`, `force` | Prefill chunks the half-chunk overlap cannot take (under 768 tokens, multimodal, batched-feature taps) run their row-parallel all-reduces in up to eight column slices, slice s on lane s of the split transport (HostExchange or PeerLanes), so each slice's exchange overlaps the later slices' compute. `0` off; `force` slices every chunk (bit test). `NINFER_TP_PREFILL_SLICE_TOKENS` fixes the width (a multiple of 128). `NINFER_TP_PREFILL_OVERLAP=0` turns off both overlaps. | performance | same bits | capy |
 | `NINFER_QWEN4_REWRITE_SPLITS` | `1` / unset (off) | `1` splits the prefill at every rewrite frontier, not only at capture frontiers: much slower on multi-turn prompts (T66). | legacy A/B | numerics (chunking) and timing | capy |
 
 ## 5. Diagnostics: observation (dumps, logs, probes)

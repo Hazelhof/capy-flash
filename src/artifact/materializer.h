@@ -45,6 +45,11 @@ struct HostMappedPlacement {
     std::uint64_t offset    = 0;
     std::uint64_t bytes     = 0;
     std::uint64_t alignment = 256;
+    // v0.7 pinned fallback (artifact/host_residency.h): 0 = must stay in the mapped page-locked
+    // allocation (a kernel reads it in place); k > 0 = may move to pageable host memory when the
+    // page-locked allocation cannot hold every parent, lower k kept pinned first. Set by the
+    // model's load plan; the binder leaves 0.
+    std::uint32_t pageable_rank = 0;
 };
 
 struct MaterializationPlan {
@@ -61,6 +66,10 @@ struct MaterializationPlan {
     // Object order. Not part of any device capacity: one allocation of host_mapped_bytes.
     std::vector<HostMappedPlacement> host_mapped_objects;
     std::uint64_t host_mapped_bytes = 0;
+    // Most bytes of the host-mapped parents to keep page-locked; 0 = no limit (the
+    // NINFER_HOST_PINNED_MAX_GIB environment variable may still set one). Above it, or when the
+    // whole page-locked allocation fails, parents with pageable_rank > 0 move to pageable memory.
+    std::uint64_t host_pinned_limit_bytes = 0;
     // Residency::HostFile objects, mapped read-only from their files (object order).
     std::vector<ObjectHandle> file_objects;
 };
@@ -88,6 +97,15 @@ struct MaterializationStats {
     // the bytes of those parents each device reads in place from it.
     std::uint64_t host_mapped_bytes = 0;
     std::array<std::uint64_t, kMaximumDevices> per_device_host_mapped_bytes{};
+    // v0.7 pinned fallback: the HostMapped parents placed in pageable host memory instead (their
+    // allocation with alignment, and how many); 0 when the pinned allocation holds them all.
+    std::uint64_t host_pageable_bytes  = 0;
+    std::size_t host_pageable_objects  = 0;
+    std::size_t host_mapped_objects    = 0; // every HostMapped parent, pinned or pageable
+    // The page-locked limit in force (0 = none) and whether the full allocation was tried and
+    // failed first.
+    std::uint64_t host_pinned_limit_bytes = 0;
+    bool host_pinned_alloc_failed         = false;
     // Bytes of the Residency::HostFile objects, mapped and never read at load.
     std::uint64_t mapped_file_bytes = 0;
 };
@@ -157,6 +175,8 @@ private:
     std::array<std::unique_ptr<DeviceArena>, kMaximumDevices> arenas_;
     // The HostMapped parents' bytes; every device's parent of such an object points into it.
     std::unique_ptr<PinnedHostBuffer> host_mapped_;
+    // v0.7 pinned fallback: the HostMapped parents that did not fit the page-locked allocation.
+    std::unique_ptr<PageableHostBuffer> host_pageable_;
     std::vector<std::unique_ptr<FileMapping>> mappings_;
     std::vector<ObjectStorage> objects_;
     MaterializationStats stats_;

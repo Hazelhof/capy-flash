@@ -60,7 +60,17 @@ struct ServeOptions {
     bool use_cuda_graph     = true;
     bool tp_mailbox         = true;
     bool embedding_host     = false; // token embedding table in mapped pinned host memory
+    // Page-locked limit of the host-mapped weights (--host-pinned-max-gib); 0 = none.
+    std::uint64_t host_pinned_max_bytes = 0;
     bool allow_prefix_reuse = true;
+    // --reasoning-close-retry (on by default since v0.7, every model; --no-reasoning-close-retry): a reply that ends with the model's
+    // terminal token inside its thinking (or right after "</think>" with blank content and no tool
+    // call) is closed with "\n</think>\n\n" and continued once (serve/reasoning_retry.h).
+    bool reasoning_close_retry = true;
+    // --reasoning-eos-guard (on by default since v0.7, every model; --no-reasoning-eos-guard): the first token of a reply that starts in
+    // thinking is never a terminal token; a terminal draw is redrawn without the terminal ids
+    // (models/qwen3_5/execution/reasoning_eos_guard.h). Token-identical when it does not fire.
+    bool reasoning_eos_guard = true;
     // Private long-anchor opportunities at the message boundaries before the final message: the
     // last N of them (0 disables). They keep a checkpoint at the point where a cancelled or edited
     // turn branches from the conversation; see to_prompt_input.
@@ -78,6 +88,9 @@ struct ServeOptions {
     ElasticKvOptions elastic_kv;
     std::optional<MissSplitMode> miss_split;
     std::optional<std::uint32_t> stream_min_tokens;
+    // RoutedExpertOptions::cpu_threads (Qwen4Exp offload backend: the CPU threads of the missing
+    // experts, one per physical core, spread over the CCDs; default 6).
+    std::optional<std::uint32_t> expert_cpu_threads;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;
     std::optional<std::uint32_t> default_thinking_budget;

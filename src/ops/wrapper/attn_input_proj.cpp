@@ -1,4 +1,6 @@
 #include "core/weight.h"
+#include "ops/linear/q3/q3_arena.h"
+#include "ops/linear/q3/q3_linear.h"
 #include "ninfer/ops/attn_input_proj.h"
 
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
@@ -105,6 +107,39 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
         return;
     }
 
+    if (weight.qtype == QType::Q3_G128_FP16) {
+        // v0.7 27b-16gb: one Q|K|Gate|V parent [14336,5120], rows split into the four outputs.
+        constexpr std::int32_t kHidden = 5120;
+        constexpr std::int32_t kQRows  = 6144;
+        constexpr std::int32_t kKvRows = 1024;
+        constexpr std::int32_t kRows   = 14336;
+        const std::int32_t cols        = x.ne[1];
+        if (cols <= 0) { throw std::invalid_argument("attn_input_proj: T must be positive"); }
+        require_matrix(x, kHidden, cols, "x");
+        require_matrix(q, kQRows, cols, "q");
+        require_matrix(gate, kQRows, cols, "gate");
+        require_matrix(k, kKvRows, cols, "k");
+        require_matrix(v, kKvRows, cols, "v");
+        detail::validate_q3_weight(weight, "q3 attn_input_proj");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("q3 attn_input_proj: unsupported weight shape");
+        }
+        detail::Q3RowSegments segments;
+        segments.count = 4;
+        Tensor* outputs[4] = {&q, &k, &gate, &v};
+        const std::int32_t rows[4] = {kQRows, kKvRows, kQRows, kKvRows};
+        std::int32_t end = 0;
+        for (int s = 0; s < 4; ++s) {
+            end += rows[s];
+            segments.data[s] = static_cast<__nv_bfloat16*>(outputs[s]->data);
+            segments.ld[s]   = rows[s];
+            segments.end[s]  = end;
+        }
+        const detail::Q3ArenaWorkspace q3ws(workspace, weight.k, cols);
+        detail::q3_linear_segments_dispatch(x, weight, segments, stream, q3ws.get());
+        return;
+    }
+
     if (weight.qtype == QType::NVFP4) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -172,6 +207,11 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     }
 
     switch (parent_qtype) {
+    case QType::Q3_G128_FP16:
+        if (parent_rows != 14336 || input_rows != 5120) {
+            throw std::invalid_argument("attn_input_proj workspace: unsupported Q3 profile");
+        }
+        return detail::q3_workspace_bytes(input_rows, max_tokens);
     case QType::BF16:
         if (parent_rows != 14336 || input_rows != 5120) {
             throw std::invalid_argument("attn_input_proj workspace: unsupported BF16 profile");

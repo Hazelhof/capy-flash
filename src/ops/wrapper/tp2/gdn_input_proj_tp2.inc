@@ -28,7 +28,9 @@ static_assert(kShardHidden == detail::Fp8N8192K5120::kInputRows &&
 
 void require_shard_profile(QType qtype, std::int32_t rows, std::int32_t input_rows,
                            const char* operation) {
-    if ((qtype != QType::FP8_E4M3FN_ROW_BF16 && qtype != QType::NVFP4) || rows != kShardRows ||
+    if ((qtype != QType::FP8_E4M3FN_ROW_BF16 && qtype != QType::NVFP4 &&
+         qtype != QType::Q3_G128_FP16) ||
+        rows != kShardRows ||
         input_rows != kShardHidden) {
         throw std::invalid_argument(std::string(operation) + ": unsupported shard profile");
     }
@@ -39,15 +41,36 @@ void require_shard_weight(const Weight& weight, const char* operation) {
         detail::validate_nvfp4_weight(weight, operation);
     } else if (weight.qtype == QType::FP8_E4M3FN_ROW_BF16) {
         detail::validate_fp8_weight(weight, operation);
+    } else if (weight.qtype == QType::Q3_G128_FP16) {
+        detail::validate_q3_weight(weight, operation);
     } else {
         throw std::invalid_argument(std::string(operation) + ": unsupported weight format");
     }
     require_shard_profile(weight.qtype, weight.n, weight.k, operation);
 }
 
+// v0.7 27b-16gb: one rank's Q|K|V|Z shard [8192,5120] in q3_g128_fp16; rows [0,5120) -> qkv
+// (or the flat conv plane), the rest -> z.
+void q3_shard_projection(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
+                         WorkspaceArena* workspace, cudaStream_t stream) {
+    detail::Q3RowSegments segments;
+    segments.count   = 2;
+    segments.data[0] = static_cast<__nv_bfloat16*>(qkv.data);
+    segments.ld[0]   = kShardChannels;
+    segments.end[0]  = kShardChannels;
+    segments.data[1] = static_cast<__nv_bfloat16*>(z.data);
+    segments.ld[1]   = kShardValueRows;
+    segments.end[1]  = kShardRows;
+    const detail::Q3ArenaWorkspace q3ws(workspace, weight.k, x.ne[1]);
+    detail::q3_linear_segments_dispatch(x, weight, segments, stream, q3ws.get());
+}
+
 // The bare projection's per-rank transient capacity over [min_tokens,max_tokens].
 std::size_t shard_projection_bytes(QType qtype, LinearPolicy policy, std::int32_t min_tokens,
                                    std::int32_t max_tokens) {
+    if (qtype == QType::Q3_G128_FP16) { // v0.7: the A8 prefill route's activation scratch
+        return detail::q3_workspace_bytes(kShardHidden, max_tokens);
+    }
     return qtype == QType::NVFP4
                ? detail::nvfp4_gdn_input_shard_workspace_capacity_bytes(policy, min_tokens,
                                                                         max_tokens)
@@ -71,6 +94,7 @@ void require_shard_residency(const ExecutionContext& ec, int rank, const Tensor&
 // The snapshot and record shards take the A8 or A4 frontier of the single-parent snapshot form,
 // not the bare projection's, so that each rank quantizes exactly when the single-device Op does.
 bool conv_shard_quantizes(QType qtype, LinearPolicy policy, ConvGeometry geometry) {
+    if (qtype == QType::Q3_G128_FP16) { return false; }
     return qtype == QType::NVFP4
                ? detail::nvfp4_gdn_conv_uses_a4(policy, geometry.width, geometry.batch)
                : detail::fp8_gdn_conv_uses_a8(policy, geometry.width, geometry.batch);
@@ -80,7 +104,9 @@ void project_conv_shard(const Tensor& x, const Weight& weight, Tensor& projected
                         LinearPolicy policy, ConvGeometry geometry, WorkspaceArena& workspace,
                         cudaStream_t stream) {
     const bool quantized = conv_shard_quantizes(weight.qtype, policy, geometry);
-    if (weight.qtype == QType::NVFP4) {
+    if (weight.qtype == QType::Q3_G128_FP16) {
+        q3_shard_projection(x, weight, projected, z, &workspace, stream);
+    } else if (weight.qtype == QType::NVFP4) {
         detail::nvfp4_gdn_input_shard_dispatch(
             x, weight, projected, z, quantized ? LinearPolicy::AllowA4 : LinearPolicy::A16Only,
             &workspace, stream);
@@ -95,6 +121,7 @@ std::size_t conv_shard_projection_bytes(QType qtype, LinearPolicy policy, std::i
                                         std::int32_t max_width) {
     // The quantization frontier is monotonic in W, so the widest block bounds the interval.
     const std::int32_t columns = batch_size * max_width;
+    if (qtype == QType::Q3_G128_FP16) { return detail::q3_workspace_bytes(kShardHidden, columns); }
     if (!conv_shard_quantizes(qtype, policy, {max_width, batch_size, columns})) { return 0; }
     if (qtype == QType::NVFP4) {
         return detail::nvfp4_a4_workspace_capacity_bytes(columns, kShardHidden);
@@ -149,7 +176,10 @@ void gdn_input_proj_column_parallel(const std::array<Tensor, 2>& x,
         const auto slot = static_cast<std::size_t>(rank);
         Tensor qkv_out  = qkv[slot];
         Tensor z_out    = z[slot];
-        if (query_key_value_z_weight[slot].qtype == QType::NVFP4) {
+        if (query_key_value_z_weight[slot].qtype == QType::Q3_G128_FP16) {
+            q3_shard_projection(x[slot], query_key_value_z_weight[slot], qkv_out, z_out,
+                                workspace[slot], ec.dev[slot]->stream);
+        } else if (query_key_value_z_weight[slot].qtype == QType::NVFP4) {
             detail::nvfp4_gdn_input_shard_dispatch(x[slot], query_key_value_z_weight[slot], qkv_out,
                                                    z_out, policy, workspace[slot],
                                                    ec.dev[slot]->stream);

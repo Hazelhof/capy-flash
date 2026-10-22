@@ -232,13 +232,16 @@ IMPORT_CHUNK_BYTES = 64 * 1024 * 1024
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4 source codes, scales and weight divisors.
+    """Preserve the current FP8/NVFP4/grouped-integer source codes, scales and weight divisors.
 
     A parent with one divisor requires its sources to agree on it. A stacked NVFP4 parent
     (``target.divisors`` > 1, one equal row block per source) keeps every source's divisor, and
     every source's activation divisor stays on that source's own Uses.
     """
-    if request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16") or len(request.target.shape) != 2:
+    grouped = isinstance(get_format(request.target.format), QuantFormat)
+    if (request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16") and not grouped) or len(
+        request.target.shape
+    ) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
     _preflight(request, values=False)
     stacked = request.target.divisors > 1
@@ -272,7 +275,11 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     # Imported words are copied, not computed, so the chunk is sized by bytes: rows_per_chunk
     # alone gives the 160-byte rows of an n-gram table tiny chunks and millions of reads. Chunk
     # boundaries do not change the stored bytes.
-    row_bytes = k // 2 + k // 16 if request.target.format == "nvfp4" else k + 2
+    if grouped:  # signed codes + binary16 multipliers (q3_g128_fp16 / q4_g64_fp16 sources)
+        spec = get_format(request.target.format)
+        row_bytes = k * spec.bits // 8 + 2 * (k // spec.group_size)
+    else:
+        row_bytes = k // 2 + k // 16 if request.target.format == "nvfp4" else k + 2
     chunk = max(request.rows_per_chunk, IMPORT_CHUNK_BYTES // row_bytes)
     if request.target.format == "nvfp4":
         chunk = max(128, chunk // 128 * 128)

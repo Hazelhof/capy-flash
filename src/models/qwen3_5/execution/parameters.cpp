@@ -357,6 +357,44 @@ public:
         float down    = 0.0F;
     };
 
+    // A layer bank of ggml blocks (gguf_blocks_v1): the expert-major row order was checked by the
+    // caller; here the formats the GGUF expert Ops support.
+    static Qwen4ExpertBank gguf_bank(const WeightParent& gate_up, const WeightParent& down) {
+        const auto format = [](QType q) -> std::optional<ops::MoeGgufFormat> {
+            switch (q) {
+            case QType::GGUF_IQ3_XXS: return ops::MoeGgufFormat::IQ3_XXS;
+            case QType::GGUF_IQ4_NL: return ops::MoeGgufFormat::IQ4_NL;
+            case QType::GGUF_IQ3_S: return ops::MoeGgufFormat::IQ3_S;
+            case QType::GGUF_IQ2_S: return ops::MoeGgufFormat::IQ2_S;
+            case QType::GGUF_IQ4_XS: return ops::MoeGgufFormat::IQ4_XS;
+            case QType::GGUF_Q2_0: return ops::MoeGgufFormat::Q2_0;
+            default: return std::nullopt;
+            }
+        };
+        const auto gu = format(gate_up.geometry.format);
+        const auto dn = format(down.geometry.format);
+        if (gate_up.geometry.layout != QuantLayout::GgufBlocks ||
+            down.geometry.layout != QuantLayout::GgufBlocks || !gu || !dn ||
+            !ops::moe_gguf_gate_up_supported(*gu) || !ops::moe_gguf_down_supported(*dn)) {
+            throw std::invalid_argument(
+                "GGUF routed experts: gate/up IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS or IQ4_NL and down "
+                "IQ4_NL or Q2_0, both gguf_blocks_v1");
+        }
+        Qwen4ExpertBank out;
+        out.gguf                   = true;
+        out.gguf_gate_up           = *gu;
+        out.gguf_down              = *dn;
+        out.gguf_gate_up_rows      = gate_up.data;
+        out.gguf_down_rows         = down.data;
+        out.gguf_gate_up_row_bytes = static_cast<std::int64_t>(gate_up.geometry.code_bytes_per_row);
+        out.gguf_down_row_bytes    = static_cast<std::int64_t>(down.geometry.code_bytes_per_row);
+        if (out.gguf_gate_up_row_bytes != ops::moe_gguf_row_bytes(*gu, 2560) ||
+            out.gguf_down_row_bytes != ops::moe_gguf_row_bytes(*dn, 640)) {
+            throw std::invalid_argument("GGUF routed experts: row bytes differ from the format");
+        }
+        return out;
+    }
+
     Qwen4ExpertBank expert_bank(const MoeWeights& moe, bool mtp = false,
                                 UniformDivisors* uniform = nullptr) const {
         const auto& config = model_.config().text;
@@ -387,6 +425,10 @@ public:
                 d.begin != e * h * ir) {
                 throw std::invalid_argument("routed experts are not stored expert-major");
             }
+        }
+        if (gate_up->geometry.layout == QuantLayout::GgufBlocks ||
+            down->geometry.layout == QuantLayout::GgufBlocks) {
+            return gguf_bank(*gate_up, *down);
         }
         for (const auto* parent : {gate_up, down}) {
             if (parent->geometry.format != QType::NVFP4 ||
@@ -647,7 +689,8 @@ Parameters::Parameters(const Model& source, int rank) : model(source), device(ra
         if (w.qwen4_mtp) {
             qwen4_mtp  = with_context("mtp", [&] { return prepare.qwen4_mtp(*w.qwen4_mtp); });
             auto& bank = qwen4_mtp->layer.moe.experts;
-            if (!(bank.gate_up_input_divisor > 0.0F) || !(bank.down_input_divisor > 0.0F)) {
+            if (!bank.gguf &&
+                (!(bank.gate_up_input_divisor > 0.0F) || !(bank.down_input_divisor > 0.0F))) {
                 // No calibrated activation divisors for the MTP experts: the widest calibrated
                 // range of the Text layers (smallest divisor), widened by the margin.
                 float gate_up = std::numeric_limits<float>::infinity();

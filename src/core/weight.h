@@ -18,6 +18,16 @@ enum class QType : std::uint16_t {
     FP8_E4M3FN_ROW_BF16    = 8,
     MXFP8_E4M3FN_G32_UE8M0 = 9,
     NVFP4_ROW_E4M3_G16     = 10,
+    // ggml block types of the GSQ-RCO routed-expert banks, stored as whole ggml blocks per row
+    // (layout GgufBlocks): ggml-common.h's block_iq3_xxs, block_iq4_nl, block_iq3_s, block_iq2_s,
+    // block_iq4_xs and block_q2_0.
+    GGUF_IQ3_XXS = 11,
+    GGUF_IQ4_NL  = 12,
+    GGUF_IQ3_S   = 13,
+    GGUF_IQ2_S   = 14,
+    GGUF_IQ4_XS  = 15,
+    GGUF_Q2_0    = 16,
+    Q3_G128_FP16 = 17, // v0.7 27b-16gb: 3-bit GSQ body, 48 code bytes per 128 (artifacts store the name)
 };
 
 enum class QuantLayout : std::uint16_t {
@@ -27,6 +37,7 @@ enum class QuantLayout : std::uint16_t {
     RowScale            = 3,
     BlockScaleK32       = 4,
     RowInterleaved      = 5,
+    GgufBlocks          = 6,
 };
 
 struct Weight {

@@ -251,6 +251,19 @@ keep the checkpoint's codes, scales, weight divisors and per-matrix activation d
 bank `ShardAxis::HostMapped`: one page-locked allocation (2 MiB pages when available) that every
 device reads over PCIe and an expert cache copies from; 48 x 512 + 512 experts take 64.6 GiB.
 
+**Page-locked limit (v0.7 pinned fallback).** Windows WDDM (also under WSL2) caps page-locked memory at about half the
+RAM, below that allocation. With `--host-pinned-max-gib G` (`EngineOptions::host_pinned_max_bytes`,
+`NINFER_HOST_PINNED_MAX_GIB`), or when the whole page-locked allocation fails, the materializer
+(`artifact/host_residency.h`) keeps the embedding and the banks of the most important layers page-locked and puts the
+rest in pageable memory, both banks of a layer together. Order (`qwen4_layer_profile.h`): the last 12 Text layers (the
+prompt lends them as streaming ring and workspace), the MTP layer, then the other Text layers by the slot-profile
+weight. A pageable layer is read in place by the CPU executor; the expert cache fills its slots through a pinned
+staging ring per GPU (`ExpertCache`, 128 MiB, `NINFER_HOST_STAGING_MIB`; a slot is reused once its batch's event
+completed); prefill chunks do not stream it (residents on the GPU, the rest on the CPU, as without streaming); the miss
+split is turned off, and the prefetch and the mapped backend refuse to start. A pageable layer inside the lent range
+turns streaming (ring) or the lent prompt workspace off. When everything fits, the plan's single allocation and offsets
+are used unchanged.
+
 At `--tp 2` the dense parameters split by heads, the routed experts stay one host-mapped copy
 partitioned by expert ID at run time, the hyper-connections, router, indexer and PLE are
 replicated (or the mixers split by residual streams), and the shared expert alternates between
@@ -293,8 +306,8 @@ state in `program/` and `state/`:
   (one BF16 rounding). Backends (`execution/qwen4_experts.h`, `EngineOptions::routed_experts`):
   - **Offload** (default): a device slot cache per layer (T14 `ExpertCache`, slot table read by
     `moe_slots_nvfp4`, W4A4) for the hot experts, and the CPU for the routed experts the table does
-    not hold (`ops/sparse_moe/host`: `HostMoeMailbox` + `HostMoeExecutor`, NVFP4 W4A8 AVX-512, 6
-    pinned threads). Per layer, inside the round's CUDA Graph: right after the router a publish
+    not hold (`ops/sparse_moe/host`: `HostMoeMailbox` + `HostMoeExecutor`, NVFP4 W4A8 in AVX-512
+    VNNI or AVX2 by `host_isa()`, same bits, 6 pinned threads). Per layer, inside the round's CUDA Graph: right after the router a publish
     kernel and two stream memory writes hand x, the routing and the host-side ids to the CPU; the GPU
     runs the shared expert and the resident experts; a stream memory wait (no SM held) and an
     accumulate kernel add the CPU's FP32 partial; `moe_combine_shared` rounds once. A prefill chunk

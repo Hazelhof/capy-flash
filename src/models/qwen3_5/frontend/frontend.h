@@ -73,6 +73,12 @@ public:
                                              const PreparationControl& control = {}) const;
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true) const;
+    // prepare(input) followed by `appended` tokens; the result continues in content (see
+    // Engine::prepare_continuation). Requires a text-only prompt that starts in thinking.
+    [[nodiscard]] PreparedPrompt prepare_continuation(PromptInput input,
+                                                      std::span<const TokenId> appended,
+                                                      const PreparationControl& control = {}) const;
+    [[nodiscard]] ReasoningGuardTokens reasoning_guard_tokens() const;
     [[nodiscard]] std::vector<TokenId> tokenize_text(std::string_view text) const;
     [[nodiscard]] std::string detokenize_text(std::span<const TokenId> token_ids) const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;

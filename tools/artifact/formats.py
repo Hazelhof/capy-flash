@@ -62,13 +62,34 @@ class Nvfp4RowFormat:
     group_size: int
 
 
-NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Mxfp8Format | Nvfp4RowFormat
+@dataclass(frozen=True, slots=True)
+class GgufFormat:
+    """One ggml block type, stored as the exporter wrote its blocks: whole blocks per row.
+
+    `ggml_type` is the block type's id in the GGUF tensor directory. A row of K elements is
+    K / block_elements consecutive blocks of block_bytes each, so a row subset is a byte copy.
+    Names, ids and sizes follow iamwavecut/ninfer-all (Apache-2.0), which stores the same blocks
+    in the same container; the block definitions are ggml's (ggml-common.h, MIT).
+    """
+
+    name: str
+    ggml_type: int
+    block_elements: int
+    block_bytes: int
+
+
+NumericFormat: TypeAlias = (
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | Mxfp8Format | Nvfp4RowFormat | GgufFormat
+)
 
 
 BF16 = DirectFormat("bf16", 2)
 FP32 = DirectFormat("fp32", 4)
 INT32 = DirectFormat("int32", 4)
 
+# v0.7 27b-16gb: symmetric 3-bit codes, one binary16 multiplier per 128 values (3.125 bpw), the
+# representation of the ISTA-DASLab 3-bit GSQ checkpoints (and of roofkid/ninfer-4080 Q3G128_F16S).
+Q3_G128_FP16 = QuantFormat("q3_g128_fp16", 3, 128, -4, 3)
 Q4_G64_FP16 = QuantFormat("q4_g64_fp16", 4, 64, -8, 7)
 Q5_G64_FP16 = QuantFormat("q5_g64_fp16", 5, 64, -16, 15)
 Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
@@ -78,13 +99,29 @@ FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 MXFP8_E4M3FN_G32_UE8M0 = Mxfp8Format("mxfp8_e4m3fn_g32_ue8m0", 32)
 NVFP4_ROW_E4M3_G16 = Nvfp4RowFormat("nvfp4_row_e4m3_g16", 16)
 
+# ggml block types of the GSQ-RCO routed-expert banks (ggml-common.h), kept byte for byte.
+GGUF_IQ3_XXS = GgufFormat("gguf_iq3_xxs", 18, 256, 98)
+GGUF_IQ4_NL = GgufFormat("gguf_iq4_nl", 20, 32, 18)
+GGUF_IQ3_S = GgufFormat("gguf_iq3_s", 21, 256, 110)
+GGUF_IQ2_S = GgufFormat("gguf_iq2_s", 22, 256, 82)
+GGUF_IQ4_XS = GgufFormat("gguf_iq4_xs", 23, 256, 136)
+# Two-bit codes over {-1, 0, 1, 2} * d, 64 per block with one binary16 d (GSQ-RCO's Q2_0).
+GGUF_Q2_0 = GgufFormat("gguf_q2_0", 42, 64, 18)
+
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
-QUANT_FORMATS = MappingProxyType({item.name: item for item in (Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16)})
+QUANT_FORMATS = MappingProxyType({item.name: item for item in (Q3_G128_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16)})
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
 FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
 MXFP8_FORMATS = MappingProxyType({MXFP8_E4M3FN_G32_UE8M0.name: MXFP8_E4M3FN_G32_UE8M0})
 NVFP4_ROW_FORMATS = MappingProxyType({NVFP4_ROW_E4M3_G16.name: NVFP4_ROW_E4M3_G16})
+GGUF_FORMATS = MappingProxyType(
+    {
+        item.name: item
+        for item in (GGUF_IQ3_XXS, GGUF_IQ4_NL, GGUF_IQ3_S, GGUF_IQ2_S, GGUF_IQ4_XS, GGUF_Q2_0)
+    }
+)
+GGUF_FORMATS_BY_TYPE = MappingProxyType({item.ggml_type: item for item in GGUF_FORMATS.values()})
 NUMERIC_FORMATS = MappingProxyType(
     {
         **DIRECT_FORMATS,
@@ -93,6 +130,7 @@ NUMERIC_FORMATS = MappingProxyType(
         **FP8_ROW_FORMATS,
         **MXFP8_FORMATS,
         **NVFP4_ROW_FORMATS,
+        **GGUF_FORMATS,
     }
 )
 
@@ -183,6 +221,7 @@ __all__ = [
     "BF16",
     "FP32",
     "INT32",
+    "Q3_G128_FP16",
     "Q4_G64_FP16",
     "Q5_G64_FP16",
     "Q6_G64_FP16",
@@ -191,6 +230,15 @@ __all__ = [
     "FP8_E4M3FN_ROW_BF16",
     "MXFP8_E4M3FN_G32_UE8M0",
     "NVFP4_ROW_E4M3_G16",
+    "GGUF_IQ3_XXS",
+    "GGUF_IQ4_NL",
+    "GGUF_IQ3_S",
+    "GGUF_IQ2_S",
+    "GGUF_IQ4_XS",
+    "GGUF_Q2_0",
+    "GGUF_FORMATS",
+    "GGUF_FORMATS_BY_TYPE",
+    "GgufFormat",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",

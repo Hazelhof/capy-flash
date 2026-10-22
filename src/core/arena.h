@@ -133,6 +133,27 @@ private:
     bool registered_  = false; // std::aligned_alloc + cudaHostRegister instead of cudaHostAlloc
 };
 
+// Plain pageable host memory aligned to 2 MiB with transparent huge pages requested (advisory),
+// for host-resident data that the CPU reads in place and that reaches devices only through
+// pinned staging (v0.7 pinned fallback: expert banks beyond the page-locked limit). Not
+// registered with CUDA: no kernel may read it.
+class PageableHostBuffer {
+public:
+    explicit PageableHostBuffer(std::size_t size_bytes);
+    ~PageableHostBuffer();
+
+    PageableHostBuffer(const PageableHostBuffer&)            = delete;
+    PageableHostBuffer& operator=(const PageableHostBuffer&) = delete;
+
+    [[nodiscard]] void* data() const noexcept { return data_; }
+
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+private:
+    void* data_       = nullptr;
+    std::size_t size_ = 0;
+};
+
 using WorkspaceArena = DeviceArena;
 
 } // namespace ninfer

@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <string_view>
 
 namespace ninfer::models {
@@ -26,6 +27,8 @@ struct LoadOptions {
     // the mixers' bytes per rank for two all-reduces per mixer. Ignored by other architectures and
     // at tp 1.
     bool hc_split_streams = false;
+    // Most bytes of the host-mapped parents to keep page-locked (EngineOptions); 0 = no limit.
+    std::uint64_t host_pinned_max_bytes = 0;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -84,7 +87,8 @@ struct LoadOptions {
             .tp               = options.tp,
             .vision_rank      = vision_rank(options),
             .embedding_host   = options.embedding_host,
-            .hc_split_streams = options.tp_hc_split_streams};
+            .hc_split_streams = options.tp_hc_split_streams,
+            .host_pinned_max_bytes = options.host_pinned_max_bytes};
 }
 
 } // namespace ninfer::models

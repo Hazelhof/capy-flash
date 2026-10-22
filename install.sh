@@ -5,7 +5,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/ValerioDolci/capy-flash/main/install.sh | bash -s -- [options]
 #
 #   --dir DIR          where the release and the model go (default ~/capy-flash)
-#   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB) or 27b (Qwen3.8-27B, 17.4 GB)
+#   --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
+#                      102 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
 #   --version vX.Y.Z   release tag (default: the latest release)
 #   --check            only check the machine, download nothing
 #   --no-model         download the release only
@@ -14,9 +15,10 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: install.sh [--dir DIR] [--model flash-next|27b] [--version vX.Y.Z] [--check] [--no-model] [--verify-model]
+usage: install.sh [--dir DIR] [--model flash-next|flash-next-64gb|27b|27b-16gb] [--version vX.Y.Z] [--check] [--no-model] [--verify-model]
   --dir DIR          where the release and the model go (default ~/capy-flash)
-  --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB) or 27b (Qwen3.8-27B, 17.4 GB)
+  --model NAME       flash-next (default, Qwen3.8-Flash-Next, 126.6 GB), flash-next-64gb (64 GB of RAM,
+                     102 GB), 27b (Qwen3.8-27B, two GPUs, 17.4 GB) or 27b-16gb (one GPU, 3-bit, 12.5 GB)
   --version vX.Y.Z   release tag (default: the latest release)
   --check            only check the machine, download nothing
   --no-model         download the release only
@@ -27,6 +29,7 @@ EOF
 repo=ValerioDolci/capy-flash
 dir=$HOME/capy-flash
 model=flash-next
+launcher_flags=""
 version=
 check_only=0
 fetch_model=1
@@ -50,14 +53,29 @@ case $model in
     artifact=qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer
     launcher=serve-flash-next.sh
     model_id=capy-flash
-    need_ram_gib=70 need_disk_gb=135 need_avx512=1 ;;
+    need_ram_gib=70 need_disk_gb=135 need_simd=1 need_gpus=2 ;;
+  flash-next-64gb)
+    # v0.7: GSQ-RCO i-quant experts (48 GiB page-locked instead of 65); small RAM caches for 64 GB.
+    hf_repo=Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash
+    artifact=qwen3_8_flash_next_gsqrco_mtpB.ninfer
+    launcher=serve-flash-next.sh
+    launcher_flags=" --host-kv-mib 1024 --host-state-slots 2"
+    model_id=capy-flash
+    need_ram_gib=56 need_disk_gb=110 need_simd=1 need_gpus=1 ;;
+  27b-16gb)
+    # v0.7: ISTA-DASLab's 3-bit GSQ weights on ONE 16 GB GPU (MMLU-Pro below the NVFP4 27B: see the README).
+    hf_repo=Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash
+    artifact=qwen3_8_27b_gsq3.ninfer
+    launcher=serve-27b-16gb.sh
+    model_id=qwen3.8-27b
+    need_ram_gib=8 need_disk_gb=15 need_simd=0 need_gpus=1 ;;
   27b)
     hf_repo=Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer
     artifact=qwen3_8_27b_quasar_nvfp4.ninfer
     launcher=serve-tp2.sh
     model_id=qwen3.8-27b
-    need_ram_gib=8 need_disk_gb=20 need_avx512=0 ;;
-  *) echo "install.sh: --model must be flash-next or 27b" >&2; exit 2 ;;
+    need_ram_gib=8 need_disk_gb=20 need_simd=0 need_gpus=2 ;;
+  *) echo "install.sh: --model must be flash-next, flash-next-64gb, 27b or 27b-16gb" >&2; exit 2 ;;
 esac
 
 failed=0
@@ -73,10 +91,10 @@ if command -v nvidia-smi > /dev/null 2>&1; then
   gpus=$(nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv,noheader,nounits 2>/dev/null || true)
   driver=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
   usable=$(printf '%s\n' "$gpus" | awk -F', ' '$3 >= 15000 && $4 == "12.0"' | wc -l)
-  if [ "$usable" -ge 2 ]; then
+  if [ "$usable" -ge "$need_gpus" ]; then
     ok "$usable sm_120 GPUs with 16 GB ($(printf '%s\n' "$gpus" | head -1 | cut -d, -f2 | sed 's/^ //'))"
   else
-    fail "two sm_120 GPUs (RTX 50 series) with 16 GB are needed; found:"
+    fail "$need_gpus sm_120 GPU(s) (RTX 50 series) with 16 GB are needed; found:"
     printf '%s\n' "$gpus" | sed 's/^/          /'
   fi
   if [ "${driver%%.*}" -ge 580 ] 2>/dev/null; then ok "NVIDIA driver $driver"
@@ -85,14 +103,16 @@ else
   fail "nvidia-smi not found: install the NVIDIA driver (R580 or newer)"
 fi
 
-if [ "$need_avx512" = 1 ]; then
+if [ "$need_simd" = 1 ]; then
+  # The experts outside VRAM run on the CPU: AVX-512 VNNI kernels, or AVX2 + FMA + F16C ones (same
+  # results bit for bit), picked at startup.
   flags=$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)
-  missing=
-  for f in avx512f avx512bw avx512vl avx512_vnni; do
-    case " $flags " in *" $f "*) ;; *) missing="$missing $f" ;; esac
-  done
-  [ -z "$missing" ] && ok "CPU has AVX-512 F/BW/VL/VNNI" \
-    || fail "the CPU lacks$missing: Flash-Next computes the experts outside VRAM with AVX-512 VNNI"
+  lacks() { for f in "$@"; do case " $flags " in *" $f "*) ;; *) printf ' %s' "$f" ;; esac; done; }
+  missing512=$(lacks avx512f avx512bw avx512vl avx512_vnni avx2 fma f16c)
+  missing2=$(lacks avx2 fma f16c)
+  if [ -z "$missing512" ]; then ok "CPU has AVX-512 F/BW/VL/VNNI"
+  elif [ -z "$missing2" ]; then ok "CPU has AVX2/FMA/F16C (no AVX-512 VNNI: the AVX2 expert kernels run)"
+  else fail "the CPU lacks$missing2: Flash-Next computes the experts outside VRAM with AVX2 or AVX-512"; fi
 fi
 
 total_gib=$(awk '/^MemTotal:/ {printf "%d", $2 / 1048576}' /proc/meminfo)
@@ -165,7 +185,9 @@ cat <<EOF
 
 capy-flash $version is ready. Serve $model with:
 
-  $dir/current/$launcher $dir/models/$model/$artifact
+  $dir/current/$launcher $dir/models/$model/$artifact$launcher_flags
+$( [ "$model" = flash-next-64gb ] && echo "
+(one GPU: NINFER_DEVICES=0 $dir/current/$launcher $dir/models/$model/$artifact)" )
 
 then, from another shell (the first start takes a minute or two):
 

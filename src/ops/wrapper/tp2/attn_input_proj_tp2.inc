@@ -33,6 +33,13 @@ void validate_column_parallel_rank(const Tensor& x, const Weight& weight, const 
     require_matrix(gate, kQRows, cols, "gate");
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
+    if (weight.qtype == QType::Q3_G128_FP16) {
+        detail::validate_q3_weight(weight, "q3 attn_input_proj column-parallel");
+        if (weight.n != kRows || weight.k != kHidden) {
+            throw std::invalid_argument("q3 attn_input_proj column-parallel: unsupported shard shape");
+        }
+        return;
+    }
     if (weight.qtype == QType::NVFP4) {
         detail::validate_nvfp4_weight(weight, "nvfp4 attn_input_proj column-parallel");
         if (weight.n != kRows || weight.k != kHidden) {
@@ -60,6 +67,8 @@ std::size_t attn_input_proj_column_parallel_workspace_capacity_bytes(QType shard
     validate_policy(policy);
     // The shard keeps the parent's input rows; the FP8 workspace also holds its split-K partials.
     switch (shard_qtype) {
+    case QType::Q3_G128_FP16:
+        return detail::q3_workspace_bytes(5120, max_tokens); // the shard keeps K = 5120
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_attn_input_shard_workspace_capacity_bytes(policy, min_tokens,
                                                                      max_tokens);
@@ -107,7 +116,23 @@ void attn_input_proj_column_parallel(
     std::array<Tensor, 2> v_out{v[0], v[1]};
     detail::for_each_rank(ec, [&](int rank) {
         const auto slot = static_cast<std::size_t>(rank);
-        if (w[slot].qtype == QType::NVFP4) {
+        if (w[slot].qtype == QType::Q3_G128_FP16) {
+            // v0.7 27b-16gb: one rank's head-local Q|K|Gate|V shard [7168,5120].
+            detail::Q3RowSegments segments;
+            segments.count            = 4;
+            Tensor* outputs[4]        = {&q_out[slot], &k_out[slot], &gate_out[slot], &v_out[slot]};
+            const std::int32_t rows[4] = {3072, 512, 3072, 512};
+            std::int32_t end           = 0;
+            for (int s = 0; s < 4; ++s) {
+                end += rows[s];
+                segments.data[s] = static_cast<__nv_bfloat16*>(outputs[s]->data);
+                segments.ld[s]   = rows[s];
+                segments.end[s]  = end;
+            }
+            const detail::Q3ArenaWorkspace q3ws(workspace[slot], w[slot].k, x[slot].ne[1]);
+            detail::q3_linear_segments_dispatch(x[slot], w[slot], segments, ec.dev[slot]->stream,
+                                                q3ws.get());
+        } else if (w[slot].qtype == QType::NVFP4) {
             detail::nvfp4_attn_input_shard_dispatch(x[slot], w[slot], q_out[slot], gate_out[slot],
                                                     k_out[slot], v_out[slot], policy,
                                                     workspace[slot], ec.dev[slot]->stream);

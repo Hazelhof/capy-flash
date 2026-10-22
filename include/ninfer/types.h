@@ -280,6 +280,16 @@ struct RoutedExpertOptions {
     // 1.8-2.9 s at 250-380. At 256 the warm cost is even (and streaming saves 0.5-1.5 s cold);
     // below it the warm CPU path is cheaper. ninfer-serve --stream-min-tokens.
     std::uint32_t stream_min_tokens = 256;
+    // ggml block expert banks (capy-flash v0.7): prompt chunks of at least this many tokens run
+    // every routed expert on the GPU, the non-resident ones read in place from the host bank
+    // (zero-copy, moe_grouped_gguf hybrid form), no ring and no lent workspace. The engine sets it
+    // from stream_min_tokens when it finds such banks (and turns the NVFP4 streaming off).
+    std::uint32_t gguf_stream_min_tokens = 0;
+    // CPU threads of the missing experts with ggml block banks (they replace cpu_threads there):
+    // their decode-once kernels are compute-bound at 6 threads and reach the RAM bandwidth at 12
+    // (one per physical core of the 9900X; T219: replay decode 196.7 -> 204.9 tok/s at 6 -> 12).
+    // ninfer-serve --expert-cpu-threads sets both.
+    std::uint32_t gguf_cpu_threads = 12;
     // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
     std::uint32_t stream_ring_slots = 576;
     // While streaming, leave the experts the previous prompt chunk routed least to the CPU (in
@@ -384,6 +394,14 @@ struct EngineOptions {
     // order. Unused by other architectures and at tp 1. Placement only: the Program refuses it
     // (the execution runs the replicated mixers).
     bool tp_hc_split_streams = false;
+    // Most bytes of the host-mapped weights (the Qwen4Exp routed-expert banks, `embedding_host`)
+    // to keep in page-locked memory; 0 = no limit (NINFER_HOST_PINNED_MAX_GIB may set one).
+    // Above it, or when the page-locked allocation fails (Windows WDDM and WSL2 cap page-locked
+    // memory at about half the RAM), the expert banks of the least important layers stay in
+    // pageable memory: the CPU reads them in place, the expert cache fills its slots from them
+    // through a pinned staging ring, prefill streaming and GPU reads in place skip them. Same
+    // results; slower where they are used.
+    std::uint64_t host_pinned_max_bytes = 0;
     RoutedExpertOptions routed_experts;
     ElasticKvOptions elastic_kv;
     ContextCacheOptions context_cache;
@@ -913,6 +931,15 @@ struct SpeculativeStats {
     std::vector<std::uint8_t> accepted_lengths;
 };
 
+// Tokenizer-derived tokens of the reasoning-close retry (serve --reasoning-close-retry): the
+// canonical suffix that closes the thinking phase ("\n</think>\n\n"), the model's default terminal
+// tokens, and the encoding of the bare "</think>" marker.
+struct ReasoningGuardTokens {
+    std::vector<TokenId> close_suffix;
+    std::vector<TokenId> stop_token_ids;
+    std::vector<TokenId> think_close;
+};
+
 struct ThinkingBudgetStats {
     std::optional<std::uint32_t> configured_budget;
     // Model-origin tokens accepted while thinking remained open, including the token that closes
@@ -1274,6 +1301,13 @@ struct LoadSummary {
     // The one mapped page-locked host allocation that every rank's weights read in place
     // (EngineOptions::embedding_host); 0 without it.
     std::uint64_t host_mapped_bytes = 0;
+    // v0.7 pinned fallback (EngineOptions::host_pinned_max_bytes): the host-mapped weights kept in
+    // pageable memory instead (with alignment) and how many parents; 0 when all are page-locked.
+    std::uint64_t host_pageable_bytes  = 0;
+    std::size_t host_pageable_objects  = 0;
+    std::size_t host_mapped_objects    = 0;
+    std::uint64_t host_pinned_limit_bytes = 0;
+    bool host_pinned_alloc_failed         = false;
     std::vector<LoadDeviceSummary> devices; // One entry per tensor-parallel rank.
     // tp 2: the driver granted direct peer access between the two devices. When false every
     // cross-device transfer is staged through Host memory by CUDA. Always false at tp 1.
@@ -1304,6 +1338,10 @@ struct LoadSummary {
     // tp 2 DFlash2: where the drafter runs, "split (...)" (both ranks, the default) or "rank 0"
     // (NINFER_TP_DRAFTER=primary); empty otherwise.
     std::string tp_drafter;
+    // tp 2: the eager (prefill) all-reduces' transport and the text prefill overlap's split-phase
+    // sums (TpTransportStatus::eager_transport / prefill_overlap); empty at tp 1.
+    std::string tp_eager_transport;
+    std::string tp_prefill_overlap;
     ContextCostSummary context_cost;
 };
 

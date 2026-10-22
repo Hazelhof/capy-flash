@@ -6,11 +6,14 @@
 
 #include "models/qwen3_5/program/prefix_identity.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
+#include "models/qwen3_5/program/context_work.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -442,6 +445,28 @@ void test_rebuild_work_prompt_frontier_boundary() {
 
 } // namespace
 
+// Issue #14: an underflow report names the accounting step and the dimension that disagreed.
+void test_resource_difference_names_the_failing_ledger() {
+    q36::detail::PhysicalResources held;
+    held.device.main_kv_pages = 513;
+    held.device.state_slots   = 2;
+    q36::detail::PhysicalResources taken;
+    taken.device.main_kv_pages = 1730;
+    std::string message;
+    try {
+        (void)q36::detail::checked_resource_difference(held, taken, "capture active entitlement");
+    } catch (const std::logic_error& error) { message = error.what(); }
+    expect(message ==
+               "Qwen3.5 resource subtraction underflow in capture active entitlement (Main KV "
+               "pages 513 - 1730)",
+           "resource underflow names its ledger and dimension");
+    taken.device.main_kv_pages                      = 500;
+    const q36::detail::PhysicalResources remaining = q36::detail::checked_resource_difference(
+        held, taken, "capture active entitlement");
+    expect(remaining.device.main_kv_pages == 13 && remaining.device.state_slots == 2,
+           "covered resource difference is exact");
+}
+
 int main() {
     test_decoder_layout();
     test_round_layout();
@@ -449,6 +474,7 @@ int main() {
     test_vision_control();
     test_prefix_identity();
     test_rebuild_work_prompt_frontier_boundary();
+    test_resource_difference_names_the_failing_ledger();
     if (failures != 0) {
         std::cerr << failures << " Qwen3.6 runtime mechanism checks failed\n";
         return 1;
