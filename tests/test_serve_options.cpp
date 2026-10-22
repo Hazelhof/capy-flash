@@ -607,7 +607,7 @@ int main() {
     const ServeOptions fn1 = parse({"ninfer-serve", "model.ninfer", "--profile", "flash-next-1gpu"});
     failures += check(fn1.tp == 1 && fn1.device == 0 && fn1.max_context == 262144 &&
                           fn1.elastic_kv.enabled && fn1.embedding_host &&
-                          fn1.context_cache.host_state_slots == 2 &&
+                          fn1.context_cache.host_state_slots == 8 &&
                           fn1.context_cache.host_kv_capacity_bytes == (1024ULL << 20),
                       "--profile flash-next-1gpu does not apply the one-GPU Flash-Next configuration");
     const ServeOptions single = parse({"ninfer-serve", "model.ninfer", "--profile", "27b-16gb"});

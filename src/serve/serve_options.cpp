@@ -122,10 +122,13 @@ const std::vector<ServeProfile>& serve_profiles() {
           "2048"}},
         // v0.7: Qwen3.8-Flash-Next on ONE 16 GB GPU (T242: GSQ-RCO 64 GB edition, 57 GiB of RAM,
         // LocalMaxxing 110 tok/s): the flash-next configuration at one device with small RAM caches.
+        // v0.7.1: 8 Host StateImages (+0.66 GiB pinned): at one device only 1 Device StateImage fits, and
+        // with 2 Host ones three interleaved agent sessions lost their turn checkpoints (prompt reuse
+        // 34 % -> 83 %, replay 858 -> 276 s, T247).
         {"flash-next-1gpu",
          {"--device", "0", "--kv-dtype", "int8", "--elastic", "--max-context", "262144",
           "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3", "--embedding-host",
-          "--host-kv-mib", "1024", "--host-state-slots", "2"}},
+          "--host-kv-mib", "1024", "--host-state-slots", "8"}},
         // v0.7: Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
         // (docs/v07/27b-16gb.md, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9 GiB).
         {"27b-16gb",

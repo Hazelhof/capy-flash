@@ -30,7 +30,7 @@ Ryzen 9 9900X, 96 GB DDR5, full clocks):
 - **Flash-Next on 64 GB of RAM, with one or two GPUs** (`--model flash-next-64gb`): ISTA-DASLab's GSQ-RCO i-quant experts
   (48 GiB in RAM instead of 65). Two GPUs: the fastest way to run it here, LocalMaxxing reasoning-v1 **239 tok/s**,
   agentic replay decode **182 tok/s** (NVFP4 172 / 155). **One 16 GB GPU** (`NINFER_DEVICES=0`, `--profile
-  flash-next-1gpu`): **110 tok/s**, replay decode 89. Quality on par with NVFP4 (GSM8K, MMLU-Pro).
+  flash-next-1gpu`): **121 tok/s** (LocalMaxxing verified run), replay decode 104. Quality on par with NVFP4 (GSM8K, MMLU-Pro).
 - **Qwen3.8-27B on one 16 GB card** (`--model 27b-16gb`, 3-bit GSQ weights, 64k context, vision): **139 tok/s** decode
   with MTP on an 8k-token prompt (two cards: 230) and 3,401 tok/s prefill at 4k. **It costs quality**: GSM8K on par,
   MMLU-Pro about 0.72 against 0.78 for the NVFP4 27B ([below](#measured)).
@@ -57,7 +57,7 @@ tensor-parallel on the two GPUs. capy-flash **is ninfer-tp2, renamed at v0.5.0**
 of [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every
 piece of prior work it builds on.
 
-Status: **v0.7.0** (2026-10-22). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
+Status: **v0.7.1** (2026-10-22). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
 
 ## What it does
 - Tensor parallel over PCIe on two GPUs **without peer-to-peer** (pinned-host mailbox, FP32 partial sums); with P2P
@@ -136,15 +136,16 @@ first 330 / 252 questions, paired with v0.6: no difference).
 
 | v0.7, new artifacts | Flash-Next 64 GB, two GPUs | Flash-Next 64 GB, one GPU | Qwen3.8-27B 3-bit, one GPU | Qwen3.8-27B 3-bit, two GPUs |
 |---|---:|---:|---:|---:|
-| LocalMaxxing reasoning-v1 / agentic replay decode | 239 / 182 tok/s | 110 / 89 tok/s | — | — |
+| LocalMaxxing reasoning-v1 / agentic replay decode | 239 / 182 tok/s | 121 / 104 tok/s | — | — |
 | prefill 4k / 16k / 64k | 2,117 / 3,305 / 3,426 | 1,888 / 2,145 / 2,257 | 3,401 / 3,211 / — | 5,787 / 5,567 / 4,304 |
 | decode, 8k real-text prompt, MTP | — | — | 139 tok/s | 230 tok/s |
 | GSM8K (vs GB300 NVFP4 reference) | 0.982 (0.985), 330 q. | same weights | 0.968 (0.968), 1,319 q. | |
 | MMLU-Pro (vs GB300 NVFP4 reference) | 0.837 (0.849), 252 q. | same weights | **0.69-0.71, ~0.72 with the guards (0.78)**, 252 q. | |
 
 The 64 GB edition peaks at 55.2 GiB of RSS inside a 64 GiB memory cgroup without swap (57 GiB used with one GPU);
-speeds were measured on the 96 GB machine. With one GPU and the small RAM caches, long agent sessions pay on resume
-(the replay's last 81k-token turn: 24 s to the first token, 3.1 s with two GPUs). The 3-bit 27B loses MMLU-Pro
+speeds were measured on the 96 GB machine. One GPU keeps only one conversation checkpoint in VRAM, so v0.7.1's
+`--profile flash-next-1gpu` keeps 8 in RAM (+0.66 GiB): on the agentic replay 83 % of the prompt tokens come from the
+cache, 1.9 s to the first token (median) and 276 s for the whole replay (v0.7.0: 34 %, 13.3 s, 858 s). The 3-bit 27B loses MMLU-Pro
 points mostly because more answers run out of their 8,192 tokens while reasoning; the v0.7 empty-reply guards bring
 back the ones that stopped inside their reasoning (9 of 9, all correct: about +3.6 points, estimated on those
 questions). With two cards, the NVFP4 27B is the better choice. At the eco clocks of 2026-10-19 the one-card 27B
