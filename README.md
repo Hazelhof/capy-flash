@@ -3,7 +3,19 @@
   <img alt="capy-flash" src="docs/logo/capy-flash-lockup.svg" width="560">
 </picture></h1>
 
-**Qwen3.8-Flash-Next (125B MoE) in NVFP4 on two 16 GB consumer GPUs, built for agents.**
+**Qwen3.8-Flash-Next (125B MoE) and Qwen3.8-27B on one or two 16 GB RTX 50-series GPUs, built for agents.**
+
+| what you want to run | GPUs (RTX 50 series, sm_120) | RAM | `install.sh` |
+|---|---|---|---|
+| Qwen3.8-27B, 3-bit | **one** with 16 GB of VRAM (the minimum) | nothing special | `--model 27b-16gb` |
+| Qwen3.8-27B, NVFP4 | two with 16 GB | nothing special (8 GiB of context cache) | `--model 27b` |
+| Flash-Next, 64 GB edition | **one** or two with 16 GB | a **64 GB** machine (~56 GiB free) | `--model flash-next-64gb` |
+| Flash-Next, NVIDIA NVFP4 (default) | two with 16 GB | a **96 GB** machine (~75 GiB free) | (default) |
+
+RAM matters for Flash-Next only: its routed experts live in host RAM and run on the CPU (AVX2 or AVX-512). Linux is
+what we test; users run the 27B on WSL2 and on Windows with Docker (a 5070 Ti + 5060 Ti pair), and on RTX 5060 Ti
+16 GB, 5070 Ti, 5080 and 5090 boards (a mixed pair runs at the pace of the slower card). A native Windows build exists
+as a community port ([OmarxGx/capy-flash](https://github.com/OmarxGx/capy-flash)), not in the releases yet.
 
 Against [Strata](https://github.com/Niko1221/Strata) 0.1.45 on the same machine, same day (2x RTX 5070 Ti 16 GB,
 Ryzen 9 9900X, 96 GB DDR5, full clocks):
@@ -38,8 +50,8 @@ Ryzen 9 9900X, 96 GB DDR5, full clocks):
 - Empty-reply guards on by default for every model; boards with P2P overlap the prefill exchanges on the direct copy
   (+29-45 % measured by @tzolkincz); a context-cache accounting error fails one request instead of the server.
 
-**Quick start** (2x RTX 50-series 16 GB, an AVX2 or AVX-512 CPU, ~75 GiB of free RAM, 135 GB of disk; smaller
-machines: `--model flash-next-64gb` or `--model 27b-16gb`, below):
+**Quick start** (default model, Flash-Next NVFP4: two 16 GB cards, ~75 GiB of free RAM, 135 GB of disk; for the
+other rows of the table at the top add their `--model`, below):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ValerioDolci/capy-flash/main/install.sh | bash -s -- --check   # can this machine run it?
 curl -fsSL https://raw.githubusercontent.com/ValerioDolci/capy-flash/main/install.sh | bash               # release + model into ~/capy-flash
@@ -52,8 +64,8 @@ a test request; `--model flash-next-64gb` installs the 64 GB edition, `--model 2
 `--model 27b-16gb` the 3-bit 27B for one GPU, `--dir` picks another place. By hand: download a
 [release](https://github.com/ValerioDolci/capy-flash/releases) tarball and `hf download Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash`.
 
-The routed experts that do not fit in VRAM live in host RAM and are computed on the CPU; everything else runs
-tensor-parallel on the two GPUs. capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork
+The routed experts that do not fit in VRAM live in host RAM and are computed on the CPU; everything else runs on
+the GPU (tensor-parallel when there are two). capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork
 of [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every
 piece of prior work it builds on.
 
@@ -154,7 +166,8 @@ decoded 105 tok/s where llama.cpp (ISTA's GSQ-RCO IQ3_S with its MTP drafting, s
 See the [development log](docs/capy-flash/development-log.md), which explains every `Tnn` tag found in the sources.
 
 ## Requirements
-Linux, CUDA 13.1, two sm_120 GPUs (RTX 50 series) with 16 GB, a CPU with AVX-512 (F/BW/VL, VNNI) or AVX2 + FMA + F16C
+See the table at the top: **16 GB of VRAM is the minimum** (the 3-bit 27B on one card); RAM is what Flash-Next needs.
+In detail: Linux (or WSL2 / Docker on Windows), CUDA 13.1, sm_120 GPUs (RTX 50 series) with 16 GB. Flash-Next NVFP4 also needs two of them, a CPU with AVX-512 (F/BW/VL, VNNI) or AVX2 + FMA + F16C
 (Zen 2/3, Intel client cores; `NINFER_HOST_ISA` in [diagnostics](docs/capy-flash/diagnostics.md)), and about **75 GiB of
 free RAM** (a 96 GB machine): the routed experts are one 64.6 GiB page-locked host allocation, and `--profile flash-next`
 also keeps the token embedding and up to 4 GiB of idle conversations in RAM. The 27B needs neither of these CPU features nor that RAM.
