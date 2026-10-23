@@ -131,6 +131,11 @@ public:
 
     void reset_memory_peaks() noexcept;
 
+    // Disk tier of the context cache (ContextCacheOptions::disk_directory; no-op when off): at a
+    // clean shutdown, writes the retained conversations that are not on disk yet, within
+    // ContextCacheOptions::disk_flush_seconds.
+    void persist_context_cache() noexcept;
+
 private:
     class Impl;
     std::shared_ptr<Impl> impl_;

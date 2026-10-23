@@ -44,6 +44,10 @@ ninfer_add_test(ninfer_state_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_state_store.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_disk_kv_cache_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_cache.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_gdn_replay_records.cpp"
   LIBRARIES ninfer_core)

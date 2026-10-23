@@ -603,10 +603,13 @@ public:
     static constexpr std::int64_t kLendPlaneBytes = ops::kMoeSlotsGateUpCodeBytes;
 
     // Whether a prompt may lend the last `layers` Text layers (ring + workspace): they hold at most
-    // three quarters of the Text layers' base slots (`layer_base`, layer_slot_profile), so the
-    // other layers keep at least a quarter of the residents (36 of 48 uniform layers).
+    // a fraction of the Text layers' base slots (`layer_base`, layer_slot_profile), so the other
+    // layers keep the rest of the residents: three quarters at tp 2, 0.9 at one GPU (v0.7.2: room
+    // for a 8192-column prompt chunk next to the ring). NINFER_QWEN4_PROMPT_LEND=<fraction in
+    // (0,1]> overrides it (planner and backend read the same value).
     [[nodiscard]] static bool may_lend(std::span<const std::int32_t> layer_base,
-                                       std::int32_t text_layers, std::int32_t layers);
+                                       std::int32_t text_layers, std::int32_t layers,
+                                       std::int32_t partitions);
 
     // Base slots of each cache layer on one GPU (prod/cache): `slots_per_layer` for every layer,
     // or, for Flash-Next at tp 2 (48 Text layers, with or without the MTP layer), the same total
@@ -714,8 +717,13 @@ private:
     std::array<cudaStream_t, 2> gguf_copy_stream_{};
     std::array<std::array<cudaEvent_t, 2>, 2> gguf_ready_{};
     std::array<std::array<cudaEvent_t, 2>, 2> gguf_free_{};
+    // v0.7.2 (tp 2): the compute stream reached layer l's experts; the ring copy of layer l + 1
+    // waits for it, so it runs under layer l's grouped GEMM instead of in front of the TP
+    // exchanges on the host-to-device copy engine (NINFER_GGUF_RING_GATE=0: off).
+    std::array<cudaEvent_t, 2> gguf_moe_start_{};
+    bool gguf_ring_gate_ = false;
     std::array<std::vector<std::uint8_t>, 2> gguf_issued_;
-    void gguf_issue_copies(int rank, std::int32_t layer);
+    void gguf_issue_copies(int rank, std::int32_t layer, cudaEvent_t after = nullptr);
     std::vector<void*> ring_dst_;
     std::vector<const void*> ring_src_;
     std::vector<std::size_t> ring_bytes_;

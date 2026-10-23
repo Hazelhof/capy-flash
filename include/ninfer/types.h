@@ -170,6 +170,21 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
+    // Disk tier (capy-flash v0.7.2, opt-in): retained conversations are written to files in
+    // `disk_directory` (at most `disk_capacity_bytes`, least recently used out) after
+    // `disk_idle_ms` of Engine inactivity (0: never) and at a clean shutdown
+    // (Engine::persist_context_cache); a request whose prompt begins with a saved checkpoint and
+    // has no reuse in VRAM/RAM loads it instead of prefilling it. Empty directory or zero
+    // capacity: off. `disk_identity` is filled by the Engine (artifact and executable identity,
+    // part of every record's validity key).
+    std::filesystem::path disk_directory;
+    std::uint64_t disk_capacity_bytes = 0;
+    // Free bytes the file system keeps at least (the cache evicts, then skips saves);
+    // 0 = max(10 GiB, 5 % of the file system).
+    std::uint64_t disk_min_free_bytes = 0;
+    std::uint32_t disk_idle_ms        = 5000;
+    std::uint32_t disk_flush_seconds  = 60;
+    std::string disk_identity;
 };
 
 struct ContextCostOptions {
@@ -238,8 +253,10 @@ struct RoutedExpertOptions {
     // the Program minus `slot_headroom_bytes`. MemorySummary reports the resolved count.
     std::uint32_t slots_per_layer   = 0;
     std::size_t slot_headroom_bytes = kDefaultExpertSlotHeadroomBytes;
-    // Host threads computing the missing experts (pinned, spread over the L3 domains).
-    std::uint32_t cpu_threads = 6;
+    // Host threads computing the missing experts (pinned, spread over the L3 domains); 0 = from the
+    // machine at load (process affinity, physical cores, L3 domains: max(6, cores/2, 2 per L3
+    // domain), capped by the cores; 6 on the 9900X).
+    std::uint32_t cpu_threads = 0;
     // Cache insertions per layer per decode window; 0 = unlimited.
     std::uint32_t insert_cap = 2;
     // > 0: a missing expert enters a full layer only with a decayed routing frequency of at least
@@ -288,8 +305,8 @@ struct RoutedExpertOptions {
     // CPU threads of the missing experts with ggml block banks (they replace cpu_threads there):
     // their decode-once kernels are compute-bound at 6 threads and reach the RAM bandwidth at 12
     // (one per physical core of the 9900X; T219: replay decode 196.7 -> 204.9 tok/s at 6 -> 12).
-    // ninfer-serve --expert-cpu-threads sets both.
-    std::uint32_t gguf_cpu_threads = 12;
+    // ninfer-serve --expert-cpu-threads sets both. 0 = one per allowed physical core (12 on the 9900X).
+    std::uint32_t gguf_cpu_threads = 0;
     // Ring slots the cache lends while streaming (rounded up to whole cache layers; >= 512).
     std::uint32_t stream_ring_slots = 576;
     // While streaming, leave the experts the previous prompt chunk routed least to the CPU (in

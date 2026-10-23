@@ -4,10 +4,12 @@
 #include "core/startup.h"
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/measurement.h"
+#include "ops/sparse_moe/host/host_moe_executor.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <set>
@@ -168,6 +170,22 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
+    if (!cache.enabled || cache.disk_directory.empty() || cache.disk_capacity_bytes == 0) {
+        cache.disk_directory.clear();
+        cache.disk_capacity_bytes = 0;
+    } else {
+        // Disk tier validity: the artifact and the executable that computed the records.
+        const auto identity = [](const std::filesystem::path& path) {
+            std::error_code error;
+            const std::filesystem::path real = std::filesystem::weakly_canonical(path, error);
+            const auto size  = std::filesystem::file_size(real, error);
+            const auto mtime = std::filesystem::last_write_time(real, error);
+            return real.string() + ":" + std::to_string(error ? 0 : size) + ":" +
+                   std::to_string(mtime.time_since_epoch().count());
+        };
+        cache.disk_identity = "artifact=" + identity(options.artifact_path) +
+                              ";exe=" + identity("/proc/self/exe");
+    }
     if (!cache.enabled) {
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
             (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
@@ -280,7 +298,22 @@ ConstructedModel construct_model_on(const EngineOptions& requested, DeviceContex
         throw std::logic_error("loaded Model device count does not match the Engine tp");
     }
     frontend.complete();
-    if (models::qwen3_5::gguf_routed_experts(instance->parameters)) {
+    const bool gguf_banks = models::qwen3_5::gguf_routed_experts(instance->parameters);
+    if (instance->parameters.qwen4) {
+        // CPU threads of the missing experts: an explicit value (--expert-cpu-threads) wins, 0 is
+        // resolved from this machine (v0.7.2, issue #11).
+        auto& e                   = options.routed_experts;
+        std::uint32_t& threads    = gguf_banks ? e.gguf_cpu_threads : e.cpu_threads;
+        std::string reason        = "set by the caller (--expert-cpu-threads)";
+        if (threads == 0) {
+            threads = static_cast<std::uint32_t>(ops::host::auto_expert_cpu_threads(
+                ops::host::host_cpu_topology(), gguf_banks, &reason));
+            reason = "auto: " + reason;
+        }
+        std::fprintf(stderr, "routed experts: %u CPU threads for the missing experts (%s)\n", threads,
+                     reason.c_str());
+    }
+    if (gguf_banks) {
         // capy-flash v0.7: ggml block expert banks run without prefill expert streaming, the
         // router-ahead prefetch and the miss split (not implemented for them): plan and run so.
         auto& e = options.routed_experts;

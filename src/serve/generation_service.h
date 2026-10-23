@@ -150,6 +150,9 @@ public:
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
+    // Disk tier of the context cache: writes the retained conversations at a clean shutdown.
+    void persist_context_cache() noexcept { engine_->persist_context_cache(); }
+
     [[nodiscard]] ninfer::MediaCacheSummary media_cache_summary() const {
         return engine_->media_cache_summary();
     }

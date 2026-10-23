@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <string_view>
 #include <numeric>
 #include <thread>
 #include <cinttypes>
@@ -492,7 +493,7 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
             workspace_layers_ = gguf_layers_below(layer_base_, bytes, lend_first_,
                                                   options_.prompt_workspace_bytes);
             if (lend_count_ > text_layers_ ||
-                !may_lend(layer_base_, text_layers_, lend_count_ + workspace_layers_)) {
+                !may_lend(layer_base_, text_layers_, lend_count_ + workspace_layers_, partitions_)) {
                 std::fprintf(stderr, "Qwen4Exp offload experts: ggml block banks: no room for the "
                                      "prefill ring and workspace; zero-copy prefill, base chunks\n");
                 lend_count_       = 0;
@@ -874,7 +875,7 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
             workspace_layers_ = layers_below(
                 layer_base_, lend_first_,
                 (options_.prompt_workspace_bytes + kLendPlaneBytes - 1) / kLendPlaneBytes);
-            if (!may_lend(layer_base_, text_layers_, lend_count_ + workspace_layers_)) {
+            if (!may_lend(layer_base_, text_layers_, lend_count_ + workspace_layers_, partitions_)) {
                 std::fprintf(stderr,
                              "Qwen4Exp offload experts: no room to lend a %lld-byte prompt "
                              "workspace (%d slots per layer); prompt chunks "
@@ -982,6 +983,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
         }
     }
     if (gguf_ && gguf_ring_slots_ > 0) {
+        const char* gate_env = std::getenv("NINFER_GGUF_RING_GATE");
+        gguf_ring_gate_      = partitions_ > 1 && !(gate_env != nullptr && std::string_view(gate_env) == "0");
         for (std::int32_t r = 0; r < partitions_; ++r) {
             const ScopedCurrentDevice scope(r == 0 ? device : peer->device);
             CUDA_CHECK(cudaStreamCreateWithFlags(&gguf_copy_stream_[static_cast<std::size_t>(r)],
@@ -992,6 +995,8 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
                 CUDA_CHECK(cudaEventCreateWithFlags(&gguf_free_[static_cast<std::size_t>(r)][h],
                                                     cudaEventDisableTiming));
             }
+            CUDA_CHECK(cudaEventCreateWithFlags(&gguf_moe_start_[static_cast<std::size_t>(r)],
+                                                cudaEventDisableTiming));
         }
         std::fprintf(stderr,
                      "Qwen4Exp offload experts: ggml block banks: prefill ring of %d slots (%d "
@@ -1077,6 +1082,7 @@ Qwen4OffloadExperts::~Qwen4OffloadExperts() {
         for (std::size_t h = 0; h < 2; ++h) {
             if (gguf_ready_[r][h] != nullptr) { (void)cudaEventDestroy(gguf_ready_[r][h]); }
             if (gguf_free_[r][h] != nullptr) { (void)cudaEventDestroy(gguf_free_[r][h]); }
+            if (h == 0 && gguf_moe_start_[r] != nullptr) { (void)cudaEventDestroy(gguf_moe_start_[r]); }
         }
     }
     if (split_totals_.decode_windows > 0) {
@@ -1365,7 +1371,7 @@ void Qwen4OffloadExperts::upload_gguf_host_rows(cudaStream_t stream) {
     }
 }
 
-void Qwen4OffloadExperts::gguf_issue_copies(int rank, std::int32_t layer) {
+void Qwen4OffloadExperts::gguf_issue_copies(int rank, std::int32_t layer, cudaEvent_t after) {
     auto& issued = gguf_issued_[static_cast<std::size_t>(rank)];
     if (layer >= text_layers_ || issued[static_cast<std::size_t>(layer)]) { return; }
     issued[static_cast<std::size_t>(layer)] = 1;
@@ -1376,6 +1382,7 @@ void Qwen4OffloadExperts::gguf_issue_copies(int rank, std::int32_t layer) {
     // the half must be free again (the grouped call of layer - 2 has read it).
     CUDA_CHECK(cudaStreamWaitEvent(copy, cache_->lend_events()[r], 0));
     CUDA_CHECK(cudaStreamWaitEvent(copy, gguf_free_[r][half], 0));
+    if (after != nullptr) { CUDA_CHECK(cudaStreamWaitEvent(copy, after, 0)); }
     const auto& c = gguf_ring_copies_[r][static_cast<std::size_t>(layer)];
     if (!c.dst.empty()) {
         std::byte* arena = (rank == 0 ? memory_.pool : peer_pool_)[0];
@@ -1402,7 +1409,12 @@ bool Qwen4OffloadExperts::gguf_ring_copy(int rank, std::int32_t layer, cudaStrea
     // This layer's copies (normally issued while the previous layer computed), then the next
     // layer's into the other half, overlapping this layer's work; the compute waits for its own.
     gguf_issue_copies(rank, layer);
-    gguf_issue_copies(rank, layer + 1);
+    cudaEvent_t gate = nullptr;
+    if (gguf_ring_gate_) {
+        gate = gguf_moe_start_[static_cast<std::size_t>(rank)];
+        CUDA_CHECK(cudaEventRecord(gate, stream));
+    }
+    gguf_issue_copies(rank, layer + 1, gate);
     CUDA_CHECK(cudaStreamWaitEvent(
         stream, gguf_ready_[static_cast<std::size_t>(rank)][static_cast<std::size_t>(layer % 2)], 0));
     return true;
@@ -1746,7 +1758,8 @@ std::int32_t Qwen4OffloadExperts::gguf_layers_below(std::span<const std::int32_t
 }
 
 bool Qwen4OffloadExperts::may_lend(std::span<const std::int32_t> layer_base,
-                                   std::int32_t text_layers, std::int32_t layers) {
+                                   std::int32_t text_layers, std::int32_t layers,
+                                   std::int32_t partitions) {
     if (layers < 0 || layers > text_layers) { return false; }
     std::int64_t lent  = 0;
     std::int64_t total = 0;
@@ -1754,7 +1767,14 @@ bool Qwen4OffloadExperts::may_lend(std::span<const std::int32_t> layer_base,
         total += layer_base[static_cast<std::size_t>(l)];
         if (l >= text_layers - layers) { lent += layer_base[static_cast<std::size_t>(l)]; }
     }
-    return 4 * lent <= 3 * total;
+    // One GPU: 0.9 (v0.7.2, a 8192-column prompt chunk next to the ring: 64k prefill +31 %, decode
+    // and replay TTFT not worse); tp 2: 0.75 (16384 columns fit already).
+    double fraction = partitions == 1 ? 0.9 : 0.75;
+    if (const char* env = std::getenv("NINFER_QWEN4_PROMPT_LEND")) {
+        const double v = std::atof(env);
+        if (v > 0.0 && v <= 1.0) fraction = v;
+    }
+    return static_cast<double>(lent) <= fraction * static_cast<double>(total);
 }
 
 std::vector<std::int32_t> Qwen4OffloadExperts::layer_slot_profile(std::int32_t layers,

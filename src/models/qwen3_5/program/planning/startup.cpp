@@ -1528,7 +1528,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                                     layer_base, text_layers - ring_layers,
                                     static_cast<std::int64_t>((need + lend_bytes - 1) / lend_bytes));
                 if (execution::Qwen4OffloadExperts::may_lend(layer_base, text_layers,
-                                                             ring_layers + layers)) {
+                                                             ring_layers + layers,
+                                                             static_cast<std::int32_t>(impl->tp))) {
                     impl->qwen4_base_chunk = base;
                     impl->prefill_chunk    = width;
                     prompt_workspace       = need;
@@ -1700,7 +1701,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
         const MissSplitOptions& split      = experts.miss_split;
         const MissSplitCosts& cost         = split.costs;
         const auto nonneg                  = [](float v) { return std::isfinite(v) && v >= 0.0F; };
-        if (experts.slots_per_layer > 512 || experts.cpu_threads == 0 ||
+        if (experts.slots_per_layer > 512 || experts.cpu_threads > 64 ||
             experts.admit_threshold < 0.0F || !(experts.half_life_tokens > 0.0F) ||
             !(experts.evict_tau_windows >= 0.0F) || !std::isfinite(experts.evict_tau_windows) ||
             experts.device_reads > 16 || split.count > 16 || split.max_reads > 16 ||
@@ -1713,7 +1714,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters,
             !(experts.prefetch_link_gbps > 0.0F)) {
             throw std::invalid_argument(
                 "Engine routed_experts: slots_per_layer must be in [0,512], "
-                "cpu_threads > 0, admit_threshold >= 0, half_life > 0, "
+                "cpu_threads <= 64 (0 = auto), admit_threshold >= 0, half_life > 0, "
                 "evict_tau_windows >= 0, "
                 "device_reads, miss_split count/max_reads <= 16, "
                 "miss_split fraction in [0,1], costs >= 0, slowdown >= 1, "

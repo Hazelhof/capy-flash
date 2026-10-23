@@ -36,6 +36,7 @@
 #include <optional>
 #include <span>
 #include <thread>
+#include <string>
 #include <vector>
 
 namespace ninfer::ops::host {
@@ -117,8 +118,24 @@ struct HostMoeCallStats {
 
 enum class Schedule { Dynamic, Static };
 
-// Physical cores spread over the L3 domains (CCDs) in round-robin order, lowest SMT sibling of
-// each core, from Linux sysfs. On the 9900X: 0, 6, 1, 7, 2, 8, ...
+// The cores this process may run on (sched_getaffinity), from Linux sysfs: an SMT group counts
+// once, represented by its lowest allowed sibling.
+struct HostCpuTopology {
+    std::int32_t logical_cpus   = 0; // allowed logical CPUs
+    std::int32_t physical_cores = 0; // allowed physical cores
+    std::int32_t l3_domains     = 0; // distinct L3 caches (CCDs) among them
+    std::int32_t numa_nodes     = 0; // distinct NUMA nodes among them
+};
+[[nodiscard]] HostCpuTopology host_cpu_topology();
+
+// Default number of CPU threads for the missing routed experts when the caller did not set one
+// (RoutedExpertOptions cpu_threads / gguf_cpu_threads = 0). `gguf`: ggml block expert banks.
+// `reason` (optional) gets a one-line explanation for the startup log.
+[[nodiscard]] std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf,
+                                                   std::string* reason = nullptr);
+
+// Physical cores spread over the L3 domains (CCDs) in round-robin order, lowest allowed SMT
+// sibling of each core, from Linux sysfs. On the 9900X: 0, 6, 1, 7, 2, 8, ...
 [[nodiscard]] std::vector<int> spread_cpus(std::int32_t count);
 // Physical cores filling one L3 domain (CCD) before the next, starting with domain `first`
 // (index in ascending L3 id order): 0, 1, 2, 3, 4, 5, 6, ... on the 9900X with first = 0.

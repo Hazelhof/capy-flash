@@ -829,6 +829,11 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`, `--profile flash-next`: `8`) |
 | `--host-kv-mib N` | shared pinned Host Main/Backend KV byte capacity in MiB | `8192`; at `--tp 2` `0` unless set (`--profile 27b`: `8192`, `--profile flash-next`: `4096`) |
+| `--disk-cache-dir DIR` | disk tier of the context cache (with `--disk-cache-gib`): retained conversations are written to `DIR` and survive a restart; see [Disk tier](#disk-tier-of-the-context-cache) | off |
+| `--disk-cache-gib N` | byte cap of the disk tier in GiB; least recently used conversations are deleted first | off (required with `--disk-cache-dir`) |
+| `--disk-cache-min-free-gib N` | free space the file system keeps at least; the disk tier evicts, then skips saves | `max(10, 5 % of the file system)` |
+| `--disk-cache-idle-ms N` | Engine inactivity after which retained conversations not yet on disk are written (`0`: only at shutdown) | `5000` |
+| `--disk-cache-flush-seconds N` | at SIGTERM/SIGINT, the time allowed to write the conversations not yet on disk | `60` |
 | `--max-private-continuations N` | private continuation descriptor capacity | `2 * max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
@@ -870,6 +875,49 @@ mode and cannot be combined with any of the seven explicit context-cache capacit
 zero-valued flags.
 
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
+
+### Disk tier of the context cache
+
+`--disk-cache-dir DIR --disk-cache-gib N` (v0.7.2, off by default; idea and first implementation by
+@KouShuo, issue #6) adds a third tier below VRAM and RAM. Retained conversations are written to `DIR` by a
+thread of their own: after `--disk-cache-idle-ms` without any request in the server (default 5 s; the
+write stops as soon as a request arrives and continues at the next idle moment, so a decode never waits
+for the disk) and at a clean shutdown (SIGTERM/SIGINT, at most `--disk-cache-flush-seconds`). After a
+restart, a request that has no reuse in VRAM or RAM and whose prompt begins with a saved conversation
+loads its KV, MTP KV and recurrent state from disk and prefills only the rest of the prompt.
+
+- Storage is content addressed, as in LMCache and SGLang HiCache: the KV is cut into 256-token blocks
+  named by a chained hash of the prefix tokens, each written once and shared by every later turn and by
+  every conversation with the same prefix; the recurrent (GDN) state cannot be cut into blocks and is
+  saved whole at one checkpoint per save (147 MiB for Qwen3.8-27B). A conversation itself is a small
+  manifest (tokens, the blocks it uses, its checkpoints). A turn therefore writes only its new tokens'
+  blocks and one state: a 32-turn agent session growing to 80k tokens wrote 3.2 GiB of KV plus one
+  state per turn.
+- One directory per server: `DIR/.lock` is held for the life of the process; a second server on the
+  same directory does not start and names the process that holds it.
+- Space: at most `--disk-cache-gib` (least recently used conversations go first, with the blocks only
+  they use; blocks of an interrupted save are reused by the next attempt or deleted at the next start),
+  and the file system always keeps `--disk-cache-min-free-gib` free (default max(10 GiB, 5 % of the file
+  system)): the cache evicts, and if that is not enough the save is skipped with a log line. The server
+  warns at start when the cap is more than the space it can use.
+- Files are written to a temporary, synced and renamed (a conversation only after its blocks): a killed
+  server leaves no partial file (temporaries are deleted at the next start). Every 4 MiB block carries a
+  checksum and every KV block its tokens; a broken file is deleted and the request prefills normally.
+- Each file carries a validity key: artifact and executable (path, size, modification time), tensor
+  parallel width, KV dtype, speculative mode and the KV/state layouts; files with another key are
+  ignored. A new build or artifact starts with an empty disk tier.
+- Text prompts only (no images); without speculation or with MTP (DFlash/DFlash2 turn the disk tier
+  off). Pinned memory: about 320 MiB plus one StateImage. Space, Qwen3.8-27B with INT8 KV (one GPU or
+  both halves at `--tp 2`): about 36 KB per token of context plus 147 MiB per saved state.
+- Measured on two RTX 5070 Ti, Qwen3.8-27B GSQ-3, `--profile 27b`, page cache dropped: time to first
+  token after a restart 0.32 / 0.70 / 1.08 s at 20k / 80k / 140k tokens of context, against 3.8 / 21 / 48 s
+  of prefill (the KV and state themselves load at about 6 GB/s); the reply is the same token for token as the prefill from zero and as
+  the resume from VRAM. `usage.prompt_tokens_details.cached_tokens` does not count the tokens loaded
+  from disk (the server log does: `[disk-kv] resumed`).
+- What leaves the RAM tier under pressure is on disk only if the server was idle for
+  `--disk-cache-idle-ms` after that conversation's last turn (or shut down cleanly); there is no
+  synchronous spill at eviction time. After a restart a conversation resumes from its latest saved
+  checkpoint: an edited last message falls back to a full prefill.
 
 ### Two GPUs
 

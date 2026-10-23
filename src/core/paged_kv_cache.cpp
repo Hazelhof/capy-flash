@@ -793,6 +793,40 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
     }
 }
 
+void DeviceKVPagePool::copy_to_host_buffer(std::span<const DeviceKVPageHandle> source,
+                                           std::byte* destination, const HostKVPageLayout& host,
+                                           cudaStream_t stream) const {
+    if (destination == nullptr || host.geometry != geometry()) {
+        throw std::invalid_argument("Paged KV D2H buffer geometry is inconsistent");
+    }
+    for (DeviceKVPageHandle page : source) { (void)physical_index(page); }
+    require_host_replicas(host);
+    copy_to_host_local(source, destination, host, 0, stream);
+    if (mirror_ != nullptr) {
+        const ScopedCurrentDevice scope(mirror_where_.device);
+        order_mirror_transfer();
+        mirror_->copy_to_host_local(source, destination, host, host.replica_stride,
+                                    mirror_where_.transfer_stream);
+    }
+}
+
+void DeviceKVPagePool::copy_from_host_buffer(const std::byte* source, const HostKVPageLayout& host,
+                                             std::span<const DeviceKVPageHandle> destination,
+                                             cudaStream_t stream) const {
+    if (source == nullptr || host.geometry != geometry()) {
+        throw std::invalid_argument("Paged KV H2D buffer geometry is inconsistent");
+    }
+    validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
+    require_host_replicas(host);
+    copy_from_host_local(source, host, 0, destination, stream);
+    if (mirror_ != nullptr) {
+        const ScopedCurrentDevice scope(mirror_where_.device);
+        order_mirror_transfer();
+        mirror_->copy_from_host_local(source, host, host.replica_stride, destination,
+                                      mirror_where_.transfer_stream);
+    }
+}
+
 std::vector<DeviceKVPageReservation>
 reserve_device_kv_page_bundle(std::span<const DeviceKVPageReservationRequest> requests) {
     for (std::size_t index = 0; index < requests.size(); ++index) {

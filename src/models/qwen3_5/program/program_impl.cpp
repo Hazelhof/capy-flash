@@ -7,6 +7,7 @@
 #include "core/device.h"
 #include "core/device_scope.h"
 #include "core/expert_cache.h"
+#include "ops/sparse_moe/host/host_moe_executor.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/hyper_connection.h"
 #include "ninfer/ops/target_logprobs.h"
@@ -430,6 +431,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     work.reset_peak();
     if (peer) { peer->work.reset(); }
     workspace_logical_peak_bytes = 0;
+    initialize_disk_cache();
 }
 
 namespace {
@@ -592,7 +594,11 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         execution::Qwen4OffloadOptions options;
         options.slots_per_layer      = q.expert_slots;
         options.elastic_columns      = q.elastic_columns;
-        options.cpu_threads          = static_cast<std::int32_t>(plan.qwen4_experts.cpu_threads);
+        // 0 (auto) is resolved by the Engine at load; callers that plan without it get the same rule.
+        options.cpu_threads = plan.qwen4_experts.cpu_threads != 0
+                                  ? static_cast<std::int32_t>(plan.qwen4_experts.cpu_threads)
+                                  : ops::host::auto_expert_cpu_threads(ops::host::host_cpu_topology(),
+                                                                       parameters.qwen4->layers.front().moe.experts.gguf);
         options.insert_cap           = static_cast<std::int32_t>(plan.qwen4_experts.insert_cap);
         options.admit_threshold      = plan.qwen4_experts.admit_threshold;
         options.half_life_tokens     = plan.qwen4_experts.half_life_tokens;

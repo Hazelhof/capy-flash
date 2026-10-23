@@ -297,6 +297,14 @@ public:
     void copy_from_host(HostKVAllocationConstView source,
                         std::span<const DeviceKVPageHandle> destination,
                         cudaStream_t stream = nullptr) const;
+    // The same transfers to/from caller memory laid out as `host` (one record per page, every
+    // rank's half), for the disk tier of the context cache (v0.7.2). The memory must stay valid
+    // and, for asynchronous copies, page-locked until the caller has synchronized both devices.
+    void copy_to_host_buffer(std::span<const DeviceKVPageHandle> source, std::byte* destination,
+                             const HostKVPageLayout& host, cudaStream_t stream = nullptr) const;
+    void copy_from_host_buffer(const std::byte* source, const HostKVPageLayout& host,
+                               std::span<const DeviceKVPageHandle> destination,
+                               cudaStream_t stream = nullptr) const;
 
 private:
     friend class DeviceKVPageLease;

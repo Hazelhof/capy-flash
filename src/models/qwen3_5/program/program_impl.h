@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/tp2/program_tp2.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
+#include "core/disk_kv_cache.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
@@ -33,6 +34,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <array>
+#include <functional>
+#include <string>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -459,6 +462,10 @@ struct RequestControl {
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
+        // Disk tier (v0.7.2): the resume was tried; the frontier it loaded (0: none). The MTP
+        // bridge then runs at this frontier instead of `base` (which stays the admitted reuse).
+        bool disk_attempted    = false;
+        std::uint32_t disk_base = 0;
     };
 
     std::optional<Prefill> prefill;
@@ -620,6 +627,17 @@ public:
     [[nodiscard]] std::size_t host_kv_free_bytes() const noexcept;
     DeviceKVCompaction compact_device_kv();
 
+    // Disk tier (v0.7.2, storage/disk_kv.cpp).
+    void initialize_disk_cache();
+    [[nodiscard]] bool disk_cache_has_unsaved() const noexcept;
+    DiskCacheSave disk_cache_save_one(const std::function<bool()>& abort);
+    DiskCacheSave disk_cache_save(std::uint32_t slot, const std::function<bool()>& abort);
+    void disk_synchronize() const;
+    [[nodiscard]] std::string disk_cache_status() const;
+    // At the first step of a root prefill: loads the longest saved checkpoint the prompt begins
+    // with (KV, MTP KV, StateImage) and moves the cursor there. Returns the tokens loaded (0: none).
+    std::uint32_t disk_cache_resume(SequenceState& sequence, RequestControl& request);
+
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 
     void reset_memory_peaks() noexcept;
@@ -675,6 +693,18 @@ public:
     std::unique_ptr<qwen3_5::StateImageDevicePool> state_images;
     std::unique_ptr<qwen3_5::HostStatePool> host_state_images;
     std::unique_ptr<StateImageStore> state_store;
+    // Disk tier (v0.7.2, storage/disk_kv.cpp): null when off. The pinned scratch holds one Host
+    // StateImage, the read buffer two resume read-ahead chunks.
+    std::unique_ptr<DiskKVCache> disk_kv;
+    std::optional<PinnedHostBuffer> disk_state_scratch;
+    std::optional<PinnedHostBuffer> disk_read_buffer;
+    // Per continuation slot: the slot generation and the frontier last handed to the disk.
+    struct DiskSaved {
+        std::uint64_t generation = 0;
+        std::uint32_t frontier   = 0;
+        std::uint64_t digest     = 0; // xxh64 of the tokens up to `frontier`
+    };
+    std::vector<DiskSaved> disk_saved;
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;

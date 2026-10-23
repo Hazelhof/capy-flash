@@ -38,6 +38,14 @@ Ryzen 9 9900X, 96 GB DDR5, full clocks):
   tokens; 175 / 326 / 560 / 927 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests).
 - **Vision on Flash-Next** (opt-in, `--vision` with a vision artifact).
 
+**New in v0.7.2: pick up where you left off.**
+- **Disk tier of the context cache** (opt-in, `--disk-cache-dir DIR --disk-cache-gib N`; idea by @KouShuo): conversations
+  survive a restart and resume without a new prefill (27B, two GPUs: 140k tokens in 1.08 s instead of 48 s). KV is
+  stored once in shared 256-token blocks, under a size cap and a free-space margin, one directory per server.
+- **Faster long prompts on the 64 GB edition of Flash-Next**: prefill 64k +19 % on two GPUs (3,994 tok/s) and +35 % on
+  one (2,921 tok/s), same tokens.
+- **CPU expert threads chosen from the machine** (physical cores, affinity, L3 domains) instead of fixed counts.
+
 **New in v0.7: start small, grow later, same engine.**
 - **Flash-Next on 64 GB of RAM, with one or two GPUs** (`--model flash-next-64gb`): ISTA-DASLab's GSQ-RCO i-quant experts
   (48 GiB in RAM instead of 65). Two GPUs: the fastest way to run it here, LocalMaxxing reasoning-v1 **239 tok/s**,
@@ -69,7 +77,7 @@ the GPU (tensor-parallel when there are two). capy-flash **is ninfer-tp2, rename
 of [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every
 piece of prior work it builds on.
 
-Status: **v0.7.1** (2026-10-22). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
+Status: **v0.7.2** (2026-10-23). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
 
 ## What it does
 - Tensor parallel over PCIe on two GPUs **without peer-to-peer** (pinned-host mailbox, FP32 partial sums); with P2P
@@ -87,6 +95,12 @@ Status: **v0.7.1** (2026-10-22). Built, tested and measured on one machine (belo
   back to expert slots at once. On an agentic replay of Qwen3.8-27B (3 interleaved sessions
   and 11 subagents, production flags, 4 lanes): median time to first token 2.14 → 0.98 s, prompt tokens served from
   cache 67 → 78 %, prompt tokens recomputed −35 %, decode unchanged.
+- Disk tier of the context cache (v0.7.2, opt-in, idea and first implementation by @KouShuo): `--disk-cache-dir DIR
+  --disk-cache-gib N` writes idle conversations to disk (and all of them at a clean shutdown), and after a restart a
+  long conversation resumes from disk instead of re-prefilling it (140k tokens: 1.1 s instead of 48 s on two RTX
+  5070 Ti). KV in 256-token blocks addressed by the prefix, written once and shared between turns and conversations;
+  validity key, atomic writes, checksums, LRU under the cap, free-space margin, one locked directory per server; see
+  [docs/serving.md](docs/serving.md#disk-tier-of-the-context-cache).
 - Expert residency that follows the conversation (v0.6): a prompt that continues a cached conversation keeps the
   experts its next answer needs, a new conversation only updates their statistics; short prompts stream their experts
   to the GPUs from 256 tokens (`--stream-min-tokens`). The post-prompt slowdown of v0.5.x (~250 ms per turn) is gone.

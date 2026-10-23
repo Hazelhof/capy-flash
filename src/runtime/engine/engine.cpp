@@ -478,6 +478,20 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+void Engine::persist_context_cache() noexcept {
+    if (impl_ == nullptr) { return; }
+    std::visit(
+        [](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (!std::is_same_v<CoreState, std::monostate>) {
+                if constexpr (requires { core->persist_context_cache(); }) {
+                    if (core != nullptr) { core->persist_context_cache(); }
+                }
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(

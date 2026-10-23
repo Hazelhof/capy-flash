@@ -523,6 +523,28 @@ std::size_t Program::host_kv_free_bytes() const noexcept { return impl_->host_kv
 
 DeviceKVCompaction Program::compact_device_kv() { return impl_->compact_device_kv(); }
 
+bool Program::disk_cache_enabled() const noexcept { return impl_->disk_kv != nullptr; }
+
+std::uint32_t Program::disk_cache_idle_ms() const noexcept {
+    return impl_->disk_kv != nullptr ? impl_->context_cache.disk_idle_ms : 0U;
+}
+
+std::uint32_t Program::disk_cache_flush_seconds() const noexcept {
+    return impl_->disk_kv != nullptr ? impl_->context_cache.disk_flush_seconds : 0U;
+}
+
+bool Program::disk_cache_has_unsaved() const noexcept { return impl_->disk_cache_has_unsaved(); }
+
+DiskCacheSave Program::disk_cache_save_one(const std::function<bool()>& abort) {
+    return impl_->disk_cache_save_one(abort);
+}
+
+bool Program::disk_cache_drain(std::chrono::steady_clock::time_point deadline) {
+    return impl_->disk_kv == nullptr || impl_->disk_kv->drain(deadline);
+}
+
+std::string Program::disk_cache_status() const { return impl_->disk_cache_status(); }
+
 ReleaseResult Program::release_continuation(ContinuationHandle&& continuation) noexcept {
     return impl_->release_continuation(std::move(continuation));
 }

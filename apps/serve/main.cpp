@@ -1,3 +1,4 @@
+#include "core/disk_kv_cache.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
 #include "serve/generation_service.h"
@@ -53,6 +54,18 @@ int main(int argc, char** argv) {
     ninfer::serve::OperationalLog operational_log(logger);
     bool serving = false;
 
+    // One disk-cache directory = one server: refuse before loading the weights.
+    if (!options.context_cache.disk_directory.empty()) {
+        if (const auto holder =
+                ninfer::DiskKVCache::directory_holder(options.context_cache.disk_directory)) {
+            std::cerr << "ninfer-serve: disk cache directory "
+                      << options.context_cache.disk_directory.string()
+                      << " is in use by another server (PID " << *holder
+                      << "): give each server its own --disk-cache-dir\n";
+            return 1;
+        }
+    }
+
     try {
         ninfer::serve::HttpServer server(options, logger);
         if (!server.bind()) {
@@ -97,6 +110,9 @@ int main(int argc, char** argv) {
         // the startup failures above) so a supervisor reloads the model instead of keeping a dead
         // endpoint up. The engine watch already logged the failure.
         if (server.engine_failed()) { return 2; }
+        // Disk tier of the context cache (--disk-cache-dir): the retained conversations go to
+        // disk before the Engine is destroyed (bounded by --disk-cache-flush-seconds).
+        service.persist_context_cache();
         operational_log.server_stopped();
         return 0;
     } catch (const std::exception& exception) {

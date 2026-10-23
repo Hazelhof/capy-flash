@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -2037,6 +2038,76 @@ private:
         publish_runtime_stats();
     }
 
+    // Disk tier (v0.7.2): with no request in the Engine, writes the retained conversations that
+    // are not on disk yet, one by one, until a request arrives (the one being written is then
+    // dropped and written again at the next idle period).
+    void save_context_to_disk_while_idle() noexcept {
+        try {
+            std::scoped_lock execution_lock(execution_mutex_);
+            auto& program = *instance_.program;
+            if (failed_ || materializing_ || program.has_context_transaction()) { return; }
+            for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                if (slots_[lane] != nullptr) { return; }
+            }
+            const auto interrupted = [&] {
+                std::lock_guard lock(queue_mutex_);
+                return stopping_ || !pending_.empty();
+            };
+            while (!interrupted()) {
+                const auto result = program.disk_cache_save_one(interrupted);
+                using DiskSave    = std::remove_cvref_t<decltype(result)>;
+                if (result == DiskSave::NothingToSave) {
+                    disk_idle_check_ = false;
+                    return;
+                }
+                if (result == DiskSave::Aborted) { return; }
+            }
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[disk-kv] idle save failed: %s\n", error.what());
+            disk_idle_check_ = false;
+        } catch (...) { disk_idle_check_ = false; }
+    }
+
+public:
+    // Disk tier (v0.7.2): at a clean shutdown, writes every retained conversation not on disk
+    // yet (most tokens first) and waits for the writer, within ContextCacheOptions::
+    // disk_flush_seconds. Requests still running keep running; their conversations are not saved.
+    void persist_context_cache() noexcept {
+        auto& program = *instance_.program;
+        if (!program.disk_cache_enabled()) { return; }
+        const auto started  = Clock::now();
+        const auto deadline = started + std::chrono::seconds(program.disk_cache_flush_seconds());
+        std::size_t saved = 0, failed = 0;
+        bool drained      = false;
+        try {
+            std::scoped_lock execution_lock(execution_mutex_);
+            if (!failed_ && !program.has_context_transaction()) {
+                const auto late = [&] { return Clock::now() >= deadline; };
+                while (!late()) {
+                    const auto result = program.disk_cache_save_one(late);
+                    using DiskSave    = std::remove_cvref_t<decltype(result)>;
+                    if (result == DiskSave::Saved) {
+                        ++saved;
+                    } else if (result == DiskSave::Failed) {
+                        ++failed;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            drained = program.disk_cache_drain(deadline);
+            std::fprintf(stderr,
+                         "[disk-kv] shutdown: %zu conversation(s) saved, %zu failed, %s in %.1f s; "
+                         "%s\n",
+                         saved, failed, drained ? "all written" : "deadline reached (unfinished dropped)",
+                         std::chrono::duration<double>(Clock::now() - started).count(),
+                         program.disk_cache_status().c_str());
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[disk-kv] shutdown save failed: %s\n", error.what());
+        } catch (...) {}
+    }
+
+private:
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
     void fail_all_locked(std::exception_ptr error) noexcept {
@@ -2073,7 +2144,20 @@ private:
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
-                    if (!active) {
+                    if (active) { disk_idle_check_ = true; }
+                    const std::uint32_t disk_idle_ms = instance_.program->disk_cache_idle_ms();
+                    if (!active && disk_idle_ms != 0 && disk_idle_check_) {
+                        // Disk tier (v0.7.2): after disk_idle_ms without work, save the retained
+                        // conversations not on disk yet; an arriving request interrupts it.
+                        const bool woke =
+                            queue_cv_.wait_for(lock, std::chrono::milliseconds(disk_idle_ms),
+                                               [&] { return stopping_ || !pending_.empty(); });
+                        if (!woke) {
+                            lock.unlock();
+                            save_context_to_disk_while_idle();
+                            continue;
+                        }
+                    } else if (!active) {
                         queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
                     }
                 }
@@ -2187,6 +2271,8 @@ private:
     std::optional<MaterializingRequest> materializing_;
     // offload_idle_device_kv(): the Program resource revision it last left behind.
     std::uint64_t idle_kv_revision_ = 0;
+    // Disk tier: some work ran since the last idle save found nothing to save.
+    std::atomic<bool> disk_idle_check_{true};
     Scheduling scheduler_;
     std::atomic<bool> admission_check_pending_{false};
     std::uint64_t worker_accounted_elapsed_ns_ = 0;

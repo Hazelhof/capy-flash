@@ -2,6 +2,7 @@
 
 #include <immintrin.h>
 #include <pthread.h>
+#include <utility>
 #include <sched.h>
 
 #include <algorithm>
@@ -64,18 +65,137 @@ bool read_first_int(const std::string& path, int& value) {
     return static_cast<bool>(f);
 }
 
-} // namespace
+// A sysfs cpu list ("0-3,8,10-11") as cpu ids; empty when the file is missing or malformed.
+std::vector<int> read_cpu_list(const std::string& path) {
+    std::ifstream f(path);
+    std::string text;
+    if (!f || !std::getline(f, text)) return {};
+    std::vector<int> out;
+    std::size_t at = 0;
+    while (at < text.size()) {
+        std::size_t end = text.find(',', at);
+        if (end == std::string::npos) end = text.size();
+        const std::string item = text.substr(at, end - at);
+        const std::size_t dash = item.find('-');
+        try {
+            if (dash == std::string::npos) {
+                if (!item.empty()) out.push_back(std::stoi(item));
+            } else {
+                const int lo = std::stoi(item.substr(0, dash)), hi = std::stoi(item.substr(dash + 1));
+                for (int c = lo; c <= hi; ++c) out.push_back(c);
+            }
+        } catch (const std::exception&) {
+            return {};
+        }
+        at = end + 1;
+    }
+    return out;
+}
 
-std::vector<int> spread_cpus(std::int32_t count) {
-    std::map<int, std::vector<int>> by_l3; // L3 id -> primary cpus, ascending
+struct HostCore {
+    int cpu  = 0; // lowest allowed SMT sibling
+    int l3   = 0;
+    int node = 0;
+};
+
+// The allowed physical cores (process affinity), grouped by nothing, in cpu order.
+std::vector<HostCore> allowed_cores(int* logical = nullptr) {
+    // The affinity of the process as it was at the first call: HostCpuPool pins its calling thread to
+    // cpus[0], so reading the calling thread's mask later would see a single cpu (and a second pool, or a
+    // test that builds several, would find "fewer physical cores than requested threads").
+    static const std::pair<bool, cpu_set_t> process_mask = [] {
+        cpu_set_t m;
+        CPU_ZERO(&m);
+        const bool ok = sched_getaffinity(0, sizeof(m), &m) == 0;
+        return std::pair<bool, cpu_set_t>{ok, m};
+    }();
+    const bool have_mask   = process_mask.first;
+    const cpu_set_t& mask  = process_mask.second;
+    auto allowed         = [&](int cpu) {
+        return !have_mask || (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &mask));
+    };
+    std::vector<HostCore> cores;
+    int n_logical = 0;
     for (int cpu = 0;; ++cpu) {
         const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
-        int first_sibling = -1, l3 = 0;
-        if (!read_first_int(base + "/topology/thread_siblings_list", first_sibling)) break;
-        if (first_sibling != cpu) continue; // an SMT sibling of a core already listed
-        if (!read_first_int(base + "/cache/index3/id", l3)) l3 = 0;
-        by_l3[l3].push_back(cpu);
+        const std::vector<int> siblings = read_cpu_list(base + "/topology/thread_siblings_list");
+        if (siblings.empty()) break;
+        if (!allowed(cpu)) continue;
+        ++n_logical;
+        int first = cpu;
+        for (const int s : siblings) {
+            if (allowed(s)) {
+                first = s;
+                break;
+            }
+        }
+        if (first != cpu) continue; // an SMT sibling of a core already listed
+        HostCore core;
+        core.cpu = cpu;
+        if (!read_first_int(base + "/cache/index3/id", core.l3)) core.l3 = 0;
+        for (int node = 0; node < 64; ++node) {
+            if (std::ifstream(base + "/node" + std::to_string(node) + "/cpulist")) {
+                core.node = node;
+                break;
+            }
+        }
+        cores.push_back(core);
     }
+    if (logical != nullptr) *logical = n_logical;
+    return cores;
+}
+
+std::map<int, std::vector<int>> cores_by_l3() {
+    std::map<int, std::vector<int>> by_l3; // L3 id -> allowed primary cpus, ascending
+    for (const HostCore& core : allowed_cores()) by_l3[core.l3].push_back(core.cpu);
+    return by_l3;
+}
+
+} // namespace
+
+HostCpuTopology host_cpu_topology() {
+    HostCpuTopology t;
+    const std::vector<HostCore> cores = allowed_cores(&t.logical_cpus);
+    std::map<int, int> l3, node;
+    for (const HostCore& c : cores) {
+        ++l3[c.l3];
+        ++node[c.node];
+    }
+    t.physical_cores = static_cast<std::int32_t>(cores.size());
+    t.l3_domains     = static_cast<std::int32_t>(l3.size());
+    t.numa_nodes     = static_cast<std::int32_t>(node.size());
+    return t;
+}
+
+std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf, std::string* reason) {
+    const std::int32_t cores = std::max<std::int32_t>(1, topology.physical_cores);
+    std::int32_t n           = 0;
+    std::string why;
+    if (gguf) {
+        // ggml block banks: the decode-once kernels are compute-bound below one thread per core
+        // (9900X: 6 -> 12 threads = +4 % decode, T219; 10 vs 12 within 3 %, v072/cpu-threads).
+        n   = cores;
+        why = "one per physical core (ggml block banks)";
+    } else {
+        // NVFP4: the dots are bound by the memory bandwidth (9900X: 68 GB/s at 6 threads, per-expert
+        // cost flat from 6 to 12, v072/cpu-threads): half the physical cores, at least 6, and at
+        // least two per L3 domain, since one core cannot fill a CCD's link to memory.
+        n   = std::max({std::int32_t{6}, cores / 2, 2 * topology.l3_domains});
+        why = "max(6, cores/2, 2 per L3 domain) (NVFP4 banks, memory-bound)";
+    }
+    n = std::min({n, cores, std::int32_t{64}});
+    if (reason != nullptr) {
+        *reason = why + "; " + std::to_string(topology.physical_cores) + " physical cores, " +
+                  std::to_string(topology.logical_cpus) + " logical CPUs allowed, " +
+                  std::to_string(topology.l3_domains) + " L3 domains, " +
+                  std::to_string(topology.numa_nodes) + " NUMA nodes";
+        if (topology.numa_nodes > 1) *reason += " (bank pages are not NUMA-placed)";
+    }
+    return n;
+}
+
+std::vector<int> spread_cpus(std::int32_t count) {
+    std::map<int, std::vector<int>> by_l3 = cores_by_l3();
     std::vector<int> out;
     for (std::size_t i = 0; out.size() < static_cast<std::size_t>(count); ++i) {
         bool any = false;
@@ -94,15 +214,7 @@ std::vector<int> spread_cpus(std::int32_t count) {
 }
 
 std::vector<int> packed_cpus(std::int32_t count, std::int32_t first) {
-    std::map<int, std::vector<int>> by_l3;
-    for (int cpu = 0;; ++cpu) {
-        const std::string base = "/sys/devices/system/cpu/cpu" + std::to_string(cpu);
-        int first_sibling = -1, l3 = 0;
-        if (!read_first_int(base + "/topology/thread_siblings_list", first_sibling)) break;
-        if (first_sibling != cpu) continue;
-        if (!read_first_int(base + "/cache/index3/id", l3)) l3 = 0;
-        by_l3[l3].push_back(cpu);
-    }
+    std::map<int, std::vector<int>> by_l3 = cores_by_l3();
     std::vector<std::vector<int>> domains;
     for (auto& [id, cpus] : by_l3) domains.push_back(cpus);
     std::vector<int> out;

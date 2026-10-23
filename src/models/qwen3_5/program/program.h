@@ -8,7 +8,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <array>
+#include <chrono>
+#include <functional>
 #include <memory>
+#include <string>
 #include <optional>
 #include <span>
 #include <utility>
@@ -59,6 +62,14 @@ struct DeviceKVLeaseShortfall {
 struct DeviceKVPages {
     std::uint32_t main    = 0;
     std::uint32_t backend = 0;
+};
+
+// Program::disk_cache_save_one (v0.7.2, disk tier of the context cache).
+enum class DiskCacheSave : std::uint8_t {
+    NothingToSave,
+    Saved,
+    Aborted,
+    Failed,
 };
 
 // Program::compact_device_kv (v0.6, idle KV to the Host).
@@ -1042,6 +1053,22 @@ public:
     idle_device_kv_host_bytes(const ContinuationHandle& continuation) const noexcept;
     [[nodiscard]] std::size_t host_kv_free_bytes() const noexcept;
     DeviceKVCompaction compact_device_kv();
+    // Disk tier of the context cache (v0.7.2; ContextCacheOptions::disk_directory). Off: every
+    // call is a no-op. Between execution units only, with no context transaction.
+    [[nodiscard]] bool disk_cache_enabled() const noexcept;
+    // ContextCacheOptions::disk_idle_ms (0: no idle export).
+    [[nodiscard]] std::uint32_t disk_cache_idle_ms() const noexcept;
+    // Whether some retained conversation is not on disk yet.
+    [[nodiscard]] bool disk_cache_has_unsaved() const noexcept;
+    // Writes one retained conversation that is not on disk yet (most tokens first): Saved when
+    // it was handed to the writer thread, NothingToSave, Aborted when `abort` returned true (the
+    // partial record is dropped; tried again later) or Failed (not tried again).
+    [[nodiscard]] DiskCacheSave disk_cache_save_one(const std::function<bool()>& abort);
+    [[nodiscard]] std::uint32_t disk_cache_flush_seconds() const noexcept;
+    // Waits for the writer thread (pending records are dropped at the deadline).
+    bool disk_cache_drain(std::chrono::steady_clock::time_point deadline);
+    // One line for the log: records, bytes, hits, writes.
+    [[nodiscard]] std::string disk_cache_status() const;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     // Drops one long anchor of an idle catalogued continuation and keeps the rest of it. Returns
     // the continuation's new summary, or nothing (and no change) when the drop is not possible now.

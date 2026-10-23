@@ -192,6 +192,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--disk-cache-dir DIR --disk-cache-gib N] [--disk-cache-min-free-gib N] "
+           "[--disk-cache-idle-ms N] "
+           "[--disk-cache-flush-seconds N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--turn-anchors N] "
            "[--elastic] [--kv-grow N] [--kv-budget-gib G] [--miss-split auto|off] "
@@ -271,8 +274,8 @@ std::string serve_usage_text(const char* argv0) {
            "over PCIe, shorter ones compute them on the CPU (default " +
            std::to_string(RoutedExpertOptions{}.stream_min_tokens) +
            ", 0 = never stream); --expert-cpu-threads N: CPU threads of the missing experts "
-           "(default " + std::to_string(RoutedExpertOptions{}.cpu_threads) + ", " +
-           std::to_string(RoutedExpertOptions{}.gguf_cpu_threads) + " with ggml block expert banks)\n"
+           "(default auto from the machine, logged at startup: max(6, cores/2, 2 per L3 domain), "
+           "one per physical core with ggml block expert banks)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --tp 2 --devices A,B splits the dense model across two GPUs (rank 0 on A) for "
@@ -298,6 +301,17 @@ std::string serve_usage_text(const char* argv0) {
            "(NINFER_HOST_PINNED_MAX_GIB also sets it)\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
+           "       --disk-cache-dir DIR --disk-cache-gib N (off by default): disk tier of the "
+           "context cache, at most N GiB in DIR (least recently used out). Retained "
+           "conversations are written after --disk-cache-idle-ms of inactivity (default 5000; 0 "
+           "= only at shutdown) and on SIGTERM/SIGINT (at most --disk-cache-flush-seconds, "
+           "default 60); after a restart a prompt that begins with a saved conversation loads "
+           "it from disk instead of prefilling it. KV is stored in 256-token blocks addressed by "
+           "the prefix, written once and shared between turns and conversations. Records carry a "
+           "validity key (artifact, executable, KV dtype, tp, speculative mode, layouts): another "
+           "key is ignored. One directory per server (locked). --disk-cache-min-free-gib N keeps N "
+           "GiB free on the file system (default max(10 GiB, 5 %): the cache evicts, then skips "
+           "saves)\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
            "control tokens count toward the request output limit\n"
            "       --preserve-thinking retains closed-turn assistant reasoning in later prompts\n"
@@ -443,6 +457,37 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
             host_kv_explicit                             = true;
+        } else if (arg == "--disk-cache-dir") {
+            options.context_cache.disk_directory = require_value("--disk-cache-dir");
+            if (options.context_cache.disk_directory.empty()) {
+                throw std::invalid_argument("--disk-cache-dir must not be empty");
+            }
+        } else if (arg == "--disk-cache-gib") {
+            const std::uint64_t gib = parse_u64(require_value("--disk-cache-gib"), "disk-cache-gib");
+            if (gib == 0 || gib > (1ULL << 20)) {
+                throw std::invalid_argument("--disk-cache-gib must be in [1,1048576]");
+            }
+            options.context_cache.disk_capacity_bytes = gib << 30;
+        } else if (arg == "--disk-cache-min-free-gib") {
+            const std::uint64_t gib =
+                parse_u64(require_value("--disk-cache-min-free-gib"), "disk-cache-min-free-gib");
+            if (gib > (1ULL << 20)) {
+                throw std::invalid_argument("--disk-cache-min-free-gib must be in [0,1048576]");
+            }
+            options.context_cache.disk_min_free_bytes = gib << 30;
+        } else if (arg == "--disk-cache-idle-ms") {
+            const std::uint64_t ms = parse_u64(require_value("--disk-cache-idle-ms"), "disk-cache-idle-ms");
+            if (ms > 86400000ULL) {
+                throw std::invalid_argument("--disk-cache-idle-ms must be at most 86400000");
+            }
+            options.context_cache.disk_idle_ms = static_cast<std::uint32_t>(ms);
+        } else if (arg == "--disk-cache-flush-seconds") {
+            const std::uint64_t seconds =
+                parse_u64(require_value("--disk-cache-flush-seconds"), "disk-cache-flush-seconds");
+            if (seconds > 3600) {
+                throw std::invalid_argument("--disk-cache-flush-seconds must be at most 3600");
+            }
+            options.context_cache.disk_flush_seconds = static_cast<std::uint32_t>(seconds);
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
@@ -668,8 +713,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         options.kv_capacity = KvCapacityPolicy::automatic(*vram_headroom_mib << 20);
     }
+    if (options.context_cache.disk_directory.empty() !=
+        (options.context_cache.disk_capacity_bytes == 0)) {
+        throw std::invalid_argument("--disk-cache-dir and --disk-cache-gib go together");
+    }
     if (!options.allow_prefix_reuse) {
-        if (context_capacity_explicit) {
+        if (context_capacity_explicit || !options.context_cache.disk_directory.empty()) {
             throw std::invalid_argument(
                 "--no-prefix-reuse cannot be combined with context-cache capacity options");
         }

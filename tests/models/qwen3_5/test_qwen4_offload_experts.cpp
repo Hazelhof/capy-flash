@@ -698,9 +698,12 @@ void test_ring_layers() {
     ::unsetenv("NINFER_QWEN4_TP2_HALF_RING");
     check(Qwen4OffloadExperts::layers_below(uniform(10), 5, 51) == 6,
           "layers_below: end + 1 when the layers below do not hold the slots");
-    check(Qwen4OffloadExperts::may_lend(uniform(66), 48, 36) &&
-              !Qwen4OffloadExperts::may_lend(uniform(66), 48, 37),
-          "uniform layers: at most 36 of 48 lent");
+    check(Qwen4OffloadExperts::may_lend(uniform(66), 48, 36, 2) &&
+              !Qwen4OffloadExperts::may_lend(uniform(66), 48, 37, 2),
+          "uniform layers, tp 2: at most 36 of 48 lent");
+    check(Qwen4OffloadExperts::may_lend(uniform(66), 48, 43, 1) &&
+              !Qwen4OffloadExperts::may_lend(uniform(66), 48, 44, 1),
+          "uniform layers, one GPU: at most 43 of 48 lent (0.9)");
 }
 
 // prod/cache: the per-layer slot profile keeps the pool (layers * slots_per_layer base slots),
@@ -738,7 +741,7 @@ void test_slot_profile() {
     // tp 2 ring still fit the lendable layers.
     const std::int32_t ring = Qwen4OffloadExperts::ring_layers(576, b, 48, 2);
     const std::int32_t ws   = Qwen4OffloadExperts::layers_below(b, 48 - ring, 24 * 66);
-    check(ring == 6 && ws == 28 && Qwen4OffloadExperts::may_lend(b, 48, ring + ws),
+    check(ring == 6 && ws == 28 && Qwen4OffloadExperts::may_lend(b, 48, ring + ws, 2),
           "profile: ring + workspace lendable at 66 slots");
 }
 
