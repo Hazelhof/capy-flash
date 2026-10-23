@@ -88,8 +88,9 @@ struct ServeOptions {
     ElasticKvOptions elastic_kv;
     std::optional<MissSplitMode> miss_split;
     std::optional<std::uint32_t> stream_min_tokens;
-    // RoutedExpertOptions::cpu_threads (Qwen4Exp offload backend: the CPU threads of the missing
-    // experts, one per physical core, spread over the CCDs; default 6).
+    // RoutedExpertOptions::cpu_threads and gguf_cpu_threads (Qwen4Exp offload backend: the CPU
+    // threads of the missing experts, pinned one per allowed physical core, spread over the L3
+    // domains). Unset = resolved at load from the machine (ops::host::auto_expert_cpu_threads).
     std::optional<std::uint32_t> expert_cpu_threads;
     std::optional<bool> enable_thinking;
     std::optional<bool> preserve_thinking;

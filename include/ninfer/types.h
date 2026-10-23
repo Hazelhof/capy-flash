@@ -158,8 +158,10 @@ struct StartupObserver {
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
     // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2; at tp 2, where every
-    // checkpoint must live in a Device StateImage, H=max(2C,8) and P=max(2C,8), and R and Host KV
-    // must be 0. Engine::options() returns those effective values.
+    // checkpoint keeps a Device StateImage, H=max(2C,8) and P=max(2C,8); R and Host KV work as at
+    // tp 1 (each Host record holds both ranks' halves) but the server leaves them 0 at tp 2 unless
+    // set (--host-state-slots / --host-kv-mib, or a profile). Engine::options() returns those
+    // effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
@@ -361,10 +363,10 @@ struct EngineOptions {
     // (one id per rank, rank 0 first; rank 0 must equal `device`) for generation, ordinary, with
     // MTP or with DFlash2 speculative decoding (DFlash2 with the optimized proposal head only; its
     // drafter runs on rank 0), with or without Vision (see `vision_device`), and for
-    // CausalScoring: DFlash, the Qwen3.5 MoE architecture, KV storage other than BF16/INT8 and
-    // the Host context-cache tiers are rejected. Qwen4Exp (Qwen3.8-Flash-Next) runs ordinary
-    // generation and CausalScoring at tp 2 (no speculative decoding, no Vision), its routed
-    // experts partitioned by ID parity between the ranks. At 1 `devices` is empty or {device}.
+    // CausalScoring: DFlash, the Qwen3.5 MoE architecture and KV storage other than
+    // BF16/INT8/NVFP4 are rejected. Qwen4Exp (Qwen3.8-Flash-Next) runs at tp 2 too (ordinary
+    // generation, MTP, Vision and CausalScoring), its routed experts partitioned by ID parity
+    // between the ranks. At 1 `devices` is empty or {device}.
     int tp = 1;
     std::vector<int> devices;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.

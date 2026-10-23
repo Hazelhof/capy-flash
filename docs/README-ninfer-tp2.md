@@ -1,13 +1,18 @@
+> **Historical README of ninfer-tp2 v0.4.x, kept for reference; not current usage — see [../README.md](../README.md).**
+> Flags, defaults, download names and the repository URL below describe ninfer-tp2 as it was (it was renamed
+> capy-flash at v0.5.0); the current instructions are in the [README](../README.md) and
+> [docs/serving.md](serving.md#capy-flash-serving).
+
 # NInfer — two-GPU tensor-parallel fork
 
 > **This is a fork of [Neroued/ninfer](https://github.com/Neroued/ninfer)** that adds an
 > experimental two-GPU tensor-parallel mode (`--tp 2 --devices A,B`), so that Qwen3.8-27B NVFP4,
 > which does not fit one 16 GB board, runs split across two. It builds on earlier TP2 forks by
-> Wael Mansour, natpate, ivanov84 and parallelno; see [NOTICE](NOTICE) for attribution.
+> Wael Mansour, natpate, ivanov84 and parallelno; see [NOTICE](../NOTICE) for attribution.
 >
 > - **Covered:** ordinary decoding, `--spec mtp`, `--spec dflash2 --lm-head-draft`, prefix
 >   reuse, concurrent requests, CUDA Graph decode and `--vision`, with `bf16`, `int8` or `nvfp4` KV. See
->   [Two GPUs](docs/cli.md#two-gpus) and [serving](docs/serving.md). `nvfp4` KV at `--tp 2` (v0.4.2,
+>   [Two GPUs](../docs/cli.md#two-gpus) and [serving](../docs/serving.md). `nvfp4` KV at `--tp 2` (v0.4.2,
 >   contributed by @glfenix) is an option, not the default: on two RTX 5070 Ti it frees about 2 GiB per
 >   board at a 262k context with perplexity and GSM8K unchanged, but costs +4…8 % per decode round
 >   with MTP3 and +4…17 % with DFlash2 between 55k and 210k prompt tokens; keep `int8` where it fits.
@@ -21,7 +26,7 @@
 >   (`_dflash2_nvfp4_gate_up` in its recipe) decodes +1.5…2.4 % faster at C=1; the request log
 >   labels callers through `X-Ninfer-Client`, counts thinking tokens without a budget, records GPU
 >   clocks and power, and `--log-speculation-detail` (off by default) adds the per-round accepted
->   draft lengths and the output/prompt 4-gram overlap. See [serving](docs/serving.md).
+>   draft lengths and the output/prompt 4-gram overlap. See [serving](../docs/serving.md).
 > - **Verified on:** two RTX 5070 Ti 16 GB without peer access, Linux, CUDA 13.1, core clocks
 >   capped at about 2.1 GHz. Other GPUs and P2P-capable pairs are untested.
 > - **Measured** with upstream's own benchmark suite against the published RTX 5090 runs, same
@@ -32,12 +37,12 @@
 >   (254.5 tok/s), plain decode 118%, prefill 72%. v0.2.2 with the core clocks locked at 2.1 GHz (2026-09-28): plain decode 82%,
 >   MTP3 77% (corpus at C=1, 123.4 vs 161.1), prefill 50% at 7.7k; with QUASAR plain decode 88-96%,
 >   MTP3 75-87%, DFlash2 83%; the lock alone costs about 17% of decode and 14-22% of prefill. Full
->   tables, per category and concurrency 1-8, in [Two-GPU performance](docs/performance/two-gpu.md).
+>   tables, per category and concurrency 1-8, in [Two-GPU performance](../docs/performance/two-gpu.md).
 >   GSM8K 0.975-0.985, the same as vLLM on the same weights.
 > - **Related forks and prior art.** The two-GPU design originates in Wael Mansour's
 >   [ninfer-tp2-1m](https://github.com/wamansou/ninfer-tp2-1m) (August 2026, 2× RTX 5090, YaRN 1M),
 >   continued by giocom, ivanov84 (pinned-host mailbox) and parallelno (DFlash2 at tp 2), all
->   credited in [NOTICE](NOTICE). A sibling continuation of the same line,
+>   credited in [NOTICE](../NOTICE). A sibling continuation of the same line,
 >   [lynx-gt/ninfer-tp2-5060ti](https://github.com/lynx-gt/ninfer-tp2-5060ti) (upstream base of
 >   2026-08-20, qualified on 2× RTX 5060 Ti, KV tiers, `/health` self-heal, no Vision or DFlash2 at
 >   tp 2), decodes at the same rate as this fork on the same pair with the official artifact
@@ -73,7 +78,7 @@
 >   (int8 stopped at 204,800). The pipelined mailbox starts cleanly there (probe 0.83 ms); the
 >   first-launch step-down lands on the mailbox for the target forward and the copies for the
 >   MTP draft phase, as on Linux.
->   [`tools/tp2/mailbox_probe.cu`](tools/README.md#standalone-tp2-mailbox-probe) tells in seconds,
+>   [`tools/tp2/mailbox_probe.cu`](../tools/README.md#standalone-tp2-mailbox-probe) tells in seconds,
 >   without a model, whether the mailbox works on a machine.
 > - **Tuning is per GPU.** The linear-op selectors (A16→A4 crossovers, MMA bands, TMA tiles and
 >   thresholds) were measured by upstream on an RTX 5090, and the tp 2 half shapes inherit their
@@ -81,7 +86,7 @@
 >   parent/2 at small T), but the best thresholds differ: A4 from T=3 on the SwiGLU, down and output
 >   projections would cut ~5 % of the MTP3 round time at a measured −1.2 pt on GSM8K (500 questions),
 >   so only the neutral change (128-token TMA tile on the attention shard at T=1024) is applied. On
->   another board, re-measure with the `bench/ops` sweeps (see [Linear tuning](docs/maintainer/linear-tuning.md))
+>   another board, re-measure with the `bench/ops` sweeps (see [Linear tuning](../docs/maintainer/linear-tuning.md))
 >   and validate with GSM8K, not only perplexity, which scores in 1024-token chunks and cannot see
 >   small-T routes.
 > - **Weights.** Verified with the Qwen3.8-27B NVFP4 artifact (`qwen3_8_27b_nvfp4.ninfer`: NVFP4
@@ -105,7 +110,7 @@
 > - **Speculative decoding.** DFlash2 needs `--lm-head-draft` and a drafter without
 >   full-attention layers (the published drafter has none). `--spec dflash` is not supported.
 > - **KV cache types.** `bf16`, `int8` and (since v0.4.2) `nvfp4`; `fp8` and `k8v4` are rejected. `int8` is the
->   default choice on 16 GB boards, see [Two GPUs](docs/cli.md#two-gpus) for the measured `nvfp4` trade-off.
+>   default choice on 16 GB boards, see [Two GPUs](../docs/cli.md#two-gpus) for the measured `nvfp4` trade-off.
 > - **Where it pays off.** The gain grows with context: prompt processing is 1.5-2.1x and decode
 >   1.1x at short context to 1.65x at 184K (1.75x with uncapped clocks) against llama.cpp on the same two boards. On short
 >   prose prompts llama.cpp with MTP was about 8% faster. With v0.2.3, uncapped and with `--lm-head-draft`
@@ -155,15 +160,15 @@ instead of 20.9), verified at `--tp 2` on two 16 GB boards. It has no DFlash2 co
 
 | Model | Weights | Artifact | Download and model card |
 |---|---|---|---|
-| Qwen3.8-27B QUASAR-QAT | `nvfp4` (all large projections), no DFlash2 | `qwen3_8_27b_quasar_nvfp4.ninfer` | [Qwen3.8-27B QUASAR-QAT NVFP4](https://huggingface.co/Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer) · [card and recipe](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md) |
+| Qwen3.8-27B QUASAR-QAT | `nvfp4` (all large projections), no DFlash2 | `qwen3_8_27b_quasar_nvfp4.ninfer` | [Qwen3.8-27B QUASAR-QAT NVFP4](https://huggingface.co/Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer) · [card and recipe](../model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md) |
 
 Each v3 `.ninfer` artifact carries model configuration, encoded weights, logical bindings and
 frontend resources. Runtime execution uses those facts with the implemented model and Op
-capabilities. You can also [convert your own weights](docs/weight-conversion.md), reuse an official
+capabilities. You can also [convert your own weights](../docs/weight-conversion.md), reuse an official
 recipe or choose another supported mixture of formats.
 
 The current engine requires v3 artifacts. Existing official v2 downloads can be
-[upgraded locally](docs/weight-conversion.md#upgrade-an-existing-v2-artifact) without downloading
+[upgraded locally](../docs/weight-conversion.md#upgrade-an-existing-v2-artifact) without downloading
 the weights again.
 
 ## Quick start
@@ -197,19 +202,19 @@ rejected at `--tp 2`):
 ```
 
 The official `qwen3_8_27b_nvfp4.ninfer` runs with the same flags (about 2 GiB more per board);
-see [Two GPUs](docs/cli.md#two-gpus) for the option reference.
+see [Two GPUs](../docs/cli.md#two-gpus) for the option reference.
 
 Tests and benchmarks are excluded from the default build. `cmake --preset release` configures
 the same product build; `cmake --preset dev` also enables tests and benchmarks and finds a
 Python 3 interpreter. Both presets use `build/` and explicitly reset the build options.
 Machine-specific compiler and Python paths belong in the ignored `CMakeUserPresets.json`.
-See [build organization and configuration](docs/maintainer/build-system.md) for details.
+See [build organization and configuration](../docs/maintainer/build-system.md) for details.
 
 There is no install target. The [Releases](https://github.com/ValerioDolci/ninfer-tp2/releases) page
 carries prebuilt binaries for one distribution (see [Releases](#releases)); otherwise run NInfer
 from its source build tree.
 Python tools run independently of CMake; the standalone HBM probe has its own
-[build command](tools/README.md#standalone-hbm-probe).
+[build command](../tools/README.md#standalone-hbm-probe).
 
 Download the artifact used by this example with the Hugging Face CLI:
 
@@ -272,7 +277,7 @@ materialization uses one transient progress line followed by a compact Engine-re
 Redirected stderr receives persistent readable progress without terminal control sequences. Use
 `--log-level debug` for complete startup detail. Option and local input errors remain direct command
 diagnostics. Use `--messages FILE` and `--vision` for structured image/video input; see the
-[CLI guide](docs/cli.md) and [committed examples](examples/cli/).
+[CLI guide](../docs/cli.md) and [committed examples](../examples/cli/).
 
 ## Resource-aware long-context reuse
 
@@ -281,14 +286,14 @@ frontier. A Device-resident checkpoint resumes directly. Under pressure, the pla
 retention, pinned Host State/KV, and eviction by immediate restore work and later reuse cost. Active
 requests retain their completion reservations.
 
-See [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-for the algorithm and [Serve TTFT benchmark](tools/bench/ttft/) for public-HTTP coverage of hot
+See [Resource scheduling and context cache](../docs/maintainer/resource-scheduling-and-context-cache.md)
+for the algorithm and [Serve TTFT benchmark](../tools/bench/ttft/) for public-HTTP coverage of hot
 reuse, Host resume, eviction, shared prefixes, scheduling boundaries, and multimodal load.
 
 ## Performance
 
-Published measurements use an RTX 5090. The [performance index](docs/performance.md) links to
-per-model run records and the [measurement rules](docs/performance/methodology.md). The tables
+Published measurements use an RTX 5090. The [performance index](../docs/performance.md) links to
+per-model run records and the [measurement rules](../docs/performance/methodology.md). The tables
 below are excerpts from those detailed results. Qwen3.8 uses FP8 E4M3 row-256 KV;
 Qwen3.6 uses INT8 group-64 KV.
 
@@ -301,11 +306,11 @@ these rates are steady decode (tok/s).
 
 | Model profile | C=1 tok/s / accept | C=2 tok/s / accept | C=4 tok/s / accept | C=8 tok/s / accept |
 |---|---:|---:|---:|---:|
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#decode-saturation) `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% |
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#decode-saturation) `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% |
-| [Qwen3.6-35B-A3B](docs/performance/qwen3.6-35b-a3b.md#decode-saturation) `groupwise-int` | 642.5 / 68.6% | 907.2 / 66.3% | 1,213.5 / 69.6% | 1,380.7 / 68.0% |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#decode-saturation) `groupwise-int` | 136.5 / 44.4% | 253.3 / 45.2% | 398.1 / 46.1% | 582.4 / 46.4% |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#decode-saturation) `nvfp4` | 147.7 / 46.2% | 291.0 / 48.7% | 522.2 / 45.8% | 922.4 / 46.1% |
+| [Qwen3.6-27B](../docs/performance/qwen3.6-27b.md#decode-saturation) `groupwise-int` | 185.8 / 68.2% | 247.0 / 69.0% | 309.5 / 68.4% | 535.0 / 68.3% |
+| [Qwen3.6-27B](../docs/performance/qwen3.6-27b.md#decode-saturation) `nvfp4` | 202.4 / 69.3% | 399.7 / 71.4% | 699.7 / 69.3% | 1,146.9 / 68.6% |
+| [Qwen3.6-35B-A3B](../docs/performance/qwen3.6-35b-a3b.md#decode-saturation) `groupwise-int` | 642.5 / 68.6% | 907.2 / 66.3% | 1,213.5 / 69.6% | 1,380.7 / 68.0% |
+| [Qwen3.8-27B](../docs/performance/qwen3.8-27b.md#decode-saturation) `groupwise-int` | 136.5 / 44.4% | 253.3 / 45.2% | 398.1 / 46.1% | 582.4 / 46.4% |
+| [Qwen3.8-27B](../docs/performance/qwen3.8-27b.md#decode-saturation) `nvfp4` | 147.7 / 46.2% | 291.0 / 48.7% | 522.2 / 45.8% | 922.4 / 46.1% |
 
 ### Single-request serving
 
@@ -316,11 +321,11 @@ linked from each model below.
 
 | Model profile | 7,680-token prefill | 260,096-token prefill | Structured MTP3 decode |
 |---|---:|---:|---:|
-| [Qwen3.6-35B-A3B](docs/performance/qwen3.6-35b-a3b.md#single-request-speculative-decode) `groupwise-int` | 17,705.4 tok/s | 5,247.0 tok/s | 779.6 tok/s |
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#single-request-speculative-decode) `groupwise-int` | 3,218.1 tok/s | 1,614.8 tok/s | 193.0 tok/s |
-| [Qwen3.6-27B](docs/performance/qwen3.6-27b.md#single-request-speculative-decode) `nvfp4` | 11,191.5 tok/s | 2,510.6 tok/s | 252.2 tok/s |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `groupwise-int` | 3,331.9 tok/s | 2,139.4 tok/s | 214.7 tok/s |
-| [Qwen3.8-27B](docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `nvfp4` | 12,819.1 tok/s | 4,016.4 tok/s | 231.7 tok/s |
+| [Qwen3.6-35B-A3B](../docs/performance/qwen3.6-35b-a3b.md#single-request-speculative-decode) `groupwise-int` | 17,705.4 tok/s | 5,247.0 tok/s | 779.6 tok/s |
+| [Qwen3.6-27B](../docs/performance/qwen3.6-27b.md#single-request-speculative-decode) `groupwise-int` | 3,218.1 tok/s | 1,614.8 tok/s | 193.0 tok/s |
+| [Qwen3.6-27B](../docs/performance/qwen3.6-27b.md#single-request-speculative-decode) `nvfp4` | 11,191.5 tok/s | 2,510.6 tok/s | 252.2 tok/s |
+| [Qwen3.8-27B](../docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `groupwise-int` | 3,331.9 tok/s | 2,139.4 tok/s | 214.7 tok/s |
+| [Qwen3.8-27B](../docs/performance/qwen3.8-27b.md#single-request-speculative-decode) `nvfp4` | 12,819.1 tok/s | 4,016.4 tok/s | 231.7 tok/s |
 
 ## Evaluation
 
@@ -329,11 +334,11 @@ enabled, MTP3, and EvalScope 1.9.0 (0-shot, rule scoring, one sample per problem
 
 | Model profile | AIME 2025 | AIME 2026 | GPQA-Diamond | ERQA | RealWorldQA |
 |---|---:|---:|---:|---:|---:|
-| [Qwen3.6-27B groupwise-int](model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
-| [Qwen3.6-27B NVFP4](model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
-| [Qwen3.6-35B-A3B groupwise-int](model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
-| [Qwen3.8-27B groupwise-int](model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
-| [Qwen3.8-27B NVFP4](model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
+| [Qwen3.6-27B groupwise-int](../model-cards/Qwen3.6-27B-NInfer/README.md) | 86.67% | 93.33% | 86.87% | — | — |
+| [Qwen3.6-27B NVFP4](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md) | 93.33% | 93.33% | 84.34% | — | — |
+| [Qwen3.6-35B-A3B groupwise-int](../model-cards/Qwen3.6-35B-A3B-NInfer/README.md) | 90.00% | 90.00% | 85.35% | — | — |
+| [Qwen3.8-27B groupwise-int](../model-cards/Qwen3.8-27B-NInfer/README.md) | 96.67% | 96.67% | 87.37% | 66.25% | 82.22% |
+| [Qwen3.8-27B NVFP4](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) | 96.67% | 96.67% | 90.40% | 66.25% | 83.53% |
 
 The Qwen3.6 rows used temperature 0.6 and presence penalty 1.0; the Qwen3.8 rows used temperature
 1.0 and presence penalty 0.0. Multimodal evaluation used `--vision` and an 81,920-token context
@@ -348,7 +353,7 @@ IFEval (200) 0.870 vs 0.880 — no paired difference is significant (exact McNem
 FLORES-200 it↔en equals the official NVFP4 weights served by vLLM (0.885 / 0.891 vs 0.885 / 0.892), and
 a synthetic long-context suite at 8k/126k matches the official NVFP4 artifact on this runtime. Details,
 sources and limits are in the
-[QUASAR-QAT model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md).
+[QUASAR-QAT model card](../model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md).
 
 ## Startup notes
 
@@ -435,7 +440,7 @@ The product boundary remains intentionally small:
 - the in-tree C++ headers are not distributed as an installed SDK.
 
 Note: an experimental two-GPU tensor-parallel mode (`--tp 2 --devices A,B`, see
-[Two GPUs](docs/cli.md#two-gpus)) splits a dense model across two 16 GB boards that cannot hold it
+[Two GPUs](../docs/cli.md#two-gpus)) splits a dense model across two 16 GB boards that cannot hold it
 alone. It is verified only on two RTX 5070 Ti without peer access and leaves every other point of
 the product boundary above unchanged.
 
@@ -446,16 +451,16 @@ capacities remain fixed for the process lifetime.
 
 ## Documentation
 
-- [Documentation index](docs/README.md)
-- [CLI](docs/cli.md)
-- [HTTP serving](docs/serving.md)
-- [Performance](docs/performance.md)
-- [Perplexity evaluation](docs/perplexity.md)
-- [Weight conversion and custom recipes](docs/weight-conversion.md)
-- [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
-- [Serve TTFT benchmark](tools/bench/ttft/)
-- [CLI examples](examples/cli/)
-- [Contributing](CONTRIBUTING.md)
+- [Documentation index](../docs/README.md)
+- [CLI](../docs/cli.md)
+- [HTTP serving](../docs/serving.md)
+- [Performance](../docs/performance.md)
+- [Perplexity evaluation](../docs/perplexity.md)
+- [Weight conversion and custom recipes](../docs/weight-conversion.md)
+- [Resource scheduling and context cache](../docs/maintainer/resource-scheduling-and-context-cache.md)
+- [Serve TTFT benchmark](../tools/bench/ttft/)
+- [CLI examples](../examples/cli/)
+- [Contributing](../CONTRIBUTING.md)
 
 Run the relevant `--help` for the exact current option contract.
 
@@ -471,7 +476,7 @@ maintainer.
 
 ## License
 
-NInfer is licensed under the [Apache License 2.0](LICENSE).
+NInfer is licensed under the [Apache License 2.0](../LICENSE).
 
 The published artifacts are derived from
 [Qwen/Qwen3.6-27B](https://huggingface.co/Qwen/Qwen3.6-27B),

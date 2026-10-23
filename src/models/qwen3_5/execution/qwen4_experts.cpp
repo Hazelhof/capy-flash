@@ -12,6 +12,8 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <array>
+#include <span>
 #include <cmath>
 #include <atomic>
 #include <chrono>
@@ -560,9 +562,15 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
     pageable_.assign(static_cast<std::size_t>(layers_), 0);
     std::string pageable_list;
     for (std::int32_t l = 0; l < layers_; ++l) {
-        const ops::MoeSlotPool& b = banks[static_cast<std::size_t>(l)].bank;
-        for (const void* base : {b.gate_up_codes.base, b.gate_up_scales.base, b.down_codes.base,
-                                 b.down_scales.base}) {
+        const Qwen4ExpertBank& bank = banks[static_cast<std::size_t>(l)];
+        const ops::MoeSlotPool& b   = bank.bank;
+        // ggml block banks keep their rows outside the NVFP4 planes, which stay null (issue #22:
+        // every GSQ-RCO layer was reported pageable although the rows are page-locked).
+        const std::array<const void*, 4> bases =
+            bank.gguf ? std::array<const void*, 4>{bank.gguf_gate_up_rows, bank.gguf_down_rows}
+                      : std::array<const void*, 4>{b.gate_up_codes.base, b.gate_up_scales.base,
+                                                   b.down_codes.base, b.down_scales.base};
+        for (const void* base : std::span(bases).first(bank.gguf ? 2 : 4)) {
             if (!expert_cache::pinned_host_memory(base)) {
                 pageable_[static_cast<std::size_t>(l)] = 1;
             }

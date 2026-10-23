@@ -309,8 +309,10 @@ All weight, sequence, workspace, and graph allocations are released when the Eng
 
 ## Two GPUs
 
-`--tp 2 --devices A,B` splits a dense artifact across two GPUs of the same compute capability, for
-models whose weights do not fit one device (Qwen3.8-27B NVFP4 on two 16 GB boards):
+`--tp 2 --devices A,B` splits an artifact across two GPUs of the same compute capability, for
+models whose weights do not fit one device (Qwen3.8-27B NVFP4 on two 16 GB boards; Qwen3.8-Flash-Next
+also runs at `--tp 2`, but it is served with `ninfer-serve --profile flash-next`, see
+[HTTP serving](serving.md#capy-flash-serving)):
 
 ```bash
 ./build/apps/ninfer models/qwen3_8_27b_nvfp4.ninfer --tp 2 --devices 0,1 \
@@ -342,8 +344,8 @@ with the recurrent state mirrored on both); its candidate selector sits on rank 
 rank 0 with `NINFER_TP_SELECTOR=primary` or when Vision is on rank 1. It requires `--lm-head-draft`,
 since the full output head is split by vocabulary across the ranks; a drafter with full-attention
 layers is not supported.
-`--spec dflash`, the MoE architecture and the `fp8` and `k8v4` KV types are rejected at
-startup. `ninfer-perplexity` takes the same `--tp 2 --devices A,B` ([Perplexity](perplexity.md#two-gpus)).
+`--spec dflash`, the Qwen3.5 MoE architecture (Qwen3.6-35B-A3B) and the `fp8` and `k8v4` KV types
+are rejected at startup. `ninfer-perplexity` takes the same `--tp 2 --devices A,B` ([Perplexity](perplexity.md#two-gpus)).
 The split attention and Gated DeltaNet projections take FP8 or NVFP4 weights and the split MLP
 FP8 or NVFP4, so both the official mixed artifact (FP8 attention and GDN, NVFP4 MLP) and an
 all-NVFP4 recipe run at `--tp 2`; the MTP head splits only in Q8, as the official recipes store it.

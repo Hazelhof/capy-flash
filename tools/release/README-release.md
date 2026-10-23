@@ -15,6 +15,7 @@ on two 16 GB Blackwell GeForce boards; since v0.7 also Flash-Next on 64 GB of RA
 | `serve-flash-next.sh` | launcher with the Qwen3.8-Flash-Next profile |
 | `serve-tp2.sh` | launcher with the Qwen3.8-27B two-GPU production profile (as in ninfer-tp2) |
 | `serve-27b-16gb.sh` | launcher for the 3-bit Qwen3.8-27B on one 16 GB board (`--profile 27b-16gb`) |
+| `chat_templates/` | `qwen3_8.jinja` (NInfer's Qwen3.8 chat template, which the launchers pass with `--chat-template`; it accepts the `developer` role and Responses `instructions`, needed by Codex CLI) and its `LICENSE` |
 | `SHA256SUMS` | digests of every file above; check with `sha256sum -c SHA256SUMS` |
 
 ## Requirements
@@ -23,13 +24,14 @@ on two 16 GB Blackwell GeForce boards; since v0.7 also Flash-Next on 64 GB of RA
   `libavcodec`, `libavformat`, `libavutil`, `libswscale`, `libcurl4`). On another distribution
   build from source or use the Dockerfile.
 - An NVIDIA driver that supports CUDA 13.1 (R580 or newer). No CUDA toolkit is needed.
-- Two `sm_120` boards with 16 GB for `--tp 2` (one for the 3-bit 27B) (validated on 2x RTX 5070 Ti without P2P; with P2P, for example through
+- Two `sm_120` boards with 16 GB for `--tp 2` (one for the 3-bit 27B or the 64 GB edition of Flash-Next) (validated on 2x RTX 5070 Ti without P2P; with P2P, for example through
   a PCIe switch, the prefill exchanges use the direct copy automatically).
 - **Qwen3.8-Flash-Next** also needs a CPU with AVX-512 (F/BW/VL, VNNI) or AVX2 + FMA + F16C (the expert kernels of
   both give the same results bit for bit) and about **75 GiB of free RAM**: the routed
   experts that stay on the host are one 64.6 GiB page-locked allocation, `--profile flash-next` keeps the token
   embedding and up to 4 GiB of idle conversations' KV in RAM as well, and the server refuses to start without room for
-  the experts (`NINFER_RAM_GUARD=0` skips the check). In practice a 96 GB machine; the 64 GB edition (GSQ-RCO
+  the experts plus a reserve (`NINFER_RAM_GUARD=0` skips the check) or for the RAM caches plus a reserve
+  (`NINFER_HOST_TIER_RAM_GUARD=0`); `install.sh` warns below 70 GiB free. In practice a 96 GB machine; the 64 GB edition (GSQ-RCO
   experts, 48 GiB) needs about 56 GiB and fits a 64 GB machine.
 
 ## Run
@@ -45,21 +47,34 @@ NINFER_DEVICES=0 ./serve-flash-next.sh /path/to/qwen3_8_flash_next_gsqrco_mtpB.n
 ./serve-27b-16gb.sh /path/to/qwen3_8_27b_gsq3.ninfer                              # Qwen3.8-27B 3-bit, one GPU
 NINFER_PORT=8099 ./serve-flash-next.sh /path/to/model.ninfer --api-key secret      # extra flags are appended
 ```
-Requests name the model `capy-flash` (Flash-Next) or `qwen3.8-27b` (27B); `NINFER_MODEL_ID` or `--model-id` changes it:
+The launchers add `--chat-template chat_templates/qwen3_8.jinja`, the model id and the profile; extra flags win
+over the profile. Requests name the model `capy-flash` (Flash-Next) or `qwen3.8-27b` (27B); `NINFER_MODEL_ID` or
+`--model-id` changes it:
 ```bash
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"capy-flash","messages":[{"role":"user","content":"What is 17*23?"}]}'
 ```
 
-Artifacts:
+Artifacts (`install.sh --model NAME` downloads exactly one of these repositories; the Flash-Next Vision artifact is
+only downloaded by hand):
 - Qwen3.8-Flash-Next: `Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash` (126.6 GB, NVIDIA's NVFP4 experts as published,
   SHA-256 in its `SHA256SUMS`), or convert `nvidia/Qwen3.8-Flash-Next-NVFP4` yourself with `tools/capy_flash/convert.py`
   from the source tree (same result).
 - Qwen3.8-27B: `Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer` (17.4 GB, SHA-256 in its `SHA256SUMS`) or the official
   `Qwen3.8-27B-nvfp4-NInfer`; both run with the same flags. For artifacts without a vision component set `NINFER_VISION=0`.
+- Qwen3.8-Flash-Next with images: `Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash` (the NVFP4 artifact plus the Q8
+  vision tower), served with `./serve-flash-next.sh <artifact> --vision`. The other Flash-Next artifacts are text only.
 - Qwen3.8-Flash-Next, 64 GB edition: `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash` (102 GB).
 - Qwen3.8-27B 3-bit for one GPU: `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash` (12.5 GB; MMLU-Pro below the NVFP4 27B, see
   the main README).
+
+Vision: the two 27B artifacts contain the vision tower and `serve-tp2.sh` / `serve-27b-16gb.sh` load it by default
+(it takes VRAM from the KV pool); `NINFER_VISION=0` before the launcher, or `--no-vision` after the artifact, turns it
+off. Flash-Next loads no tower unless `--vision` is given with the Vision artifact.
+
+Clients: Claude Code with `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`; Codex CLI, OpenCode and other OpenAI clients
+with base URL `http://127.0.0.1:8080/v1` and the model id above (Codex: a custom provider with the `responses` wire
+API). Details: `docs/serving.md` in the source repository, section "capy-flash serving".
 
 `GET /health` answers 200 while the Engine accepts work and 503 after an Engine-wide failure; the
 server then exits with status 2, so run it under a supervisor that restarts on a non-zero exit

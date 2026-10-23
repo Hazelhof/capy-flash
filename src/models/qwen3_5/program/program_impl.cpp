@@ -665,6 +665,10 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         // fallback banks (--host-pinned-max-gib, or a refused page-locked allocation) cannot.
         const auto pinned = [](const execution::Qwen4ExpertBank& bank) {
             const ops::MoeSlotPool& b = bank.bank;
+            if (bank.gguf) { // rows outside the NVFP4 planes (issue #22)
+                return expert_cache::pinned_host_memory(bank.gguf_gate_up_rows) &&
+                       expert_cache::pinned_host_memory(bank.gguf_down_rows);
+            }
             return expert_cache::pinned_host_memory(b.gate_up_codes.base) &&
                    expert_cache::pinned_host_memory(b.gate_up_scales.base) &&
                    expert_cache::pinned_host_memory(b.down_codes.base) &&

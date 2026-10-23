@@ -570,6 +570,33 @@ void test_layer(std::mt19937_64& rng, int E, int H, int I, bool statistics) {
 }
 
 
+// v0.7.3 (issue #11): the automatic thread count leaves one core to the main thread when no SMT
+// sibling is free, and is otherwise unchanged.
+void test_auto_threads() {
+    using ninfer::ops::host::auto_expert_cpu_threads;
+    using ninfer::ops::host::HostCpuTopology;
+    const auto topo = [](int logical, int physical, int l3) {
+        HostCpuTopology t;
+        t.logical_cpus   = logical;
+        t.physical_cores = physical;
+        t.l3_domains     = l3;
+        t.numa_nodes     = 1;
+        return t;
+    };
+    expect(auto_expert_cpu_threads(topo(24, 12, 2), true) == 12, "9900X GGUF: 12");
+    expect(auto_expert_cpu_threads(topo(24, 12, 2), false) == 6, "9900X NVFP4: 6");
+    expect(auto_expert_cpu_threads(topo(12, 12, 2), true) == 11, "9900X SMT off GGUF: 11");
+    expect(auto_expert_cpu_threads(topo(12, 12, 2), false) == 6, "9900X SMT off NVFP4: 6");
+    expect(auto_expert_cpu_threads(topo(32, 16, 16), false) == 16, "7F52 NVFP4: 16");
+    expect(auto_expert_cpu_threads(topo(16, 16, 16), false) == 15, "7F52 taskset 0-15 NVFP4: 15");
+    expect(auto_expert_cpu_threads(topo(16, 16, 16), true) == 15, "7F52 taskset 0-15 GGUF: 15");
+    expect(auto_expert_cpu_threads(topo(1, 1, 1), true) == 1, "one CPU: 1");
+    std::string why;
+    (void)auto_expert_cpu_threads(topo(16, 16, 16), true, &why);
+    expect(why.find("one core left to the main thread") != std::string::npos, "reason names it");
+    std::printf("auto threads: %s\n", why.c_str());
+}
+
 } // namespace
 
 int main() {
@@ -580,6 +607,7 @@ int main() {
     }
     std::printf("host ISA: %s\n", host_isa_name(host_isa()));
     std::mt19937_64 rng(20261007);
+    test_auto_threads();
     test_dots(rng);
     test_layer(rng, 16, 2560, 640, true); // Flash-Next expert shape
     test_layer(rng, 5, 256, 128, false);  // small shape: one row tile, odd expert count

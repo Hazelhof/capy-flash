@@ -184,7 +184,15 @@ std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf,
         why = "max(6, cores/2, 2 per L3 domain) (NVFP4 banks, memory-bound)";
     }
     n = std::min({n, cores, std::int32_t{64}});
+    // The main thread spin-waits on the GPU (NINFER_CUDA_SYNC=spin) and is not pinned. With one
+    // allowed logical CPU per core (a cpuset such as taskset -c 0-15, or SMT off) it has no free
+    // sibling and shares a worker's core: 16 workers on a 16-CPU cpuset dropped decode from ~144
+    // to 80-90 tok/s on an EPYC 7F52 (issue #11), so one core is left to it.
+    const bool spare_core = cores > 1 && topology.logical_cpus <= topology.physical_cores &&
+                            n >= cores;
+    if (spare_core) n = cores - 1;
     if (reason != nullptr) {
+        if (spare_core) why += ", one core left to the main thread (no free SMT sibling)";
         *reason = why + "; " + std::to_string(topology.physical_cores) + " physical cores, " +
                   std::to_string(topology.logical_cpus) + " logical CPUs allowed, " +
                   std::to_string(topology.l3_domains) + " L3 domains, " +

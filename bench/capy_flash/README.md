@@ -8,9 +8,9 @@ total time.
 
 ```
 # 1. start the server under test (capy-flash below, see the main README for the build and the artifact)
-CUDA_VISIBLE_DEVICES=0,1 build/apps/ninfer-serve <artifact>.ninfer --host 127.0.0.1 --port 8098 \
-  --model-id capy-flash --tp 2 --devices 0,1 --spec mtp --draft-tokens 3 --kv-dtype int8 --elastic \
-  --max-context 262144 --kv-capacity 262144 --max-concurrency 1 --greedy --request-log-jsonl reqlog.jsonl
+CUDA_VISIBLE_DEVICES=0,1 build/apps/ninfer-serve <artifact>.ninfer --profile flash-next --host 127.0.0.1 \
+  --port 8098 --model-id capy-flash --greedy --request-log-jsonl reqlog.jsonl
+#    (one GPU, 64 GB edition: --profile flash-next-1gpu; the profiles are listed in docs/serving.md#profiles)
 # 2. replay, then summarize
 python3 bench/capy_flash/replay.py http://127.0.0.1:8098 capy-flash bench/capy_flash/sessions.json out.jsonl 256
 python3 bench/capy_flash/summarize.py out.jsonl --ninfer-request-log reqlog.jsonl

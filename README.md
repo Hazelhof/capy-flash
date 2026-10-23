@@ -1,9 +1,29 @@
+
 <h1 align="center"><picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/logo/capy-flash-lockup-dark.svg">
   <img alt="capy-flash" src="docs/logo/capy-flash-lockup.svg" width="560">
 </picture></h1>
 
 **Qwen3.8-Flash-Next (125B MoE) and Qwen3.8-27B on one or two 16 GB RTX 50-series GPUs, built for agents.**
+
+capy-flash is an inference server. It runs two models on consumer GPUs with 16 GB of VRAM and exposes an OpenAI- and
+Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and OpenCode can use it like a hosted model.
+
+- **Qwen3.8-Flash-Next** is a mixture-of-experts model too large for the GPUs. capy-flash keeps the experts that do
+  not fit in VRAM in host RAM and computes them on the CPU; everything else runs on the GPU (split over two GPUs when
+  there are two). That is why Flash-Next needs a lot of RAM and a CPU with AVX2 or AVX-512.
+- **Qwen3.8-27B** is a dense model that runs entirely on the GPUs.
+- For agents: a prefix cache across turns, idle conversations moved to RAM (and optionally to disk) instead of being
+  recomputed, and the expert cache follows the conversation.
+
+capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
+[Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
+of prior work it builds on. Status: **v0.7.3**. Built, tested and measured on one machine ([below](#benchmarks));
+users report other setups. Not affiliated with Qwen or NVIDIA.
+
+## Pick a model
+
+**16 GB of VRAM per GPU is the minimum.** RAM matters for Flash-Next only.
 
 | what you want to run | GPUs (RTX 50 series, sm_120) | RAM | `install.sh` |
 |---|---|---|---|
@@ -12,54 +32,31 @@
 | Flash-Next, 64 GB edition | **one** or two with 16 GB | a **64 GB** machine (~56 GiB free) | `--model flash-next-64gb` |
 | Flash-Next, NVIDIA NVFP4 (default) | two with 16 GB | a **96 GB** machine (~75 GiB free) | (default) |
 
-RAM matters for Flash-Next only: its routed experts live in host RAM and run on the CPU (AVX2 or AVX-512). Linux is
-what we test; users run the 27B on WSL2 and on Windows with Docker (a 5070 Ti + 5060 Ti pair), and on RTX 5060 Ti
-16 GB, 5070 Ti, 5080 and 5090 boards (a mixed pair runs at the pace of the slower card). A native Windows build exists
-as a community port ([OmarxGx/capy-flash](https://github.com/OmarxGx/capy-flash)), not in the releases yet.
+- **One GPU, little RAM:** the 3-bit 27B. It costs quality: GSM8K on par with the NVFP4 27B, MMLU-Pro about 0.72
+  against 0.78 ([benchmarks](#benchmarks)).
+- **One GPU and 64 GB of RAM:** the 64 GB edition of Flash-Next (ISTA-DASLab's GSQ-RCO experts, 48 GiB in RAM instead
+  of 65; quality on par with NVFP4 on GSM8K and MMLU-Pro).
+- **Two GPUs:** the 64 GB edition is the fastest Flash-Next here; the NVFP4 edition uses NVIDIA's experts as published.
+  For the 27B on two cards, the NVFP4 27B is the better choice than the 3-bit one.
 
-Against [Strata](https://github.com/Niko1221/Strata) 0.1.45 on the same machine, same day (2x RTX 5070 Ti 16 GB,
-Ryzen 9 9900X, 96 GB DDR5, full clocks):
+## What you need
 
-| | **capy-flash**, NVFP4 | Strata, same NVFP4 weights | Strata, 3-bit IQ3_S (tuned) |
-|---|---:|---:|---:|
-| agentic replay, 53 turns up to 81k tokens: total time | **177 s** | 268 s | 197 s |
-| agentic replay: decode, server side (median) | **155 tok/s** | 98 tok/s | 151 tok/s |
-| agentic replay: time to first token, median (p90) | **1.48 s (2.62)** | 2.35 s (4.17) | 1.60 s (3.69) |
-| prefill, ~15k-token prompt | **4,615 tok/s** | 3,513 tok/s | 3,811 tok/s |
-| prefill, ~55k-token prompt | 4,828 tok/s | 4,849 tok/s | **5,233 tok/s** |
-| LocalMaxxing reasoning-v1 (short prompt, 512 tokens) | 178 tok/s | 119 tok/s | **195 tok/s** |
+- Linux x86_64 (tested on Ubuntu). Users run the 27B on WSL2 and on Windows with Docker; a native Windows build exists
+  as a community port ([OmarxGx/capy-flash](https://github.com/OmarxGx/capy-flash)), not in the releases yet.
+- An NVIDIA driver with CUDA 13.1 support (R580 or newer). The release needs no CUDA toolkit; building does (CUDA 13.1).
+- `sm_120` GPUs with 16 GB: RTX 5060 Ti 16 GB, 5070 Ti, 5080 and 5090 are reported to work; a mixed pair runs at the
+  pace of the slower card. Peer-to-peer is not needed.
+- **Flash-Next only:** a CPU with AVX-512 (F/BW/VL, VNNI) or AVX2 + FMA + F16C (Zen 2/3, Intel client cores), and the
+  free RAM of the table: the routed experts are one page-locked host allocation (64.6 GiB for NVFP4, 48 GiB for the
+  64 GB edition), and `--profile flash-next` also keeps the token embedding and up to 4 GiB of idle conversations in
+  RAM. The server checks this at startup and refuses with the numbers when it does not fit (`NINFER_RAM_GUARD=0`
+  starts anyway). On Windows/WSL2, which limit page-locked memory to about half the RAM, the layers that do not fit
+  stay in pageable RAM (same tokens, slower).
+- Disk: about 135 GB (Flash-Next NVFP4), 110 GB (64 GB edition), 20 GB (27B NVFP4), 15 GB (27B 3-bit).
 
-- **NVIDIA's official NVFP4 experts, used as published**: not re-quantized. Strata's IQ3_S experts are 26 % smaller
-  (lower quality: KL 0.144 vs 0.070 for NVFP4, as Strata reports), which is why it leads on the short benchmark.
-- **Decode stays flat with context**: 168 / 165 / 171 / 165 tok/s with 0 / 14k / 61k / 118k tokens of prompt.
-- **Built for agents**: idle conversations move to RAM and give their VRAM back to the expert cache, a continued
-  conversation keeps the experts its next answer needs, prefix cache across turns; OpenAI- and Anthropic-compatible API.
-- **One engine, two models**: it also serves the dense **Qwen3.8-27B** (prefill +61-65 % over v0.5.4 at 4k-16k, same
-  tokens; 175 / 326 / 560 / 927 tok/s aggregate at 1 / 2 / 4 / 8 concurrent requests).
-- **Vision on Flash-Next** (opt-in, `--vision` with a vision artifact).
+## Quick start
 
-**New in v0.7.2: pick up where you left off.**
-- **Disk tier of the context cache** (opt-in, `--disk-cache-dir DIR --disk-cache-gib N`; idea by @KouShuo): conversations
-  survive a restart and resume without a new prefill (27B, two GPUs: 140k tokens in 1.08 s instead of 48 s). KV is
-  stored once in shared 256-token blocks, under a size cap and a free-space margin, one directory per server.
-- **Faster long prompts on the 64 GB edition of Flash-Next**: prefill 64k +19 % on two GPUs (3,994 tok/s) and +35 % on
-  one (2,921 tok/s), same tokens.
-- **CPU expert threads chosen from the machine** (physical cores, affinity, L3 domains) instead of fixed counts.
-
-**New in v0.7: start small, grow later, same engine.**
-- **Flash-Next on 64 GB of RAM, with one or two GPUs** (`--model flash-next-64gb`): ISTA-DASLab's GSQ-RCO i-quant experts
-  (48 GiB in RAM instead of 65). Two GPUs: the fastest way to run it here, LocalMaxxing reasoning-v1 **239 tok/s**,
-  agentic replay decode **182 tok/s** (NVFP4 172 / 155). **One 16 GB GPU** (`NINFER_DEVICES=0`, `--profile
-  flash-next-1gpu`): **121 tok/s** (LocalMaxxing verified run), replay decode 104. Quality on par with NVFP4 (GSM8K, MMLU-Pro).
-- **Qwen3.8-27B on one 16 GB card** (`--model 27b-16gb`, 3-bit GSQ weights, 64k context, vision): **139 tok/s** decode
-  with MTP on an 8k-token prompt (two cards: 230) and 3,401 tok/s prefill at 4k. **It costs quality**: GSM8K on par,
-  MMLU-Pro about 0.72 against 0.78 for the NVFP4 27B ([below](#measured)).
-- **AVX2 CPUs** (Zen 2/3, Intel client) and **Windows/WSL2** with its page-locked memory limit start Flash-Next too.
-- Empty-reply guards on by default for every model; boards with P2P overlap the prefill exchanges on the direct copy
-  (+29-45 % measured by @tzolkincz); a context-cache accounting error fails one request instead of the server.
-
-**Quick start** (default model, Flash-Next NVFP4: two 16 GB cards, ~75 GiB of free RAM, 135 GB of disk; for the
-other rows of the table at the top add their `--model`, below):
+Default model (Flash-Next NVFP4, two 16 GB cards); for another row of the table add its `--model`:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ValerioDolci/capy-flash/main/install.sh | bash -s -- --check   # can this machine run it?
 curl -fsSL https://raw.githubusercontent.com/ValerioDolci/capy-flash/main/install.sh | bash               # release + model into ~/capy-flash
@@ -67,209 +64,193 @@ curl -fsSL https://raw.githubusercontent.com/ValerioDolci/capy-flash/main/instal
 curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
   -d '{"model":"capy-flash","messages":[{"role":"user","content":"What is 17*23?"}]}'                # from another shell
 ```
-The installer checks GPUs, driver, AVX2/AVX-512, RAM and disk and says what to fix, verifies every download, and prints
-a test request; `--model flash-next-64gb` installs the 64 GB edition, `--model 27b` Qwen3.8-27B for two GPUs,
-`--model 27b-16gb` the 3-bit 27B for one GPU, `--dir` picks another place. By hand: download a
-[release](https://github.com/ValerioDolci/capy-flash/releases) tarball and `hf download Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash`.
+- The installer checks GPUs, driver, AVX2/AVX-512, RAM and disk and says what to fix, downloads the latest release and
+  **one** model repository from Hugging Face, verifies both, and prints the command that serves it and a test request.
+  `--dir` picks another place, `--no-model` downloads the release only, `--verify-model` also checks the model's digests.
+- The first start takes a minute or two (a cold start of Flash-Next reads its experts from disk).
+- **Launchers.** `serve-flash-next.sh` (Flash-Next; `NINFER_DEVICES=0` for one GPU), `serve-tp2.sh` (27B, two GPUs) and
+  `serve-27b-16gb.sh` (27B 3-bit, one GPU) start `ninfer-serve` with the tested profile, the model id (`capy-flash` or
+  `qwen3.8-27b`, the `model` name requests must use) and the chat template. `NINFER_PORT=9000` changes the port;
+  extra `ninfer-serve` flags go after the model path and win over the profile.
+- **Vision.** The two 27B artifacts include the vision tower and their launchers load it (it takes VRAM from the
+  context); `NINFER_VISION=0` before the launcher, or `--no-vision` after the model path, turns it off. The Flash-Next
+  downloads are text only: images on Flash-Next need the separate
+  [Vision artifact](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash), which `install.sh` does
+  not fetch, and `--vision`.
+- **Keep it running.** `ninfer-serve` exits with status 2 when the Engine fails, so run it under a supervisor that
+  restarts it: a systemd unit and a llama-swap entry are in [examples/serving](examples/serving).
+- By hand: download a [release](https://github.com/ValerioDolci/capy-flash/releases) tarball
+  ([contents](tools/release/README-release.md)) and `hf download Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash --local-dir <dir>`.
 
-The routed experts that do not fit in VRAM live in host RAM and are computed on the CPU; everything else runs on
-the GPU (tensor-parallel when there are two). capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork
-of [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every
-piece of prior work it builds on.
+## Connect a client
 
-Status: **v0.7.2** (2026-10-23). Built, tested and measured on one machine (below). Not affiliated with Qwen or NVIDIA.
+The server listens on `http://127.0.0.1:8080` (`NINFER_HOST` / `NINFER_PORT` change it): OpenAI Chat Completions and
+Responses under `/v1`, Anthropic Messages at `/v1/messages`. `--api-key KEY` makes it require
+`Authorization: Bearer KEY` or `x-api-key: KEY`.
 
-## What it does
-- Tensor parallel over PCIe on two GPUs **without peer-to-peer** (pinned-host mailbox, FP32 partial sums); with P2P
-  (for example two boards behind a PCIe switch) the prefill exchanges take the direct copy automatically (v0.6).
-- A cache of routed experts in VRAM, partitioned by expert id between the two GPUs; missing experts are computed on
-  the CPU (NVFP4 kernels in AVX-512 VNNI or AVX2, chosen at startup and identical bit for bit, with the GPU's W4A4
-  activation quantization), inside the captured CUDA graph.
-- MTP speculative decoding (K = 3, draft vocabulary shortlist), INT8 KV with an elastic KV / expert-slot budget up to
-  262,144 tokens, prefix cache across turns; OpenAI- and Anthropic-compatible server (`ninfer-serve`).
-- The same binary still serves the dense **Qwen3.8-27B** (NVFP4, entirely on the two GPUs) exactly like ninfer-tp2 v0.4.9.
-- Context cache for agents (v0.5.4): a request reserves its prompt plus a 4,096-token window of KV and grows it as the
-  answer grows (a large `max_tokens` no longer pushes other conversations out of VRAM), and with two GPUs the cache can
-  keep evicted conversations in RAM (`--host-kv-mib`, `--host-state-slots`; on in `--profile 27b` with 8 GiB). On
-  Flash-Next (v0.6) the KV of idle conversations moves to RAM (`--profile flash-next`: 4 GiB) and the VRAM it frees goes
-  back to expert slots at once. On an agentic replay of Qwen3.8-27B (3 interleaved sessions
-  and 11 subagents, production flags, 4 lanes): median time to first token 2.14 → 0.98 s, prompt tokens served from
-  cache 67 → 78 %, prompt tokens recomputed −35 %, decode unchanged.
-- Disk tier of the context cache (v0.7.2, opt-in, idea and first implementation by @KouShuo): `--disk-cache-dir DIR
-  --disk-cache-gib N` writes idle conversations to disk (and all of them at a clean shutdown), and after a restart a
-  long conversation resumes from disk instead of re-prefilling it (140k tokens: 1.1 s instead of 48 s on two RTX
-  5070 Ti). KV in 256-token blocks addressed by the prefix, written once and shared between turns and conversations;
-  validity key, atomic writes, checksums, LRU under the cap, free-space margin, one locked directory per server; see
-  [docs/serving.md](docs/serving.md#disk-tier-of-the-context-cache).
-- Expert residency that follows the conversation (v0.6): a prompt that continues a cached conversation keeps the
-  experts its next answer needs, a new conversation only updates their statistics; short prompts stream their experts
-  to the GPUs from 256 tokens (`--stream-min-tokens`). The post-prompt slowdown of v0.5.x (~250 ms per turn) is gone.
-- MTP draft head re-distilled on this engine's own output (v0.6): +18 % decode in Italian, +4-8 % in English and code.
-- Vision on Flash-Next (v0.6, opt-in): `--vision` with an artifact converted by `tools/capy_flash/convert.py --vision`
-  (Q8 tower, 0.45 GiB of VRAM, ~4 % decode); without `--vision` nothing changes.
-- NVIDIA's FP4-Local checkpoint runs too (recipe `qwen3_8_flash_next_fp4_local`), ~19 % slower than the default artifact.
-- GGUF i-quant experts (v0.7): IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and Q2_0 blocks with variable-size expert slots
-  per layer, GPU kernels from ggml (via fngine / ninfer-all), CPU kernels in AVX-512 VNNI and AVX2; the 64 GB edition of
-  Flash-Next takes its experts verbatim from ISTA-DASLab's GSQ-RCO GGUF.
-- 3-bit GSQ weights for the dense 27B (v0.7, `q3_g128_fp16`): tensor-core kernels with int8 activations in the prefill
-  (`NINFER_Q3_A8=0` for 16-bit), `--profile 27b-16gb` for one 16 GB card.
-- Page-locked memory limit (v0.7): when the system grants less pinned memory than the experts need (Windows/WSL2 caps it
-  at about half the RAM), the layers that don't fit stay in pageable RAM: the CPU reads them in place, the GPUs copy
-  them through a pinned staging ring (`--host-pinned-max-gib` sets the cap by hand). Same tokens as fully pinned.
-- Empty-reply guards (v0.7, every model, on by default): a terminal token drawn right after `<think>` is redrawn, a reply
-  that ends inside its reasoning is closed and continued once (`--no-reasoning-eos-guard`, `--no-reasoning-close-retry`).
+- **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` (any model name is accepted on Messages).
+- **Codex CLI:** a custom provider with base URL `http://127.0.0.1:8080/v1`, the `responses` wire API and the server's
+  model id. It needs the chat template the launchers pass (`qwen3_8.jinja`), because Codex always sends `instructions`.
+- **OpenCode and other OpenAI clients:** base URL `http://127.0.0.1:8080/v1`, model `capy-flash` (or `qwen3.8-27b`).
 
-## Measured
-One machine: AMD Ryzen 9 9900X, 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.0 x8 + x8 (no P2P), Ubuntu, CUDA 13.1.
-"GB300" below is the quality reference: NVIDIA's NVFP4 checkpoint served by vLLM on a GB300, same prompts, paired.
+Details, including authentication and what each client sends: [docs/serving.md](docs/serving.md#connect-a-client).
 
-**Quality** (v0.6 release candidate, 2026-10-18, serving configuration of this README):
+## Run it other ways
 
-| benchmark | capy-flash | GB300 reference | verdict |
-|---|---:|---:|---|
-| GSM8K, 1,319 questions | 0.9750 | 0.9810 | 9 / 1 discordant, McNemar p 0.02 (v0.5.3: 0.9765, p 0.07) |
-| MMLU-Pro, 1,008 questions | 0.8413 | 0.8452 | non-inferior (difference -0.40 pt, lower bound -1.85 pt, margin -2.5 pt) |
-
-The final binary was checked on the first 330 / 252 questions (GSM8K 0.979, MMLU-Pro 0.841). Output is not
-bit-reproducible run to run (which experts sit in VRAM depends on timing), so two runs of the same build differ by a
-few questions.
-
-**Agentic replay** ([bench/capy_flash](bench/capy_flash)): 3 synthetic coding-agent sessions, 53 turns, prompts growing to
-~81k tokens with ~90 % prefix reuse, 256 output tokens per turn, temperature 0. Same machine, same day (2026-10-18),
-full clocks: table at the top. v0.6 against the build before the v0.6 work (2026-10-17): total 212 → 177 s, decode
-118 → 155 tok/s.
-
-**Agent tasks** (2026-10-14 build): 5 multi-step coding tasks of a private task bank, 4 runs each, OpenCode with the
-model's sampling: 20/20 solved, 42.9k generated tokens per run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20;
-the GB300 reference: 26.5k), no malformed tool call in 1,124.
-
-**Prefill** (same prompts on the three engines, server side, no prefix reuse, ~3.5k / ~15k / ~55k tokens): capy-flash
-v0.6 2,422 / 4,615 / 4,828 tok/s; Strata 0.1.45 IQ3_S 2,216 / 3,811 / 5,233; Strata NVFP4 1,519 / 3,513 / 4,849.
-A cold 382-token prompt answers in 1.35 s (2.5-2.9 s with the previous 512-token streaming threshold).
-
-**Start**: a cold start of the Flash-Next server takes 26-29 s here (measured on v0.5.3), most of it reading the
-64.6 GiB of experts from disk.
-
-**Qwen3.8-27B** (`--profile 27b`, MTP; 280 prompts of three languages, server side): the same tokens as v0.5.4 on 280 of
-280 answers (and with DFlash2), decode +5 % (Italian 168 → 176 tok/s), prefill at 4k / 16k / 64k 5,777 / 5,585 /
-4,352 → 9,343 / 9,234 / 6,287 tok/s with MTP and 5,719 / 5,530 / 4,316 → 9,205 / 9,052 / 6,198 with DFlash2.
-Concurrent decode (NInfer's `decode-saturation` suite, MTP3, 8,192 tokens per request): 175 / 326 / 560 / 927 tok/s
-aggregate at 1 / 2 / 4 / 8 requests.
-
-**v0.7** (2026-10-22, same machine, full clocks): the NVFP4 Flash-Next and 27B artifacts run as in v0.6 (27B: the same
-tokens on 280 of 280 prompts; Flash-Next decode within ±2 % on six prompt sets; GSM8K 0.985 and MMLU-Pro 0.829 on the
-first 330 / 252 questions, paired with v0.6: no difference).
-
-| v0.7, new artifacts | Flash-Next 64 GB, two GPUs | Flash-Next 64 GB, one GPU | Qwen3.8-27B 3-bit, one GPU | Qwen3.8-27B 3-bit, two GPUs |
-|---|---:|---:|---:|---:|
-| LocalMaxxing reasoning-v1 / agentic replay decode | 239 / 182 tok/s | 121 / 104 tok/s | — | — |
-| prefill 4k / 16k / 64k | 2,117 / 3,305 / 3,426 | 1,888 / 2,145 / 2,257 | 3,401 / 3,211 / — | 5,787 / 5,567 / 4,304 |
-| decode, 8k real-text prompt, MTP | — | — | 139 tok/s | 230 tok/s |
-| GSM8K (vs GB300 NVFP4 reference) | 0.982 (0.985), 330 q. | same weights | 0.968 (0.968), 1,319 q. | |
-| MMLU-Pro (vs GB300 NVFP4 reference) | 0.837 (0.849), 252 q. | same weights | **0.69-0.71, ~0.72 with the guards (0.78)**, 252 q. | |
-
-The 64 GB edition peaks at 55.2 GiB of RSS inside a 64 GiB memory cgroup without swap (57 GiB used with one GPU);
-speeds were measured on the 96 GB machine. One GPU keeps only one conversation checkpoint in VRAM, so v0.7.1's
-`--profile flash-next-1gpu` keeps 8 in RAM (+0.66 GiB): on the agentic replay 83 % of the prompt tokens come from the
-cache, 1.9 s to the first token (median) and 276 s for the whole replay (v0.7.0: 34 %, 13.3 s, 858 s). The 3-bit 27B loses MMLU-Pro
-points mostly because more answers run out of their 8,192 tokens while reasoning; the v0.7 empty-reply guards bring
-back the ones that stopped inside their reasoning (9 of 9, all correct: about +3.6 points, estimated on those
-questions). With two cards, the NVFP4 27B is the better choice. At the eco clocks of 2026-10-19 the one-card 27B
-decoded 105 tok/s where llama.cpp (ISTA's GSQ-RCO IQ3_S with its MTP drafting, same card and prompt) did 66-67.
-
-See the [development log](docs/capy-flash/development-log.md), which explains every `Tnn` tag found in the sources.
-
-## Requirements
-See the table at the top: **16 GB of VRAM is the minimum** (the 3-bit 27B on one card); RAM is what Flash-Next needs.
-In detail: Linux (or WSL2 / Docker on Windows), CUDA 13.1, sm_120 GPUs (RTX 50 series) with 16 GB. Flash-Next NVFP4 also needs two of them, a CPU with AVX-512 (F/BW/VL, VNNI) or AVX2 + FMA + F16C
-(Zen 2/3, Intel client cores; `NINFER_HOST_ISA` in [diagnostics](docs/capy-flash/diagnostics.md)), and about **75 GiB of
-free RAM** (a 96 GB machine): the routed experts are one 64.6 GiB page-locked host allocation, and `--profile flash-next`
-also keeps the token embedding and up to 4 GiB of idle conversations in RAM. The 27B needs neither of these CPU features nor that RAM.
-**Smaller machines (v0.7):** the 64 GB edition of Flash-Next needs about 56 GiB of free RAM (48 GiB of experts) and runs
-on one or two 16 GB cards; the 3-bit 27B runs on one 16 GB card. Tested here on Linux; users run the 27B on WSL2 and on Windows with Docker. The server checks this at startup and
-refuses with the numbers when it does not fit (`NINFER_RAM_GUARD=0` starts anyway).
-
-## Build
+### Build
 ```
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a \
   -DNINFER_BUILD_APPS=ON -DNINFER_BUILD_BENCHMARKS=OFF -DBUILD_TESTING=ON \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.1/bin/nvcc
 ninja -C build apps/ninfer-serve
+build/apps/ninfer-serve <dir>/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --profile flash-next --model-id capy-flash \
+  --chat-template tools/chat_templates/qwen3_8.jinja
 ```
-Or take the prebuilt tarball of a [release](https://github.com/ValerioDolci/capy-flash/releases) (Ubuntu, `sm_120a`):
-it has `serve-flash-next.sh`, `serve-tp2.sh` (27B, two GPUs) and `serve-27b-16gb.sh` (27B 3-bit, one GPU) with the profiles of this README ([tools/release](tools/release/README-release.md)).
+Or take the prebuilt tarball of a [release](https://github.com/ValerioDolci/capy-flash/releases) (Ubuntu, `sm_120a`),
+which has the three launchers ([tools/release](tools/release/README-release.md)).
 
-## Model weights
-Ready to serve: [`Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash)
-(126.6 GB, the artifact measured above, with its draft shortlist and `SHA256SUMS`; NVIDIA Open Model License together with
-the Qwen Community License of Qwen3.8-Flash-Next):
-```
-hf download Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash --local-dir <dir>
-```
-Or convert `nvidia/Qwen3.8-Flash-Next-NVFP4` yourself in one command (artifact + MTP draft shortlist, same result):
-```
-python tools/capy_flash/convert.py --model <checkpoint dir> --out <dir>
-```
-It runs `python -m tools.convert --recipe qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 --components text,mtp` (experts NVFP4
-as published, indexer BF16, GDN Q8, about 5 minutes on a GPU, 118 GB) and `tools/qwen4_draft_shortlist.py`.
+### Profiles
+`--profile NAME` applies the tested configuration of a model; flags given on the command line override it, in any
+order. `ninfer-serve --help` and [docs/serving.md](docs/serving.md#profiles) list the full expansions.
 
-With images (`--vision`, see below): [`Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash)
-(the same artifact plus the Q8 vision tower, capy-flash v0.6.0 or newer). The previous text artifact, with NVIDIA's MTP
-head, stays available as revision `v0.5.4` of the first repository (`hf download ... --revision v0.5.4`).
+| profile | for | in short |
+|---|---|---|
+| `flash-next` | Flash-Next on two GPUs (the launcher's default) | `--tp 2`, INT8 KV, elastic KV / expert slots, 262,144 tokens, MTP 3, 4 GiB of idle KV and 8 conversation states in RAM, embedding in RAM |
+| `flash-next-1gpu` | the 64 GB edition on one GPU (`NINFER_DEVICES=0`) | the same on one device, 1 GiB of idle KV and 8 states in RAM |
+| `27b` | Qwen3.8-27B NVFP4 on two GPUs | `--tp 2`, INT8 KV, 196,608 tokens, MTP 3, Vision, 8 GiB of context cache in RAM |
+| `27b-16gb` | Qwen3.8-27B 3-bit on one GPU | INT8 KV, 65,536 tokens, MTP 3, Vision, embedding in RAM (13.9 GB of VRAM) |
 
-v0.7: [`Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash)
-(102 GB, the 64 GB edition: ISTA-DASLab's GSQ-RCO experts, the rest as above) and
-[`Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash) (12.5 GB,
-ISTA-DASLab's 3-bit GSQ 27B plus the official MTP layer; convert it yourself with the recipe `qwen3_8_27b_gsq3`).
+For the 64 GB edition on two GPUs add `--host-kv-mib 1024 --host-state-slots 2` to `--profile flash-next` (smaller RAM
+caches); `install.sh --model flash-next-64gb` prints that command.
 
-## Serve
-```
-build/apps/ninfer-serve <dir>/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --profile flash-next --port 8098 --model-id capy-flash
-```
-`--profile flash-next` is the configuration measured above (`--tp 2 --devices 0,1 --kv-dtype int8 --elastic
---max-context 262144 --max-concurrency 1 --spec mtp --draft-tokens 3`); `--profile 27b` is the ninfer-tp2 one for
-Qwen3.8-27B (with Vision; `--no-vision` for artifacts without it); `--profile 27b-16gb` runs the 3-bit 27B on one card
-(int8 KV, 65,536 tokens, vision, 13.9 GB of VRAM). For the 64 GB edition of Flash-Next add `--host-kv-mib 1024
---host-state-slots 2` to `--profile flash-next` (smaller RAM caches), or use `--profile flash-next-1gpu` on one GPU. Flags given on the command line override the
-profile's, in any order (`ninfer-serve --help` lists both). To keep it running: a systemd unit and a llama-swap entry
-in [examples/serving](examples/serving).
-
-**Images (opt-in).** Flash-Next is multimodal: convert with `--vision` (`python tools/capy_flash/convert.py --model
-<checkpoint dir> --out <dir> --vision`, i.e. `tools.convert ... --components text,vision,mtp`; the Text and MTP parts
-come from the same conversion as the text-only artifact, the tower is stored Q8; ready-made on
-[Hugging Face](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash)) and start with `--profile flash-next --vision`
-(tower on GPU 0, `--vision-device 1` moves it, `--max-vision-tokens N` caps one image). Images and videos are accepted
-in the chat APIs and a conversation with an image resumes its cached prefix. Measured here (`--max-vision-tokens
-4096`): tower 0.45 GiB on its GPU, 4 expert slots per layer fewer (66 to 62), decode about 4 % slower on short prompts,
-prefill unchanged; its merged embeddings are within 0.09 (relative) of a BF16 PyTorch reference. Without `--vision` the tower is not loaded and nothing changes.
-
-**Docker.** [docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (1.2 GB, builds in about a
-minute; the root [Dockerfile](Dockerfile) compiles from source instead). It needs the NVIDIA Container Toolkit:
+### Docker
+[docker/Dockerfile.release](docker/Dockerfile.release) packs a release tarball (builds in about a minute; the root
+[Dockerfile](Dockerfile) compiles from source instead). It needs the NVIDIA Container Toolkit:
 ```
 docker build -f docker/Dockerfile.release -t capy-flash .
 docker run --gpus all -p 8080:8080 -v ~/capy-flash/models:/models capy-flash \
-  /models/flash-next/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --profile flash-next --host 0.0.0.0
+  /models/flash-next/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --profile flash-next --host 0.0.0.0 \
+  --model-id capy-flash --chat-template /opt/capy-flash/chat_templates/qwen3_8.jinja
 ```
 Tested with rootless Podman and the two GPUs passed through (Flash-Next loads its 64.6 GiB of page-locked experts
 without extra limits).
-The CPU expert path quantizes activations like the GPU path (W4A4, on by default; `NINFER_HOST_MOE_A4=0` restores
-the older W4A8, which made the output depend on which experts happened to be in VRAM). `--turn-anchors` is 0 by
-default on Flash-Next, which saves one prefill pass per agentic turn (about 0.8 s here); the cost is that a cancelled or
-edited turn re-reads the whole conversation (`--turn-anchors 1` restores the anchor). Models that sit entirely on the
-GPU (Qwen3.8-27B) keep the anchor by default: there the extra pass costs nothing measurable. Other switches, diagnostics and dumps:
-[docs/capy-flash/diagnostics.md](docs/capy-flash/diagnostics.md); general server options: [docs/serving.md](docs/serving.md).
 
-## Tests
-`ctest --test-dir build` runs the unit tests (208). The Engine integration tests run when their artifacts are set:
-`NINFER_TEST_QWEN4_ARTIFACT` (a small synthetic Flash-Next artifact with the real layer geometry, made by
-`tools/capy_flash/make_test_artifact.sh <checkpoint dir> <out dir>`, CPU only) and `NINFER_TEST_ARTIFACT` (a
-Qwen3.8-27B artifact, for the tests inherited from ninfer-tp2). For the 27B, `tools/tp2/gate.sh` is the reference run:
-it sets the artifacts, runs the two-device integration tests and excludes the seven single-GPU tests that need other
-artifact kinds (DFlash, MoE, vision workspace; `GATE_CTEST_EXCLUDE`), then checks golden ids, perplexity and greedy
-texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
+### Model weights
+Ready to serve on Hugging Face (`install.sh --model` downloads one of these; each has its `SHA256SUMS`):
+- [`Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash)
+  (126.6 GB, the default; NVIDIA Open Model License together with the Qwen Community License of Qwen3.8-Flash-Next).
+  Or convert `nvidia/Qwen3.8-Flash-Next-NVFP4` yourself in one command, same result:
+  `python tools/capy_flash/convert.py --model <checkpoint dir> --out <dir>`. It runs `python -m tools.convert --recipe
+  qwen3_8_flash_next_nvfp4_idxbf16_gdnq8 --components text,mtp` (experts NVFP4 as published, indexer BF16, GDN Q8,
+  about 5 minutes on a GPU, 118 GB) and `tools/qwen4_draft_shortlist.py`. The previous text artifact, with NVIDIA's
+  MTP head, stays available as revision `v0.5.4` (`hf download ... --revision v0.5.4`).
+- [`Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash)
+  (the same plus the Q8 vision tower; download by hand, serve with `--vision`; or `convert.py ... --vision`).
+- [`Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash)
+  (102 GB, the 64 GB edition: ISTA-DASLab's GSQ-RCO experts, the rest as above).
+- [`Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`](https://huggingface.co/Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash) (12.5 GB,
+  ISTA-DASLab's 3-bit GSQ 27B plus the official MTP layer; recipe `qwen3_8_27b_gsq3`).
+- [`Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer`](https://huggingface.co/Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer)
+  (17.4 GB, the 27B for two GPUs; [model card](model-cards/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer/README.md)).
+
+How the engine runs these models, every server flag, the RAM tiers, the chat template and the CPU threads:
+[docs/serving.md](docs/serving.md#capy-flash-serving). Environment variables and diagnostics:
+[docs/capy-flash/diagnostics.md](docs/capy-flash/diagnostics.md). All documentation: [docs/README.md](docs/README.md).
+
+## Benchmarks
+
+Our machine: AMD Ryzen 9 9900X (12 cores), 96 GB DDR5-5600, 2x RTX 5070 Ti 16 GB on PCIe 5.0 x8 + x8 (no P2P),
+Ubuntu, CUDA 13.1, full clocks. Decode is the server-side rate. The agentic replay is
+[bench/capy_flash](bench/capy_flash): 3 synthetic coding-agent sessions, 53 turns, prompts growing to ~81k tokens with
+~90 % prefix reuse, 256 output tokens per turn, temperature 0. LocalMaxxing is the reasoning-v1 benchmark (short
+prompt, 512 tokens).
+
+**Ours** (one GPU = one RTX 5070 Ti):
+
+| model, edition | GPUs | version, date | measured | result |
+|---|---|---|---|---|
+| Flash-Next NVFP4 | 2 | v0.6.0, 2026-10-18 | agentic replay: decode median / total time / time to first token, median (p90) | 155 tok/s / 177 s / 1.48 s (2.62 s) |
+| Flash-Next NVFP4 | 2 | v0.6.0, 2026-10-18 | prefill, cold, ~3.5k / ~15k / ~55k-token prompts | 2,422 / 4,615 / 4,828 tok/s |
+| Flash-Next NVFP4 | 2 | v0.6.0, 2026-10-18 | LocalMaxxing reasoning-v1 | 178 tok/s |
+| Flash-Next NVFP4 | 2 | v0.7.0, 2026-10-22 | agentic replay decode median | 155 tok/s (as v0.6) |
+| Flash-Next 64 GB | 2 | v0.7.0, 2026-10-22 | agentic replay decode median | 182 tok/s |
+| Flash-Next 64 GB | 2 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7d5d03o3rf01ex9g9wiw) | 234 tok/s |
+| Flash-Next 64 GB | 2 | v0.7.2, 2026-10-23 | prefill 4k / 16k / 64k | 2,168 / 3,924 / 3,994 tok/s |
+| Flash-Next 64 GB | 1 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7dm603o7rf01i54inoup) | 121 tok/s |
+| Flash-Next 64 GB | 1 | v0.7.1, 2026-10-22 | agentic replay: decode median / total time / time to first token, median / prompt tokens from cache | 104 tok/s / 276 s / 1.9 s / 83 % |
+| Flash-Next 64 GB | 1 | v0.7.2, 2026-10-23 | prefill 4k / 16k / 64k | 1,671 / 2,838 / 2,921 tok/s |
+| Qwen3.8-27B 3-bit | 1 | v0.7.0, 2026-10-22 | decode, 8k-token real-text prompt, MTP | 139 tok/s |
+| Qwen3.8-27B 3-bit | 1 | v0.7.0 | prefill 4k / 16k | 3,401 / 3,211 tok/s |
+| Qwen3.8-27B 3-bit | 1 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7ebb03ofrf01mkfqs948) | 174 tok/s |
+| Qwen3.8-27B 3-bit | 2 | v0.7.0, 2026-10-22 | decode, 8k-token real-text prompt, MTP | 230 tok/s |
+| Qwen3.8-27B 3-bit | 2 | v0.7.0 | prefill 4k / 16k / 64k | 5,787 / 5,567 / 4,304 tok/s |
+| Qwen3.8-27B 3-bit | 2 | v0.7.0, 2026-10-22 | LocalMaxxing reasoning-v1, [verified run](https://www.localmaxxing.com/runs/cmvjb7emi03oirf01vyxuhulr) | 288 tok/s |
+| Qwen3.8-27B NVFP4 (QUASAR) | 2 | v0.6.0 | prefill 4k / 16k / 64k, `--profile 27b` | 9,343 / 9,234 / 6,287 tok/s |
+
+More on the 27B NVFP4 (`--profile 27b`, MTP; 280 prompts in three languages, v0.6): the same tokens as v0.5.4 on 280 of
+280 answers (and with DFlash2), decode +5 % (Italian 168 → 176 tok/s), prefill at 4k / 16k / 64k 5,777 / 5,585 / 4,352
+→ 9,343 / 9,234 / 6,287 tok/s with MTP and 5,719 / 5,530 / 4,316 → 9,205 / 9,052 / 6,198 with DFlash2; concurrent decode (NInfer's `decode-saturation`
+suite, MTP3, 8,192 tokens per request) 175 / 326 / 560 / 927 tok/s aggregate at 1 / 2 / 4 / 8 requests. On an agentic
+replay of the 27B (3 interleaved sessions and 11 subagents, 4 lanes), the v0.5.4 context cache took the median time to
+first token from 2.14 to 0.98 s and the prompt tokens served from cache from 67 to 78 %, decode unchanged.
+Flash-Next decode stays flat with context: 168 / 165 / 171 / 165 tok/s with 0 / 14k / 61k / 118k tokens of prompt
+(v0.6), and a cold 382-token prompt answers in 1.35 s. A cold start of the Flash-Next server takes 26-29 s here
+(v0.5.3), most of it reading the 64.6 GiB of experts. The 64 GB edition peaks at 55.2 GiB of RSS inside a 64 GiB
+memory cgroup without swap (57 GiB used with one GPU); its speeds were measured on the 96 GB machine.
+
+**Reported by users** (not reproduced by us):
+
+| setup | model, edition | version | measured | result | source |
+|---|---|---|---|---|---|
+| AMD EPYC 7F52 16 cores (Zen 2, AVX2), 2x RTX 5070 Ti (overclocked) | Flash-Next NVFP4 | v0.7.2 built with CUDA 13.4 | agentic replay (53 turns, greedy): decode median | 141.3 tok/s with automatic threads; 144.4 with `--expert-cpu-threads 15` and `taskset -c 0-15`; release tarball (CUDA 13.1) 137.6; v0.7.1 tarball 121.8 | [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11) |
+| same | same | same | own measurement, not greedy | prefill at 131k 5,541 tok/s; time to first token 22.1 s at 131k, 1.15 s at 1k | [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11) |
+| AMD Threadripper PRO 5975WX (AVX2), 2x RTX PRO 4000 Blackwell 24 GB (145 W), Proxmox LXC | Flash-Next 64 GB (GSQ-RCO) | v0.7.1 built from source, CUDA 13.3 | decode / prefill / local aider coding benchmark | decode ~100-114 tok/s on prose, ~140-155 on reasoning; prefill at 40k ~3,300 tok/s; aider 145-146 of 148 | [issue #22](https://github.com/ValerioDolci/capy-flash/issues/22) |
+
+**Against Strata.** [Strata](https://github.com/Niko1221/Strata) 0.1.45 on our machine, same day (2026-10-18), two GPUs,
+capy-flash v0.6.0:
+
+| | **capy-flash**, NVFP4 | Strata, same NVFP4 weights | Strata, 3-bit IQ3_S (tuned) |
+|---|---:|---:|---:|
+| agentic replay, 53 turns up to 81k tokens: total time | **177 s** | 268 s | 197 s |
+| agentic replay: decode, server side (median) | **155 tok/s** | 98 tok/s | 151 tok/s |
+| agentic replay: time to first token, median (p90) | **1.48 s (2.62)** | 2.35 s (4.17) | 1.60 s (3.69) |
+| prefill, ~3.5k-token prompt | **2,422 tok/s** | 1,519 tok/s | 2,216 tok/s |
+| prefill, ~15k-token prompt | **4,615 tok/s** | 3,513 tok/s | 3,811 tok/s |
+| prefill, ~55k-token prompt | 4,828 tok/s | 4,849 tok/s | **5,233 tok/s** |
+| LocalMaxxing reasoning-v1 (short prompt, 512 tokens) | 178 tok/s | 119 tok/s | **195 tok/s** |
+
+Strata's IQ3_S experts are 26 % smaller than NVIDIA's NVFP4 ones (lower quality: KL 0.144 vs 0.070 for NVFP4, as
+Strata reports), which is why it leads on the short benchmark. v0.6 against the build before the v0.6 work
+(2026-10-17): replay total 212 → 177 s, decode 118 → 155 tok/s.
+
+**Comparing decode with other engines.** capy-flash computes every routed expert the model selects; an expert that
+misses the VRAM cache is computed on the CPU, never skipped. Strata's "route tail skip" skips low-ranked experts that
+miss the cache, which changes the output slightly and saves CPU work. A decode-speed gap against Strata, especially on
+a slower CPU, most likely comes from that. Measured here with the same GSQ-RCO IQ3_S experts on both (one RTX 5070 Ti,
+LocalMaxxing decode, 2026-10-23): Strata 138 tok/s with the skip, 116.6 with `STRATA_ROUTE_TAIL_SKIP=0`, capy-flash
+129.8. On two GPUs (capy-flash v0.7.0 against Strata 0.2.2, 2026-10-22) the agentic replay decode median was 200.9
+against 171.3 tok/s; Strata finished that replay sooner overall (189 against 200 s) thanks to its faster prefill.
+
+**Quality** against the GB300 reference (NVIDIA's NVFP4 checkpoint served by vLLM on a GB300, same prompts, paired):
+
+| model, version | GSM8K (reference) | MMLU-Pro (reference) |
+|---|---:|---:|
+| Flash-Next NVFP4, v0.6.0 | 0.9750 (0.9810), 1,319 questions; 9 / 1 discordant, McNemar p 0.02 | 0.8413 (0.8452), 1,008 questions: non-inferior (difference -0.40 pt, lower bound -1.85 pt, margin -2.5 pt) |
+| Flash-Next NVFP4, v0.7.0 | 0.985 (0.985), 330 questions | 0.829 (0.849), 252 questions; paired with v0.6: no difference |
+| Flash-Next 64 GB, v0.7.0 | 0.982 (0.985), 330 questions | 0.837 (0.849), 252 questions |
+| Qwen3.8-27B 3-bit, v0.7.0 | 0.968 (0.968), 1,319 questions | 0.69-0.71, about 0.72 with the empty-reply guards (0.78), 252 questions |
+
+The v0.6.0 release binary was checked on the first 330 / 252 questions (GSM8K 0.979, MMLU-Pro 0.841). Output is not
+bit-reproducible run to run (which experts sit in VRAM depends on timing), so two runs of the same build differ by a
+few questions. The 3-bit 27B loses MMLU-Pro points mostly because more answers run out of their 8,192
+tokens while reasoning; the v0.7 empty-reply guards bring back the ones that stopped inside their reasoning (9 of 9,
+all correct: about +3.6 points, estimated on those questions). Agent tasks (2026-10-14 build): 5 multi-step coding
+tasks of a private task bank, 4 runs each, OpenCode with the model's sampling: 20/20 solved, 42.9k generated tokens per
+run (Strata 0.1.43 IQ3_S on the same tasks: 52.7k, 20/20; the GB300 reference: 26.5k), no malformed tool call in 1,124.
 
 ## Known limits
-- One request at a time (`--max-concurrency 1`); tested only on the machine above.
+- Flash-Next is tested with one request at a time (`--max-concurrency 1`, as its profiles set) and only on the
+  machine above. The server accepts up to 8 (`--max-concurrency`); the 27B NVFP4 was measured at 1 to 8.
 - With several requests decoding, an answer that outgrows its KV window when the GPUs are full first moves idle cached
   conversations to RAM (or drops them without a RAM tier); only if that cannot free a page does it end early with
   `finish_reason: length` (the request log counts it). `--kv-lease-window 0` restores the full reservation of v0.5.3.
@@ -279,8 +260,55 @@ texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
   stack is length of reasoning, not correctness.
 - Output is not bit-reproducible run to run: which experts sit in VRAM (GPU path) or not (CPU path) depends on timing,
   and long streamed prefills differ in the last bits; quality is measured with that in place.
-- Decode is bound by host-RAM bandwidth for the experts computed on the CPU (about 270-300 per MTP window).
+- Decode of Flash-Next is bound by host-RAM bandwidth for the experts computed on the CPU (about 270-300 per MTP
+  window), so a slower CPU or RAM decodes slower.
+
+## Tests
+`ctest --test-dir build` runs the unit tests. The Engine integration tests run when their artifacts are set:
+`NINFER_TEST_QWEN4_ARTIFACT` (a small synthetic Flash-Next artifact with the real layer geometry, made by
+`tools/capy_flash/make_test_artifact.sh <checkpoint dir> <out dir>`, CPU only) and `NINFER_TEST_ARTIFACT` (a
+Qwen3.8-27B artifact, for the tests inherited from ninfer-tp2). For the 27B, `tools/tp2/gate.sh` is the reference run:
+it sets the artifacts, runs the two-device integration tests and excludes the seven single-GPU tests that need other
+artifact kinds (DFlash, MoE, vision workspace; `GATE_CTEST_EXCLUDE`), then checks golden ids, perplexity and greedy
+texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
+
+## What's new
+
+**v0.7.3**
+- CPU expert threads: when the allowed CPUs have no free SMT sibling (for example `taskset -c 0-15` on a 16-core /
+  32-thread CPU, or SMT off) and the automatic count would take every core, one core is left to the main thread, which
+  spin-waits on the GPU. Reported in [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11): on an EPYC 7F52,
+  16 threads on `taskset -c 0-15` dropped decode to 80-90 tok/s, against about 144 with 15. `--expert-cpu-threads N`
+  still overrides ([details](docs/serving.md#cpu-expert-threads)).
+- 64 GB edition: the startup line `Qwen4Exp offload experts: 49 of 49 expert layers in pageable host memory` was a
+  false alarm (the check read the NVFP4 bank pointers, which ggml block banks do not use); fixed, no speed change
+  ([issue #22](https://github.com/ValerioDolci/capy-flash/issues/22)).
+- Documentation: every server flag and the four profiles in [docs/serving.md](docs/serving.md#capy-flash-serving),
+  client setup, the chat template, the vision opt-out.
+
+**v0.7.2: pick up where you left off.**
+- Disk tier of the context cache (opt-in, `--disk-cache-dir DIR --disk-cache-gib N`; idea by @KouShuo): conversations
+  survive a restart and resume without a new prefill (27B, two GPUs: 140k tokens in 1.08 s instead of 48 s); see
+  [docs/serving.md](docs/serving.md#disk-tier-of-the-context-cache).
+- Faster long prompts on the 64 GB edition of Flash-Next: prefill 64k +19 % on two GPUs (3,994 tok/s) and +35 % on
+  one (2,921 tok/s), same tokens.
+- CPU expert threads chosen from the machine (physical cores, affinity, L3 domains) instead of fixed counts;
+  `--expert-cpu-threads N` sets them by hand.
+
+**v0.7.1:** `--profile flash-next-1gpu` keeps 8 conversation states in RAM (+0.66 GiB): on the agentic replay with one
+GPU 83 % of the prompt tokens come from the cache, 1.9 s to the first token (median) and 276 s for the whole replay
+(v0.7.0: 34 %, 13.3 s, 858 s).
+
+**v0.7.0: start small, grow later, same engine.**
+- Flash-Next on 64 GB of RAM, with one or two GPUs (`--model flash-next-64gb`, GGUF i-quant experts).
+- Qwen3.8-27B on one 16 GB card (`--model 27b-16gb`, 3-bit GSQ weights, 64k context, vision).
+- AVX2 CPUs (Zen 2/3, Intel client) and Windows/WSL2 with its page-locked memory limit start Flash-Next too.
+- Empty-reply guards on by default for every model; boards with P2P overlap the prefill exchanges on the direct copy
+  (+29-45 % measured by @tzolkincz); a context-cache accounting error fails one request instead of the server.
+
+Older releases: [GitHub releases](https://github.com/ValerioDolci/capy-flash/releases) and the
+[development log](docs/capy-flash/development-log.md), which records the work behind the `Tnn` tags in the sources.
 
 ## License
 Apache License 2.0 ([LICENSE](LICENSE)); attribution in [NOTICE](NOTICE). The original ninfer-tp2 README is in
-[docs/README-ninfer-tp2.md](docs/README-ninfer-tp2.md).
+[docs/README-ninfer-tp2.md](docs/README-ninfer-tp2.md) (historical).

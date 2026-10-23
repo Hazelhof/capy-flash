@@ -1,11 +1,209 @@
 # HTTP serving
 
 `build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+Anthropic-compatible HTTP endpoints over one resident NInfer Engine. For capy-flash's models on 16 GB boards
+start with [capy-flash serving](#capy-flash-serving); the sections after it are the general server reference.
+
+## capy-flash serving
+
+capy-flash serves two models with the same `ninfer-serve` binary: **Qwen3.8-Flash-Next** (MoE; the routed
+experts that do not fit in VRAM stay in host RAM and run on the CPU) and the dense **Qwen3.8-27B**, on one or
+two 16 GB `sm_120` boards. The rest of this page is NInfer's general server reference; this section is what is
+specific to capy-flash: launchers, profiles, RAM, chat template, CPU threads and client setup.
+
+### Launchers and profiles
+
+`install.sh` downloads one Hugging Face repository per `--model` (the whole repository) and prints the
+launcher command. The launchers ship in the release tarball (`tools/release/` in the source tree), add the
+profile, the model id and the chat template, and append any extra flag you give them, which then wins over
+the profile:
+
+| `install.sh --model` | artifact repository | launcher | profile | GPUs | free RAM checked by install.sh |
+|---|---|---|---|---|---|
+| `flash-next` (default) | `Feyd89/Qwen3.8-Flash-Next-NVFP4-capy-flash` | `serve-flash-next.sh` | `flash-next` | 2 | 70 GiB |
+| `flash-next-64gb` | `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash` | `serve-flash-next.sh` (install.sh adds `--host-kv-mib 1024 --host-state-slots 2`); `NINFER_DEVICES=0` for one GPU | `flash-next`; one GPU: `flash-next-1gpu` | 1 or 2 | 56 GiB |
+| `27b` | `Feyd89/Qwen3.8-27B-QUASAR-QAT-nvfp4-NInfer` | `serve-tp2.sh` | `27b` | 2 | 8 GiB |
+| `27b-16gb` | `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash` | `serve-27b-16gb.sh` | `27b-16gb` | 1 | 8 GiB |
+
+Launcher environment (defaults in brackets): `NINFER_HOST` (`127.0.0.1`), `NINFER_PORT` (`8080`),
+`NINFER_MAX_CONTEXT` (the profile's), `NINFER_MODEL_ID` (`capy-flash` for Flash-Next, `qwen3.8-27b` for the 27B),
+`NINFER_DEVICES` (`0,1`; `serve-flash-next.sh` switches to `flash-next-1gpu` when it holds one id),
+`NINFER_DEVICE` (`0`, `serve-27b-16gb.sh`) and `NINFER_VISION=0` (the two 27B launchers: `--no-vision`).
+
+#### Profiles
+
+`--profile NAME` (after the artifact path) inserts the tested configuration of a model before the other flags,
+so a flag given on the command line overrides the profile's value; the KV capacity follows `--max-context`
+unless the profile sets it. `ninfer-serve --help` prints the same expansions.
+
+| profile | expands to |
+|---|---|
+| `flash-next` | `--tp 2 --devices 0,1 --kv-dtype int8 --elastic --max-context 262144 --max-concurrency 1 --spec mtp --draft-tokens 3 --host-kv-mib 4096 --host-state-slots 8 --embedding-host` |
+| `flash-next-1gpu` | `--device 0 --kv-dtype int8 --elastic --max-context 262144 --max-concurrency 1 --spec mtp --draft-tokens 3 --embedding-host --host-kv-mib 1024 --host-state-slots 8` |
+| `27b` | `--tp 2 --devices 0,1 --kv-dtype int8 --max-context 196608 --device-state-slots 4 --max-concurrency 1 --spec mtp --draft-tokens 3 --vision --vision-device 0 --max-vision-tokens 4096 --host-state-slots 8 --host-kv-mib 8192 --prefill-chunk 2048` |
+| `27b-16gb` | `--device 0 --kv-dtype int8 --max-context 65536 --kv-capacity auto --vram-headroom-mib 384 --device-state-slots 2 --max-concurrency 1 --spec mtp --draft-tokens 3 --lm-head-draft --embedding-host --vision --vision-device 0 --max-vision-tokens 4096 --host-state-slots 8 --host-kv-mib 4096 --prefill-chunk 2048` |
+
+`flash-next-1gpu` is meant for the 64 GB edition (GSQ-RCO experts) on one GPU. The 64 GB edition on two GPUs
+uses `flash-next` with `--host-kv-mib 1024 --host-state-slots 2` (smaller RAM caches), which is what
+`install.sh --model flash-next-64gb` prints.
+
+#### Vision
+
+- The two 27B artifacts contain the vision tower, and `--profile 27b` / `--profile 27b-16gb` (so `serve-tp2.sh` and
+  `serve-27b-16gb.sh`) turn Vision on. It costs VRAM that would otherwise go to the KV pool. To turn it off:
+  `NINFER_VISION=0` with the launchers, or `--no-vision` after the profile (it also drops the profile's
+  `--vision-device` and `--max-vision-tokens`).
+- The Flash-Next artifacts that `install.sh` downloads are text only, and the Flash-Next profiles leave Vision off.
+  Images on Flash-Next need the separate artifact `Feyd89/Qwen3.8-Flash-Next-NVFP4-Vision-capy-flash` (download it by
+  hand; `install.sh` never fetches it) or a conversion with `python tools/capy_flash/convert.py --model <checkpoint
+  dir> --out <dir> --vision`, and `--vision` on the command line (`serve-flash-next.sh <vision artifact> --vision`).
+  The tower goes on GPU 0 (`--vision-device 1` moves it, `--max-vision-tokens N` caps one image). Measured with
+  `--max-vision-tokens 4096`: tower 0.45 GiB on its GPU, 4 expert slots per layer fewer (66 to 62), decode about 4 %
+  slower on short prompts, prefill unchanged; the merged embeddings are within 0.09 (relative) of a BF16 PyTorch
+  reference. Without `--vision` the tower is not loaded.
+
+### RAM
+
+- **Flash-Next experts.** The routed experts are one page-locked host allocation: 64.6 GiB for the NVFP4 artifact,
+  48 GiB for the GSQ-RCO (64 GB) edition. While loading, the server checks that MemAvailable covers the page-locked
+  host weights plus max(2 GiB, 5 % of MemTotal) and otherwise refuses to start with the numbers (`NINFER_RAM_GUARD=0`
+  skips the check); the Host tiers below are checked after that, with the experts already pinned. With
+  `--profile flash-next` on a 96 GB machine the two checks add up to about 75 GiB free at startup; `install.sh` fails
+  below 70 GiB in total and warns below 70 GiB free (56 GiB for the 64 GB edition). The 27B needs no RAM beyond its
+  context cache.
+- **Context cache in RAM (Host KV and Host StateImages).** On one GPU (`--tp 1`) they are on by default: 8 Host
+  StateImages and 8 GiB of pinned Host KV. At `--tp 2` an unset `--host-kv-mib` or `--host-state-slots` becomes 0.
+  The profiles set them: `flash-next` 4096 MiB + 8 states, `flash-next-1gpu` 1024 MiB + 8, `27b` 8192 MiB + 8,
+  `27b-16gb` 4096 MiB + 8. The server refuses to start when these pinned tiers would leave less than max(4 GiB, 5 %
+  of RAM) available (`NINFER_HOST_TIER_RAM_GUARD=0` skips that check).
+- **Page-locked limit (Windows WDDM / WSL2).** When the system grants less pinned memory than the experts need, the
+  banks of the least used layers stay in pageable RAM: the CPU reads them in place and the GPUs copy them through a
+  pinned staging ring (no prefill streaming for those layers). Same tokens as fully pinned, slower where pageable.
+  `--host-pinned-max-gib G` (or `NINFER_HOST_PINNED_MAX_GIB`) sets the cap by hand.
+
+### Chat template
+
+Launch through a launcher, or pass `--chat-template`: the launchers add
+`--chat-template <release>/chat_templates/qwen3_8.jinja` automatically. That template is NInfer's Qwen3.8 template
+(system and developer turns anywhere, final-assistant continuation). Qwen's upstream template, which older copies
+of the published artifacts embed, rejects the `developer` role, the Responses `instructions` field and system
+messages after the first turn, so Codex CLI and other Responses clients need `qwen3_8.jinja`. Its path:
+
+- release tarball: `chat_templates/qwen3_8.jinja`;
+- source tree: `tools/chat_templates/qwen3_8.jinja`;
+- Docker image (`docker/Dockerfile.release`): `/opt/capy-flash/chat_templates/qwen3_8.jinja`.
+
+`python3 tools/replace_chat_template.py ENTRY.ninfer TEMPLATE.jinja OUT_DIR` writes a copy of an artifact with
+another embedded template instead (weights unchanged; the unchanged parts are hard links to the input, which is
+never modified).
+
+### CPU expert threads
+
+Flash-Next computes the routed experts that miss the VRAM cache on the CPU. `--expert-cpu-threads N` (1..64) sets
+the number of CPU threads that do it; unset, it is chosen at load from the CPUs the process may run on (its
+affinity mask, so `taskset` and cgroup cpusets count; SMT siblings count once):
+
+- GGUF/ggml block expert banks (the 64 GB GSQ-RCO edition): one thread per allowed physical core;
+- NVFP4 expert banks: max(6, cores / 2, 2 per L3 domain);
+- both capped at the core count and at 64;
+- v0.7.3: when the allowed CPUs have no free SMT sibling (allowed logical CPUs ≤ allowed physical cores, e.g.
+  `taskset -c 0-15` on a 16-core / 32-thread CPU, or SMT off) and the count would take every core, one core is
+  left to the main thread, which spin-waits on the GPU by default (`NINFER_CUDA_SYNC=spin`) and is not pinned.
+  Reported in issue #11: on an EPYC 7F52 with `taskset -c 0-15`, 16 threads dropped decode to 80-90 tok/s, against
+  about 144 with 15.
+
+Each thread is pinned to its own physical core, spread over the L3 domains. The startup log names the result:
+`routed experts: N CPU threads for the missing experts (auto: <rule>; P physical cores, L logical CPUs allowed, D
+L3 domains, M NUMA nodes)`; with v0.7.3's rule the reason says `one core left to the main thread (no free SMT
+sibling)`, and with the flag it says `set by the caller (--expert-cpu-threads)`. A value above the allowed physical
+cores stops the server at startup (`host MoE pool: fewer physical cores than requested threads`).
+`NINFER_HOST_MOE_CPUS=a,b,c` replaces the list with explicit CPU numbers, SMT siblings allowed
+([diagnostics](capy-flash/diagnostics.md)). Lower the count when the machine runs other work; in a container with a
+CPU quota but no cpuset, the affinity mask shows every core, so set it by hand.
+
+capy-flash computes every routed expert the router selects: an expert that misses the VRAM cache is computed on
+the CPU, never skipped. Engines that skip low-ranked missing experts (Strata's route tail skip) change the output
+slightly and decode faster on slow CPUs; see the README's [benchmarks](../README.md#benchmarks).
+
+### Connect a client
+
+The server speaks OpenAI Chat Completions and Responses under `/v1` and Anthropic Messages at `/v1/messages` on
+`http://HOST:PORT` (`127.0.0.1:8080` by default). With `--api-key KEY` every endpoint except `/health` requires
+`Authorization: Bearer KEY` or `x-api-key: KEY`.
+
+- **Model name.** The OpenAI endpoints accept only the server's model id: `--model-id` (`capy-flash` or
+  `qwen3.8-27b` with the launchers; without it, the artifact's `metadata.name`); `GET /v1/models` returns it, and
+  any other name gets HTTP 404 `model_not_found`. Anthropic Messages accepts any non-empty model name and echoes it.
+- **Claude Code** (Anthropic Messages): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`. With `--api-key`, Claude
+  Code's `ANTHROPIC_API_KEY` is sent as `x-api-key` and `ANTHROPIC_AUTH_TOKEN` as a bearer token; both work. The
+  model names Claude Code sends are accepted as they are. Claude Code's tool search (`defer_loading`,
+  `tool_reference`) is supported ([Anthropic Messages](#anthropic-messages)).
+- **Codex CLI** (Responses): configure a custom model provider whose base URL is `http://127.0.0.1:8080/v1` and
+  whose wire API is `responses`, and use the server's model id as the model (Codex's own documentation has the
+  configuration keys). Serve with `qwen3_8.jinja` (the launchers do): Codex always sends `instructions`. Its
+  encrypted-reasoning `include`, custom tools and the hosted `web_search` tool are handled as described in
+  [OpenAI Responses Core](#openai-responses-core).
+- **OpenCode and other OpenAI-compatible clients**: an OpenAI-compatible provider with base URL
+  `http://127.0.0.1:8080/v1` and the server's model id.
+
+### What the engine does
+
+On Qwen3.8-Flash-Next:
+
+- Tensor parallel over PCIe on two GPUs **without peer-to-peer** (pinned-host mailbox, FP32 partial sums); with P2P
+  (for example two boards behind a PCIe switch) the prefill exchanges take the direct copy automatically (v0.6).
+- A cache of routed experts in VRAM, partitioned by expert id between the two GPUs; missing experts are computed on
+  the CPU (NVFP4 kernels in AVX-512 VNNI or AVX2, chosen at startup and identical bit for bit, with the GPU's W4A4
+  activation quantization; `NINFER_HOST_MOE_A4=0` restores the older W4A8, which made the output depend on which
+  experts happened to be in VRAM), inside the captured CUDA graph.
+- MTP speculative decoding (K = 3, draft vocabulary shortlist; the draft head was re-distilled on this engine's own
+  output in v0.6: +18 % decode in Italian, +4-8 % in English and code), INT8 KV with an elastic KV / expert-slot budget up to 262,144 tokens (`--elastic`: the KV pool
+  keeps its address space for `--max-context` but backs pages on demand, and unused VRAM becomes extra expert slots),
+  prefix cache across turns.
+- KV of idle conversations in RAM (v0.6): with a Host KV tier, once a request decodes the KV of every idle retained
+  conversation moves to RAM and the VRAM it frees goes back to expert slots at once ([Two GPUs](#two-gpus)).
+- Expert residency that follows the conversation (v0.6): a prompt that continues a cached conversation keeps the
+  experts its next answer needs, a new conversation only updates their statistics. Prompt chunks of at least
+  `--stream-min-tokens` tokens (default 256) stream the non-resident experts to the GPUs over PCIe; shorter ones
+  compute them on the CPU. The post-prompt slowdown of v0.5.x (about 250 ms per turn) is gone, and a cold 382-token
+  prompt answers in 1.35 s (2.5-2.9 s with the earlier 512-token threshold).
+- GGUF i-quant experts (v0.7): IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL and Q2_0 blocks with variable-size expert slots
+  per layer, GPU kernels from ggml (via fngine / ninfer-all), CPU kernels in AVX-512 VNNI and AVX2; the 64 GB edition
+  takes its experts verbatim from ISTA-DASLab's GSQ-RCO GGUF. With these banks the prefill reads the non-resident
+  experts in place from host RAM (zero-copy, from `--stream-min-tokens` tokens), and `--miss-split` is forced off.
+- `--turn-anchors` is 0 by default on Flash-Next, which saves one prefill pass per agentic turn (about 0.8 s on the
+  test machine); the cost is that a cancelled or edited turn re-reads the whole conversation (`--turn-anchors 1`
+  restores the anchor). Models that sit entirely on the GPU (Qwen3.8-27B) keep the anchor by default.
+- NVIDIA's FP4-Local checkpoint runs too (recipe `qwen3_8_flash_next_fp4_local`), about 19 % slower than the default
+  artifact.
+- Empty-reply guards (v0.7, every model, on by default): a terminal token drawn right after `<think>` is redrawn
+  (`--reasoning-eos-guard`), and a reply that ends inside its reasoning is closed and continued once
+  (`--reasoning-close-retry`); `--no-reasoning-eos-guard` and `--no-reasoning-close-retry` turn them off.
+- Output is not bit-reproducible run to run: which experts sit in VRAM (GPU path) or not (CPU path) depends on
+  timing, and long streamed prefills differ in the last bits. For exact A/B comparisons freeze the residency
+  ([diagnostics](capy-flash/diagnostics.md)).
+
+On Qwen3.8-27B:
+
+- The same binary serves the dense Qwen3.8-27B entirely on the GPUs, at `--tp 2` exactly like ninfer-tp2 v0.4.9
+  ([Two GPUs](#two-gpus)), with MTP or DFlash2, Vision and the context cache in RAM (`--profile 27b`).
+- 3-bit GSQ weights (v0.7, `q3_g128_fp16`): tensor-core kernels with int8 activations in the prefill
+  (`NINFER_Q3_A8=0` for 16-bit); `--profile 27b-16gb` fits one 16 GB card (int8 KV, 65,536 tokens, Vision, 13.9 GB of
+  VRAM).
+
+On every model, the context cache keeps retained conversations in VRAM, in RAM (Host tiers) and, opt-in, on disk
+([Disk tier](#disk-tier-of-the-context-cache)); a request's KV reservation is a lease that grows with its answer
+([Start the server](#start-the-server)).
+
+Environment variables (production settings, A/B switches, dumps): [docs/capy-flash/diagnostics.md](capy-flash/diagnostics.md).
 
 ## Start the server
 
 See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
+
+**Upstream NInfer example (one RTX 5090).** The command below comes from upstream NInfer and targets a single large
+board: the 27B NVFP4 artifact does not fit one 16 GB board, and `fp8` KV is rejected at `--tp 2`. On 16 GB boards
+use the [launchers and profiles](#launchers-and-profiles) above.
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
@@ -176,7 +374,7 @@ server-error codes. Failures in the normalized prompt contract use `invalid_prom
 and availability failures retain their dedicated codes. Internal invariant failures are not
 relabeled as client input errors.
 
-The request `model` must equal the public model ID: the artifact `identity.model_id` by default, or
+The request `model` must equal the public model ID: the artifact's `metadata.name` by default, or
 the explicit `--model-id` override. Reasoning is returned separately as `reasoning_content`; answer
 text remains in `content`.
 
@@ -802,14 +1000,16 @@ curl http://127.0.0.1:8080/v1/models \
 
 ## Server options
 
-The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
+The table lists executable defaults, without a `--profile` ([profiles](#profiles) set many of them). The
+upstream startup example selects a long-context FP8/MTP3 configuration.
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--profile NAME` | insert a tested configuration (`flash-next`, `flash-next-1gpu`, `27b`, `27b-16gb`; expansions in [Profiles](#profiles)) before the other flags, which override it; must follow the artifact path | none |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
-| `--model-id ID` | override the public OpenAI model alias | artifact `identity.model_id` |
+| `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
 | `--vram-headroom-mib N` | VRAM in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto` | `1024` |
@@ -817,6 +1017,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--prefill-chunk N` | text-prefill chunk | `1024` |
+| `--kv-lease-window N` | output tokens of Device KV a request reserves beyond its prompt (or the prefill chunk, if larger), extended as the answer grows; `0` reserves the whole `max_tokens` at admission | `4096` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
 | `--device N` | CUDA device index | `0` |
@@ -839,11 +1040,13 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--default-max-tokens N` | output limit when omitted by a request | `8192` |
 | `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
 | `--vision` | enable media input and load Vision GPU allocations | off |
+| `--no-vision` | turn Vision off, also dropping a profile's `--vision-device` and `--max-vision-tokens` (the 27B profiles turn Vision on) | Vision off unless `--vision` |
 | `--vision-device N` | CUDA device that holds the Vision tower and encodes; one of `--devices` at `--tp 2`; see [Two GPUs](#two-gpus) | `--device` |
 | `--max-vision-tokens N` | merged Vision tokens of one image or video item (`64..16384`); larger media are resized and the encode workspace is planned for `N` | `16384` |
 | `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
 | `--no-tp-mailbox` | keep the captured `--tp 2` all-reduces on cross-device copies; see [Two GPUs](#two-gpus) | mailbox on without P2P |
 | `--embedding-host` | keep the token embedding table in one copy in pinned host memory that every GPU reads in place over PCIe, instead of one copy per GPU: frees its VRAM (1.18 GiB per GPU for Qwen3.8-27B) for the KV pool, identical results; see [Two GPUs](#two-gpus) | off |
+| `--host-pinned-max-gib G` | keep at most `G` GiB of the host-mapped weights (Flash-Next expert banks) page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them); same tokens, slower where pageable. Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). `NINFER_HOST_PINNED_MAX_GIB` also sets it | no limit |
 | `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
 | `--device-state-slots N` | extra Device checkpoint StateImages beyond the active-lane guarantee | `max-concurrency`; `max(2 * max-concurrency, 8)` at `--tp 2` |
 | `--host-state-slots N` | pinned Host StateImage capacity | `8`; at `--tp 2` `0` unless set (`--profile 27b`, `--profile flash-next`: `8`) |
@@ -857,11 +1060,20 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--max-shared-prefixes N` | Engine-wide shared stable-prefix descriptor capacity | `max(max-concurrency, 4)` |
 | `--max-long-anchors-per-continuation N` | private long-anchor limit per continuation | `2` |
 | `--turn-anchors N` | private long-anchor opportunities at the last N message boundaries before the final message, so a cancelled or edited turn resumes from the end of the previous turn instead of re-prefilling the conversation (`0` disables). Default by model: `0` on Qwen3.8-Flash-Next (each anchor costs one extra prefill pass per turn, ~0.8 s there), `1` on the others, where the extra pass is not measurable | `0` Flash-Next, `1` others |
+| `--elastic` | Qwen3.8-Flash-Next with offloaded experts: the KV pool keeps its address space for `--max-context` but backs pages on demand, and the VRAM it does not use becomes extra expert slots, given back when the KV grows; no effect on models without offloaded experts | off (on in `--profile flash-next` and `flash-next-1gpu`) |
+| `--kv-grow N` | with `--elastic`: step, in tokens, in which the KV backing starts and grows; must be positive | `8192` |
+| `--kv-budget-gib G` | with `--elastic`: at most `G` GiB of KV per GPU (Text and MTP pools); the base expert slots are sized for it instead of `--max-context`'s KV, and a request that needs more KV fails. Keeps more experts resident when contexts stay short | unset (sized for `--max-context`) |
+| `--miss-split auto\|off` | Qwen3.8-Flash-Next: `auto` lets the GPU read part of each decode window's missing experts over PCIe in parallel with the CPU (best at one GPU); `off` leaves them all to the CPU. Forced off with GGUF expert banks (the 64 GB edition) | `off` |
+| `--stream-min-tokens N` | Qwen3.8-Flash-Next: prompt chunks of at least `N` tokens stream the non-resident experts to the GPU over PCIe, shorter chunks compute them on the CPU; `0` never streams. With GGUF expert banks it is the threshold from which the prefill reads them in place from host RAM | `256` |
+| `--expert-cpu-threads N` | Qwen3.8-Flash-Next: CPU threads of the experts that miss the VRAM cache (`1..64`, at most the allowed physical cores, otherwise startup fails); see [CPU expert threads](#cpu-expert-threads) | automatic, logged at startup |
 | `--prefill-miss-dump DIR` | diagnostic for prefix-reuse misses: Serve keeps the token contexts of its last 16 requests (prompt plus committed output, cancelled requests included); a request that recomputes at least `--prefill-miss-min-tokens` prompt tokens and shares at least `--prefill-miss-min-match` of its prompt with the closest of them is dumped when the server recomputed that many tokens identical to it, or when that many of its tokens follow the divergence point (the client changed or dropped earlier text). Each dump is a new directory under `DIR` with `new_prompt.txt`, `old_context.txt`, both token-ID lists and `summary.json` (token counts, divergence point with the text on both sides, and the reading); the request also logs a `prefill miss` warning. At most 64 dumps per process. The files contain conversation text verbatim | off |
 | `--prefill-miss-min-tokens N` | threshold of `--prefill-miss-dump` in tokens | `10000` |
 | `--prefill-miss-min-match F` | minimum share of the prompt matching a recent context for `--prefill-miss-dump` (`0..1`) | `0.5` |
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
+| `--reasoning-eos-guard`, `--no-reasoning-eos-guard` | the first token of a reply that starts in thinking is never a terminal token: a terminal draw is redrawn without the terminal ids; token-identical when it does not fire. A model whose stop configuration the guard cannot handle serves without it (log line `reasoning EOS guard off for this model`) | on |
+| `--reasoning-close-retry`, `--no-reasoning-close-retry` | a reply that ends with a terminal token inside its thinking (or right after `</think>` with blank content and no tool call) gets `"\n</think>\n\n"` appended and is continued once; text requests with prefix reuse only. Turn both guards off to compare outputs with another engine or to measure raw model behaviour | on |
+| `--chat-template FILE` | Jinja chat template used instead of the one embedded in the artifact; the capy-flash launchers pass `qwen3_8.jinja` ([Chat template](#chat-template)) | artifact's template |
 | `--cors` | permissive browser CORS headers | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
@@ -940,8 +1152,9 @@ loads its KV, MTP KV and recurrent state from disk and prefills only the rest of
 
 ### Two GPUs
 
-`--tp 2 --devices A,B` serves a dense artifact split across two GPUs, for a model that does not fit
-one device:
+`--tp 2 --devices A,B` serves an artifact split across two GPUs, for a model that does not fit
+one device. Qwen3.8-Flash-Next runs at `--tp 2` through `--profile flash-next` ([capy-flash
+serving](#capy-flash-serving)); the examples below use the dense Qwen3.8-27B:
 
 ```bash
 ./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
@@ -1081,7 +1294,8 @@ token in prefill.
 
 Tensor parallelism covers ordinary decoding, `--spec mtp` and `--spec dflash2 --lm-head-draft`,
 each with or without `--vision`, with `bf16`, `int8` or `nvfp4` KV. `--spec dflash`, `--spec dflash2` without
-`--lm-head-draft` or with a drafter that has full-attention layers, the MoE architecture and the
+`--lm-head-draft` or with a drafter that has full-attention layers, the Qwen3.5 MoE architecture
+(Qwen3.6-35B-A3B; Qwen3.8-Flash-Next is a different MoE architecture and runs at `--tp 2`) and the
 `fp8` and `k8v4` KV types are rejected at startup (`nvfp4` is accepted since v0.4.2, see [Two GPUs](cli.md#two-gpus)), and so is a `--vision-device` outside
 `--devices`.
 
@@ -1279,8 +1493,11 @@ pool used by active requests and retained prefixes. `auto` accounts for the comp
 and leaves 1 GiB of sizing headroom (`--vram-headroom-mib` changes that margin); omitting the option makes it follow `--max-context`. Capacity
 resolves once at startup.
 
-Admission reserves the full prompt-plus-effective-output page entitlement through request
-completion. A request remains queued until a legal resource plan can satisfy that entitlement.
+Admission reserves the prompt plus a lease of `--kv-lease-window` output tokens (default 4096),
+which grows at decode-round boundaries as the answer grows (see [Start the server](#start-the-server));
+`--kv-lease-window 0` reserves the full prompt-plus-effective-output page entitlement through request
+completion, as earlier releases did. A request remains queued until a legal resource plan can satisfy its
+reservation.
 
 Each reusable checkpoint contains KV and complete continuation state. At admission, capture, and
 finish boundaries, resource pressure may keep it on Device, move its StateImage and/or KV replicas

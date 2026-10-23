@@ -15,6 +15,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 |---|---|
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
+| Replace the chat template embedded in an artifact (weights unchanged; writes a new artifact directory) | [`replace_chat_template.py`](replace_chat_template.py), with positional `ENTRY.ninfer TEMPLATE.jinja OUT_DIR`; maintained templates in [`chat_templates/`](chat_templates/) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
@@ -39,7 +40,7 @@ nvcc -O3 -std=c++17 -arch=sm_120a tools/hbm_bandwidth_probe.cu \
 
 `--tp 2` exchanges its all-reduce operands through a pinned-host mailbox (one kernel per GPU) when
 the GPUs have no peer access, and falls back to driver-staged copies when the startup probe finds
-the mailbox timing out or slow (WSL2 does that, [issue #1](https://github.com/ValerioDolci/ninfer-tp2/issues/1)).
+the mailbox timing out or slow (WSL2 does that, [issue #1](https://github.com/ValerioDolci/capy-flash/issues/1)).
 `tools/tp2/mailbox_probe.cu` runs the same check without the engine or a model — nvcc and the CUDA
 runtime only; it includes the production exchange kernels from `src/ops/kernel/peer_exchange.cuh`,
 so build it from a checkout — and prints driver, devices, peer access, the startup exchange, the

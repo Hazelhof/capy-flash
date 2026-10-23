@@ -17,13 +17,13 @@ tags:
 # Qwen3.8-27B QUASAR-QAT NVFP4 on two 16 GB GPUs — NInfer artifact (`qwen3_8_27b_quasar_nvfp4.ninfer`)
 
 > **Runs Qwen3.8-27B on two 16 GB GPUs.** Verified on 2× RTX 5070 Ti (PCIe, no P2P) with tensor
-> parallelism (`--tp 2`) in [ninfer-tp2](https://github.com/ValerioDolci/ninfer-tp2): 196,608-token context
+> parallelism (`--tp 2`) in [capy-flash](https://github.com/ValerioDolci/capy-flash) (formerly ninfer-tp2): 196,608-token context
 > with Vision and MTP at 13,083 / 12,743 MiB per board; 262,144 tokens also fit.
 
 An all-NVFP4 `.ninfer` v3 artifact of Qwen3.8-27B built from the
 [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
 checkpoint (quantization-aware training, every layer projection in NVFP4), for the
-[two-GPU tensor-parallel fork of NInfer](https://github.com/ValerioDolci/ninfer-tp2). Compared with the
+[two-GPU tensor-parallel fork of NInfer](https://github.com/ValerioDolci/capy-flash) (capy-flash, formerly ninfer-tp2). Compared with the
 official `qwen3_8_27b_nvfp4.ninfer` (NVFP4 MLP in layers 0-55, FP8 elsewhere) it needs **17.0 GiB of
 weights instead of 20.9**, which on two 16 GB boards buys either ~2 GiB per board or the full 262,144-token
 context with Vision and 8 device state slots.
@@ -44,7 +44,7 @@ context with Vision and 8 device state slots.
 | [Qwen/Qwen3.8-27B](https://huggingface.co/Qwen/Qwen3.8-27B) | base model (architecture; the checkpoint below carries its vision and MTP weights) | Apache-2.0 |
 | [QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4) | all weights: NVFP4 projections (QAT) plus BF16 vision, MTP, head | Apache-2.0 |
 | [Neroued/ninfer](https://github.com/Neroued/ninfer) | converter (unchanged in the fork), single-GPU runtime | Apache-2.0 |
-| [ValerioDolci/ninfer-tp2](https://github.com/ValerioDolci/ninfer-tp2) | two-GPU runtime this artifact was verified with | Apache-2.0 |
+| [ValerioDolci/capy-flash](https://github.com/ValerioDolci/capy-flash) (formerly ninfer-tp2) | two-GPU runtime this artifact was verified with | Apache-2.0 |
 
 This artifact is redistributed under Apache-2.0. All credit for the quantization goes to the QUASAR-QAT
 authors; this card only documents the conversion and the measurements below.
@@ -61,7 +61,7 @@ plus the QUASAR checkpoint). This one was built independently from the QUASAR ch
 Recipe [`quasar_recipe.py`](quasar_recipe.py) (next to this card; at the root of the Hub repository). The
 converter is upstream's (unchanged in the fork); running the result at `--tp 2` needs the fork at commit
 `d24bffd2` or later for the NVFP4 split projections. The QUASAR checkpoint is both the `--model` and the
-`quantized` source; no BF16 copy of Qwen3.8-27B is required. From the root of a `ninfer-tp2` checkout:
+`quantized` source; no BF16 copy of Qwen3.8-27B is required. From the root of a capy-flash (formerly `ninfer-tp2`) checkout:
 
 ```bash
 python3 -m tools.convert \

@@ -5,12 +5,18 @@ flags are documented in [cli.md](../cli.md) and [serving.md](../serving.md). The
 the production settings, A/B switches kept so that a change can be measured again on one binary, and validation
 and diagnostic aids. `Tnn` tags refer to [the development log](development-log.md).
 
-No engine variable needs to be set in production:
+No engine variable needs to be set in production. A Flash-Next server as the release launcher `serve-flash-next.sh` starts
+it (the launcher also passes `--host`, `--port` and `--max-context`):
 
 ```
-CUDA_VISIBLE_DEVICES=0,1 ninfer-serve <artifact> --tp 2 --devices 0,1 --spec mtp --draft-tokens 3 \
-  --kv-dtype int8 --elastic --max-context 262144 --kv-capacity 262144 --max-concurrency 1
+CUDA_VISIBLE_DEVICES=0,1 ninfer-serve <artifact> --profile flash-next --model-id capy-flash \
+  --chat-template <release>/chat_templates/qwen3_8.jinja
 ```
+
+`--profile flash-next` expands to `--tp 2 --devices 0,1 --kv-dtype int8 --elastic --max-context 262144
+--max-concurrency 1 --spec mtp --draft-tokens 3 --host-kv-mib 4096 --host-state-slots 8 --embedding-host`
+(all profiles: [serving.md](../serving.md#profiles)). Without the profile, `--tp 2` leaves the Host KV and Host
+StateImage tiers at 0.
 
 `NINFER_HOST_MOE_A4` is on by default since v0.5.0 (it was opt-in before: keep it on) and `NINFER_RAM_GUARD` stays
 at its default (on). Leave every other variable unset in a server.
@@ -38,9 +44,11 @@ residency (`NINFER_QWEN4_EXPERT_FREEZE`, see below).
 
 | variable | values (default) | effect | class | results | scope |
 |---|---|---|---|---|---|
-| `NINFER_HOST_MOE_A4` | `0` / unset (on, since v0.5.0) | The CPU expert path uses the GPU kernel's W4A4 activation codec and its BF16 roundings of gate/up and h, instead of int8 activations (W4A8). Removes the CPU/GPU mix that changed answers with residency (T98). AVX-512 implementation at no measurable cost (T148). **On by default since v0.2.1; keep it on.** | production | numerics | capy |
+| `NINFER_HOST_MOE_A4` | `0` / unset (on, since v0.5.0) | The CPU expert path uses the GPU kernel's W4A4 activation codec and its BF16 roundings of gate/up and h, instead of int8 activations (W4A8). Removes the CPU/GPU mix that changed answers with residency (T98). AVX-512 implementation at no measurable cost (T148). **On by default since v0.5.0; keep it on.** | production | numerics | capy |
 | `NINFER_HOST_ISA` | `auto` (default), `avx2`, `avx512` | Instruction set of the CPU expert kernels: `auto` takes AVX-512 VNNI where the CPU has it, else AVX2 + FMA + F16C; `avx2` forces the AVX2 kernels on an AVX-512 CPU (to test them); a value the CPU cannot run stops the server at startup. The log line `qwen4 experts: host expert kernels …` names the choice. Both compute identical bits (`ninfer_host_nvfp4_isa_test`); only speed differs. | performance | timing | capy |
 | `NINFER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked host weights (64.6 GiB for Flash-Next) + max(2 GiB, 5 % of MemTotal). Otherwise the server refuses to start and prints the numbers. `0` skips the check (T156). | production | none | capy |
+| `NINFER_HOST_PINNED_MAX_GIB` | GiB, may be fractional (unset = no limit) | Same as `--host-pinned-max-gib` (the flag wins): at most this much of the host-mapped weights (Flash-Next expert banks) is page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them). Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). A value that is not a positive number stops the server at startup. | production | same tokens, slower where pageable | capy |
+| `NINFER_HOST_STAGING_MIB` | MiB (128) | Size of the pinned staging ring per GPU that fills expert slots from pageable banks; only allocated when some bank is pageable. At least one expert, at most the fill depth. If the allocation fails the server stops and suggests lowering `--host-pinned-max-gib` or this value. | performance | timing | capy |
 | `NINFER_CUDA_SYNC` | `spin` (default), `blocking`, `yield`, `auto` | CUDA device synchronization schedule ([cli.md](../cli.md#cuda-synchronization)). | performance | timing (host CPU use) | ninfer |
 
 `CUDA_VISIBLE_DEVICES=0,1` in the serve line is the standard CUDA variable, not an engine setting.
@@ -92,7 +100,7 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_HOST_MOE_STEAL` | `1` (default), `0` | Static schedule: a thread that finishes early takes single slices from the others. | performance | same bits | capy |
 | `NINFER_HOST_MOE_MEMBER_QUANT` | `1` (default), `0` | Each thread quantizes the activations it needs, instead of a shared quantization phase plus a barrier. | performance | same bits | capy |
 | `NINFER_HOST_MOE_PREFETCH` | `0` (default, off), rows | Software prefetch of weight codes N rows ahead. | performance | same bits | capy |
-| `NINFER_HOST_MOE_CPUS` | comma list; default: the engine's thread count spread over both CCDs | CPU cores used by the executor. | performance | timing | capy |
+| `NINFER_HOST_MOE_CPUS` | comma list of CPU numbers; unset = automatic | Replaces the automatic CPU list of the executor: one thread per listed CPU, pinned in that order (SMT siblings may be listed); the `routed experts: N CPU threads …` startup line still prints the automatic or requested count. Unset: `--expert-cpu-threads` threads, or the automatic count, each thread pinned to its own physical core among those the process may run on (`taskset`, cgroup cpuset), spread over their L3 domains. See [serving.md](../serving.md#cpu-expert-threads). | performance | timing | capy |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 
