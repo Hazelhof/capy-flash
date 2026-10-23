@@ -1,0 +1,104 @@
+name: Bug report
+description: Something fails, crashes, hangs or gives wrong output.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Most of the time we can only reproduce a problem with the exact
+        version, hardware, command and startup log, so please fill in every field you can.
+        See [CONTRIBUTING.md](https://github.com/ValerioDolci/capy-flash/blob/main/CONTRIBUTING.md#bug-reports).
+  - type: input
+    id: version
+    attributes:
+      label: capy-flash version
+      description: Release tag (e.g. v0.7.2) or commit hash if built from source.
+      placeholder: v0.7.2
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install it?
+      options:
+        - Release tarball / install.sh
+        - Docker image
+        - Built from source
+        - Other (explain below)
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - Linux, inside Docker
+        - Windows, WSL2
+        - Windows, native build
+        - Other (explain below)
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and drivers
+      description: |
+        GPUs (model, count, VRAM, and which one drives a display, if any), CPU, system RAM,
+        PCIe/P2P setup, OS and kernel, NVIDIA driver, CUDA version (if you build). The output of
+        `nvidia-smi` and `free -g` is ideal.
+      placeholder: |
+        2x RTX 5070 Ti 16 GB (GPU 0 drives the monitor), Ryzen 9 9900X, 96 GB DDR5
+        Ubuntu 24.04, driver 595.99, CUDA 13.4
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Model / artifact
+      options:
+        - Qwen3.8-Flash-Next NVFP4
+        - Qwen3.8-Flash-Next NVFP4 + Vision
+        - Qwen3.8-Flash-Next GSQ-RCO (64 GB edition)
+        - Qwen3.8-27B NVFP4
+        - Qwen3.8-27B GSQ 3-bit
+        - Custom or converted artifact (give source and recipe below)
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Full command line
+      description: The complete serve command with every flag (or the launcher you used and its arguments).
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: For wrong output, include the request (or the smallest one that shows it) and the response.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce, and how often
+      description: Steps, request, client (Claude Code, OpenCode, curl...). Every time, sometimes, once?
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log
+      description: |
+        As text, not a screenshot: the startup log from `starting engine` to `listening on`
+        (or to the error), plus the lines around the failure.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you already tried
+      description: Flags changed, older versions tested, anything that made it go away.

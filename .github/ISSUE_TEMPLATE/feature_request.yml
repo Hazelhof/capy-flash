@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a new capability, API or supported setup.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the use case first; we will agree on scope and design here before anyone
+        writes code. See [CONTRIBUTING.md](https://github.com/ValerioDolci/capy-flash/blob/main/CONTRIBUTING.md#feature-and-architecture-proposals).
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Use case
+      description: What are you trying to do, with which model, hardware and client?
+    validations:
+      required: true
+  - type: textarea
+    id: limitation
+    attributes:
+      label: What gets in the way today
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: API, flags or semantics you have in mind, and how it should behave at the edges.
+    validations:
+      required: true
+  - type: dropdown
+    id: contribute
+    attributes:
+      label: Would you like to implement it?
+      options:
+        - No, just proposing it
+        - Yes, after we agree on the design here
+        - Maybe, with some guidance
+    validations:
+      required: true

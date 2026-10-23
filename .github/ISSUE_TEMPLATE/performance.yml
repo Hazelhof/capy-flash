@@ -1,0 +1,73 @@
+name: Performance report
+description: Slower than expected, a regression between versions, or a measured speed-up idea.
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Numbers are only comparable with the exact setup behind them. See
+        [CONTRIBUTING.md](https://github.com/ValerioDolci/capy-flash/blob/main/CONTRIBUTING.md#performance-reports).
+  - type: input
+    id: version
+    attributes:
+      label: capy-flash version(s)
+      description: The version you measured, and the baseline version if this is a regression.
+      placeholder: v0.7.2 (baseline v0.7.1)
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - Linux, inside Docker
+        - Windows, WSL2
+        - Windows, native build
+        - Other (explain below)
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and drivers
+      description: GPUs (and which one drives a display), CPU, RAM, PCIe/P2P, driver, CUDA.
+    validations:
+      required: true
+  - type: dropdown
+    id: model
+    attributes:
+      label: Model / artifact
+      options:
+        - Qwen3.8-Flash-Next NVFP4
+        - Qwen3.8-Flash-Next NVFP4 + Vision
+        - Qwen3.8-Flash-Next GSQ-RCO (64 GB edition)
+        - Qwen3.8-27B NVFP4
+        - Qwen3.8-27B GSQ 3-bit
+        - Custom or converted artifact (give source and recipe below)
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Full command line
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: What you measured
+      description: |
+        Which phase (prefill, decode, time to first token, end to end), prompt length, concurrency,
+        how you measured (tool or script, warmup, repetitions), and the numbers you got vs. expected.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log
+      description: Startup log from `starting engine` to `listening on`, plus the request lines (`req#N done`) of the measured run.
+      render: text
+    validations:
+      required: true
