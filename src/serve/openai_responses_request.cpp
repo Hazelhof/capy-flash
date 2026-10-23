@@ -74,7 +74,8 @@ std::string lower_function_identity(
                     param, "invalid_tool_name");
     }
     const auto [position, inserted] = identities.emplace(engine_name, identity);
-    if (!inserted && position->second != identity) {
+    if (!inserted && (position->second.name != identity.name ||
+                      position->second.wire_namespace != identity.wire_namespace)) {
         bad_request("function identity collision after namespace translation: '" + engine_name +
                         "'",
                     param, "duplicate_tool_name");
@@ -428,6 +429,48 @@ ToolCall parse_function_call_item(
     return call;
 }
 
+ToolCall parse_custom_tool_call_item(
+    const Json& item, Json& canonical,
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    static const std::unordered_set<std::string> allowed = {
+        "id", "type", "call_id", "name", "input", "status", "caller", "namespace"};
+    reject_nonnull_unknown_members(item, allowed, "input");
+    if (item.contains("caller") && !item.at("caller").is_null()) {
+        bad_request("custom_tool_call.caller is not supported", "input",
+                    "tool_relationship_not_supported");
+    }
+
+    ToolCall call;
+    if (!item.contains("call_id") || !item.at("call_id").is_string() ||
+        item.at("call_id").get_ref<const std::string&>().empty()) {
+        bad_request("custom_tool_call must contain a non-empty call_id", "input");
+    }
+    call.id                                        = item.at("call_id").get<std::string>();
+    const OpenAIResponsesFunctionIdentity identity = function_identity(item, "input");
+    call.name = lower_function_identity(identity, identities, "input");
+    std::string input;
+    if (item.contains("input") && !item.at("input").is_null()) {
+        if (!item.at("input").is_string()) {
+            bad_request("custom_tool_call input must be a string", "input");
+        }
+        input = item.at("input").get<std::string>();
+    }
+    if (item.contains("status") && !item.at("status").is_null() &&
+        (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
+        bad_request("partial custom_tool_call Items cannot be represented in model history",
+                    "input", "partial_tool_call_not_supported");
+    }
+    call.arguments_json = Json{{"input", input}}.dump();
+
+    canonical = {{"id", item_id(item, "ctc")},
+                 {"type", "custom_tool_call"},
+                 {"status", "completed"},
+                 {"call_id", call.id},
+                 {"input", input}};
+    add_wire_function_identity(canonical, identity);
+    return call;
+}
+
 ContentPart tool_output_text(std::string text, const Json* wire, std::size_t& breakpoint_count) {
     ContentPart part;
     part.kind     = ContentKind::Text;
@@ -439,25 +482,23 @@ ContentPart tool_output_text(std::string text, const Json* wire, std::size_t& br
 
 ChatTurn parse_function_call_output_item(
     const Json& item, Json& canonical, std::size_t& breakpoint_count,
-    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities, bool custom) {
     static const std::unordered_set<std::string> allowed = {
         "id", "type", "call_id", "output", "status", "caller", "name", "namespace"};
+    const std::string kind = custom ? "custom_tool_call_output" : "function_call_output";
     reject_nonnull_unknown_members(item, allowed, "input");
     if (item.contains("caller") && !item.at("caller").is_null()) {
-        bad_request("function_call_output.caller is not supported", "input",
-                    "tool_relationship_not_supported");
+        bad_request(kind + ".caller is not supported", "input", "tool_relationship_not_supported");
     }
     if (!item.contains("call_id") || !item.at("call_id").is_string() ||
         item.at("call_id").get_ref<const std::string&>().empty()) {
-        bad_request("function_call_output must contain a non-empty call_id", "input");
+        bad_request(kind + " must contain a non-empty call_id", "input");
     }
-    if (!item.contains("output")) {
-        bad_request("function_call_output must contain output", "input");
-    }
+    if (!item.contains("output")) { bad_request(kind + " must contain output", "input"); }
     if (item.contains("status") && !item.at("status").is_null() &&
         (!item.at("status").is_string() || item.at("status").get<std::string>() != "completed")) {
-        bad_request("partial function_call_output Items cannot be represented in model history",
-                    "input", "partial_tool_result_not_supported");
+        bad_request("partial " + kind + " Items cannot be represented in model history", "input",
+                    "partial_tool_result_not_supported");
     }
 
     ChatTurn turn;
@@ -466,7 +507,7 @@ ChatTurn parse_function_call_output_item(
     const bool has_name      = item.contains("name") && !item.at("name").is_null();
     const bool has_namespace = item.contains("namespace") && !item.at("namespace").is_null();
     if (has_namespace && !has_name) {
-        bad_request("function_call_output.namespace requires function_call_output.name", "input",
+        bad_request(kind + ".namespace requires " + kind + ".name", "input",
                     "invalid_tool_history");
     }
     std::optional<OpenAIResponsesFunctionIdentity> asserted_identity;
@@ -480,7 +521,7 @@ ChatTurn parse_function_call_output_item(
     } else if (item.at("output").is_array()) {
         for (const Json& value : item.at("output")) {
             if (!value.is_object() || !value.contains("type") || !value.at("type").is_string()) {
-                bad_request("function_call_output content parts must have a string type", "input");
+                bad_request(kind + " content parts must have a string type", "input");
             }
             const std::string type = value.at("type").get<std::string>();
             if (type == "input_text") {
@@ -500,19 +541,17 @@ ChatTurn parse_function_call_output_item(
                 bad_request("tool result input_file requires a Files API", "input",
                             "file_inputs_not_supported");
             } else {
-                bad_request("unsupported function_call_output content type: " + type, "input",
+                bad_request("unsupported " + kind + " content type: " + type, "input",
                             "modality_not_supported");
             }
         }
-        if (turn.content.empty()) {
-            bad_request("function_call_output content must not be empty", "input");
-        }
+        if (turn.content.empty()) { bad_request(kind + " content must not be empty", "input"); }
     } else {
-        bad_request("function_call_output output must be a string or content array", "input");
+        bad_request(kind + " output must be a string or content array", "input");
     }
 
-    canonical = {{"id", item_id(item, "fco")},
-                 {"type", "function_call_output"},
+    canonical = {{"id", item_id(item, custom ? "ctco" : "fco")},
+                 {"type", kind},
                  {"status", "completed"},
                  {"call_id", turn.tool_call_id},
                  {"output", item.at("output")}};
@@ -635,9 +674,16 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
             assistant.append_reasoning(parse_reasoning_item(item, canonical), index);
         } else if (type == "function_call") {
             assistant.append_call(parse_function_call_item(item, canonical, identities));
+        } else if (type == "custom_tool_call") {
+            assistant.append_call(parse_custom_tool_call_item(item, canonical, identities));
         } else if (type == "function_call_output") {
-            ChatTurn result =
-                parse_function_call_output_item(item, canonical, breakpoint_count, identities);
+            ChatTurn result = parse_function_call_output_item(item, canonical, breakpoint_count,
+                                                              identities, /*custom=*/false);
+            assistant.flush(out.input_turns);
+            out.input_turns.push_back(std::move(result));
+        } else if (type == "custom_tool_call_output") {
+            ChatTurn result = parse_function_call_output_item(item, canonical, breakpoint_count,
+                                                              identities, /*custom=*/true);
             assistant.flush(out.input_turns);
             out.input_turns.push_back(std::move(result));
         } else if (type == "input_file") {
@@ -764,12 +810,95 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
     return parsed;
 }
 
+ParsedFunctionTool
+parse_custom_tool(const Json& item, std::optional<std::string> wire_namespace,
+                  std::string_view namespace_description,
+                  std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
+    static const std::unordered_set<std::string> allowed_members = {
+        "type", "name", "description", "format", "allowed_callers", "defer_loading"};
+    reject_nonnull_unknown_members(item, allowed_members, "tools");
+    const std::string tool_name = require_function_name(item, "tools");
+
+    std::string description;
+    if (item.contains("description") && !item.at("description").is_null()) {
+        if (!item.at("description").is_string()) {
+            bad_request("custom tool description must be a string", "tools");
+        }
+        description = item.at("description").get<std::string>();
+    }
+    // The Engine has no free-form decoder: a grammar format is rendered as prompt text the model
+    // reads, and the input travels as one required string parameter through the function path.
+    // Formats are {"type":"text"} or a lark/regex grammar; anything else is rejected rather than
+    // silently ignored.
+    Json format = nullptr;
+    if (item.contains("format") && !item.at("format").is_null()) {
+        format = item.at("format");
+        if (!format.is_object() || !format.contains("type") || !format.at("type").is_string()) {
+            bad_request("custom tool format must be a typed object", "tools");
+        }
+        const std::string format_type = format.at("type").get<std::string>();
+        if (format_type == "grammar") {
+            static const std::unordered_set<std::string> grammar_members = {"type", "syntax",
+                                                                            "definition"};
+            reject_nonnull_unknown_members(format, grammar_members, "tools");
+            const bool known_syntax =
+                format.contains("syntax") && format.at("syntax").is_string() &&
+                (format.at("syntax") == "lark" || format.at("syntax") == "regex");
+            if (!known_syntax || !format.contains("definition") ||
+                !format.at("definition").is_string()) {
+                bad_request(
+                    "custom tool grammar format needs syntax 'lark' or 'regex' and a string "
+                    "definition",
+                    "tools", "tool_format_not_supported");
+            }
+            description += "\n\nThe input must follow this " +
+                           format.at("syntax").get<std::string>() + " grammar:\n" +
+                           format.at("definition").get<std::string>();
+        } else if (format_type != "text" || format.size() != 1) {
+            bad_request("custom tool format must be {\"type\":\"text\"} or a grammar", "tools",
+                        "tool_format_not_supported");
+        }
+    }
+
+    const Json input_schema = {
+        {"type", "object"},
+        {"properties", {{"input", {{"type", "string"}, {"description", "the raw input"}}}}},
+        {"required", Json::array({"input"})}};
+    Json lowered = {{"type", "function"}, {"name", tool_name}, {"parameters", input_schema}};
+    if (!description.empty()) { lowered["description"] = description; }
+    if (item.contains("allowed_callers")) {
+        lowered["allowed_callers"] = item.at("allowed_callers");
+    }
+    if (item.contains("defer_loading")) { lowered["defer_loading"] = item.at("defer_loading"); }
+    ParsedFunctionTool parsed = parse_function_tool(std::move(lowered), std::move(wire_namespace),
+                                                    namespace_description, identities);
+    identities[parsed.engine_name].custom = true;
+
+    parsed.canonical = {{"type", "custom"}, {"name", tool_name}};
+    if (item.contains("description") && !item.at("description").is_null()) {
+        parsed.canonical["description"] = item.at("description");
+    }
+    if (!format.is_null()) { parsed.canonical["format"] = std::move(format); }
+    if (item.contains("allowed_callers") && !item.at("allowed_callers").is_null()) {
+        parsed.canonical["allowed_callers"] = item.at("allowed_callers");
+    }
+    if (item.contains("defer_loading") && !item.at("defer_loading").is_null()) {
+        parsed.canonical["defer_loading"] = false;
+    }
+    return parsed;
+}
+
 void parse_tools(const Json& body, ParsedPromptFields& out) {
     if (!body.contains("tools") || body.at("tools").is_null()) { return; }
     if (!body.at("tools").is_array()) { bad_request("tools must be an array", "tools"); }
 
     static const std::unordered_set<std::string> namespace_members = {"type", "name", "description",
                                                                       "tools"};
+    // Only provider-side web search is dropped: a request can lose it without the model losing a
+    // capability the client executes (local_shell, computer_use) or one that changes what the
+    // answer is grounded on (file_search, code_interpreter); those still 400.
+    static const std::unordered_set<std::string> dropped_hosted_types = {"web_search",
+                                                                         "web_search_preview"};
     std::unordered_set<std::string> declared_names;
     std::unordered_set<std::string> namespace_names;
     const auto append_function = [&](ParsedFunctionTool parsed) {
@@ -791,6 +920,18 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
                 append_function(parse_function_tool(item, std::nullopt, {}, out.tool_identities)));
             continue;
         }
+        if (type == "custom") {
+            out.wire_tools.push_back(
+                append_function(parse_custom_tool(item, std::nullopt, {}, out.tool_identities)));
+            continue;
+        }
+        if (dropped_hosted_types.contains(type)) {
+            // Web search runs on the serving provider's executor, which NInfer does not have.
+            // Codex CLI attaches it unconditionally: drop it from the prompt instead of
+            // rejecting, so the model simply never sees it. Other executor-backed types still
+            // 400 below.
+            continue;
+        }
         if (type != "namespace") {
             bad_request("tool type '" + type +
                             "' requires an executor that NInfer does not provide",
@@ -798,7 +939,8 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
         }
 
         // OpenAI Responses beta groups functions/custom tools under a namespace. NInfer lowers
-        // only nested functions because custom tools require unsupported free-form decoding.
+        // both: a nested custom tool becomes a function with one input parameter (see
+        // parse_custom_tool).
         reject_nonnull_unknown_members(item, namespace_members, "tools");
         const std::string namespace_name = require_namespace_tool_name(item);
         if (!namespace_names.insert(namespace_name).second) {
@@ -823,13 +965,17 @@ void parse_tools(const Json& body, ParsedPromptFields& out) {
                 bad_request("namespace tool entries must be objects with a string type", "tools");
             }
             const std::string nested_type = nested.at("type").get<std::string>();
-            if (nested_type != "function") {
+            if (nested_type != "function" && nested_type != "custom") {
                 bad_request("nested tool type '" + nested_type +
                                 "' cannot be represented by the Engine",
                             "tools", "tool_type_not_supported");
             }
-            canonical["tools"].push_back(append_function(parse_function_tool(
-                nested, namespace_name, namespace_description, out.tool_identities)));
+            canonical["tools"].push_back(append_function(
+                nested_type == "custom"
+                    ? parse_custom_tool(nested, namespace_name, namespace_description,
+                                        out.tool_identities)
+                    : parse_function_tool(nested, namespace_name, namespace_description,
+                                          out.tool_identities)));
         }
         out.wire_tools.push_back(std::move(canonical));
     }
@@ -920,10 +1066,22 @@ void parse_reasoning(const Json& body, OpenAIResponsesPromptRequest& out) {
     static const std::unordered_set<std::string> allowed = {"effort", "context", "summary",
                                                             "generate_summary", "mode"};
     reject_nonnull_unknown_members(reasoning, allowed, "reasoning");
-    for (const char* key : {"context", "summary", "generate_summary", "mode"}) {
+    for (const char* key : {"context", "generate_summary", "mode"}) {
         if (reasoning.contains(key) && !reasoning.at(key).is_null()) {
             bad_request("reasoning." + std::string(key) +
                             " changes reasoning input or output and is not supported",
+                        "reasoning", "reasoning_option_not_supported");
+        }
+    }
+    if (reasoning.contains("summary") && !reasoning.at("summary").is_null()) {
+        // Codex CLI always sends reasoning.summary. This model writes no summaries and clients
+        // tolerate their absence, which is what the Responses path already returns: accept the
+        // standard tiers and ignore them.
+        static const std::unordered_set<std::string> summary_tiers = {"auto", "concise",
+                                                                      "detailed"};
+        if (!reasoning.at("summary").is_string() ||
+            !summary_tiers.contains(reasoning.at("summary").get<std::string>())) {
+            bad_request("reasoning.summary changes reasoning input or output and is not supported",
                         "reasoning", "reasoning_option_not_supported");
         }
     }
@@ -1189,10 +1347,16 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     }
     if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
-        if (!body.at("include").empty()) {
-            bad_request("the requested additional response fields have no available response "
-                        "representation",
-                        "include", "include_not_supported");
+        for (const Json& entry : body.at("include")) {
+            // Codex CLI always includes reasoning.encrypted_content. The Engine returns no
+            // encrypted reasoning and Codex runs fine without it (it only echoes what a
+            // response actually carried), so accept the request and drop it. Any other
+            // include value still has no available representation.
+            if (!entry.is_string() || entry.get<std::string>() != "reasoning.encrypted_content") {
+                bad_request("the requested additional response fields have no available response "
+                            "representation",
+                            "include", "include_not_supported");
+            }
         }
     }
     if (body.contains("stream_options") && !body.at("stream_options").is_null()) {
