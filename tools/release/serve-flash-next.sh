@@ -12,6 +12,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 [ $# -ge 1 ] || { echo "usage: $0 <artifact.ninfer> [ninfer-serve flags...]" >&2; exit 2; }
 artifact=$1; shift
 context=${NINFER_MAX_CONTEXT:-262144}
+# The NInfer Qwen3.8 chat template (system/developer turns anywhere, final-assistant continuation): many
+# published artifacts embed Qwen's upstream template, which rejects the `developer` role and Responses `instructions`.
+template=()
+[ -f "$here/chat_templates/qwen3_8.jinja" ] && template=(--chat-template "$here/chat_templates/qwen3_8.jinja")
 export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 devices=${NINFER_DEVICES:-0,1}
 if [ "${devices#*,}" = "$devices" ]; then
@@ -22,4 +26,4 @@ else
 fi
 exec "$here/bin/ninfer-serve" "$artifact" "${placement[@]}" \
   --host "${NINFER_HOST:-127.0.0.1}" --port "${NINFER_PORT:-8080}" \
-  --max-context "$context" --model-id "${NINFER_MODEL_ID:-capy-flash}" "$@"
+  --max-context "$context" --model-id "${NINFER_MODEL_ID:-capy-flash}" "${template[@]}" "$@"

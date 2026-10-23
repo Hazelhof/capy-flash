@@ -15,8 +15,12 @@ artifact=$1; shift
 device=${NINFER_DEVICE:-0}
 vision=(--vision-device "$device")
 [ "${NINFER_VISION:-1}" = 0 ] && vision=(--no-vision)
+# The NInfer Qwen3.8 chat template (system/developer turns anywhere, final-assistant continuation): many
+# published artifacts embed Qwen's upstream template, which rejects the `developer` role and Responses `instructions`.
+template=()
+[ -f "$here/chat_templates/qwen3_8.jinja" ] && template=(--chat-template "$here/chat_templates/qwen3_8.jinja")
 export LD_LIBRARY_PATH="$here/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec "$here/bin/ninfer-serve" "$artifact" --profile 27b-16gb \
   --host "${NINFER_HOST:-127.0.0.1}" --port "${NINFER_PORT:-8080}" \
   --device "$device" --max-context "${NINFER_MAX_CONTEXT:-65536}" --model-id "${NINFER_MODEL_ID:-qwen3.8-27b}" \
-  "${vision[@]}" "$@"
+  "${vision[@]}" "${template[@]}" "$@"
