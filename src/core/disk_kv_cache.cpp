@@ -1541,6 +1541,32 @@ void DiskKVCache::discard(std::uint64_t manifest, std::optional<DiskKVBlobId> bl
     } catch (...) {}
 }
 
+std::uint32_t DiskKVCache::longest_indexed_frontier(std::span<const std::int32_t> prompt,
+                                                    std::uint32_t max_frontier) {
+    std::lock_guard lock(mutex_);
+    std::uint32_t best = 0;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> digests;
+    for (const Entry& entry : entries_) {
+        if (!entry.key_ok) { continue; }
+        for (const DiskKVCheckpoint& checkpoint : entry.checkpoints) {
+            if (checkpoint.frontier <= best || checkpoint.frontier > max_frontier ||
+                checkpoint.frontier > prompt.size()) {
+                continue;
+            }
+            std::optional<std::uint64_t> digest;
+            for (const auto& [f, d] : digests) {
+                if (f == checkpoint.frontier) { digest = d; }
+            }
+            if (!digest) {
+                digest = xxh64(prompt.data(), checkpoint.frontier * sizeof(std::int32_t));
+                digests.emplace_back(checkpoint.frontier, *digest);
+            }
+            if (*digest == checkpoint.digest) { best = checkpoint.frontier; }
+        }
+    }
+    return best;
+}
+
 std::optional<DiskKVCache::Match> DiskKVCache::find(std::span<const std::int32_t> prompt,
                                                     std::uint32_t max_frontier) {
     struct Candidate {

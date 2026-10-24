@@ -117,7 +117,7 @@ Each thread is pinned to its own physical core, spread over the L3 domains. The 
 L3 domains, M NUMA nodes)`; with v0.7.3's rule the reason says `one core left to the main thread (no free SMT
 sibling)`, and with the flag it says `set by the caller (--expert-cpu-threads)`. A value above the allowed physical
 cores stops the server at startup (`host MoE pool: fewer physical cores than requested threads`).
-`NINFER_HOST_MOE_CPUS=a,b,c` replaces the list with explicit CPU numbers, SMT siblings allowed
+`NINFER_HOST_MOE_CPUS=0-7,16` replaces the list with explicit CPU numbers and ranges as `taskset` writes them, SMT siblings allowed
 ([diagnostics](capy-flash/diagnostics.md)). Lower the count when the machine runs other work; in a container with a
 CPU quota but no cpuset, the affinity mask shows every core, so set it by hand.
 
@@ -991,6 +991,11 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
 Pass `--api-key VALUE` to require the same value as an OpenAI bearer token or Anthropic
 `x-api-key` header. `GET /health` and CORS preflight requests remain unauthenticated.
 
+A key passed with `--api-key` is visible to every local user in `ps`, `/proc/PID/cmdline` and `systemctl status`. To
+keep it off the command line, use `--api-key-file FILE` (the file holds the key on one line; one trailing newline is
+stripped; a missing or empty file stops the server at startup) or set `NINFER_API_KEY` (read only when neither flag
+is given; with systemd, `EnvironmentFile=`). `--api-key` and `--api-key-file` together are refused.
+
 ```bash
 curl http://127.0.0.1:8080/v1/models \
   -H 'Authorization: Bearer local-secret'
@@ -1009,6 +1014,7 @@ upstream startup example selects a long-context FP8/MTP3 configuration.
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--api-key KEY` | required bearer or `x-api-key` value | unset |
+| `--api-key-file FILE` | read the key from FILE (one line); without either flag `NINFER_API_KEY` is used when set | unset |
 | `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name` |
 | `--max-context N` | logical context ceiling of each sequence | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
@@ -1114,8 +1120,10 @@ Run `./build/apps/ninfer-serve --help` for the exact option contract.
 thread of their own: after `--disk-cache-idle-ms` without any request in the server (default 5 s; the
 write stops as soon as a request arrives and continues at the next idle moment, so a decode never waits
 for the disk) and at a clean shutdown (SIGTERM/SIGINT, at most `--disk-cache-flush-seconds`). After a
-restart, a request that has no reuse in VRAM or RAM and whose prompt begins with a saved conversation
-loads its KV, MTP KV and recurrent state from disk and prefills only the rest of the prompt.
+restart, a request whose prompt begins with a saved conversation loads its KV, MTP KV and recurrent
+state from disk and prefills only the rest of the prompt. The disk wins over a match in VRAM or RAM when it
+holds more of the prompt by more than 1/16 of its own length (v0.7.4; before, a shorter in-memory match,
+such as a system prompt another conversation left, made the long conversation prefill again).
 
 - Storage is content addressed, as in LMCache and SGLang HiCache: the KV is cut into 256-token blocks
   named by a chained hash of the prefix tokens, each written once and shared by every later turn and by

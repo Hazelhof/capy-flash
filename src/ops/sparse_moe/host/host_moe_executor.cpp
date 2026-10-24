@@ -70,26 +70,11 @@ std::vector<int> read_cpu_list(const std::string& path) {
     std::ifstream f(path);
     std::string text;
     if (!f || !std::getline(f, text)) return {};
-    std::vector<int> out;
-    std::size_t at = 0;
-    while (at < text.size()) {
-        std::size_t end = text.find(',', at);
-        if (end == std::string::npos) end = text.size();
-        const std::string item = text.substr(at, end - at);
-        const std::size_t dash = item.find('-');
-        try {
-            if (dash == std::string::npos) {
-                if (!item.empty()) out.push_back(std::stoi(item));
-            } else {
-                const int lo = std::stoi(item.substr(0, dash)), hi = std::stoi(item.substr(dash + 1));
-                for (int c = lo; c <= hi; ++c) out.push_back(c);
-            }
-        } catch (const std::exception&) {
-            return {};
-        }
-        at = end + 1;
+    try {
+        return parse_cpu_list(text);
+    } catch (const std::invalid_argument&) {
+        return {};
     }
-    return out;
 }
 
 struct HostCore {
@@ -99,21 +84,21 @@ struct HostCore {
 };
 
 // The allowed physical cores (process affinity), grouped by nothing, in cpu order.
-std::vector<HostCore> allowed_cores(int* logical = nullptr) {
-    // The affinity of the process as it was at the first call: HostCpuPool pins its calling thread to
-    // cpus[0], so reading the calling thread's mask later would see a single cpu (and a second pool, or a
-    // test that builds several, would find "fewer physical cores than requested threads").
-    static const std::pair<bool, cpu_set_t> process_mask = [] {
+// The affinity of the process as it was at the first call: HostCpuPool pins its calling thread to
+// cpus[0], so reading the calling thread's mask later would see a single cpu (and a second pool, or a
+// test that builds several, would find "fewer physical cores than requested threads").
+const std::pair<bool, cpu_set_t>& process_mask() {
+    static const std::pair<bool, cpu_set_t> mask = [] {
         cpu_set_t m;
         CPU_ZERO(&m);
         const bool ok = sched_getaffinity(0, sizeof(m), &m) == 0;
         return std::pair<bool, cpu_set_t>{ok, m};
     }();
-    const bool have_mask   = process_mask.first;
-    const cpu_set_t& mask  = process_mask.second;
-    auto allowed         = [&](int cpu) {
-        return !have_mask || (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &mask));
-    };
+    return mask;
+}
+
+std::vector<HostCore> allowed_cores(int* logical = nullptr) {
+    auto allowed = [](int cpu) { return process_may_run_on(cpu); };
     std::vector<HostCore> cores;
     int n_logical = 0;
     for (int cpu = 0;; ++cpu) {
@@ -152,6 +137,46 @@ std::map<int, std::vector<int>> cores_by_l3() {
 }
 
 } // namespace
+
+bool process_may_run_on(int cpu) {
+    const auto& [have_mask, mask] = process_mask();
+    return cpu >= 0 && (!have_mask || (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &mask)));
+}
+
+std::vector<int> parse_cpu_list(std::string_view text) {
+    const auto bad = [&] {
+        return std::invalid_argument("not a cpu list (expected e.g. 0-7,16,18-19): \"" +
+                                     std::string(text) + "\"");
+    };
+    const auto number = [&](std::string_view digits) {
+        if (digits.empty() || digits.size() > 4) throw bad();
+        int value = 0;
+        for (const char c : digits) {
+            if (c < '0' || c > '9') throw bad();
+            value = value * 10 + (c - '0');
+        }
+        if (value >= CPU_SETSIZE) throw bad();
+        return value;
+    };
+    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) text.remove_suffix(1);
+    if (text.empty()) throw bad();
+    std::vector<int> out;
+    for (std::size_t at = 0; at <= text.size();) {
+        std::size_t end = text.find(',', at);
+        if (end == std::string_view::npos) end = text.size();
+        const std::string_view item = text.substr(at, end - at);
+        const std::size_t dash      = item.find('-');
+        if (dash == std::string_view::npos) {
+            out.push_back(number(item));
+        } else {
+            const int lo = number(item.substr(0, dash)), hi = number(item.substr(dash + 1));
+            if (hi < lo) throw bad();
+            for (int c = lo; c <= hi; ++c) out.push_back(c);
+        }
+        at = end + 1;
+    }
+    return out;
+}
 
 HostCpuTopology host_cpu_topology() {
     HostCpuTopology t;

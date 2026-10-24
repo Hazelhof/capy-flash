@@ -86,7 +86,8 @@ curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
 
 The server listens on `http://127.0.0.1:8080` (`NINFER_HOST` / `NINFER_PORT` change it): OpenAI Chat Completions and
 Responses under `/v1`, Anthropic Messages at `/v1/messages`. `--api-key KEY` makes it require
-`Authorization: Bearer KEY` or `x-api-key: KEY`.
+`Authorization: Bearer KEY` or `x-api-key: KEY`; `--api-key-file FILE` or the `NINFER_API_KEY` environment variable
+set the key without putting it on the command line.
 
 - **Claude Code:** `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` (any model name is accepted on Messages).
 - **Codex CLI:** a custom provider with base URL `http://127.0.0.1:8080/v1`, the `responses` wire API and the server's
@@ -202,7 +203,7 @@ memory cgroup without swap (57 GiB used with one GPU); its speeds were measured 
 
 | setup | model, edition | version | measured | result | source |
 |---|---|---|---|---|---|
-| AMD EPYC 7F52 16 cores (Zen 2, AVX2), 2x RTX 5070 Ti (overclocked) | Flash-Next NVFP4 | v0.7.2 built with CUDA 13.4 | agentic replay (53 turns, greedy): decode median | 141.3 tok/s with automatic threads; 144.4 with `--expert-cpu-threads 15` and `taskset -c 0-15`; release tarball (CUDA 13.1) 137.6; v0.7.1 tarball 121.8 | [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11) |
+| AMD EPYC 7F52 16 cores (Zen 2, AVX2), 2x RTX 5080 (overclocked) | Flash-Next NVFP4 | v0.7.2 built with CUDA 13.4 | agentic replay (53 turns, greedy): decode median | 141.3 tok/s with automatic threads; 144.4 with `--expert-cpu-threads 15` and `taskset -c 0-15`; release tarball (CUDA 13.1) 137.6; v0.7.1 tarball 121.8 | [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11) |
 | same | same | same | own measurement, not greedy | prefill at 131k 5,541 tok/s; time to first token 22.1 s at 131k, 1.15 s at 1k | [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11) |
 | AMD Threadripper PRO 5975WX (AVX2), 2x RTX PRO 4000 Blackwell 24 GB (145 W), Proxmox LXC | Flash-Next 64 GB (GSQ-RCO) | v0.7.1 built from source, CUDA 13.3 | decode / prefill / local aider coding benchmark | decode ~100-114 tok/s on prose, ~140-155 on reasoning; prefill at 40k ~3,300 tok/s; aider 145-146 of 148 | [issue #22](https://github.com/ValerioDolci/capy-flash/issues/22) |
 

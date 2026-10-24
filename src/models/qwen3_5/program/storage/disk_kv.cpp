@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -137,7 +139,11 @@ void ProgramImpl::initialize_disk_cache() {
     };
     options.release = [](void* data) { (void)cudaFreeHost(data); };
     disk_kv         = std::make_unique<DiskKVCache>(std::move(options));
-    disk_state_scratch.emplace(state_layout.image_bytes);
+    // read_region reads whole 4 KiB pages (O_DIRECT): at one device the StateImage is not a multiple
+    // of 4096 bytes (27B 16 GB profile: 153 954 304), and an exact-size buffer made every resume
+    // fail ("conversation ... unreadable (blob ...)").
+    disk_state_scratch.emplace((state_layout.image_bytes + kDiskKVAlignment - 1U) / kDiskKVAlignment *
+                               kDiskKVAlignment);
     disk_read_buffer.emplace(2U * kDiskReadBytes); // two read-ahead chunks
     disk_saved.assign(continuation_capacity, DiskSaved{});
     const DiskKVCacheStats stats = disk_kv->stats();
@@ -622,6 +628,22 @@ DiskCacheSave ProgramImpl::disk_cache_save(std::uint32_t slot,
                  frontier, kinds.c_str(), new_blocks, blocks, new_states, plans.size(),
                  static_cast<double>(new_bytes) / kMiB, milliseconds_since(started));
     return DiskCacheSave::Saved;
+}
+
+// Issue #6: the prompt tokens a root prefill of `prompt` would load from disk (the static checks
+// of disk_cache_resume, then the index), 0 when none. Lets admission prefer the root over a shorter
+// in-memory match.
+std::uint32_t ProgramImpl::disk_resume_tokens(const PreparedPromptData& prompt) {
+    const std::size_t tokens = prompt.token_ids.size();
+    if (!disk_kv || prompt.has_media() || prompt.rope_delta != 0 || tokens <= kDiskMinimumTokens ||
+        tokens > std::numeric_limits<std::uint32_t>::max() ||
+        !std::all_of(prompt.token_types.begin(), prompt.token_types.end(),
+                     [](std::uint8_t type) { return type == 0; })) {
+        return 0;
+    }
+    return disk_kv->longest_indexed_frontier(
+        std::span<const TokenId>(prompt.token_ids.data(), tokens),
+        static_cast<std::uint32_t>(tokens) - 1U);
 }
 
 std::uint32_t ProgramImpl::disk_cache_resume(SequenceState& sequence, RequestControl& request) {

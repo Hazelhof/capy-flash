@@ -32,6 +32,7 @@
 #include <map>
 #include <random>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -597,6 +598,25 @@ void test_auto_threads() {
     std::printf("auto threads: %s\n", why.c_str());
 }
 
+// Issue #11: NINFER_HOST_MOE_CPUS=1-31 used to pin a thread to cpu -31.
+void test_cpu_list() {
+    using ninfer::ops::host::parse_cpu_list;
+    expect(parse_cpu_list("3") == std::vector<int>{3}, "cpu list: one cpu");
+    expect(parse_cpu_list("0,2,4") == std::vector<int>({0, 2, 4}), "cpu list: commas");
+    expect(parse_cpu_list("1-4") == std::vector<int>({1, 2, 3, 4}), "cpu list: range");
+    expect(parse_cpu_list("0-2,8,10-11\n") == std::vector<int>({0, 1, 2, 8, 10, 11}),
+           "cpu list: sysfs line");
+    expect(parse_cpu_list("1-31").size() == 31 && parse_cpu_list("1-31").back() == 31,
+           "cpu list: 1-31");
+    for (const char* bad : {"", "-3", "1-", "4-1", "1,,2", "1,", "a", "1 2", "1-2-3", "99999"}) {
+        bool rejected = false;
+        try {
+            (void)parse_cpu_list(bad);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, std::string("cpu list rejects \"") + bad + "\"");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -608,6 +628,7 @@ int main() {
     std::printf("host ISA: %s\n", host_isa_name(host_isa()));
     std::mt19937_64 rng(20261007);
     test_auto_threads();
+    test_cpu_list();
     test_dots(rng);
     test_layer(rng, 16, 2560, 640, true); // Flash-Next expert shape
     test_layer(rng, 5, 256, 128, false);  // small shape: one row tile, odd expert count

@@ -37,6 +37,7 @@
 #include <span>
 #include <thread>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ninfer::ops::host {
@@ -133,6 +134,12 @@ struct HostCpuTopology {
 // `reason` (optional) gets a one-line explanation for the startup log.
 [[nodiscard]] std::int32_t auto_expert_cpu_threads(const HostCpuTopology& topology, bool gguf,
                                                    std::string* reason = nullptr);
+
+// A Linux cpu list as taskset and sysfs write it ("0-7,16,18-19") as cpu ids, in order. Throws
+// std::invalid_argument on anything else (empty items, negative or reversed ranges, ids >= 1024).
+[[nodiscard]] std::vector<int> parse_cpu_list(std::string_view text);
+// Whether the process affinity (taskset, cgroup cpuset) as read at its first use includes `cpu`.
+[[nodiscard]] bool process_may_run_on(int cpu);
 
 // Physical cores spread over the L3 domains (CCDs) in round-robin order, lowest allowed SMT
 // sibling of each core, from Linux sysfs. On the 9900X: 0, 6, 1, 7, 2, 8, ...

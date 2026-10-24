@@ -398,6 +398,25 @@ public:
             }
         }
 
+        // Issue #6: the disk tier resumes only a root prefill, so a shorter in-memory match (a
+        // system prompt another conversation left) used to win over the longer conversation saved
+        // on disk, which then went through prefill again. Loading costs a small fraction of a
+        // prefill of the same tokens (140k: ~1 s vs ~48 s on two 5070 Ti), so plan from the root
+        // alone when the disk holds more than the best in-memory match plus 1/16 of its own length.
+        if constexpr (requires { program.disk_resume_tokens(prompt); }) {
+            if (candidates.size() > 1) {
+                const std::uint32_t disk = program.disk_resume_tokens(prompt);
+                std::uint32_t memory     = 0;
+                for (const Candidate& candidate : candidates) {
+                    if (candidate.plan) {
+                        memory = std::max(memory, candidate.plan->summary().reusable_prompt_tokens);
+                    }
+                }
+                if (disk > memory && disk - memory > disk / 16U) {
+                    candidates.erase(candidates.begin() + 1, candidates.end());
+                }
+            }
+        }
         std::optional<Choice> selected =
             plan_materialization(program, prompt, base, *destination, candidates, publication_order,
                                  planning_started, provisional_demand, allowance);

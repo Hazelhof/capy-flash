@@ -1,6 +1,9 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -629,6 +632,63 @@ int main() {
     failures +=
         check(serve_usage_text("ninfer-serve").find("flash-next: --tp 2") != std::string::npos,
               "the usage text does not list the profiles");
+
+    {   // issue #25: --api-key-file and NINFER_API_KEY
+        const std::string key_path = "test_serve_options.api_key";
+        const auto write_key = [&](const char* text) {
+            std::ofstream(key_path, std::ios::binary | std::ios::trunc) << text;
+        };
+        const auto rejected = [&](std::vector<std::string> arguments) {
+            try {
+                (void)parse(std::move(arguments));
+            } catch (const std::invalid_argument&) { return true; }
+            return false;
+        };
+        ::unsetenv("NINFER_API_KEY");
+        write_key("file-secret\n");
+        const ServeOptions from_file =
+            parse({"ninfer-serve", "model.ninfer", "--api-key-file", key_path});
+        failures += check(from_file.api_key == "file-secret",
+                          "--api-key-file did not read the key without its newline");
+        bool file_key_logged = false;
+        for (const std::string& argument : from_file.startup_argv) {
+            file_key_logged = file_key_logged || argument.find("file-secret") != std::string::npos;
+        }
+        failures += check(!file_key_logged, "--api-key-file put the key in the startup argv");
+        write_key("crlf-secret\r\n");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key-file", key_path})
+                                  .api_key == "crlf-secret",
+                          "--api-key-file kept a CRLF line ending");
+        failures += check(rejected({"ninfer-serve", "model.ninfer", "--api-key", "a",
+                                    "--api-key-file", key_path}),
+                          "--api-key together with --api-key-file was accepted");
+        write_key("\n");
+        failures += check(rejected({"ninfer-serve", "model.ninfer", "--api-key-file", key_path}),
+                          "an empty --api-key-file was accepted");
+        write_key("one\ntwo\n");
+        failures += check(rejected({"ninfer-serve", "model.ninfer", "--api-key-file", key_path}),
+                          "a two-line --api-key-file was accepted");
+        std::remove(key_path.c_str());
+        failures += check(rejected({"ninfer-serve", "model.ninfer", "--api-key-file", key_path}),
+                          "a missing --api-key-file was accepted");
+        failures += check(parse({"ninfer-serve", "model.ninfer"}).api_key.empty(),
+                          "an API key was set without a flag or NINFER_API_KEY");
+        ::setenv("NINFER_API_KEY", "env-secret", 1);
+        failures += check(parse({"ninfer-serve", "model.ninfer"}).api_key == "env-secret",
+                          "NINFER_API_KEY was not used");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key", "flag"}).api_key ==
+                              "flag",
+                          "NINFER_API_KEY overrode --api-key");
+        write_key("file-secret");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--api-key-file", key_path})
+                                  .api_key == "file-secret",
+                          "NINFER_API_KEY overrode --api-key-file");
+        std::remove(key_path.c_str());
+        ::unsetenv("NINFER_API_KEY");
+        failures += check(serve_usage_text("ninfer-serve").find("NINFER_API_KEY") !=
+                              std::string::npos,
+                          "serve help omits NINFER_API_KEY");
+    }
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

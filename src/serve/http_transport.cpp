@@ -98,14 +98,20 @@ bool SseTransport::poll(Clock::time_point now) {
 }
 
 void configure_http_server_socket(socket_t socket) noexcept {
-    httplib::default_socket_options(socket);
 #if defined(__linux__)
     const int enabled = 1;
+    // Issue #24: SO_REUSEADDR instead of httplib's default SO_REUSEPORT. SO_REUSEPORT let a second
+    // server bind the same port and silently share the connections with the first, and binds over
+    // TIME-WAIT only when the sockets that left it had SO_REUSEPORT too. With SO_REUSEADDR a second
+    // server is refused and a restart binds over the TIME-WAIT its predecessor left.
+    set_socket_option(socket, SOL_SOCKET, SO_REUSEADDR, enabled);
     set_socket_option(socket, SOL_SOCKET, SO_KEEPALIVE, enabled);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPIDLE, kKeepAliveIdleSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
     set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+#else
+    httplib::default_socket_options(socket);
 #endif
 }
 

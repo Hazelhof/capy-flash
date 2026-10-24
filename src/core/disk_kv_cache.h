@@ -319,6 +319,11 @@ public:
     // manifest's last use. A broken manifest is deleted and skipped.
     [[nodiscard]] std::optional<Match> find(std::span<const std::int32_t> prompt,
                                             std::uint32_t max_frontier);
+    // The frontier find() would try first: the longest F <= max_frontier whose digest matches
+    // prompt[0, F), from the in-memory index alone (no file opened, last use untouched); 0 when
+    // none. Admission compares it with the in-memory matches (issue #6).
+    [[nodiscard]] std::uint32_t longest_indexed_frontier(std::span<const std::int32_t> prompt,
+                                                         std::uint32_t max_frontier);
 
     // Opens a blob for reading (header verified: kind, id, key).
     [[nodiscard]] std::optional<DiskKVRecordFile> open_blob(DiskKVBlobId id) const;

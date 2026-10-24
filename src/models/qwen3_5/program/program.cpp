@@ -279,6 +279,10 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
     return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
 }
 
+std::uint32_t Program::disk_resume_tokens(const PreparedPrompt& prompt) {
+    return impl_->disk_resume_tokens(PreparedPromptAccess::view(prompt));
+}
+
 std::optional<AdmissionCandidate> Program::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,

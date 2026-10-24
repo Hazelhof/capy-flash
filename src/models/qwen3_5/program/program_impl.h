@@ -637,6 +637,7 @@ public:
     // At the first step of a root prefill: loads the longest saved checkpoint the prompt begins
     // with (KV, MTP KV, StateImage) and moves the cursor there. Returns the tokens loaded (0: none).
     std::uint32_t disk_cache_resume(SequenceState& sequence, RequestControl& request);
+    [[nodiscard]] std::uint32_t disk_resume_tokens(const PreparedPromptData& prompt);
 
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
 

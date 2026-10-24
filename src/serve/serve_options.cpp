@@ -9,7 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -35,6 +38,20 @@ float parse_float_in(const char* text, const char* label, float lo, float hi) {
         throw std::invalid_argument(std::string("invalid ") + label + ": " + text);
     }
     return static_cast<float>(value);
+}
+
+// --api-key-file (issue #25): the whole file is the key, minus one trailing newline.
+std::string read_api_key_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) { throw std::invalid_argument("--api-key-file: cannot read " + path); }
+    std::string key((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (!key.empty() && key.back() == '\n') { key.pop_back(); }
+    if (!key.empty() && key.back() == '\r') { key.pop_back(); }
+    if (key.empty()) { throw std::invalid_argument("--api-key-file: " + path + " is empty"); }
+    if (key.find_first_of("\r\n") != std::string::npos) {
+        throw std::invalid_argument("--api-key-file: " + path + " must hold the key on one line");
+    }
+    return key;
 }
 
 std::uint64_t parse_u64(const char* text, const char* label) {
@@ -183,7 +200,7 @@ std::vector<std::string> expand_profiles(int argc, char** argv) {
 
 std::string serve_usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
-           " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] [--port N] [--api-key KEY] "
+           " <model.ninfer> [--profile flash-next|flash-next-1gpu|27b|27b-16gb] [--host H] [--port N] [--api-key KEY|--api-key-file FILE] "
            "[--model-id ID] [--max-context N] [--kv-capacity N|auto] [--max-concurrency N] "
            "[--max-pending-requests N] [--pending-timeout-ms N] "
            "[--prefill-chunk N] [--kv-lease-window N] [--log-stats-interval-ms N] [--device N] "
@@ -322,7 +339,9 @@ std::string serve_usage_text(const char* argv0) {
            "a terminal token (a terminal draw is redrawn without them; on by default; --no-reasoning-eos-guard turns it off)\n"
            "       sampler defaults come from the loaded model and resolved thinking mode; "
            "server flags and request fields override individual values.\n"
-           "       --greedy forces temperature 0 (exact argmax).\n";
+           "       --greedy forces temperature 0 (exact argmax).\n"
+           "       --api-key-file FILE reads the key from FILE (one trailing newline stripped); "
+           "without --api-key or --api-key-file the key comes from NINFER_API_KEY when it is set.\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -339,6 +358,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
+    bool api_key_explicit            = false;
+    std::optional<std::string> api_key_file;
     bool kv_capacity_explicit        = false;
     bool context_capacity_explicit   = false;
     bool device_explicit             = false;
@@ -370,7 +391,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--port") {
             options.port = parse_nonnegative_int(require_value("--port"), "port");
         } else if (arg == "--api-key") {
-            options.api_key = require_value("--api-key");
+            options.api_key  = require_value("--api-key");
+            api_key_explicit = true;
+        } else if (arg == "--api-key-file") {
+            api_key_file = require_value("--api-key-file");
         } else if (arg == "--model-id") {
             options.model_id_override = require_value("--model-id");
             if (options.model_id_override->empty()) {
@@ -767,6 +791,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    // The key without putting it on the command line (ps, /proc/PID/cmdline, systemctl status):
+    // --api-key-file, else NINFER_API_KEY. --api-key KEY keeps working.
+    if (api_key_file) {
+        if (api_key_explicit) {
+            throw std::invalid_argument("--api-key and --api-key-file cannot be used together");
+        }
+        options.api_key = read_api_key_file(*api_key_file);
+    } else if (!api_key_explicit) {
+        if (const char* key = std::getenv("NINFER_API_KEY"); key != nullptr) {
+            options.api_key = key;
+        }
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

@@ -1195,6 +1195,10 @@ public:
     FakeContinuationSummary capture_summary;
     FakePhysicalUsage usage;
 
+    [[nodiscard]] std::uint32_t disk_resume_tokens(const FakePreparedPrompt&) const noexcept {
+        return disk_tokens;
+    }
+    std::uint32_t disk_tokens                 = 0;
     std::uint64_t admission_inspections       = 0;
     std::uint64_t pressure_planning_sessions  = 0;
     std::uint64_t pressure_target_assessments = 0;
@@ -2446,6 +2450,26 @@ void test_root_lifecycle_and_prefix_reuse() {
             "selected endpoint did not reach the sealed Program plan");
     require(manager.catalog_state(0) == FakeManager::CatalogState::Catalogued,
             "failed start did not roll back its logical source claim");
+}
+
+// Issue #6: a longer checkpoint on the disk tier (loaded only by a root prefill) beats a shorter
+// in-memory match; a disk match not clearly longer leaves the in-memory reuse alone.
+void test_disk_tier_beats_shorter_memory_match() {
+    FakeManager manager = make_manager(1, 2);
+    FakeProgram program;
+    const ActiveRequest first = start_active(manager, program, 7, make_base(7), 1);
+    (void)finish_active(manager, program, first);
+    program.disk_tokens = 17; // 16 in memory: 1 more is under 17/16
+    auto close = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 2);
+    require(close.readiness == Readiness::Ready && close.choice &&
+                close.choice->summary().reusable_prompt_tokens == 16,
+            "a disk match barely longer displaced the in-memory endpoint");
+    program.disk_tokens = 60;
+    auto longer = manager.inspect(program, FakePreparedPrompt{7}, make_base(7), 3);
+    require(longer.readiness == Readiness::Ready && longer.choice &&
+                longer.choice->summary().reusable_prompt_tokens == 0 &&
+                longer.choice->summary().prefix_reuse_path == PrefixReusePath::Root,
+            "a longer disk checkpoint did not select the root admission");
 }
 
 // A cancelled request settles like a finished turn: the sequence it holds (a consumed same-session
@@ -3729,6 +3753,7 @@ int main() {
     run_test("dominating identity fast path",
              test_dominating_identity_does_not_build_pressure_graph);
     run_test("root lifecycle and prefix reuse", test_root_lifecycle_and_prefix_reuse);
+    run_test("disk tier beats shorter memory match", test_disk_tier_beats_shorter_memory_match);
     run_test("cancelled request is catalogued", test_cancelled_request_is_catalogued);
     run_test("stale revision is retryable", test_stale_revision_is_retryable);
     run_test("materialization abort preserves source", test_materialization_abort_preserves_source);

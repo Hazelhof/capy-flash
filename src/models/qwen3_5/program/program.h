@@ -923,6 +923,8 @@ public:
                                                const runtime::ResolvedExecutionOptions& options);
     [[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt,
                                                   std::uint32_t first_target);
+    // Prompt tokens a root admission would resume from the disk tier (0 without one).
+    [[nodiscard]] std::uint32_t disk_resume_tokens(const PreparedPrompt& prompt);
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,

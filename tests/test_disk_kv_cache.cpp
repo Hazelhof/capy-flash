@@ -258,6 +258,8 @@ void test_roundtrip_and_sharing(const fs::path& dir) {
     DiskKVCache cache(options(dir, 1024 * kMiB));
     expect(cache.stats().records == 2 && cache.stats().blobs == 7, "restart: index reloaded");
     std::vector<std::int32_t> prompt = tokens(1501, 5);
+    expect(cache.longest_indexed_frontier(prompt, 1500) == 1500, "restart: index probe frontier");
+    expect(cache.longest_indexed_frontier(prompt, 1499) < 1500, "restart: index probe bound");
     auto match                       = cache.find(prompt, 1500);
     expect(match.has_value(), "restart: found");
     if (match) {
@@ -279,6 +281,7 @@ void test_roundtrip_and_sharing(const fs::path& dir) {
            "restart: pipelined blob reads");
     std::vector<std::int32_t> miss = tokens(1501, 6);
     expect(!cache.find(miss, 1500).has_value(), "restart: other prompt misses");
+    expect(cache.longest_indexed_frontier(miss, 1500) == 0, "restart: index probe misses");
 }
 
 void test_key(const fs::path& dir) {
@@ -289,6 +292,7 @@ void test_key(const fs::path& dir) {
            "key: manifests of another key ignored, their blobs kept");
     std::vector<std::int32_t> prompt = tokens(1501, 5);
     expect(!cache.find(prompt, 1500).has_value(), "key: no hit across keys");
+    expect(cache.longest_indexed_frontier(prompt, 1500) == 0, "key: index probe misses across keys");
 }
 
 void test_lock(const fs::path& dir) {

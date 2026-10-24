@@ -492,13 +492,19 @@ HostMoeMailbox::HostMoeMailbox(HostMoeMailboxConfig config, std::vector<HostExpe
         early_partial_ = std::atoi(v) != 0; // v07/decode-overheads B
     }
     if (const char* v = std::getenv("NINFER_HOST_MOE_CPUS"); v != nullptr && *v != 0) {
-        config_.cpus.clear();
-        for (const char* p = v; *p != 0;) {
-            char* end = nullptr;
-            config_.cpus.push_back(static_cast<int>(std::strtol(p, &end, 10)));
-            if (end == p)
-                throw std::invalid_argument("NINFER_HOST_MOE_CPUS: not a list of cpu numbers");
-            p = *end == ',' ? end + 1 : end;
+        // Issue #11: "1-31" used to read as cpus 1 and -31. Ranges as taskset writes them.
+        try {
+            config_.cpus = parse_cpu_list(v);
+        } catch (const std::invalid_argument& error) {
+            throw std::invalid_argument(std::string("NINFER_HOST_MOE_CPUS: ") + error.what());
+        }
+        // A cpu outside the affinity used to abort in a worker thread ("cannot pin a thread").
+        for (const int cpu : config_.cpus) {
+            if (!process_may_run_on(cpu)) {
+                throw std::invalid_argument("NINFER_HOST_MOE_CPUS: cpu " + std::to_string(cpu) +
+                                            " does not exist or is outside the CPUs this process "
+                                            "may run on (taskset, cgroup cpuset)");
+            }
         }
     }
     const auto& c = config_;
