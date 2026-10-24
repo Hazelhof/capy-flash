@@ -188,6 +188,8 @@ capy-flash $version is ready. Serve $model with:
   $dir/current/$launcher $dir/models/$model/$artifact$launcher_flags
 $( [ "$model" = flash-next-64gb ] && echo "
 (one GPU: NINFER_DEVICES=0 $dir/current/$launcher $dir/models/$model/$artifact)" )
+$( case "$model" in 27b|27b-16gb) echo "
+(text only, more room for the KV: NINFER_VISION=0 $dir/current/$launcher $dir/models/$model/$artifact)" ;; esac )
 
 then, from another shell (the first start takes a minute or two):
 

@@ -57,6 +57,43 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `qwen3_8_27b_gsq3` | ISTA-DASLab 3-bit GSQ weights for one 16 GB GPU (the `27b-16gb` profile; published as `Feyd89/Qwen3.8-27B-GSQ-3bit-capy-flash`) | `quantized` |
+
+Qwen3.8-Flash-Next recipes. All keep the routed experts NVFP4 (imported from NVIDIA's checkpoint) and differ in the
+dense part; the published NVFP4 artifact uses `qwen3_8_flash_next_nvfp4_idxbf16_gdnq8`. The others are the
+candidates measured on the way (tags in the [development log](capy-flash/development-log.md)).
+
+| Recipe | Dense part |
+|---|---|
+| `qwen3_8_flash_next_nvfp4` | Q8 dense projections, Q6 head (ninfer-ext's choices) |
+| `qwen3_8_flash_next_nvfp4_dense` | NVFP4 attention, GDN and shared-expert projections and head |
+| `qwen3_8_flash_next_nvfp4_mix` | NVFP4 attention/GDN projections and head, Q8 shared expert (T26b) |
+| `qwen3_8_flash_next_nvfp4_gdn` | NVFP4 GDN projections (q/k/v/z/out), the rest as `qwen3_8_flash_next_nvfp4` (T26c) |
+| `qwen3_8_flash_next_nvfp4_gdn_idxbf16` | as `_gdn`, indexer BF16 |
+| `qwen3_8_flash_next_nvfp4_gdn_hcbf16` | as `_gdn`, hyper-connections BF16 |
+| `qwen3_8_flash_next_nvfp4_gdn_idxhcbf16` | as `_gdn`, indexer and hyper-connections BF16 |
+| `qwen3_8_flash_next_nvfp4_gdnbf16` | GDN projections BF16 instead of NVFP4 |
+| `qwen3_8_flash_next_nvfp4_allbf16` | indexer, hyper-connections and GDN BF16 |
+| `qwen3_8_flash_next_nvfp4_idxhcbf16_gdnq8` | indexer and hyper-connections BF16, GDN Q8 (T103) |
+| `qwen3_8_flash_next_nvfp4_idxbf16_gdnq8` | indexer BF16, GDN Q8, hyper-connections Q8 (T104; **the published artifact**) |
+| `qwen3_8_flash_next_fp4_local` | `nvidia/Qwen3.8-Flash-Next-FP4-Local` in the checkpoint's own formats (MXFP8 and row NVFP4 copied verbatim) |
+
+**The 64 GB edition of Flash-Next** (GSQ-RCO, `Feyd89/Qwen3.8-Flash-Next-GSQ-RCO-capy-flash`) is not a recipe: it
+takes an NVFP4 artifact built with the recipe above and replaces its routed-expert banks with the GGUF i-quant
+banks of ISTA-DASLab's `Qwen3.8-Flash-Next-GSQ-RCO-*.gguf`, copied byte for byte as ggml blocks
+([`tools/convert/gguf_experts.py`](../tools/convert/gguf_experts.py); `inventory`, `extract` and `verify` are pure
+Python, `assemble` also needs numpy and a C compiler for `third_party/ggml-iq`):
+
+```bash
+python3 -m tools.convert.gguf_experts inventory --gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-*.gguf \
+  --artifact /path/to/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer
+python3 -m tools.convert.gguf_experts assemble --gguf /path/to/Qwen3.8-Flash-Next-GSQ-RCO-*.gguf \
+  --artifact /path/to/qwen3_8_flash_next_nvfp4_idxgdnq8.ninfer --out /path/to/flash_next_gsqrco.ninfer
+```
+
+`inventory` checks that the GGUF banks match the artifact (shapes, layers, expert count); `assemble --plan-only`
+builds and checks the directory without writing the payload. By default the MTP layer's NVFP4 experts are
+re-encoded as IQ4_NL (`--no-mtp-iq4nl` keeps them NVFP4), so every routed-expert layer is a ggml block bank.
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;

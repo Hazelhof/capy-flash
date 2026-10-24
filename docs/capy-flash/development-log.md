@@ -437,3 +437,50 @@ per generated token worse (7.74 -> 7.79 s per 1k tokens); the prompt's targets c
 cost decode instead (all 148.9, 32 per layer 151.5); frequencies only 153.9 tok/s, TTFT 0.577 s, 7.65 s per 1k
 tokens. The replayed policy on the T194 routing agrees on the residency (targets 6.66 M CPU experts, frequencies
 only 7.13 M, T211 7.25 M) but not on the price of the copies, which only the GPU shows.
+
+**T161** (v0.5.0): one engine for both models. Qwen3.8-27B served by capy-flash against ninfer-tp2 v0.4.9, the
+production build then: the two-GPU gate is identical (golden ids 3/3, perplexity 4.385905 at 4k and 4.133481 at 64k,
+greedy texts 60/60, DFlash2 10/10), greedy round time 16.87 vs 16.70 ms (+1 %). On the 27B agentic replay
+(production flags, greedy), time to first token / server decode / total: v0.4.9 1.40 s / 172.2 tok/s / 154 s,
+capy-flash with `--turn-anchors 0` 1.39 / 174.4 / 152, with `--turn-anchors 1` 1.42 / 171.2 / 156. The turn anchor
+costs Flash-Next a prefill pass per agentic turn (T152), but nothing measurable on the 27B, whose weights are all
+on the GPU. So `--turn-anchors` defaults per model: 0 on Qwen4Exp, 1 elsewhere.
+
+**T201** (v0.6): where a production decode round of Flash-Next goes (two GPUs, NVFP4). 16.3 ms per round: GPU 0
+waits 5.1 ms for the CPU experts (137 per round, ~9 us fixed per call + 49 us per expert, about 57 GB/s: the RAM
+ceiling), GPU experts 3.1 ms, Q8 dense 2.9, TP exchanges 1.29 (102 per round, 5.4 us median), hyper-connections
+0.87, heads 0.83, router 0.47. An exchange takes 5.3 us with no expert-cache fill on either PCIe link, 16.1 with one
+on GPU 0's link and 27.0 with one on both (0.42 ms per round): the copy engine keeps many reads in flight and every
+small PCIe read waits behind them. `NINFER_QWEN4_FILL_SM` (fills by a kernel of a few blocks, bounded reads in
+flight) is the switch that came out of it; it is off by default.
+
+**T209** (v0.6, PR #9 by @jsmcconn): a text-only prefill chunk after a cached multimodal prefix reset the RoPE
+delta to 0. Now a text continuation keeps the sequence's delta and a chunk at base 0 resets it, at one and two GPUs.
+27B with vision, greedy, conversation [image and question, fixed answer, text-only question], suffix after 808
+cached tokens: cold prefill identical before and after the fix (12/12); warm equal to cold 8/12 before and 7/12
+after, the differences being formatting at near-ties; correct answers 12/12 in every case. The fix is right and
+regresses nothing; its effect on quality is not measurable.
+
+**T219** (v0.7): first full measurement of the 64 GB edition of Flash-Next (GGUF GSQ-RCO i-quant experts, two
+GPUs). In a 64 GB cgroup it starts in 18 s with 5,733 expert slots per GPU (10.96 GiB), at most 55.2 GiB resident,
+no OOM or swap, 8/8 prompts correct. Agentic replay decode with 6 CPU threads 190.6 tok/s against 155.4 for the
+NVFP4 edition (+22.6 %); with 12 threads, one per physical core of the 9900X, 207.4 (+33.5 %). The GGUF experts are
+smaller, so more of them fit in VRAM, and the CPU kernels for the missing ones scale with the cores. Default: one
+thread per physical core for ggml block banks. Prefill had collapsed in this first build (4k 526, 16k 496 tok/s,
+with streaming and prefetch off for GGUF banks); copying the next layers' banks to VRAM fixed it later (T225:
+4k 2,108, 16k 3,298 tok/s).
+
+**T242** (v0.7): the 64 GB edition on ONE RTX 5070 Ti (`--device 0 --kv-dtype int8 --elastic --max-context 262144
+--spec mtp --draft-tokens 3 --embedding-host --host-kv-mib 1024 --host-state-slots 2`). 57 GiB of RAM in use;
+LocalMaxxing reasoning-v1 medians 95.8 / 112.6 / 110.5 tok/s (two GPUs: 239); agentic replay decode 89.1 tok/s;
+prefill 4k / 16k / 64k 1,888 / 2,145 / 2,257 tok/s. On the replay's last turn (81k tokens) only 25k came from the
+cache and the first token took 24.0 s (two GPUs: 3.09 s): with one card and small RAM caches, long agent sessions
+lose their checkpoints. This became `--profile flash-next-1gpu`, and T247.
+
+**T247** (v0.7.1): prompt reuse at one GPU. The cause of T242's re-prefills was the conversation states, not the
+KV: at one device the context cache keeps 1 active + 1 cached device state and 2 in RAM, so three interleaved agent
+sessions lost their end-of-turn checkpoints (two GPUs keep 8 device states). Agentic replay, Flash-Next 64 GB on one
+GPU (prompt tokens from cache / median TTFT / total time / decode median): 1024 MiB host KV + 2 states 34 % /
+13.3 s / 858 s / 97 tok/s; 1024 MiB + 8 states 83 % / 1.94 s / 276 s / 103.6 tok/s at 58 GiB of RAM. A rule that
+demoted without releasing gave 0 % and was dropped. `--profile flash-next-1gpu` keeps 8 RAM states (+0.66 GiB pinned).
+

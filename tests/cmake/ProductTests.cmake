@@ -86,3 +86,8 @@ ninfer_add_test(ninfer_serve_engine_failure_real_test
 target_link_options(ninfer_serve_engine_failure_real_test PRIVATE
   "LINKER:--wrap=cudaStreamSynchronize")
 set_tests_properties(ninfer_serve_engine_failure_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# Documentation guard: every serve flag, NINFER_* variable, conversion recipe and Tnn tag of the
+# sources appears in the user docs (tools/check_docs.py).
+add_test(NAME ninfer_docs_guard_test
+  COMMAND ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tools/check_docs.py ${PROJECT_SOURCE_DIR})

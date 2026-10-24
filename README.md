@@ -18,7 +18,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.7.3**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.7.4**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -274,6 +274,13 @@ artifact kinds (DFlash, MoE, vision workspace; `GATE_CTEST_EXCLUDE`), then check
 texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.7.4**
+- Disk tier: a long conversation saved on disk now resumes even when a shorter match (a system prompt another
+  conversation left) is in memory, and resumes work on one GPU (27B: 7.63 → 0.46 s on two GPUs, 15.18 → 0.60 s on
+  one; [issue #6](https://github.com/ValerioDolci/capy-flash/issues/6)).
+- `NINFER_HOST_MOE_CPUS` takes ranges (`0-15,32-47`); `--api-key-file FILE` and `NINFER_API_KEY` keep the key off
+  the command line; a second server on the same port is refused.
 
 **v0.7.3**
 - CPU expert threads: when the allowed CPUs have no free SMT sibling (for example `taskset -c 0-15` on a 16-core /

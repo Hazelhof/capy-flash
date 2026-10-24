@@ -16,6 +16,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Convert weights with an official or custom recipe | [`convert/`](convert/); [user guide](../docs/weight-conversion.md) |
 | Inspect artifact metadata and objects | [`artifact/inspect.py`](artifact/inspect.py) |
 | Replace the chat template embedded in an artifact (weights unchanged; writes a new artifact directory) | [`replace_chat_template.py`](replace_chat_template.py), with positional `ENTRY.ninfer TEMPLATE.jinja OUT_DIR`; maintained templates in [`chat_templates/`](chat_templates/) |
+| Check that every `ninfer-serve` flag, `NINFER_*` variable, conversion recipe and `Tnn` tag of the sources is in the user docs (ctest `ninfer_docs_guard_test`) | [`check_docs.py`](check_docs.py) |
 | One-time upgrade of official v2 artifacts | [`upgrade_ninfer_v2_to_v3.py`](upgrade_ninfer_v2_to_v3.py), with positional `INPUT OUTPUT` paths |
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |

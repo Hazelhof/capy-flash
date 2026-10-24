@@ -147,7 +147,7 @@ const std::vector<ServeProfile>& serve_profiles() {
           "--max-concurrency", "1", "--spec", "mtp", "--draft-tokens", "3", "--embedding-host",
           "--host-kv-mib", "1024", "--host-state-slots", "8"}},
         // v0.7: Qwen3.8-27B with the 3-bit GSQ weights (q3_g128_fp16 artifact) on ONE 16 GB board
-        // (docs/v07/27b-16gb.md, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9 GiB).
+        // (docs/serving.md#profiles, profile 16gb-64k: int8 KV, 65 536 tokens, vision; VRAM 13.9 GiB).
         {"27b-16gb",
          {"--device", "0", "--kv-dtype", "int8", "--max-context", "65536", "--kv-capacity", "auto",
           "--vram-headroom-mib", "384", "--device-state-slots", "2", "--max-concurrency", "1",

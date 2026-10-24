@@ -47,6 +47,7 @@ residency (`NINFER_QWEN4_EXPERT_FREEZE`, see below).
 | `NINFER_HOST_MOE_A4` | `0` / unset (on, since v0.5.0) | The CPU expert path uses the GPU kernel's W4A4 activation codec and its BF16 roundings of gate/up and h, instead of int8 activations (W4A8). Removes the CPU/GPU mix that changed answers with residency (T98). AVX-512 implementation at no measurable cost (T148). **On by default since v0.5.0; keep it on.** | production | numerics | capy |
 | `NINFER_HOST_ISA` | `auto` (default), `avx2`, `avx512` | Instruction set of the CPU expert kernels: `auto` takes AVX-512 VNNI where the CPU has it, else AVX2 + FMA + F16C; `avx2` forces the AVX2 kernels on an AVX-512 CPU (to test them); a value the CPU cannot run stops the server at startup. The log line `qwen4 experts: host expert kernels …` names the choice. Both compute identical bits (`ninfer_host_nvfp4_isa_test`); only speed differs. | performance | timing | capy |
 | `NINFER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked host weights (64.6 GiB for Flash-Next) + max(2 GiB, 5 % of MemTotal). Otherwise the server refuses to start and prints the numbers. `0` skips the check (T156). | production | none | capy |
+| `NINFER_HOST_TIER_RAM_GUARD` | `0` / unset (on) | Startup check that MemAvailable ≥ the page-locked RAM tiers of the context cache (`--host-state-slots`, `--host-kv-mib`) + max(4 GiB, 5 % of MemTotal); otherwise the server stops with the sizes. `0` skips it. | production | none | capy |
 | `NINFER_HOST_PINNED_MAX_GIB` | GiB, may be fractional (unset = no limit) | Same as `--host-pinned-max-gib` (the flag wins): at most this much of the host-mapped weights (Flash-Next expert banks) is page-locked; the banks of the least used layers beyond it stay in pageable RAM (CPU reads them in place, GPU copies go through a pinned staging ring, no prefill streaming for them). Unset: the whole page-locked allocation is tried first and the fallback starts only if the driver refuses it (Windows WDDM / WSL2). A value that is not a positive number stops the server at startup. | production | same tokens, slower where pageable | capy |
 | `NINFER_HOST_STAGING_MIB` | MiB (128) | Size of the pinned staging ring per GPU that fills expert slots from pageable banks; only allocated when some bank is pageable. At least one expert, at most the fill depth. If the allocation fails the server stops and suggests lowering `--host-pinned-max-gib` or this value. | performance | timing | capy |
 | `NINFER_CUDA_SYNC` | `spin` (default), `blocking`, `yield`, `auto` | CUDA device synchronization schedule ([cli.md](../cli.md#cuda-synchronization)). | performance | timing (host CPU use) | ninfer |
@@ -101,6 +102,15 @@ CPU expert executor (all bit-identical by construction, T35):
 | `NINFER_HOST_MOE_MEMBER_QUANT` | `1` (default), `0` | Each thread quantizes the activations it needs, instead of a shared quantization phase plus a barrier. | performance | same bits | capy |
 | `NINFER_HOST_MOE_PREFETCH` | `0` (default, off), rows | Software prefetch of weight codes N rows ahead. | performance | same bits | capy |
 | `NINFER_HOST_MOE_CPUS` | comma list of CPU numbers and ranges (`0-7,16`); unset = automatic | Replaces the automatic CPU list of the executor: one thread per listed CPU, pinned in that order (SMT siblings may be listed); the `routed experts: N CPU threads …` startup line still prints the automatic or requested count. Unset: `--expert-cpu-threads` threads, or the automatic count, each thread pinned to its own physical core among those the process may run on (`taskset`, cgroup cpuset), spread over their L3 domains. See [serving.md](../serving.md#cpu-expert-threads). | performance | timing | capy |
+| `NINFER_HOST_MOE_DOWN_PREFETCH` | KiB (32), `0` = off | Software prefetch distance for the down-projection weight codes in the CPU expert kernels. | performance | same bits | capy |
+| `NINFER_HOST_MOE_EARLY_PARTIAL` | `1` / unset (off) | Decode: the GPU kernel that adds the CPU experts' partial result may start on it early (v0.7 decode-overhead experiment, not adopted). | performance | same bits | capy |
+| `NINFER_GGUF_IQ3_GRID` | unset (default), `gather` | 64 GB edition, AVX-512: the IQ3 decoders look the grids up with `vpgatherdd` instead of `vpermi2b` (same decoded bytes). | performance | same bits | capy |
+| `NINFER_GGUF_RING_GATE` | on with two GPUs (default), `0` | 64 GB edition at `--tp 2`: the ring copy of layer l + 1 waits until the compute stream reaches layer l's experts, so it runs under that layer's GEMM instead of in front of the TP exchanges on the copy engine (v0.7.2). | performance | same bits | capy |
+| `NINFER_QWEN4_FILL_SM` | thread blocks (unset = off) | Expert cache fills are copied by a kernel of N blocks that reads the host bank in place, instead of the copy engine; bounds the reads in flight so small PCIe reads (TP exchange, CPU partials) do not wait behind a fill (T201). | performance | same bits | capy |
+| `NINFER_QWEN4_PROMPT_LEND` | fraction in (0, 1] (0.9 at one GPU, 0.75 at two) | Share of the expert slots a prompt chunk may borrow for its streamed experts. | performance | residency (tokens may change) | capy |
+| `NINFER_QWEN4_SLOT_PROFILE` | on (default), `0` | Two GPUs, 48 text layers: expert slots per layer follow the measured usage profile; `0` gives every layer the same count. | performance | residency (tokens may change) | capy |
+| `NINFER_TP_EXCHANGE_PREFETCH_KIB` | KiB (12288), `0` = off | `--tp 2`: prefetch window of the decode exchange buffers. | performance | same bits | capy |
+| `NINFER_TP_PREFILL_OVERLAP` | on (default), `0` | `--tp 2` text prefill: each chunk runs as two halves (multiples of 128 columns) so one half's exchange overlaps the other half's compute; `0` runs the chunk as one call. | performance | same bits | capy |
 
 ## 4. Numerical paths of the TP2 exchanges (legacy A/B)
 
@@ -139,6 +149,9 @@ note above). Variables marked *eager* need `--no-cuda-graph`.
 | `NINFER_QWEN4_TFDUMP_MTP` | `1` (eager) | Every prompt column also runs the MTP layer; draft logits go to `mtp_logits/`. | capy |
 | `NINFER_QWEN4_TFDUMP_STRIDE` | `1` (default), n | Logits only at positions divisible by n (KL over long windows). | capy |
 | `NINFER_QWEN4_TFDUMP_SEQUENCES` | `1` | One subdirectory per scored sequence. | capy |
+| `NINFER_QWEN4_TFDUMP_COMPACT` | `1` | Smaller tfdump records (no wide residuals beyond what the layers list asks). | capy |
+| `NINFER_QWEN4_TFDUMP_TOPK` | n (0 = all) | Keep only the top-n logits per position. | capy |
+| `NINFER_LEASE_DEBUG` | set | Log lines for the KV lease demotions run by admission pressure. | capy |
 | `NINFER_VISION_DUMP` | directory | Each encoded image/video item: `itemN.patches.bf16` (the patches the tower received, BF16 [patches, 1536]), `itemN.merged.bf16` (its merged embeddings, BF16 [merged, H]) and `itemN.json` (grid, counts). Synchronizes the encoding device per item. Compare with an independent tower reference on the same patches. | capy |
 | `NINFER_QWEN4_XDUMP` | directory | The two rank partials of each TP2 prefill exchange, before the sum (T128). | capy |
 | `NINFER_QWEN4_XDUMP_STRIDE` | `16` (default), n | Column stride of the exchange taps. | capy |
@@ -181,6 +194,8 @@ These variables change execution on purpose so that runs can be compared exactly
 | `NINFER_T49_NVFP4` | candidate index (unset = tuned selection) | Kernel candidate for the Qwen4Exp NVFP4 dense decode shapes (T49). | may change rounding | capy |
 | `NINFER_T49_Q8` | candidate index (unset = tuned selection) | Kernel candidate for the Qwen4Exp Q8 dense shapes (T49). | may change rounding | capy |
 | `NINFER_Q6_DRAFT_ROUTE` | route index (unset = tuned) | GEMV route of the shortlist draft head at T = 1 (T43). | drafts only | capy |
+| `NINFER_Q3_SMALLT` | `2` / unset (register-direct tensor-core route), `1` (shared-memory staged), `0` (warp-per-row GEMV) | 3-bit 27B linear layers at T ≤ 8 (decode, MTP verify). | may change rounding | capy |
+| `NINFER_Q3_A8` | `1` / unset (A8, prefill ~3.5x), `0` (A16, exact BF16 activations), `f` (A8 through the in-kernel quantizing tile only) | 3-bit 27B prefill route for T ≥ 64 (v0.7: perplexity within 0.5 % of A16). T < 64 is always A16. | `0`/`f` change rounding | capy |
 
 ## 8. Inherited from ninfer-tp2
 

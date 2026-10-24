@@ -1,4 +1,4 @@
-# NInfer CLI
+# `ninfer` one-shot CLI (from NInfer)
 
 `build/apps/ninfer` runs one request against one v3 `.ninfer` artifact. Build NInfer and
 download an artifact using the [project README](../README.md) before following this guide.
