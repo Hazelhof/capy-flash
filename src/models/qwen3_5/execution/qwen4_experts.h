@@ -249,6 +249,11 @@ struct Qwen4OffloadOptions {
     bool split_staged = false;
     // tp 2: the share runs on rank 1 (MissSplitOptions::peer_share; staged only).
     bool split_on_peer = false;
+    // Cost split only (MissSplitOptions::calibrate): the GPU share's copy rate is timed at
+    // startup, the first kSplitCalibrationCalls decode calls keep every miss on the CPU while the
+    // mailbox times them, then the fitted CPU line and the measured GPU cost replace `split`'s
+    // costs (written to a device copy of the rule the publishes read; no graph is captured again).
+    bool split_calibrate = false;
     // Prefill calls of at least this many columns stream the layer's non-resident experts into a
     // ring of slots lent by the cache and run every routed expert on the GPU
     // (Qwen4ExpertStream, ops::moe_grouped_nvfp4); 0 = never (the CPU computes them).
@@ -655,6 +660,8 @@ private:
     void observe_layer(std::int32_t layer);
     // Throws when the host expert executor has failed (HostMoeMailbox::failed).
     void require_executor() const;
+    // Decode calls timed before --miss-split calibrate fits the CPU cost line.
+    static constexpr std::int64_t kSplitCalibrationCalls = 4096;
     // Warm start: the prompt window's layers as the chunk passes them (fills pumped meanwhile).
     void observe_prompt_layers(cudaStream_t stream);
     void close_stream() noexcept;
@@ -798,6 +805,16 @@ private:
     float* peer_divisors_ = nullptr;
     std::array<int, 2> device_ids_{};
     bool split_on_peer_ = false;
+    // --miss-split calibrate: device copies of the split rule (rank 0's publish, rank 1's share
+    // selection), the rule they get once the CPU has been measured, the GPU share's copy cost
+    // measured at startup (us per expert, fixed us).
+    std::array<ops::host::HostMoeSplit*, 2> split_live_{};
+    ops::host::HostMoeSplit split_measured_{};
+    bool split_calibrated_     = false;
+    float share_copy_us_       = 0.0F;
+    float share_copy_fixed_us_ = 0.0F;
+    void setup_split_calibration();
+    void finish_split_calibration(cudaStream_t stream);
     Peer peer_{};                        // rank 1's memory (tp 2)
     std::vector<Qwen4ExpertBank> banks_; // host banks (input divisors, planes)
     // v0.7 pinned fallback: [layers] bank in pageable host memory (the CPU reads it in place, the

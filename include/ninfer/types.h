@@ -245,6 +245,11 @@ struct MissSplitOptions {
     // waits for the CPU), from its own copy of the residency mirror and the same device rule;
     // false = on rank 0, as at one device. Staged path only (the zero-copy share stays on rank 0).
     bool peer_share = true;
+    // Auto only: measure the costs on this machine instead of using `costs` as given. The GPU
+    // share's copy rate is timed at startup; the CPU line (fixed + per expert + per column) is
+    // fitted from the first decode calls, which keep every missing expert on the CPU while they
+    // are measured; then the measured costs replace `costs` for the rest of the run.
+    bool calibrate = false;
 };
 
 // Routed experts of a MoE model whose expert banks stay in host memory (Qwen3.8-Flash-Next).

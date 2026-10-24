@@ -82,11 +82,12 @@ struct ServeOptions {
     // measurable, so they keep the anchor.
     std::optional<std::uint32_t> turn_anchors;
     // T64/T66c Qwen4Exp product options (no effect on other models): elastic KV <-> expert slots
-    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split auto|off) and
+    // (--elastic, --kv-grow, --kv-budget-gib), the decode miss split (--miss-split auto|calibrate|off) and
     // the prompt-chunk width from which the missing experts stream over PCIe (--stream-min-tokens,
     // RoutedExpertOptions::stream_min_tokens; 0 = never).
     ElasticKvOptions elastic_kv;
     std::optional<MissSplitMode> miss_split;
+    bool miss_split_calibrate = false; // --miss-split calibrate (MissSplitOptions::calibrate)
     std::optional<std::uint32_t> stream_min_tokens;
     // RoutedExpertOptions::cpu_threads and gguf_cpu_threads (Qwen4Exp offload backend: the CPU
     // threads of the missing experts, pinned one per allowed physical core, spread over the L3

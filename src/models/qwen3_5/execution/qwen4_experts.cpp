@@ -22,6 +22,7 @@
 #include <numeric>
 #include <thread>
 #include <cinttypes>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -1059,6 +1060,126 @@ Qwen4OffloadExperts::Qwen4OffloadExperts(std::span<const Qwen4ExpertBank> banks,
             options_.split.device_column_us);
         std::fflush(trace_);
     }
+    if (options_.split_calibrate) { setup_split_calibration(); }
+}
+
+// ---- --miss-split calibrate ----------------------------------------------------------------------
+
+// The GPU share's cost per expert = the staged copy measured on this machine + the expert kernel
+// on the copied slots at decode widths, which does not depend on the link: T18's 140 us per staged
+// expert on the 2x RTX 5070 Ti (PCIe 5.0 x8) minus the copy measured there (102.7 us, 26.9 GB/s).
+constexpr float kShareComputeUs = 37.0F;
+
+void Qwen4OffloadExperts::setup_split_calibration() {
+    if (!splitting() || !options_.split_staged ||
+        options_.split.mode != ops::host::HostMoeSplit::Mode::Cost) {
+        std::fprintf(stderr, "qwen4 experts: --miss-split calibrate needs the staged auto split "
+                             "(off here); costs left as given\n");
+        return;
+    }
+    // The share runs on rank 1 at tp 2 (its own link), else on this GPU. Every bank is page-locked
+    // whenever the split is on, so layer 0's bank stands for all.
+    const int rank                         = split_on_peer_ ? 1 : 0;
+    std::int32_t* picks                    = rank == 1 ? peer_.picks : memory_.picks;
+    const std::array<std::byte*, 4> stage  = rank == 1 ? peer_.staging : memory_.staging;
+    const ops::MoeSlotPool& b              = banks_.front().bank;
+    const std::array<std::int64_t, 4> unit = {
+        ops::kMoeSlotsGateUpCodeBytes, ops::kMoeSlotsGateUpScaleBytes, ops::kMoeSlotsDownCodeBytes,
+        ops::kMoeSlotsDownScaleBytes};
+    {
+        const ScopedCurrentDevice on(device_ids_[static_cast<std::size_t>(rank)]);
+        cudaStream_t s = nullptr;
+        cudaEvent_t e0 = nullptr, e1 = nullptr;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreate(&e0));
+        CUDA_CHECK(cudaEventCreate(&e1));
+        std::array<std::int32_t, kMissSplitSlots + 1> host_picks{};
+        for (std::int32_t k = 0; k < kMissSplitSlots; ++k) { host_picks[k] = (k * 37) % kExperts; }
+        const auto time_copy = [&](std::int32_t n) {
+            host_picks[kMissSplitSlots] = n;
+            CUDA_CHECK(cudaMemcpy(picks, host_picks.data(), sizeof host_picks,
+                                  cudaMemcpyHostToDevice));
+            float best = std::numeric_limits<float>::max();
+            for (int rep = 0; rep < 14; ++rep) {
+                CUDA_CHECK(cudaEventRecord(e0, s));
+                ops::host::stage_device_share(
+                    s, picks,
+                    {static_cast<const std::byte*>(b.gate_up_codes.base),
+                     static_cast<const std::byte*>(b.gate_up_scales.base),
+                     static_cast<const std::byte*>(b.down_codes.base),
+                     static_cast<const std::byte*>(b.down_scales.base)},
+                    stage, {unit[0], unit[1], unit[2], unit[3]});
+                CUDA_CHECK(cudaEventRecord(e1, s));
+                CUDA_CHECK(cudaEventSynchronize(e1));
+                float ms = 0.0F;
+                CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
+                if (rep >= 4) { best = std::min(best, 1e3F * ms); }
+            }
+            return best;
+        };
+        const float t16      = time_copy(kMissSplitSlots);
+        const float t4       = time_copy(4);
+        share_copy_us_       = std::max((t16 - t4) / static_cast<float>(kMissSplitSlots - 4), 0.0F);
+        share_copy_fixed_us_ = std::max(t4 - 4.0F * share_copy_us_, 0.0F);
+        host_picks[kMissSplitSlots] = 0;
+        CUDA_CHECK(cudaMemcpy(picks, host_picks.data(), sizeof host_picks, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaEventDestroy(e0));
+        CUDA_CHECK(cudaEventDestroy(e1));
+        CUDA_CHECK(cudaStreamDestroy(s));
+    }
+    // Until the CPU is measured the publishes read a rule with no GPU share (max_reads 0).
+    ops::host::HostMoeSplit measuring = options_.split;
+    measuring.max_reads               = 0;
+    for (int r = 0; r < (split_on_peer_ ? 2 : 1); ++r) {
+        const ScopedCurrentDevice on(device_ids_[static_cast<std::size_t>(r)]);
+        CUDA_CHECK(cudaMalloc(&split_live_[static_cast<std::size_t>(r)], sizeof measuring));
+        CUDA_CHECK(cudaMemcpy(split_live_[static_cast<std::size_t>(r)], &measuring,
+                              sizeof measuring, cudaMemcpyHostToDevice));
+    }
+    mailbox_->collect_cost_samples(kSplitCalibrationCalls);
+    const double bytes = static_cast<double>(unit[0] + unit[1] + unit[2] + unit[3]);
+    std::fprintf(stderr,
+                 "qwen4 experts: miss split calibrate: GPU %d copies an expert in %.1f us "
+                 "(%.1f GB/s, + %.1f us per copy); the first %" PRId64
+                 " decode calls keep every miss on the CPU and time it\n",
+                 device_ids_[static_cast<std::size_t>(rank)], share_copy_us_,
+                 share_copy_us_ > 0.0F ? bytes / (1e3 * share_copy_us_) : 0.0,
+                 share_copy_fixed_us_, kSplitCalibrationCalls);
+}
+
+void Qwen4OffloadExperts::finish_split_calibration(cudaStream_t stream) {
+    const std::vector<ops::host::HostMoeCostSample> samples = mailbox_->cost_samples();
+    if (static_cast<std::int64_t>(samples.size()) < kSplitCalibrationCalls) { return; }
+    mailbox_->collect_cost_samples(0);
+    split_calibrated_ = true;
+    const ops::host::HostMoeCostFit fit =
+        ops::host::fit_host_costs(samples, options_.split.host_column_us);
+    ops::host::HostMoeSplit rule = options_.split;
+    if (fit.samples > 0 && fit.expert_us > 0.0F) {
+        rule.host_fixed_us  = fit.fixed_us;
+        rule.host_expert_us = fit.expert_us;
+        rule.host_column_us = fit.column_us;
+    }
+    rule.device_expert_us = share_copy_us_ + kShareComputeUs;
+    rule.device_fixed_us  = std::max(options_.split.device_fixed_us, share_copy_fixed_us_);
+    split_measured_       = rule;
+    // Stream order on both ranks: this window's publish (rank 0) and share selection (rank 1) read
+    // the same rule, so the two sides never disagree on which experts the GPU takes.
+    for (int r = 0; r < (split_on_peer_ ? 2 : 1); ++r) {
+        const ScopedCurrentDevice on(device_ids_[static_cast<std::size_t>(r)]);
+        CUDA_CHECK(cudaMemcpyAsync(split_live_[static_cast<std::size_t>(r)], &split_measured_,
+                                   sizeof split_measured_, cudaMemcpyHostToDevice,
+                                   r == 0 ? stream : peer_stream_));
+        CUDA_CHECK(cudaStreamSynchronize(r == 0 ? stream : peer_stream_));
+    }
+    options_.split = rule; // the exit line and the trace report the rule in use
+    std::fprintf(stderr,
+                 "qwen4 experts: miss split calibrated on %zu decode calls (%d kept, rms %.1f us): "
+                 "CPU %.1f us + %.1f us per expert + %.1f us per extra column, GPU %.1f us + "
+                 "%.1f us per expert%s\n",
+                 samples.size(), fit.samples, fit.rms_us, rule.host_fixed_us, rule.host_expert_us,
+                 rule.host_column_us, rule.device_fixed_us, rule.device_expert_us,
+                 fit.samples > 0 && fit.expert_us > 0.0F ? "" : " (CPU fit failed: CPU costs as given)");
 }
 
 Qwen4OffloadSplitCounters Qwen4OffloadExperts::split_counters() const noexcept {
@@ -1085,6 +1206,11 @@ void Qwen4OffloadExperts::snapshot_save_block() {
 }
 
 Qwen4OffloadExperts::~Qwen4OffloadExperts() {
+    for (std::size_t r = 0; r < split_live_.size(); ++r) {
+        if (split_live_[r] == nullptr) { continue; }
+        const ScopedCurrentDevice on(device_ids_[r]);
+        (void)cudaFree(split_live_[r]);
+    }
     for (std::size_t r = 0; r < 2; ++r) {
         if (gguf_copy_stream_[r] != nullptr) { (void)cudaStreamDestroy(gguf_copy_stream_[r]); }
         for (std::size_t h = 0; h < 2; ++h) {
@@ -1258,7 +1384,8 @@ void Qwen4OffloadExperts::routed(std::int32_t layer, const Qwen4ExpertBank& bank
         ops::host::HostMoeDeviceShare{.reads = memory_.reads,
                                       .picks = options_.split_staged ? memory_.picks : nullptr,
                                       .stage_table =
-                                          options_.split_staged ? memory_.stage_table : nullptr});
+                                          options_.split_staged ? memory_.stage_table : nullptr,
+                                      .live = split_live_[0]});
     published_layer_ = layer;
     if (splitting() && !split_on_peer_) {
         side_partial_ = work.alloc(DType::FP32, {kHidden, T});
@@ -2000,6 +2127,9 @@ Qwen4OffloadExperts::prompt_workspace(std::span<const cudaStream_t> streams) {
 void Qwen4OffloadExperts::begin_window(cudaStream_t stream, Qwen4Window kind) {
     if (open_) { throw std::logic_error("Qwen4Exp offload experts: window already open"); }
     require_executor();
+    if (split_live_[0] != nullptr && !split_calibrated_ && kind == Qwen4Window::Decode) {
+        finish_split_calibration(stream);
+    }
     if (kind == Qwen4Window::Prompt &&
         (!snapshot_any_window_ || snapshot_last_kind_ == Qwen4Window::Decode)) {
         // T59: a request begins (its first prompt window).
@@ -2420,7 +2550,10 @@ void Qwen4OffloadExperts::run_peer_share(std::int32_t layer, const Tensor& x, co
         stream, T, kTopK, static_cast<const std::int32_t*>(ids.data),
         peer_.mirror + static_cast<std::size_t>(layer) * kExperts, kExperts, options_.split,
         ops::host::HostMoeDeviceShare{
-            .reads = peer_.reads, .picks = peer_.picks, .stage_table = peer_.stage_table});
+            .reads       = peer_.reads,
+            .picks       = peer_.picks,
+            .stage_table = peer_.stage_table,
+            .live        = split_live_[1]});
     const Qwen4ExpertBank& bank = banks_[static_cast<std::size_t>(layer)];
     const ops::MoeSlotPool& b   = bank.bank;
     ops::host::stage_device_share(stream, peer_.picks,

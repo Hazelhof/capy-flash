@@ -8,13 +8,16 @@
 #include <time.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstdint>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::ops::host {
 
@@ -162,7 +165,8 @@ __global__ void publish_kernel(const uint4* __restrict__ x, const std::int32_t* 
                 return e >= 0 && e < resident.experts && resident.table[e] >= 0;
             return false;
         };
-        const HostMoeSplit& split = resident.split;
+        const HostMoeSplit split =
+            resident.share.live != nullptr ? *resident.share.live : resident.split;
         if (split.mode != HostMoeSplit::Mode::Off) {
             __shared__ std::int32_t route_id[kMaxRoutes]; // missing id of the route, or -1
             __shared__ unsigned char first[kMaxRoutes];   // first route of its id
@@ -882,6 +886,95 @@ std::int64_t HostMoeMailbox::device_share_routes(std::int32_t layer) const noexc
     return n;
 }
 
+void HostMoeMailbox::collect_cost_samples(std::int64_t max_samples) {
+    const std::lock_guard lock(cost_mutex_);
+    cost_samples_.clear();
+    cost_samples_.reserve(static_cast<std::size_t>(std::max<std::int64_t>(max_samples, 0)));
+    cost_capacity_.store(std::max<std::int64_t>(max_samples, 0), std::memory_order_relaxed);
+}
+
+std::vector<HostMoeCostSample> HostMoeMailbox::cost_samples() const {
+    const std::lock_guard lock(cost_mutex_);
+    return cost_samples_;
+}
+
+namespace {
+// Least squares of us on (1, experts, pairs - experts) over `s` (weights 0/1 in `keep`), or on
+// (1, experts) with the column term fixed at `column`. Returns {fixed, expert, column}; false when
+// singular.
+bool solve_costs(std::span<const HostMoeCostSample> s, const std::vector<char>& keep,
+                 bool with_column, double column, std::array<double, 3>& out) {
+    const int n = with_column ? 3 : 2;
+    double a[3][4] = {};
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (keep[i] == 0) continue;
+        const double c = static_cast<double>(s[i].pairs - s[i].experts);
+        const double x[3] = {1.0, static_cast<double>(s[i].experts), c};
+        const double y    = static_cast<double>(s[i].us) - (with_column ? 0.0 : column * c);
+        for (int r = 0; r < n; ++r) {
+            for (int k = 0; k < n; ++k) a[r][k] += x[r] * x[k];
+            a[r][3] += x[r] * y;
+        }
+    }
+    for (int col = 0; col < n; ++col) { // Gauss-Jordan with partial pivoting
+        int piv = col;
+        for (int r = col + 1; r < n; ++r)
+            if (std::fabs(a[r][col]) > std::fabs(a[piv][col])) piv = r;
+        if (std::fabs(a[piv][col]) < 1e-9) return false;
+        for (int k = 0; k < 4; ++k) std::swap(a[col][k], a[piv][k]);
+        for (int r = 0; r < n; ++r) {
+            if (r == col) continue;
+            const double f = a[r][col] / a[col][col];
+            for (int k = col; k < 4; ++k) a[r][k] -= f * a[col][k];
+        }
+    }
+    out = {a[0][3] / a[0][0], a[1][3] / a[1][1], with_column ? a[2][3] / a[2][2] : column};
+    return true;
+}
+} // namespace
+
+HostMoeCostFit fit_host_costs(std::span<const HostMoeCostSample> samples, float default_column_us) {
+    HostMoeCostFit fit;
+    if (samples.size() < 16) return fit;
+    // The column term is identifiable only if calls vary in columns per expert.
+    double c_min = 1e30, c_max = -1e30;
+    for (const auto& s : samples) {
+        const double c = static_cast<double>(s.pairs - s.experts) / std::max(s.experts, 1);
+        c_min = std::min(c_min, c), c_max = std::max(c_max, c);
+    }
+    const bool with_column = c_max - c_min >= 0.25;
+    std::vector<char> keep(samples.size(), 1);
+    std::array<double, 3> k{};
+    const auto residual = [&](const HostMoeCostSample& s) {
+        return static_cast<double>(s.us) -
+               (k[0] + k[1] * s.experts + k[2] * static_cast<double>(s.pairs - s.experts));
+    };
+    for (int pass = 0; pass < 2; ++pass) {
+        if (!solve_costs(samples, keep, with_column, default_column_us, k)) return HostMoeCostFit{};
+        if (pass == 1) break;
+        std::vector<double> r;
+        r.reserve(samples.size());
+        for (const auto& s : samples) r.push_back(std::fabs(residual(s)));
+        std::vector<double> sorted = r;
+        std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+        const double mad = std::max(sorted[sorted.size() / 2], 0.5);
+        for (std::size_t i = 0; i < samples.size(); ++i) keep[i] = r[i] <= 4.0 * mad ? 1 : 0;
+    }
+    double ss = 0.0;
+    std::int32_t kept = 0;
+    for (std::size_t i = 0; i < samples.size(); ++i) {
+        if (keep[i] == 0) continue;
+        const double e = residual(samples[i]);
+        ss += e * e, ++kept;
+    }
+    fit.samples   = kept;
+    fit.fixed_us  = static_cast<float>(std::max(k[0], 0.0));
+    fit.expert_us = static_cast<float>(std::max(k[1], 0.0));
+    fit.column_us = static_cast<float>(std::max(k[2], 0.0));
+    fit.rms_us    = static_cast<float>(std::sqrt(ss / std::max(kept, 1)));
+    return fit;
+}
+
 void HostMoeMailbox::clear_route_flags() noexcept {
     if (config_.route_log_tokens <= 0) return;
     for (std::int32_t l = 0; l < config_.layers; ++l) {
@@ -950,6 +1043,14 @@ void HostMoeMailbox::serve(HostMoeExecutor& executor, std::int32_t layer) {
         r.pairs   = st.pairs;
         served_experts_.fetch_add(st.experts, std::memory_order_relaxed);
         served_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (r.tokens <= kHostMaxTokens && st.experts > 0 &&
+            cost_capacity_.load(std::memory_order_relaxed) > 0) {
+            const std::lock_guard lock(cost_mutex_);
+            if (static_cast<std::int64_t>(cost_samples_.size()) <
+                cost_capacity_.load(std::memory_order_relaxed)) {
+                cost_samples_.push_back({st.experts, st.pairs, 1e-3F * static_cast<float>(st.end_ns)});
+            }
+        }
     }
     if (!dump_path_.empty() && r.tokens <= kHostMaxTokens && dump_records_ < dump_max_) {
         if (!any)

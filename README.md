@@ -18,7 +18,7 @@ Anthropic-compatible HTTP API, so agent tools such as Claude Code, Codex CLI and
 
 capy-flash **is ninfer-tp2, renamed at v0.5.0**: the two-GPU tensor-parallel fork of
 [Neroued/ninfer](https://github.com/Neroued/ninfer) (v0.1-v0.4.9 under the old name); [NOTICE](NOTICE) lists every piece
-of prior work it builds on. Status: **v0.7.4**. Built, tested and measured on one machine ([below](#benchmarks));
+of prior work it builds on. Status: **v0.7.5**. Built, tested and measured on one machine ([below](#benchmarks));
 users report other setups. Not affiliated with Qwen or NVIDIA.
 
 ## Pick a model
@@ -274,6 +274,16 @@ artifact kinds (DFlash, MoE, vision workspace; `GATE_CTEST_EXCLUDE`), then check
 texts against a recorded reference ([tools/tp2/README.md](tools/tp2/README.md)).
 
 ## What's new
+
+**v0.7.5**
+- `--miss-split calibrate` (Flash-Next NVFP4, opt-in; asked for in
+  [issue #11](https://github.com/ValerioDolci/capy-flash/issues/11)): the decode miss split with costs measured on
+  your machine instead of the fixed ones fitted on our Ryzen 9 9900X. It times the GPU's copy of an expert over PCIe at
+  startup and the CPU's time per expert over the first 4,096 decode calls, logs both, then splits with them. On our
+  box it lands where the fixed costs already were, and splitting does not beat `off` there (agentic replay, two runs:
+  one GPU 74.8 / 73.5 tok/s against 72.9 / 73.0 with `off`; two GPUs 155.5 / 152.5 against 157.6 / 154.1), so the
+  default stays `off`. It is there to check whether the split pays on other CPUs and links
+  ([docs/serving.md](docs/serving.md#capy-flash-serving)).
 
 **v0.7.4**
 - Disk tier: a long conversation saved on disk now resumes even when a shorter match (a system prompt another

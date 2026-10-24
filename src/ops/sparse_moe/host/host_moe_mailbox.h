@@ -46,6 +46,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -94,7 +95,34 @@ struct HostMoeDeviceShare {
     std::int32_t* reads       = nullptr;
     std::int32_t* picks       = nullptr;
     std::int32_t* stage_table = nullptr;
+    // Optional device copy of the split rule: when set the publish reads the rule there instead of
+    // its launch argument, so the owner can change it between windows without capturing the
+    // graphs again (--miss-split calibrate).
+    const HostMoeSplit* live = nullptr;
 };
+
+// One served decode call (<= kHostMaxTokens tokens with host experts) for the cost fit: distinct
+// host experts, (token, expert) pairs, executor time in microseconds.
+struct HostMoeCostSample {
+    std::int32_t experts = 0;
+    std::int32_t pairs   = 0;
+    float us             = 0.0F;
+};
+
+// Host cost line of HostMoeSplit fitted on samples: us = fixed + expert * experts + column *
+// (pairs - experts), least squares, refitted once without the samples whose residual exceeds 4x
+// the median absolute residual (wake-ups after idle, preemption). When the samples barely vary in
+// columns per expert (one token per call) `column_us` keeps `default_column_us` and the other two
+// are fitted. Coefficients are clamped at >= 0. `samples` = samples kept; 0 = no fit.
+struct HostMoeCostFit {
+    std::int32_t samples = 0;
+    float fixed_us       = 0.0F;
+    float expert_us      = 0.0F;
+    float column_us      = 0.0F;
+    float rms_us         = 0.0F; // residual of the kept samples
+};
+[[nodiscard]] HostMoeCostFit fit_host_costs(std::span<const HostMoeCostSample> samples,
+                                            float default_column_us);
 
 struct HostMoeMailboxConfig {
     int device                = 0;
@@ -247,6 +275,11 @@ public:
         return served_calls_.load(std::memory_order_relaxed);
     }
 
+    // Cost fit (--miss-split calibrate): the service records up to `max_samples` decode calls
+    // with host experts from now on; samples() copies them (any thread).
+    void collect_cost_samples(std::int64_t max_samples);
+    [[nodiscard]] std::vector<HostMoeCostSample> cost_samples() const;
+
     // Clears every layer's `published` word and split words (no window in flight).
     void clear_route_flags() noexcept;
     // Stamps of `layer` (gpu_stamps; nullptr otherwise): kStampCount words, device clock.
@@ -307,6 +340,9 @@ private:
     std::vector<HostMoeCallRecord> call_log_;
     std::atomic<std::int64_t> served_experts_{0};
     std::atomic<std::int64_t> served_calls_{0};
+    std::atomic<std::int64_t> cost_capacity_{0};
+    mutable std::mutex cost_mutex_;
+    std::vector<HostMoeCostSample> cost_samples_;
     // T98 validation dump (NINFER_HOST_MOE_DUMP=<file>): every served decode call (<= 8 tokens
     // with host experts) as the executor saw it (layer, ids, alpha, x, out) plus the partial the
     // device's accumulate actually read (`echo_`, mapped, written by the accumulate kernel),

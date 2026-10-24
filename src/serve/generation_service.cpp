@@ -295,7 +295,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.kv_cache               = options_.kv_cache;
     engine_options.elastic_kv             = options_.elastic_kv;
     if (options_.miss_split) {
-        engine_options.routed_experts.miss_split.mode = *options_.miss_split;
+        engine_options.routed_experts.miss_split.mode      = *options_.miss_split;
+        engine_options.routed_experts.miss_split.calibrate = options_.miss_split_calibrate;
     }
     if (options_.expert_cpu_threads) {
         engine_options.routed_experts.cpu_threads      = *options_.expert_cpu_threads;

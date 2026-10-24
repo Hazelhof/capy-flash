@@ -704,9 +704,38 @@ void split_shares(HostMoeMailboxConfig cfg, const LayerData& data, const std::ve
     CK(cudaFreeHost(dn));
 }
 
+// fit_host_costs (--miss-split calibrate): recovers a known cost line from noisy samples with
+// outliers, and keeps the given column cost when every call has one column per expert.
+void cost_fit() {
+    std::mt19937_64 rng(11);
+    std::normal_distribution<float> noise(0.0F, 2.0F);
+    std::vector<HostMoeCostSample> s;
+    for (int i = 0; i < 4000; ++i) {
+        const int e = 1 + static_cast<int>(rng() % 12), extra = static_cast<int>(rng() % (3 * e + 1));
+        float us = 20.0F + 50.0F * e + 3.0F * extra + noise(rng);
+        if (i % 97 == 0) us += 2000.0F; // wake-up after idle
+        s.push_back({e, e + extra, us});
+    }
+    const HostMoeCostFit f = fit_host_costs(s, 1.9F);
+    expect(f.samples > 3800 && std::fabs(f.fixed_us - 20.0F) < 1.5F &&
+               std::fabs(f.expert_us - 50.0F) < 0.5F && std::fabs(f.column_us - 3.0F) < 0.3F &&
+               f.rms_us < 3.0F,
+           "cost fit recovers 20 + 50/expert + 3/column");
+    std::vector<HostMoeCostSample> one;
+    for (int i = 0; i < 500; ++i) {
+        const int e = 1 + i % 9;
+        one.push_back({e, e, 10.0F + 40.0F * e + noise(rng)});
+    }
+    const HostMoeCostFit g = fit_host_costs(one, 1.9F);
+    expect(g.samples > 450 && std::fabs(g.expert_us - 40.0F) < 0.5F && g.column_us == 1.9F,
+           "cost fit with one column per expert keeps the given column cost");
+    expect(fit_host_costs(std::span(s).first(8), 1.9F).samples == 0, "cost fit needs samples");
+}
+
 } // namespace
 
 int main() {
+    cost_fit();
     int devices = 0;
     if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0 ||
         !host_experts_supported()) {

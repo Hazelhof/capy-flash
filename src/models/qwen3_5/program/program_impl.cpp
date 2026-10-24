@@ -608,6 +608,7 @@ void ProgramImpl::construct_qwen4(const SequencePlanImpl& plan, DeviceSpan backi
         options.split                = execution::host_miss_split(split);
         options.split_staged         = split.mode != MissSplitMode::Off && split.staged;
         options.split_on_peer        = offload_peer.has_value() && split.peer_share;
+        options.split_calibrate      = split.mode == MissSplitMode::Auto && split.calibrate;
         options.stream_min_tokens = static_cast<std::int32_t>(plan.qwen4_experts.stream_min_tokens);
         options.gguf_stream_min_tokens =
             static_cast<std::int32_t>(plan.qwen4_experts.gguf_stream_min_tokens);

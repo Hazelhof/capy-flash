@@ -214,7 +214,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--disk-cache-flush-seconds N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] [--turn-anchors N] "
-           "[--elastic] [--kv-grow N] [--kv-budget-gib G] [--miss-split auto|off] "
+           "[--elastic] [--kv-grow N] [--kv-budget-gib G] [--miss-split auto|calibrate|off] "
            "[--stream-min-tokens N] [--expert-cpu-threads N] "
            "[--request-log-jsonl FILE] [--log-speculation-detail] "
            "[--log-speculation-detail-max-steps N] "
@@ -286,7 +286,9 @@ std::string serve_usage_text(const char* argv0) {
            "       Qwen4Exp: --elastic backs the KV on demand and lends unused KV to the expert "
            "slot cache (grow step --kv-grow tokens, default 8192; --kv-budget-gib caps one "
            "request's KV); --miss-split auto lets the GPU read part of each window's missing "
-           "experts (best at one GPU), off keeps them all on the CPU (default); prompt chunks of "
+           "experts (best at one GPU), calibrate does the same with costs measured on this machine "
+           "(GPU copy rate at startup, CPU time per expert over the first decode calls, logged), "
+           "off keeps them all on the CPU (default); prompt chunks of "
            "at least --stream-min-tokens N tokens stream the non-resident experts to the GPU "
            "over PCIe, shorter ones compute them on the CPU (default " +
            std::to_string(RoutedExpertOptions{}.stream_min_tokens) +
@@ -547,12 +549,16 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.elastic_kv.kv_budget_bytes = static_cast<std::size_t>(gib * 1073741824.0);
         } else if (arg == "--miss-split") {
             const std::string value = require_value("--miss-split");
+            options.miss_split_calibrate = false;
             if (value == "auto") {
                 options.miss_split = MissSplitMode::Auto;
+            } else if (value == "calibrate") {
+                options.miss_split           = MissSplitMode::Auto;
+                options.miss_split_calibrate = true;
             } else if (value == "off") {
                 options.miss_split = MissSplitMode::Off;
             } else {
-                throw std::invalid_argument("--miss-split must be auto or off");
+                throw std::invalid_argument("--miss-split must be auto, calibrate or off");
             }
         } else if (arg == "--expert-cpu-threads") {
             const int n = parse_nonnegative_int(require_value("--expert-cpu-threads"), "expert-cpu-threads");

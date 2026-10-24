@@ -357,6 +357,12 @@ int main() {
             check(parse({"ninfer-serve", "model.ninfer", "--miss-split", "off"}).miss_split ==
                       ninfer::MissSplitMode::Off,
                   "--miss-split off did not reach serving options");
+        {
+            const auto c = parse({"ninfer-serve", "model.ninfer", "--miss-split", "calibrate"});
+            failures += check(c.miss_split == ninfer::MissSplitMode::Auto && c.miss_split_calibrate &&
+                                  !e.miss_split_calibrate,
+                              "--miss-split calibrate did not reach serving options");
+        }
         int rejected = 0;
         for (const auto& bad : {std::vector<std::string>{"--miss-split", "0.3"},
                                 std::vector<std::string>{"--kv-grow", "0"},
